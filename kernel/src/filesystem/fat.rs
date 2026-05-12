@@ -132,7 +132,6 @@ impl FatDriver {
     //get entries array address and overwrite that mem location with data from root directory
     //calculate size and position of root direcotry based on data from header
     pub fn load_entries(&mut self) {
-        print!(" loading entries");
         let target = &mut self.entries as *mut Entry;
 
         let entry_size = mem::size_of::<Entry>() as u16;

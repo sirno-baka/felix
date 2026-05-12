@@ -2,6 +2,7 @@
 //Manages text output by directly writing to VGA video memory
 
 use core::arch::asm;
+use core::fmt;
 
 //Warning! Mutable static here
 //TODO: Implement a mutex to get safe access to this
@@ -11,6 +12,8 @@ pub static mut PRINTER: Printer = Printer {
     foreground: 0x7,
     background: 0,
 };
+
+
 
 const WIDTH: u16 = 80;
 const HEIGHT: u16 = 25;
@@ -159,5 +162,39 @@ impl Printer {
         }
 
         self.set_cursor_position();
+    }
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.prints(s);
+        Ok(())
+    }
+}
+impl fmt::Write for Printer {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.prints(s);
+        Ok(())
+    }
+}
+
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => ($crate::print::_print(format_args!($($arg)*)));
+}
+
+#[macro_export]
+macro_rules! println {
+    () => {
+        unsafe { $crate::print::PRINTER.prints("\n"); }
+    };
+
+    ($($arg:tt)*) => {
+        $crate::print!("{}", format_args!($($arg)*));
+        unsafe { $crate::print::PRINTER.prints("\n"); }
+    };
+}
+
+pub fn _print(args: fmt::Arguments) {
+    use core::fmt::Write;
+    unsafe {
+        PRINTER.write_fmt(args).unwrap();
     }
 }

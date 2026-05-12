@@ -10,7 +10,7 @@ unsafe impl GlobalAlloc for SyscallAllocator {
         let ptr: u32;
         core::arch::asm!(
         "int 0x80",
-        inlateout("eax") 2 => ptr,   // ← 2 = alloc
+        inlateout("eax") 200 => ptr,   // SYS_MALLOC = 200
         in("ebx") size,
         in("ecx") align,
         options(nostack, preserves_flags)
@@ -24,7 +24,7 @@ unsafe impl GlobalAlloc for SyscallAllocator {
 
         core::arch::asm!(
         "int 0x80",
-        in("eax") 3,                 // ← 3 = dealloc
+        in("eax") 201,                 // SYS_FREE = 201
         in("ebx") ptr as u32,
         in("ecx") size,
         in("edx") align,
@@ -32,6 +32,5 @@ unsafe impl GlobalAlloc for SyscallAllocator {
         );
     }
 }
-
 #[global_allocator]
 static ALLOCATOR: SyscallAllocator = SyscallAllocator;

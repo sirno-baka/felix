@@ -2,7 +2,7 @@
 
 use crate::filesystem::fat::FAT;
 use crate::multitasking::task::TASK_MANAGER;
-use crate::syscalls::print::PRINTER;
+use crate::print::PRINTER;
 
 use crate::memory::paging::PAGING;
 use crate::memory::paging::TABLES;
@@ -219,7 +219,7 @@ impl Shell {
                 if signature == APP_SIGNATURE {
                     TASK_MANAGER.add_task((target + 4) as u32);
                 } else {
-                    println!("File is not a valid executable!");
+                    PRINTER.prints("File is not a valid executable!");
                 }
             }
         } else {

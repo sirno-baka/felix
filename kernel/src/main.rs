@@ -12,6 +12,7 @@ mod memory;
 mod multitasking;
 mod shell;
 mod syscalls;
+pub mod print;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
@@ -20,7 +21,7 @@ use drivers::pic::PICS;
 use interrupts::idt::IDT;
 use memory::paging::PAGING;
 use shell::shell::SHELL;
-use syscalls::print::PRINTER;
+use print::PRINTER;
 use filesystem::fat::FAT;
 
 use multitasking::task::TASK_MANAGER;

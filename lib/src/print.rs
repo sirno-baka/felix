@@ -1,4 +1,3 @@
-use alloc::vec::Vec;
 use core::arch::asm;
 use core::fmt;
 
@@ -6,37 +5,51 @@ pub struct Printer {}
 
 pub static mut PRINTER: Printer = Printer {};
 
-// ====================== КОНВЕРТЕР UTF-8 → CP866 ======================
+// ====================== КОНВЕРТЕР UTF-8 → CP866 (без аллокации) ======================
+fn char_to_cp866(c: char) -> u8 {
+    match c {
+        // Основная кириллица
+        'А'..='Я' => (c as u32 - 'А' as u32 + 0x80) as u8,
+        'а'..='п' => (c as u32 - 'а' as u32 + 0xA0) as u8,
+        'р'..='я' => (c as u32 - 'р' as u32 + 0xE0) as u8,
 
+        // Ё / ё
+        'Ё' => 0xF0,
+        'ё' => 0xF1,
 
-// ====================== ОСНОВНОЙ ПРИНТЕР ======================
+        // Управляющие символы
+        '\n' => b'\n',
+        '\r' => b'\r',
+        '\t' => b'\t',
+
+        // ASCII как есть
+        c if c.is_ascii() => c as u8,
+
+        // Неизвестный символ → ?
+        _ => b'?',
+    }
+}
+
 impl fmt::Write for Printer {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.prints(s);
+        unsafe { self.prints(s); }
         Ok(())
     }
 }
 
 impl Printer {
-    pub fn prints(&self, s: &str) {
-
+    // Печатаем один байт через syscall (самый безопасный способ)
+    fn print_byte(&self, byte: u8) {
         unsafe {
-            let ptr = s.as_ptr();
-            let len = s.len();
-
-            asm!(
-            "push eax",
-            "push ebx",
-            "push ecx",
-            "int 0x80",
-            "pop ecx",
-            "pop ebx",
-            "pop eax",
-            in("eax") 0,
-            in("ebx") ptr as u32,
-            in("ecx") len as u32,
-            );
+            let ptr = &byte as *const u8;
+            crate::syscall::write(1, ptr, 1);   // fd = 1 = stdout
         }
+    }
+
+    pub unsafe fn prints(&self, s: &str) {
+        let ptr = s.as_ptr();
+
+        crate::syscall::write(1, ptr, s.len());
     }
 }
 
