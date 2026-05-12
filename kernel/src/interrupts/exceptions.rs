@@ -1,5 +1,5 @@
 use core::arch::asm;
-
+use crate::println;
 //CPU EXCEPTIONS HANDLERS
 
 //handle excpetion based on interrupt number
@@ -7,28 +7,28 @@ use core::arch::asm;
 pub extern "C" fn exception_handler(int: u32, eip: u32, cs: u32, eflags: u32) {
     match int {
         0x00 => {
-            libfelix::println!("DIVISION ERROR!");
+            println!("DIVISION ERROR!");
         }
         0x06 => {
-            libfelix::println!("INVALID OPCODE!");
+            println!("INVALID OPCODE!");
         }
         0x08 => {
-            libfelix::println!("DOUBLE FAULT!");
+            println!("DOUBLE FAULT!");
         }
         0x0D => {
-            libfelix::println!("GENERAL PROTECTION FAULT!");
+            println!("GENERAL PROTECTION FAULT!");
         }
         0x0E => {
-            libfelix::println!("PAGE FAULT!");
+            println!("PAGE FAULT!");
         }
         0xFF => {
-            libfelix::println!("EXCEPTION!");
+            println!("EXCEPTION!");
         }
         _ => {
-            libfelix::println!("EXCEPTION!");
+            println!("EXCEPTION!");
         }
     }
-    libfelix::println!("EIP: {:X}, CS: {:X}, EFLAGS: {:b}", eip, cs, eflags);
+    println!("EIP: {:X}, CS: {:X}, EFLAGS: {:b}", eip, cs, eflags);
 
     loop {}
 }

@@ -18,7 +18,6 @@ use core::panic::PanicInfo;
 use drivers::disk::DISK;
 use drivers::pic::PICS;
 use interrupts::idt::IDT;
-use memory::allocator::Allocator;
 use memory::paging::PAGING;
 use shell::shell::SHELL;
 use syscalls::print::PRINTER;
@@ -26,10 +25,7 @@ use filesystem::fat::FAT;
 
 use multitasking::task::TASK_MANAGER;
 
-use libfelix;
 
-#[global_allocator]
-static ALLOCATOR: Allocator = Allocator;
 
 //1MiB. TODO: Get those from linker
 const KERNEL_START: u32 = 0x0010_0000;
@@ -108,7 +104,6 @@ pub extern "C" fn _start() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    libfelix::println!("PANIC! Info: {}", info);
 
     loop {}
 }
@@ -118,12 +113,6 @@ fn print_info() {
         PRINTER.set_colors(0xf, 0);
     }
 
-    libfelix::println!();
-    libfelix::println!("FELIX {}", VERSION);
-    libfelix::println!("Copyright (c) 2023 Gianmatteo Palmieri");
-    libfelix::println!();
-    libfelix::println!("Type \"help\" and press enter to show a list of available commands");
-    libfelix::println!();
 
     unsafe {
         PRINTER.reset_colors();

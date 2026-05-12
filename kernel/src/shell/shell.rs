@@ -8,6 +8,7 @@ use crate::memory::paging::PAGING;
 use crate::memory::paging::TABLES;
 
 use core::arch::asm;
+use crate::{print, println};
 
 const APP_TARGET: u32 = 0x00a0_0000;
 const APP_SIZE: u32 = 0x0001_0000;
@@ -45,7 +46,7 @@ impl Shell {
 
         unsafe {
             PRINTER.set_colors(0xc, 0);
-            libfelix::print!("{}", PROMPT);
+            print!("{}", PROMPT);
 
             PRINTER.reset_colors();
         }
@@ -56,7 +57,7 @@ impl Shell {
         self.buffer[self.cursor] = c;
         self.cursor += 1;
 
-        libfelix::print!("{}", c);
+        print!("{}", c);
     }
 
     //backspace, removes last char from buffer and updates cursor
@@ -92,9 +93,14 @@ impl Shell {
         match self.buffer {
             //test command
             _b if self.is_command("ping") => {
-                libfelix::println!("PONG!");
+                println!("PONG!");
             }
-
+            _b if self.is_command("alloc") => {
+                let mut v = alloc::vec::Vec::new();
+                v.push(1);
+                v.push(2);
+                println!("vec allocated! len = {}", v.len());
+            }
             //list root directory
             _b if self.is_command("ls") => unsafe {
                 FAT.acquire().list_entries();
@@ -109,7 +115,7 @@ impl Shell {
             //remove runing task
             b if self.is_command("rt") => unsafe {
                 if (b[3] as u8) < 0x30 {
-                    libfelix::println!("No task id provided!");
+                    println!("No task id provided!");
                     return;
                 }
 
@@ -145,14 +151,14 @@ impl Shell {
                         TASK_MANAGER.add_dummy_task_c();
                     }
                     _ => {
-                        libfelix::println!("Specify test a, b, or c!");
+                        println!("Specify test a, b, or c!");
                     }
                 }
             },
 
             //help command
             _b if self.is_command("help") => {
-                libfelix::println!("{}", HELP);
+                println!("{}", HELP);
             }
 
             //empty, do nothing
@@ -160,7 +166,7 @@ impl Shell {
 
             //unknown command
             _ => {
-                libfelix::println!("Unknown command!");
+                println!("Unknown command!");
             }
         }
     }
@@ -179,12 +185,12 @@ impl Shell {
 
             for c in fat.buffer {
                 if c != 0 {
-                    libfelix::print!("{}", c as char);
+                    print!("{}", c as char);
                 }
             }
-            libfelix::println!();
+            println!();
         } else {
-            libfelix::println!("File not found!");
+            println!("File not found!");
         }
         FAT.free();
     }
@@ -213,11 +219,11 @@ impl Shell {
                 if signature == APP_SIGNATURE {
                     TASK_MANAGER.add_task((target + 4) as u32);
                 } else {
-                    libfelix::println!("File is not a valid executable!");
+                    println!("File is not a valid executable!");
                 }
             }
         } else {
-            libfelix::println!("Program not found!");
+            println!("Program not found!");
         }
         FAT.free();
     }

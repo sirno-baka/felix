@@ -2,7 +2,8 @@
 
 use crate::drivers::disk::DISK;
 use core::mem;
-use libfelix::mutex::Mutex;
+use crate::{print, println};
+use crate::multitasking::mutex::Mutex;
 
 pub static mut FAT: Mutex<FatDriver> = Mutex::new(FatDriver {
     header: NULL_HEADER,
@@ -131,7 +132,7 @@ impl FatDriver {
     //get entries array address and overwrite that mem location with data from root directory
     //calculate size and position of root direcotry based on data from header
     pub fn load_entries(&mut self) {
-        libfelix::print!(" loading entries");
+        print!(" loading entries");
         let target = &mut self.entries as *mut Entry;
 
         let entry_size = mem::size_of::<Entry>() as u16;
@@ -151,24 +152,24 @@ impl FatDriver {
     //list each entry in root direcotry
     //TODO: add other info like creation_date ecc
     pub fn list_entries(&self) {
-        libfelix::println!("Listing root directory entries:");
+        println!("Listing root directory entries:");
 
-        libfelix::println!("Name          Size          Cluster number");
+        println!("Name          Size          Cluster number");
 
         for i in 0..ENTRY_COUNT {
             if self.entries[i].name[0] != 0 {
                 //print name
                 for c in self.entries[i].name {
-                    libfelix::print!("{}", c as char);
+                    print!("{}", c as char);
                 }
                 //print size
                 let size = self.entries[i].size;
-                libfelix::print!("   {} bytes", size);
+                print!("   {} bytes", size);
 
                 //print cluster
                 let cluster = self.entries[i].first_cluster_low;
-                libfelix::print!("     {}", cluster);
-                libfelix::println!();
+                print!("     {}", cluster);
+                println!();
             }
         }
     }

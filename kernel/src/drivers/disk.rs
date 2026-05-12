@@ -2,6 +2,7 @@
 //Driver for ATA disk supporting PIO MODE
 
 use core::arch::asm;
+use crate::println;
 
 //Warning! Mutable static here
 //TODO: Implement a mutex to get safe access to this
@@ -37,7 +38,7 @@ impl Disk {
     //read multiple sectors from lba to specified target
     pub fn read<T>(&self, target: *mut T, lba: u64, sectors: u16) {
         if !self.enabled {
-            libfelix::println!("[ERROR] Cannot read! Disk not enabled");
+            println!("[ERROR] Cannot read! Disk not enabled");
             return;
         }
 
@@ -119,10 +120,10 @@ impl Disk {
 
         if status != 0 && status != 0xff {
             self.enabled = true;
-            libfelix::println!("[!] ATA drive found! Status register: {:X}", status);
+            println!("[!] ATA drive found! Status register: {:X}", status);
         } else {
             self.enabled = false;
-            libfelix::println!(
+            println!(
                 "[ERROR] ATA drive not working! Status register: {:X}",
                 status
             );
@@ -146,7 +147,7 @@ pub extern "C" fn ata_interrupt() {
 
 #[no_mangle]
 pub extern "C" fn ata_handler() {
-    libfelix::println!("0x2e int");
+    println!("0x2e int");
 
     PICS.end_interrupt(0x2e);
 }*/

@@ -1,5 +1,6 @@
 //TASK MANAGER
 use core::arch::asm;
+use crate::println;
 
 const STACK_SIZE: usize = 4096;
 const MAX_TASKS: i8 = 32;
@@ -168,12 +169,12 @@ impl TaskManager {
     }
 
     pub fn list_tasks(&self) {
-        libfelix::println!("Running tasks:");
+        println!("Running tasks:");
 
         for i in 0..MAX_TASKS {
             let running = self.tasks[i as usize].running;
             if running {
-                libfelix::println!("ID: {}", i);
+                println!("ID: {}", i);
             }
         }
     }
@@ -205,12 +206,12 @@ fn task_a() {
     let mut b: u8 = 0;
     loop {
         if a == 100_000_000 {
-            libfelix::println!("Process A running. {}% complete.", b);
+            println!("Process A running. {}% complete.", b);
             a = 0;
             b += 1;
 
             if b == 100 {
-                libfelix::println!("Process A complete.");
+                println!("Process A complete.");
                 break;
             }
         }
@@ -224,12 +225,12 @@ fn task_b() {
     let mut b: u8 = 0;
     loop {
         if a == 100_000_000 {
-            libfelix::println!("Process B running. {}% complete.", b);
+            println!("Process B running. {}% complete.", b);
             a = 0;
             b += 1;
 
             if b == 100 {
-                libfelix::println!("Process B complete.");
+                println!("Process B complete.");
                 break;
             }
         }
@@ -243,12 +244,12 @@ fn task_c() {
     let mut b: u8 = 0;
     loop {
         if a == 100_000_000 {
-            libfelix::println!("Process C running. {}% complete.", b);
+            println!("Process C running. {}% complete.", b);
             a = 0;
             b += 1;
 
             if b == 100 {
-                libfelix::println!("Process C complete.");
+                println!("Process C complete.");
                 break;
             }
         }
