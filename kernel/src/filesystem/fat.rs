@@ -294,6 +294,72 @@ impl FatDriver {
         }
     }
 
+    // Открыть файл → возвращает fd (>= 3) или -1
+    pub fn open(&mut self, filename: &str) -> i32 {
+        let fat_name = Self::string_to_fat_name(filename);
+
+        for (i, entry) in self.entries.iter().enumerate() {
+            if entry.name == fat_name && entry.name[0] != 0 && entry.name[0] != 0xE5 {
+                return (i as i32) + 3;
+            }
+        }
+        println!("[FAT] open: file '{}' not found", filename);
+        -1
+    }
+
+    // Запись по file descriptor (перезаписывает файл полностью)
+    pub fn write_fd(&mut self, fd: i32, data: &[u8]) -> i32 {
+        if fd < 3 {
+            return -1;
+        }
+
+        let entry_index = (fd as usize) - 3;
+        if entry_index >= ENTRY_COUNT {
+            return -1;
+        }
+
+        let entry = &self.entries[entry_index];
+
+        if entry.name[0] == 0 || entry.name[0] == 0xE5 {
+            return -1;
+        }
+
+        // Используем уже существующую функцию
+        self.write_file_from_source(entry, data.as_ptr());
+        data.len() as i32
+    }
+    pub fn write_file_from_source(&self, entry: &Entry, source: *const u8) {
+        let mut next_cluster = entry.first_cluster_low;
+        let mut current_source = source as *const u32;
+
+        loop {
+            let data_lba: u64 = FAT_START as u64
+                + (self.header.reserved_sectors
+                + self.header.sectors_per_fat * self.header.fat_count as u16
+                + 32) as u64;
+
+            let lba: u64 =
+                data_lba + ((next_cluster - 2) * self.header.sectors_per_cluster as u16) as u64;
+
+            let sectors: u16 = self.header.sectors_per_cluster as u16;
+
+            unsafe {
+                DISK.write(current_source as *const u32, lba, sectors);
+            }
+
+            //advance pointer by cluster size
+            let cluster_size = self.header.sectors_per_cluster as u32 * self.header.bytes_per_sector as u32;
+            current_source = unsafe {
+                (current_source as *const u8).add(cluster_size as usize) as *const u32
+            };
+
+            next_cluster = self.table[next_cluster as usize];
+
+            if next_cluster == 0xffff {
+                break;
+            }
+        }
+    }
     pub fn delete_file(&mut self, filename: &str) -> bool {
 
         self.load_table();
