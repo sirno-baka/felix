@@ -12,11 +12,10 @@ pub static mut FAT: Mutex<FatDriver> = Mutex::new(FatDriver {
     buffer: [0; 2048],
 });
 
-const ENTRY_COUNT: usize = 512;
+const ENTRY_COUNT: usize = 1024;
 const FAT_START: u16 = 36864;
 
-const FAT_SIZE: usize = 256;
-
+const FAT_SIZE: usize = 32768;   // 64 КБ — с запасом хватит для sectors_per_fat до ~250
 //FAT16 header
 #[derive(Copy, Clone, Debug)]
 #[repr(C, packed)]
@@ -173,17 +172,252 @@ impl FatDriver {
         }
     }
 
+    // === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+
+    // Преобразует "file.txt" → [u8;11] в формате 8.3 FAT (uppercase + пробелы)
+    fn string_to_fat_name(filename: &str) -> [u8; 11] {
+        let mut fat_name = [b' '; 11];
+        let upper = filename.to_ascii_uppercase();
+        let bytes = upper.as_bytes();
+
+        if let Some(dot_pos) = bytes.iter().position(|&b| b == b'.') {
+            // имя (до 8 символов)
+            for (i, &b) in bytes.iter().take(8).take(dot_pos).enumerate() {
+                fat_name[i] = b;
+            }
+            // расширение (3 символа)
+            let ext_start = dot_pos + 1;
+            for (i, &b) in bytes.iter().skip(ext_start).take(3).enumerate() {
+                fat_name[8 + i] = b;
+            }
+        } else {
+            // без расширения
+            for (i, &b) in bytes.iter().take(11).enumerate() {
+                fat_name[i] = b;
+            }
+        }
+        fat_name
+    }
+
+    // Поиск свободного слота в root directory (0x00 или 0xE5 = свободно/удалено)
+    pub fn find_free_entry(&mut self) -> Option<usize> {
+        for (i, entry) in self.entries.iter_mut().enumerate() {
+            if entry.name[0] == 0x00 || entry.name[0] == 0xE5 {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    // Поиск следующего свободного кластера начиная с указанного номера
+    pub fn find_free_cluster(&self, start: u16) -> Option<u16> {
+        let start = start.max(2);
+        for i in start..self.table.len() as u16 {
+            if self.table[i as usize] == 0 {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    // Выделение цепочки кластеров и связывание их в FAT
+    pub fn allocate_clusters(&mut self, num_clusters: usize) -> Option<u16> {
+        if num_clusters == 0 {
+            return None;
+        }
+
+        let mut first_cluster: Option<u16> = None;
+        let mut prev_cluster: u16 = 0;
+
+        for i in 0..num_clusters {
+            // Для первого кластера ищем с 2, для остальных — после предыдущего
+            let start_search = if i == 0 { 2u16 } else { prev_cluster + 1 };
+
+            let cluster = match self.find_free_cluster(start_search) {
+                Some(c) => c,
+                None => return None, // нет свободного места
+            };
+
+            if first_cluster.is_none() {
+                first_cluster = Some(cluster);
+            }
+
+            // Связываем предыдущий кластер с текущим
+            if prev_cluster != 0 {
+                self.table[prev_cluster as usize] = cluster;
+            }
+
+            prev_cluster = cluster;
+        }
+
+        // Последний кластер — конец файла
+        if prev_cluster != 0 {
+            self.table[prev_cluster as usize] = 0xFFFF;
+        }
+
+        first_cluster
+    }
+
+    // LBA кластера данных
+    fn cluster_to_lba(&self, cluster: u16) -> u64 {
+        let root_dir_sectors = ((self.header.dir_entries_count as u32 * 32) / self.header.bytes_per_sector as u32) as u64;
+
+        let data_start_lba = FAT_START as u64
+            + self.header.reserved_sectors as u64
+            + (self.header.sectors_per_fat as u64 * self.header.fat_count as u64)
+            + root_dir_sectors;
+
+        data_start_lba + ((cluster as u64 - 2) * self.header.sectors_per_cluster as u64)
+    }
+
+    // Запись данных в цепочку кластеров
+    fn write_data_to_clusters(&self, mut cluster: u16, data: &[u8]) {
+        let cluster_size = self.header.sectors_per_cluster as usize * self.header.bytes_per_sector as usize;
+        let mut offset = 0;
+
+        while offset < data.len() && cluster != 0xFFFF {
+            let chunk_len = (data.len() - offset).min(cluster_size);
+            let chunk = &data[offset..offset + chunk_len];
+
+            let lba = self.cluster_to_lba(cluster);
+
+            // Пишем целый кластер (последний может быть частично заполнен — остаток останется как есть)
+            unsafe {
+                DISK.write(chunk.as_ptr() as *const u32, lba, self.header.sectors_per_cluster as u16);
+            }
+
+            offset += chunk_len;
+            cluster = self.table[cluster as usize];
+        }
+    }
+
+    // === ОСНОВНОЙ МЕТОД: СОЗДАНИЕ + ЗАПИСЬ ФАЙЛА ===
+    // Если файл уже существует — перезаписывает его
+    pub fn write_file(&mut self, filename: &str, data: &[u8]) -> bool {
+        // if !DISK.enabled {
+        //     println!("[FAT ERROR] Disk not enabled");
+        //     return false;
+        // }
+
+        self.load_table();   // загружаем актуальную таблицу
+
+        let fat_name = Self::string_to_fat_name(filename);
+
+        // 1. Ищем существующий файл (иммутабельный поиск)
+        let mut entry_index = None;
+        for (i, entry) in self.entries.iter().enumerate() {
+            if entry.name == fat_name {
+                entry_index = Some(i);
+                break;
+            }
+        }
+
+        // 2. Если файла нет — ищем свободный слот
+        if entry_index.is_none() {
+            entry_index = self.find_free_entry();
+        }
+
+        let entry_index = match entry_index {
+            Some(idx) => idx,
+            None => {
+                println!("[FAT ERROR] No free directory entry");
+                return false;
+            }
+        };
+
+        // 3. Сколько кластеров нужно?
+        let bytes_per_cluster = self.header.sectors_per_cluster as usize * self.header.bytes_per_sector as usize;
+        let num_clusters = if data.is_empty() { 0 } else { (data.len() + bytes_per_cluster - 1) / bytes_per_cluster };
+
+        // 4. Выделяем кластеры (теперь borrow'ов нет)
+        let first_cluster = if num_clusters > 0 {
+            match self.allocate_clusters(num_clusters) {
+                Some(c) => c,
+                None => {
+                    println!("[FAT ERROR] Not enough free space");
+                    return false;
+                }
+            }
+        } else {
+            0
+        };
+
+        // 5. Записываем данные в кластеры
+        if num_clusters > 0 {
+            self.write_data_to_clusters(first_cluster, data);
+        }
+
+        // 6. Заполняем/обновляем запись в директории (только сейчас)
+        self.entries[entry_index] = Entry {
+            name: fat_name,
+            attributes: 0x20,                    // Archive
+            reserved: 0,
+            created_time_tenths: 0,
+            created_time: 0,
+            created_date: 0x21C0,                // dummy дата
+            accessed_date: 0x21C0,
+            first_cluster_high: 0,
+            modified_time: 0,
+            modified_date: 0x21C0,
+            first_cluster_low: first_cluster,
+            size: data.len() as u32,
+        };
+
+        // 7. Сохраняем изменения на диск
+        self.save_table();
+        self.save_entries();
+
+        println!("[FAT OK] File '{}' written ({} bytes, start cluster {})",
+                 filename, data.len(), first_cluster);
+        true
+    }
+
     //load file allocation table
+    //load full FAT table (было только 1 сектор)
     pub fn load_table(&mut self) {
         let target = &mut self.table as *mut u16;
 
         let lba: u64 = FAT_START as u64 + self.header.reserved_sectors as u64;
-
-        //let sectors: u16 = self.header.sectors_per_fat;
-        let sectors: u16 = 1;
-
+        let sectors: u16 = self.header.sectors_per_fat;   // ← теперь полный FAT
         unsafe {
             DISK.read(target, lba, sectors);
+        }
+    }
+
+    //save full FAT table
+    pub fn save_table(&self) {
+        let source = &self.table as *const u16;
+        let lba: u64 = FAT_START as u64 + self.header.reserved_sectors as u64;
+        let sectors: u16 = self.header.sectors_per_fat;
+
+        unsafe {
+            DISK.write(source, lba, sectors);
+        }
+    }
+
+    //save header (boot sector) back to disk
+    pub fn save_header(&self) {
+        let source = &self.header as *const Header;
+        let lba: u64 = FAT_START as u64;
+        unsafe {
+            DISK.write(source, lba, 1);
+        }
+    }
+
+
+    //save root directory entries back to disk
+    pub fn save_entries(&self) {
+        let source = &self.entries as *const Entry;
+        let lba: u64 = FAT_START as u64
+            + (self.header.reserved_sectors
+            + self.header.sectors_per_fat * self.header.fat_count as u16) as u64;
+
+        let entry_size = mem::size_of::<Entry>() as u16;
+        let size: u16 = entry_size * self.header.dir_entries_count;
+        let sectors: u16 = size / self.header.bytes_per_sector;
+
+        unsafe {
+            DISK.write(source, lba, sectors);
         }
     }
 

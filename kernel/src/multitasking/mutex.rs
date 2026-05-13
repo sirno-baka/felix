@@ -19,6 +19,22 @@ impl<T> Mutex<T> {
         }
     }
 
+    /// Главный удобный метод — теперь всё просто и безопасно
+    pub fn lock<R, F: FnOnce(&mut T) -> R>(&mut self, f: F) -> R {
+        // spinlock
+        while !self.free.load(Ordering::SeqCst) {
+            core::hint::spin_loop();
+        }
+        self.free.store(false, Ordering::SeqCst);
+
+        // выполняем closure с mutable доступом
+        let result = f(&mut self.target);
+
+        // автоматически освобождаем
+        self.free.store(true, Ordering::SeqCst);
+        result
+    }
+
     //WARNING: You MUST call free()  after using acquire() or acquire_mut() when the target is no longer needed. Not doing so can, and will, lead to problems.
     pub fn acquire_mut(&mut self) -> &mut T {
         while !self.free.load(Ordering::SeqCst) {} // Wait until free is true
