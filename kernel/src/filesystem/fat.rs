@@ -148,27 +148,30 @@ impl FatDriver {
     }
 
     //list each entry in root direcotry
-    //TODO: add other info like creation_date ecc
+    //list each entry in root directory (теперь игнорирует удалённые файлы)
     pub fn list_entries(&self) {
         println!("Listing root directory entries:");
 
         println!("Name          Size          Cluster number");
 
         for i in 0..ENTRY_COUNT {
-            if self.entries[i].name[0] != 0 {
-                //print name
-                for c in self.entries[i].name {
-                    print!("{}", c as char);
-                }
-                //print size
-                let size = self.entries[i].size;
-                print!("   {} bytes", size);
-
-                //print cluster
-                let cluster = self.entries[i].first_cluster_low;
-                print!("     {}", cluster);
-                println!();
+            let name0 = self.entries[i].name[0];
+            if name0 == 0 || name0 == 0xE5 {
+                continue; // пропускаем пустые и удалённые записи
             }
+
+            //print name
+            for c in self.entries[i].name {
+                print!("{}", c as char);
+            }
+            //print size
+            let size = self.entries[i].size;
+            print!("   {} bytes", size);
+
+            //print cluster
+            let cluster = self.entries[i].first_cluster_low;
+            print!("     {}", cluster);
+            println!();
         }
     }
 
@@ -289,6 +292,52 @@ impl FatDriver {
             offset += chunk_len;
             cluster = self.table[cluster as usize];
         }
+    }
+
+    pub fn delete_file(&mut self, filename: &str) -> bool {
+
+        self.load_table();
+
+        let fat_name = Self::string_to_fat_name(filename);
+
+        let mut entry_index = None;
+        for (i, entry) in self.entries.iter().enumerate() {
+            if entry.name == fat_name {
+                entry_index = Some(i);
+                break;
+            }
+        }
+
+        let entry_index = match entry_index {
+            Some(idx) => idx,
+            None => {
+                println!("[FAT WARN] File '{}' not found", filename);
+                return false;
+            }
+        };
+
+        let first_cluster = self.entries[entry_index].first_cluster_low;
+
+        // Освобождаем цепочку кластеров
+        if first_cluster >= 2 {
+            let mut cluster = first_cluster;
+            while cluster != 0xFFFF && cluster != 0 {
+                let next = self.table[cluster as usize];
+                self.table[cluster as usize] = 0;
+                cluster = next;
+            }
+        }
+
+        // Помечаем как удалённый + чистим данные
+        self.entries[entry_index].name[0] = 0xE5;
+        self.entries[entry_index].size = 0;
+        self.entries[entry_index].first_cluster_low = 0;
+
+        self.save_table();
+        self.save_entries();
+
+        println!("[FAT OK] File '{}' successfully deleted", filename);
+        true
     }
 
     // === ОСНОВНОЙ МЕТОД: СОЗДАНИЕ + ЗАПИСЬ ФАЙЛА ===

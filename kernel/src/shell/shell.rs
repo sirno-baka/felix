@@ -1,5 +1,6 @@
 //SHELL
 
+use alloc::borrow::ToOwned;
 use crate::filesystem::fat::FAT;
 use crate::multitasking::task::TASK_MANAGER;
 use crate::print::PRINTER;
@@ -129,6 +130,28 @@ impl Shell {
             //display content of file
             b if self.is_command("cat") => unsafe {
                 self.cat(&b);
+            },
+
+            b if self.is_command("rm") => unsafe {
+                for i in 4..15 {
+                    self.arg[i - 4] = b[i];
+                }
+
+                let f = FAT.acquire_mut();          // ← без &mut
+                f.delete_file("TEST.TXT");
+                FAT.free();
+            },
+
+
+            b if self.is_command("write") => unsafe {
+                for i in 4..15 {
+                    self.arg[i - 4] = b[i];
+                }
+                let data = b"Hello from my Rust OS!\nFAT16 write is working perfectly!\n".to_vec();
+
+                let f = FAT.acquire_mut();          // ← без &mut
+                f.write_file("TEST.TXT", &data);
+                FAT.free();
             },
 
             //jump to specified program
