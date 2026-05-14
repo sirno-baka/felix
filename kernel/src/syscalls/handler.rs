@@ -53,28 +53,28 @@ pub extern "C" fn syscall_handler(
                 }
                 len as u32
             } else {
-                0
+                1
             }
 
         }
 
-        // 5 — open(filename) → fd
-        crate::syscalls::SYS_OPEN => unsafe {
-            let filename_ptr = arg1 as *const u8;
-            let filename = unsafe {
-                let mut len = 0;
-                while *filename_ptr.add(len) != 0 && len < 255 {
-                    len += 1;
-                }
-                core::str::from_utf8_unchecked(core::slice::from_raw_parts(filename_ptr, len))
-            };
-
-            FAT.lock(|fat| {
-                fat.load_header();
-                fat.load_entries();
-                fat.open(filename) as u32
-            })
-        }
+        // // 5 — open(filename) → fd
+        // crate::syscalls::SYS_OPEN => unsafe {
+        //     let filename_ptr = arg1 as *const u8;
+        //     let filename = unsafe {
+        //         let mut len = 0;
+        //         while *filename_ptr.add(len) != 0 && len < 255 {
+        //             len += 1;
+        //         }
+        //         core::str::from_utf8_unchecked(core::slice::from_raw_parts(filename_ptr, len))
+        //     };
+        //
+        //     FAT.lock(|fat| {
+        //         fat.load_header();
+        //         fat.load_entries();
+        //         fat.open(filename) as u32
+        //     })
+        // }
 
         // 6 — close(fd)
         crate::syscalls::SYS_CLOSE => {
@@ -82,80 +82,80 @@ pub extern "C" fn syscall_handler(
             0
         }
 
-        crate::syscalls::SYS_MKDIR => unsafe {
-            let filename_ptr = arg1 as *const u8;
-            let filename = unsafe {
-                let mut len = 0;
-                while *filename_ptr.add(len) != 0 && len < 255 {
-                    len += 1;
-                }
-                core::str::from_utf8_unchecked(
-                    core::slice::from_raw_parts(filename_ptr, len)
-                )
-            };
+        // crate::syscalls::SYS_MKDIR => unsafe {
+        //     let filename_ptr = arg1 as *const u8;
+        //     let filename = unsafe {
+        //         let mut len = 0;
+        //         while *filename_ptr.add(len) != 0 && len < 255 {
+        //             len += 1;
+        //         }
+        //         core::str::from_utf8_unchecked(
+        //             core::slice::from_raw_parts(filename_ptr, len)
+        //         )
+        //     };
+        //
+        //     let success = FAT.lock(|fat| {
+        //         fat.load_header();
+        //         fat.load_entries();
+        //         fat.load_table();
+        //         fat.mkdir(filename)
+        //     });
+        //
+        //     if success { 0 } else { u32::MAX } // -1 = ошибка
+        // }
 
-            let success = FAT.lock(|fat| {
-                fat.load_header();
-                fat.load_entries();
-                fat.load_table();
-                fat.mkdir(filename)
-            });
-
-            if success { 0 } else { u32::MAX } // -1 = ошибка
-        }
-
-        crate::syscalls::SYS_RMDIR => unsafe {
-            let dirname_ptr = arg1 as *const u8;
-            let dirname = unsafe {
-                let mut len = 0;
-                while *dirname_ptr.add(len) != 0 && len < 255 {
-                    len += 1;
-                }
-                core::str::from_utf8_unchecked(
-                    core::slice::from_raw_parts(dirname_ptr, len)
-                )
-            };
-
-            let success = FAT.lock(|fat| {
-                fat.load_header();
-                fat.load_entries();
-                fat.load_table();
-                fat.rmdir(dirname)
-            });
-
-            if success { 0 } else { u32::MAX } // -1 при ошибке
-        }
+        // crate::syscalls::SYS_RMDIR => unsafe {
+        //     let dirname_ptr = arg1 as *const u8;
+        //     let dirname = unsafe {
+        //         let mut len = 0;
+        //         while *dirname_ptr.add(len) != 0 && len < 255 {
+        //             len += 1;
+        //         }
+        //         core::str::from_utf8_unchecked(
+        //             core::slice::from_raw_parts(dirname_ptr, len)
+        //         )
+        //     };
+        //
+        //     let success = FAT.lock(|fat| {
+        //         fat.load_header();
+        //         fat.load_entries();
+        //         fat.load_table();
+        //         fat.rmdir(dirname)
+        //     });
+        //
+        //     if success { 0 } else { u32::MAX } // -1 при ошибке
+        // }
 
         // 10 — unlink / delete
-        crate::syscalls::SYS_UNLINK => unsafe {
-            let filename_ptr = arg1 as *const u8;
-            let filename = unsafe {
-                let mut len = 0;
-                while *filename_ptr.add(len) != 0 && len < 255 {
-                    len += 1;
-                }
-                core::str::from_utf8_unchecked(core::slice::from_raw_parts(filename_ptr, len))
-            };
-
-            let success = FAT.lock(|fat| {
-                fat.load_header();
-                fat.load_entries();
-                fat.load_table();
-                fat.delete_file(filename)
-            });
-
-            if success { 0 } else { u32::MAX }  // -1 в unsigned
-        }
+        // crate::syscalls::SYS_UNLINK => unsafe {
+        //     let filename_ptr = arg1 as *const u8;
+        //     let filename = unsafe {
+        //         let mut len = 0;
+        //         while *filename_ptr.add(len) != 0 && len < 255 {
+        //             len += 1;
+        //         }
+        //         core::str::from_utf8_unchecked(core::slice::from_raw_parts(filename_ptr, len))
+        //     };
+        //
+        //     let success = FAT.lock(|fat| {
+        //         fat.load_header();
+        //         fat.load_entries();
+        //         fat.load_table();
+        //         fat.delete_file(filename)
+        //     });
+        //
+        //     if success { 0 } else { u32::MAX }  // -1 в unsigned
+        // }
 
         // 302 — ls
-        crate::syscalls::SYS_LS => unsafe {
-            FAT.lock(|fat| {
-                fat.load_header();
-                fat.load_entries();
-                fat.list_entries("/");
-            });
-            0
-        }
+        // crate::syscalls::SYS_LS => unsafe {
+        //     FAT.lock(|fat| {
+        //         fat.load_header();
+        //         fat.load_entries();
+        //         fat.list_entries("/");
+        //     });
+        //     0
+        // }
 
         // 200 — malloc(size, align)
         crate::syscalls::SYS_MALLOC => {

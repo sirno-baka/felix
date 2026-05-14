@@ -5,9 +5,8 @@ use alloc::vec::Vec;
 use crate::drivers::disk::DISK;
 use core::mem;
 use crate::{print, println};
-use crate::multitasking::mutex::Mutex;
 
-pub static mut FAT: Mutex<FatDriver> = Mutex::new(FatDriver {
+pub static mut FAT: spin::Mutex<FatDriver> = spin::Mutex::new(FatDriver {
     header: NULL_HEADER,
     entries: [NULL_ENTRY; ENTRY_COUNT],
     table: [0; FAT_SIZE],
@@ -921,4 +920,33 @@ impl FatDriver {
 
         &NULL_ENTRY
     }
+}
+
+impl crate::filesystem::Filesystem for FatDriver {
+    fn read_file(&mut self, path: &str) -> Option<Vec<u8>> {
+        let entry = self.search_file(path);   // если у тебя search_file принимает &str — ок
+        // если нет — замени на свой метод
+
+        if entry.name[0] != 0 {
+            println!("buf: {:?}", entry);
+            let mut buf = Vec::with_capacity(entry.size as usize);
+            let target = buf.as_mut_ptr();
+            self.read_file_to_ptr(entry, target);
+            Some(buf)
+        } else {
+            None
+        }
+    }
+
+    fn write_file(&mut self, path: &str, data: &[u8]) -> bool {
+        self.write_path(path, data);
+        true
+    }
+
+    fn list_directory(&mut self, path: &str) {
+        // если нужно — реализуй list по пути позже
+        self.list_entries(path);
+    }
+
+    fn is_mounted(&self) -> bool { true }
 }

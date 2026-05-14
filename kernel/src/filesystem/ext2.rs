@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 // fs/ext2.rs
 use core::mem;
 use crate::drivers::disk::{Disk, DISK};
@@ -386,7 +387,7 @@ impl Ext2 {
     }
 
     /// Записать файл по пути (перезаписывает существующий файл)
-    pub fn write_file(&self, path: &str, data: &[u8]) -> bool {
+    pub fn write_file(&mut self, path: &str, data: &[u8]) -> bool {
         if let Some(inode_num) = self.resolve_path(path) {
             if self.write_file_by_inode(inode_num, data) {
                 println!("[EXT2] Successfully wrote {} bytes to {}", data.len(), path);
@@ -440,5 +441,23 @@ impl Ext2 {
         } else {
             println!("[EXT2] Directory not found: {}", path);
         }
+    }
+}
+
+impl crate::filesystem::Filesystem for Ext2 {
+    fn read_file(&mut self, path: &str) -> Option<Vec<u8>> {
+        self.read_file(path)
+    }
+
+    fn write_file(&mut self, path: &str, data: &[u8]) -> bool {
+        self.write_file(path, data)
+    }
+
+    fn list_directory(&mut self, path: &str) {
+        self.list_directory_path(path);
+    }
+
+    fn is_mounted(&self) -> bool {
+        self.mounted
     }
 }

@@ -107,18 +107,35 @@ impl Shell {
                 println!("vec allocated! len = {}", v.len());
             }
 
-            "ls" => {
+            "ls" => unsafe {
                 let path = args.get(1).map(|s| s.as_str()).unwrap_or("/");
-                crate::filesystem::EXT2_SLAVE.lock().as_mut().map(|fs| {
-                    fs.list_directory_path(path);
-                });
+                if let Some(vfs) = &filesystem::VFS {
+                    if let mut vfs = vfs.lock() {
+                        vfs.list_directory(path);
+                    }
+                }
             },
 
-            "cat" => {
+            "cat" => unsafe {
                 if let Some(filename) = args.get(1) {
                     self.cat(filename.as_str());
                 } else {
                     println!("Usage: cat <file>");
+                }
+            },
+
+            "write" => unsafe {
+                if let Some(filename) = args.get(1) {
+                    if let Some(data) = args.get(2) {
+                        if let Some(vfs) = &filesystem::VFS {
+                            let success = vfs.lock().write_file(filename.as_str(), data.as_bytes());
+                            if success {
+                                println!("Written to {}", filename);
+                            }
+                        }
+                    }
+                } else {
+                    println!("Usage: write <file> <data>");
                 }
             },
 
@@ -127,11 +144,35 @@ impl Shell {
 
             "rt" => unsafe { /* ... твой старый код ... */ },
 
+            "mkdir" => unsafe {
+                if let Some(name) = args.get(1) {
+                    let mut f = FAT.lock();
+                    f.mkdir(name);
+                } else {
+                    println!("Usage: mkdir <name>");
+                }
+            },
 
+            "rmdir" => unsafe {
+                if let Some(name) = args.get(1) {
+                    let mut f = FAT.lock();
+                    f.rmdir(name);
+                } else {
+                    println!("Usage: rmdir <name>");
+                }
+            },
 
-            "mkdir" => unsafe { /* ... твой код ... */ },
-            "rmdir" => unsafe { /* ... твой код ... */ },
-            "write" => unsafe { /* ... твой код ... */ },
+            "write" => unsafe {
+                if let Some(filename) = args.get(1) {
+                    if let Some(data) = args.get(2) {
+                        let mut f = FAT.lock();
+                        f.write_path(filename, data.to_string().as_bytes());
+                    }
+                } else {
+                    println!("Usage: write <file>");
+                }
+            },
+
             "run" => unsafe { /* ... твой код ... */ },
             "test" => unsafe { /* ... твой код ... */ },
 
@@ -140,12 +181,11 @@ impl Shell {
     }
 
     // показывает содержимое файла (теперь БЕЗ unsafe и с with_ext2_slave)
-    pub fn cat(&self, filename: &str) {
-        let mut guard = crate::filesystem::EXT2_SLAVE.lock();
-        if let Some(fs) = guard.as_mut() {
-            let data = fs.read_file(filename);
+    pub unsafe fn cat(&self, filename: &str) {
+        if let Some(vfs) = &filesystem::VFS {
+            let data = vfs.lock().read_file(filename);
             match data {
-                None => println!("File not found or cannot be read: {}", filename),
+                None => println!("File not found: {}", filename),
                 Some(data) => {
                     if let Ok(text) = alloc::string::String::from_utf8(data) {
                         println!("{}", text);
@@ -154,14 +194,12 @@ impl Shell {
                     }
                 }
             }
-        } else {
-            println!("[EXT2] Filesystem not mounted");
         }
     }
 
     // запускает исполняемый файл как задачу
     pub unsafe fn run(&self, filename: &str) {
-        let fat = FAT.acquire();
+        let fat = FAT.lock();
         let entry = fat.search_file(filename);   // аналогично cat
 
         if entry.name[0] != 0 {
@@ -183,6 +221,5 @@ impl Shell {
         } else {
             println!("Program not found: {}", filename);
         }
-        FAT.free();
     }
 }

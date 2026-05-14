@@ -14,10 +14,12 @@ mod shell;
 mod syscalls;
 pub mod print;
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::panic::PanicInfo;
+use spin::Mutex;
 use drivers::disk::DISK;
 use drivers::pic::PICS;
 use interrupts::idt::IDT;
@@ -29,7 +31,7 @@ use filesystem::ext2::Ext2;
 
 use multitasking::task::TASK_MANAGER;
 use crate::drivers::disk::DISK_SLAVE;
-
+use crate::filesystem::vfs::Vfs;
 
 //1MiB. TODO: Get those from linker
 const KERNEL_START: u32 = 0x0010_0000;
@@ -78,26 +80,49 @@ pub extern "C" fn _start() -> ! {
         //enable ata disk if present
         DISK.check();
 
-        //init filesystem
+
+        let mut vfs = Vfs::new();
+
+        DISK.check();
         if DISK.enabled {
-            let fat = FAT.acquire_mut();
+            let mut fat = FAT.lock();
             fat.load_header();
             fat.load_table();
             fat.load_entries();
-            FAT.free();
+            vfs.set_root(Box::new(fat.clone()));   // или без clone, если сделаешь move
         }
 
-        //print name, version and copyright
-        print_info();
-
+        // Монтируем EXT2 (если диск есть)
         DISK_SLAVE.check();
         if DISK_SLAVE.enabled {
             let mut ext2 = Ext2::new(&mut DISK_SLAVE);
             ext2.mount();
-
-            *crate::filesystem::EXT2_SLAVE.lock() = Some(ext2);
-            println!("[EXT2] Slave filesystem mounted via Mutex");
+            vfs.mount("/mnt/ext2", Box::new(ext2));
         }
+
+        crate::filesystem::VFS.insert(Mutex::new(vfs));
+        println!("[VFS] Virtual filesystem initialized");
+
+        // //init filesystem
+        // if DISK.enabled {
+        //     let fat = FAT.acquire_mut();
+        //     fat.load_header();
+        //     fat.load_table();
+        //     fat.load_entries();
+        //     FAT.free();
+        // }
+
+        //print name, version and copyright
+        print_info();
+
+        // DISK_SLAVE.check();
+        // if DISK_SLAVE.enabled {
+        //     let mut ext2 = Ext2::new(&mut DISK_SLAVE);
+        //     ext2.mount();
+        //
+        //     *crate::filesystem::EXT2_SLAVE.lock() = Some(ext2);
+        //     println!("[EXT2] Slave filesystem mounted via Mutex");
+        // }
 
         //init felix shell
         SHELL.init();
