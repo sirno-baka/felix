@@ -1,12 +1,14 @@
-//SHELL
+// SHELL
+// Нормальная, высокоуровневая версия с настоящим парсингом аргументов
 
-use alloc::borrow::ToOwned;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 use crate::filesystem::fat::FAT;
 use crate::multitasking::task::TASK_MANAGER;
 use crate::print::PRINTER;
 
-use crate::memory::paging::PAGING;
-use crate::memory::paging::TABLES;
+use crate::memory::paging::{PAGING, TABLES};
 
 use core::arch::asm;
 use crate::{print, println};
@@ -16,71 +18,61 @@ const APP_SIZE: u32 = 0x0001_0000;
 const APP_SIGNATURE: u32 = 0xB16B00B5;
 
 const HELP: &'static str = "Available commands:
-ls - lists root directory entries
-cat <file> - displays content of a file
-test <a,b,c> - runs a dummy task
-run <file> - loads file as task and adds it to the task list
-ps - lists running tasks
-rt <id> - removes specified task";
-
-//Warning! Mutable static here
-//TODO: Implement a mutex to get safe access to this
-pub static mut SHELL: Shell = Shell {
-    buffer: [0 as char; 256],
-    arg: [0 as char; 11],
-    cursor: 0,
-};
+ls                  - lists root directory entries
+cat <file>          - displays content of a file
+test <a|b|c>        - runs a dummy task
+run <file>          - loads and runs executable
+ps                  - lists running tasks
+rt <id>             - removes specified task
+mkdir <name>        - create directory
+rmdir <name>        - remove directory
+write <file>        - write test data to file
+help                - shows this help";
 
 const PROMPT: &str = "felix> ";
 
+// Warning! Mutable static here
+// TODO: заменить на spin::Mutex или lock-free
+pub static mut SHELL: Shell = Shell {
+    buffer: String::new(),
+};
+
 pub struct Shell {
-    buffer: [char; 256],
-    arg: [char; 11],
-    cursor: usize,
+    buffer: String,
 }
 
 impl Shell {
-    //init shell
+    // init shell
     pub fn init(&mut self) {
-        self.buffer = [0 as char; 256];
-        self.cursor = 0;
+        self.buffer.clear();
 
         unsafe {
             PRINTER.set_colors(0xc, 0);
             print!("{}", PROMPT);
-
             PRINTER.reset_colors();
         }
     }
 
-    //adds new char to shell buffer
+    // добавляет символ (теперь char — удобнее)
     pub fn add(&mut self, c: char) {
-        self.buffer[self.cursor] = c;
-        self.cursor += 1;
-
+        self.buffer.push(c);
         print!("{}", c);
     }
 
-    //backspace, removes last char from buffer and updates cursor
+    // backspace
     pub fn backspace(&mut self) {
-        if self.cursor > 0 {
-            self.buffer[self.cursor] = 0 as char;
-            self.cursor -= 1;
-
+        if self.buffer.pop().is_some() {
             unsafe {
                 PRINTER.delete();
             }
         }
     }
 
-    //shell enter
+    // enter
     pub fn enter(&mut self) {
-        //e9 port hack, new line
+        // e9 port hack + real new line
         unsafe {
             asm!("out dx, al", in("dx") 0xe9 as u16, in("al") '\n' as u8);
-        }
-
-        unsafe {
             PRINTER.new_line();
         }
 
@@ -88,177 +80,181 @@ impl Shell {
         self.init();
     }
 
-    //command interpreter
-    #[allow(unused_unsafe)]
+    // ─────────────────────────────────────────────────────────────
+    // НОВЫЙ ПАРСЕР АРГУМЕНТОВ
+    // ─────────────────────────────────────────────────────────────
+    fn parse_args(&self) -> Vec<&str> {
+        self.buffer
+            .trim()                    // убираем пробелы в начале/конце
+            .split_whitespace()        // разбиваем по любому количеству пробелов
+            .collect()                 // Vec<&str> — именно то, что ты хотел
+    }
+
+    // command interpreter
     fn interpret(&mut self) {
-        match self.buffer {
-            //test command
-            _b if self.is_command("ping") => {
-                println!("PONG!");
-            }
-            _b if self.is_command("alloc") => {
+        let args: Vec<&str> = self.parse_args();
+
+        if args.is_empty() {
+            return;
+        }
+
+        match args[0] {
+            // простые команды без аргументов
+            "ping" => println!("PONG!"),
+            "alloc" => {
                 let mut v = alloc::vec::Vec::new();
                 v.push(1);
                 v.push(2);
                 println!("vec allocated! len = {}", v.len());
             }
-            //list root directory
-            _b if self.is_command("ls") => unsafe {
-                FAT.acquire().list_entries();
-                FAT.free();
-            },
+            "ls" => unsafe {
+                if let Some(id_str) = args.get(1) {
+                    FAT.lock(|fat| {
+                        fat.list_entries(id_str);
+                    });
+                } else {
 
-            //list running tasks
-            _b if self.is_command("ps") => unsafe {
+                    FAT.lock(|fat| {
+                        fat.list_entries("/");
+                    });
+                }
+
+            },
+            "ps" => unsafe {
                 TASK_MANAGER.list_tasks();
             },
+            "help" => println!("{}", HELP),
 
-            //remove runing task
-            b if self.is_command("rt") => unsafe {
-                if (b[3] as u8) < 0x30 {
-                    println!("No task id provided!");
-                    return;
-                }
-
-                //convert first char of arg to id
-                let id = ((b[3] as u8) - 0x30) as usize;
-
-                TASK_MANAGER.remove_task(id);
-                //TASK_MANAGER.remove_current_task();
-            },
-
-            //display content of file
-            b if self.is_command("cat") => unsafe {
-                self.cat(&b);
-            },
-
-            b if self.is_command("rm") => unsafe {
-                for i in 4..15 {
-                    self.arg[i - 4] = b[i];
-                }
-
-                let f = FAT.acquire_mut();          // ← без &mut
-                f.delete_file("TEST.TXT");
-                FAT.free();
-            },
-
-
-            b if self.is_command("write") => unsafe {
-                for i in 4..15 {
-                    self.arg[i - 4] = b[i];
-                }
-                let data = b"Hello from my Rust OS!\nFAT16 write is working perfectly!\n".to_vec();
-
-                let f = FAT.acquire_mut();          // ← без &mut
-                f.write_file("TEST.TXT", &data);
-                FAT.free();
-            },
-
-            //jump to specified program
-            b if self.is_command("run") => unsafe {
-                self.run(&b);
-            },
-
-            //run test task
-            b if self.is_command("test") => unsafe {
-                let a = b[5];
-
-                match a {
-                    'a' => {
-                        TASK_MANAGER.add_dummy_task_a();
+            // команды с аргументами
+            "rt" => unsafe {
+                if let Some(id_str) = args.get(1) {
+                    match id_str.parse::<usize>() {
+                        Ok(id) => TASK_MANAGER.remove_task(id),
+                        Err(_) => println!("Invalid task id!"),
                     }
-                    'b' => {
-                        TASK_MANAGER.add_dummy_task_b();
-                    }
-                    'c' => {
-                        TASK_MANAGER.add_dummy_task_c();
-                    }
-                    _ => {
-                        println!("Specify test a, b, or c!");
-                    }
+                } else {
+                    println!("Usage: rt <id>");
                 }
             },
 
-            //help command
-            _b if self.is_command("help") => {
-                println!("{}", HELP);
-            }
+            "cat" => unsafe {
+                if let Some(filename) = args.get(1) {
+                    self.cat(filename);
+                } else {
+                    println!("Usage: cat <file>");
+                }
+            },
 
-            //empty, do nothing
-            b if b[0] == '\0' => {}
+            "mkdir" => unsafe {
+                if let Some(name) = args.get(1) {
+                    let f = FAT.acquire_mut();
+                    f.mkdir(name);
+                    FAT.free();
+                } else {
+                    println!("Usage: mkdir <name>");
+                }
+            },
 
-            //unknown command
-            _ => {
-                println!("Unknown command!");
-            }
+            "rmdir" => unsafe {
+                if let Some(name) = args.get(1) {
+                    let f = FAT.acquire_mut();
+                    f.rmdir(name);
+                    FAT.free();
+                } else {
+                    println!("Usage: rmdir <name>");
+                }
+            },
+
+            "write" => unsafe {
+                if let Some(filename) = args.get(1) {
+                    if let Some(data) = args.get(2) {
+                        let f = FAT.acquire_mut();
+                        f.write_path(filename, data.to_string().as_bytes());
+                        FAT.free();
+                    }
+                } else {
+                    println!("Usage: write <file>");
+                }
+            },
+
+            "run" => unsafe {
+                if let Some(filename) = args.get(1) {
+                    self.run(filename);
+                } else {
+                    println!("Usage: run <file>");
+                }
+            },
+
+            "test" => unsafe {
+                if let Some(param) = args.get(1) {
+                    match *param {
+                        "a" => TASK_MANAGER.add_dummy_task_a(),
+                        "b" => TASK_MANAGER.add_dummy_task_b(),
+                        "c" => TASK_MANAGER.add_dummy_task_c(),
+                        _ => println!("Specify test a, b, or c!"),
+                    }
+                } else {
+                    println!("Usage: test <a|b|c>");
+                }
+            },
+
+            // неизвестная команда
+            _ => println!("Unknown command: {}", args[0]),
         }
     }
 
-    //shows content of a file in ascii format
-    pub unsafe fn cat(&mut self, b: &[char]) {
-        for i in 4..15 {
-            self.arg[i - 4] = b[i];
-        }
+    // показывает содержимое файла
+    pub unsafe fn cat(&self, filename: &str) {
         let fat = FAT.acquire();
-
-        let entry = fat.search_file(&self.arg);
+        let entry = fat.search_file(filename);   // если у тебя search_file принимает &str — ок
+        // если нет — замени на свой метод
 
         if entry.name[0] != 0 {
-            fat.read_file_to_buffer(entry);
+            println!("buf: {:?}", entry);
+            let mut buf = Vec::with_capacity(entry.size as usize);
+            let target = buf.as_mut_ptr();
+            fat.read_file_to_ptr(entry, target);
+            let size = entry.size as usize;
 
-            for c in fat.buffer {
-                if c != 0 {
-                    print!("{}", c as char);
+            unsafe { buf.set_len(size ); }
+            for (i, val) in buf.iter().enumerate() {
+                if i > size  {
+                    break
                 }
+                print!("{}", *val as char);
             }
+
             println!();
         } else {
-            println!("File not found!");
+            println!("File not found: {}", filename);
         }
         FAT.free();
     }
 
-    //loads an executable as a task
-    pub unsafe fn run(&mut self, b: &[char]) {
-        for i in 4..15 {
-            self.arg[i - 4] = b[i];
-        }
+    // запускает исполняемый файл как задачу
+    pub unsafe fn run(&self, filename: &str) {
         let fat = FAT.acquire();
+        let entry = fat.search_file(filename);   // аналогично cat
 
-        let entry = fat.search_file(&self.arg);
         if entry.name[0] != 0 {
             let slot = TASK_MANAGER.get_free_slot();
             let target = APP_TARGET + (slot as u32 * APP_SIZE);
 
-            //map table 8 (0x02000000) to the address where the executable is loaded
+            // map table 8
             TABLES[8].set(target);
             PAGING.set_table(8, &TABLES[8]);
 
             fat.read_file_to_target(&entry, target as *mut u32);
 
-            unsafe {
-                let signature = *(target as *mut u32);
-
-                if signature == APP_SIGNATURE {
-                    TASK_MANAGER.add_task((target + 4) as u32);
-                } else {
-                    PRINTER.prints("File is not a valid executable!");
-                }
+            let signature = *(target as *mut u32);
+            if signature == APP_SIGNATURE {
+                TASK_MANAGER.add_task((target + 4) as u32);
+            } else {
+                println!("File is not a valid executable!");
             }
         } else {
-            println!("Program not found!");
+            println!("Program not found: {}", filename);
         }
         FAT.free();
-    }
-
-    pub fn is_command(&self, command: &str) -> bool {
-        let mut i = 0;
-        for c in command.chars() {
-            if c != self.buffer[i as usize] {
-                return false;
-            }
-            i += 1;
-        }
-        true
     }
 }

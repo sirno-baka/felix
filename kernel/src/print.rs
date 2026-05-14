@@ -187,8 +187,8 @@ macro_rules! println {
     };
 
     ($($arg:tt)*) => {
-        $crate::print!("{}", format_args!($($arg)*));
-        unsafe { $crate::print::PRINTER.prints("\n"); }
+        $crate::print!("{}\n", format_args!($($arg)*));
+        // unsafe { $crate::print::PRINTER.prints("\n"); }
     };
 }
 

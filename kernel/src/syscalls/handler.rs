@@ -52,18 +52,10 @@ pub extern "C" fn syscall_handler(
                     print::PRINTER.prints(s);
                 }
                 len as u32
-            } else if fd >= 3 {
-                // Запись в файл по fd
-                let data = slice::from_raw_parts(buf as *const u8, len);
-                FAT.lock(|fat| {
-                    fat.load_header();
-                    fat.load_entries();
-                    fat.load_table();
-                    fat.write_fd(fd, data) as u32
-                })
             } else {
                 0
             }
+
         }
 
         // 5 — open(filename) → fd
@@ -88,6 +80,50 @@ pub extern "C" fn syscall_handler(
         crate::syscalls::SYS_CLOSE => {
             // Пока просто успех (в будущем можно освободить fd)
             0
+        }
+
+        crate::syscalls::SYS_MKDIR => unsafe {
+            let filename_ptr = arg1 as *const u8;
+            let filename = unsafe {
+                let mut len = 0;
+                while *filename_ptr.add(len) != 0 && len < 255 {
+                    len += 1;
+                }
+                core::str::from_utf8_unchecked(
+                    core::slice::from_raw_parts(filename_ptr, len)
+                )
+            };
+
+            let success = FAT.lock(|fat| {
+                fat.load_header();
+                fat.load_entries();
+                fat.load_table();
+                fat.mkdir(filename)
+            });
+
+            if success { 0 } else { u32::MAX } // -1 = ошибка
+        }
+
+        crate::syscalls::SYS_RMDIR => unsafe {
+            let dirname_ptr = arg1 as *const u8;
+            let dirname = unsafe {
+                let mut len = 0;
+                while *dirname_ptr.add(len) != 0 && len < 255 {
+                    len += 1;
+                }
+                core::str::from_utf8_unchecked(
+                    core::slice::from_raw_parts(dirname_ptr, len)
+                )
+            };
+
+            let success = FAT.lock(|fat| {
+                fat.load_header();
+                fat.load_entries();
+                fat.load_table();
+                fat.rmdir(dirname)
+            });
+
+            if success { 0 } else { u32::MAX } // -1 при ошибке
         }
 
         // 10 — unlink / delete
@@ -116,7 +152,7 @@ pub extern "C" fn syscall_handler(
             FAT.lock(|fat| {
                 fat.load_header();
                 fat.load_entries();
-                fat.list_entries();
+                fat.list_entries("/");
             });
             0
         }
