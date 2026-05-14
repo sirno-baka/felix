@@ -14,6 +14,8 @@ mod shell;
 mod syscalls;
 pub mod print;
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::arch::asm;
 use core::panic::PanicInfo;
 use drivers::disk::DISK;
@@ -23,9 +25,10 @@ use memory::paging::PAGING;
 use shell::shell::SHELL;
 use print::PRINTER;
 use filesystem::fat::FAT;
+use filesystem::ext2::Ext2;
 
 use multitasking::task::TASK_MANAGER;
-
+use crate::drivers::disk::DISK_SLAVE;
 
 
 //1MiB. TODO: Get those from linker
@@ -86,6 +89,15 @@ pub extern "C" fn _start() -> ! {
 
         //print name, version and copyright
         print_info();
+
+        DISK_SLAVE.check();
+        if DISK_SLAVE.enabled {
+            let mut ext2 = Ext2::new(&mut DISK_SLAVE);
+            ext2.mount();
+
+            *crate::filesystem::EXT2_SLAVE.lock() = Some(ext2);
+            println!("[EXT2] Slave filesystem mounted via Mutex");
+        }
 
         //init felix shell
         SHELL.init();

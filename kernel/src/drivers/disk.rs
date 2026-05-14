@@ -1,85 +1,92 @@
-//DISK DRIVER
-//Driver for ATA disk supporting PIO MODE
-
+// DISK DRIVER — ATA PIO MODE (Master + Slave)
 use core::arch::asm;
 use crate::println;
 
-//Warning! Mutable static here
-//TODO: Implement a mutex to get safe access to this
-pub static mut DISK: Disk = Disk { enabled: false };
-
-//controller registers ports
 const DATA_REGISTER: u16 = 0x1f0;
 const SECTOR_COUNT_REGISTER: u16 = 0x1f2;
 const LBA_LOW_REGISTER: u16 = 0x1f3;
 const LBA_MID_REGISTER: u16 = 0x1f4;
 const LBA_HIGH_REGISTER: u16 = 0x1f5;
 const DRIVE_REGISTER: u16 = 0x1f6;
-
-//port used for both sending command and getting status
 const STATUS_COMMAND_REGISTER: u16 = 0x1f7;
 
-//read write command codes
 const READ_COMMAND: u8 = 0x20;
-const WRITE_COMMAND: u8 = 0x30;   // ←
-//status register bits
+const WRITE_COMMAND: u8 = 0x30;
+
 const STATUS_BSY: u8 = 0b10000000;
-//read write command codes
-
-//status register bits
 const STATUS_RDY: u8 = 0b01000000;
-const STATUS_DRQ: u8 = 0b00001000;   // ← добавлено (важно для записи)
+const STATUS_DRQ: u8 = 0b00001000;
 
+#[derive(Copy, Clone)]
 pub struct Disk {
     pub enabled: bool,
+    is_master: bool,
 }
 
 impl Disk {
-    //read multiple sectors from lba to specified target
+    pub const fn new(is_master: bool) -> Self {
+        Disk {
+            enabled: false,
+            is_master,
+        }
+    }
+
+    // Возвращает байт для записи в DRIVE_REGISTER (0xE0 или 0xF0 + LBA high)
+    fn drive_select_byte(&self, lba: u64) -> u8 {
+        let base = if self.is_master { 0xE0 } else { 0xF0 };
+        base | ((lba >> 24) & 0x0F) as u8
+    }
+
+    // Выбрать нужный диск перед операцией
+    fn select_drive(&self, lba: u64) {
+        unsafe {
+            asm!("out dx, al",
+            in("dx") DRIVE_REGISTER,
+            in("al") self.drive_select_byte(lba));
+        }
+        // Небольшая задержка для slave-диска (рекомендуется)
+        if !self.is_master {
+            for _ in 0..4 {
+                unsafe { asm!("nop"); }
+            }
+        }
+    }
+
+    // ====================== READ ======================
     pub fn read<T>(&self, target: *mut T, lba: u64, sectors: u16) {
         if !self.enabled {
-            println!("[ERROR] Cannot read! Disk not enabled");
+            println!("[ERROR] Cannot read! Disk {} not enabled", if self.is_master { "MASTER" } else { "SLAVE" });
             return;
         }
 
-        //wait until not busy
         while self.is_busy() {}
 
+        self.select_drive(lba);
+
         unsafe {
-            //disable ata interrupt
-            asm!("out dx, al", in("dx") 0x3f6, in("al") 0b00000010 as u8);
+            // disable ATA interrupt
+            asm!("out dx, al", in("dx") 0x3f6, in("al") 0b00000010u8);
 
-            //setup registers
-            asm!("out dx, al", in("dx") SECTOR_COUNT_REGISTER, in("al") sectors as u8); //number of setcors to read
-            asm!("out dx, al", in("dx") LBA_LOW_REGISTER, in("al") lba as u8); //low 8 bits of lba
-            asm!("out dx, al", in("dx") LBA_MID_REGISTER, in("al") (lba >> 8) as u8); //next 8 bits of lba
-            asm!("out dx, al", in("dx") LBA_HIGH_REGISTER, in("al") (lba >> 16) as u8); //next 8 bits of lba
-            asm!("out dx, al", in("dx") DRIVE_REGISTER, in("al") (0xE0 | ((lba >> 24) & 0xF)) as u8); //0xe0 (master drive) ORed with highest 4 bits of lba
-
-            //send read command to port
+            asm!("out dx, al", in("dx") SECTOR_COUNT_REGISTER, in("al") sectors as u8);
+            asm!("out dx, al", in("dx") LBA_LOW_REGISTER,  in("al") lba as u8);
+            asm!("out dx, al", in("dx") LBA_MID_REGISTER,  in("al") (lba >> 8) as u8);
+            asm!("out dx, al", in("dx") LBA_HIGH_REGISTER, in("al") (lba >> 16) as u8);
+            // drive select уже выполнен
             asm!("out dx, al", in("dx") STATUS_COMMAND_REGISTER, in("al") READ_COMMAND);
         }
 
         let mut sectors_left = sectors;
-        let mut target_pointer = target;
-        while sectors_left > 0 {
-            //a sector is 512 byte, buffer size is 4 byte, so loop for 512/4
-            for _i in 0..128 {
-                //wait until not busy
-                while self.is_busy() {}
+        let mut target_pointer = target as *mut u32;
 
-                //wait until ready
+        while sectors_left > 0 {
+            for _i in 0..128 {
+                while self.is_busy() {}
                 while !self.is_ready() {}
 
                 let buffer: u32;
                 unsafe {
-                    //read 16 bit from controller buffer
                     asm!("in eax, dx", out("eax") buffer, in("dx") DATA_REGISTER);
-
-                    //copy buffer in memory pointed by target
-                    //*(target_pointer as *mut u32) = buffer;
-                    core::ptr::write_unaligned(target_pointer as *mut u32, buffer);
-
+                    core::ptr::write_unaligned(target_pointer, buffer);
                     target_pointer = target_pointer.byte_add(4);
                 }
             }
@@ -89,37 +96,24 @@ impl Disk {
         self.reset();
     }
 
-    // NEW helper
-    pub fn is_drq(&self) -> bool {
-        let status: u8;
-        unsafe {
-            asm!("in al, dx", out("al") status, in("dx") STATUS_COMMAND_REGISTER);
-        }
-        (status & STATUS_DRQ) != 0
-    }
-
-    //write multiple sectors from source to lba (PIO MODE)
+    // ====================== WRITE ======================
     pub fn write<T>(&self, source: *const T, lba: u64, sectors: u16) {
         if !self.enabled {
-            println!("[ERROR] Cannot write! Disk not enabled");
+            println!("[ERROR] Cannot write! Disk {} not enabled", if self.is_master { "MASTER" } else { "SLAVE" });
             return;
         }
 
-        //wait until not busy
         while self.is_busy() {}
 
+        self.select_drive(lba);
+
         unsafe {
-            //disable ata interrupt
-            asm!("out dx, al", in("dx") 0x3f6, in("al") 0b00000010 as u8);
+            asm!("out dx, al", in("dx") 0x3f6, in("al") 0b00000010u8);
 
-            //setup registers
             asm!("out dx, al", in("dx") SECTOR_COUNT_REGISTER, in("al") sectors as u8);
-            asm!("out dx, al", in("dx") LBA_LOW_REGISTER, in("al") lba as u8);
-            asm!("out dx, al", in("dx") LBA_MID_REGISTER, in("al") (lba >> 8) as u8);
+            asm!("out dx, al", in("dx") LBA_LOW_REGISTER,  in("al") lba as u8);
+            asm!("out dx, al", in("dx") LBA_MID_REGISTER,  in("al") (lba >> 8) as u8);
             asm!("out dx, al", in("dx") LBA_HIGH_REGISTER, in("al") (lba >> 16) as u8);
-            asm!("out dx, al", in("dx") DRIVE_REGISTER, in("al") (0xE0 | ((lba >> 24) & 0xF)) as u8);
-
-            //send write command
             asm!("out dx, al", in("dx") STATUS_COMMAND_REGISTER, in("al") WRITE_COMMAND);
         }
 
@@ -127,12 +121,10 @@ impl Disk {
         let mut source_pointer = source as *const u32;
 
         while sectors_left > 0 {
-            //wait until ready to receive data (DRQ)
             while self.is_busy() || !self.is_drq() {}
 
             for _i in 0..128 {
                 let data = unsafe { core::ptr::read_unaligned(source_pointer) };
-
                 unsafe {
                     asm!("out dx, eax", in("dx") DATA_REGISTER, in("eax") data);
                     source_pointer = source_pointer.byte_add(4);
@@ -144,30 +136,35 @@ impl Disk {
         self.reset();
     }
 
-    //check if disk is busy
+    // ====================== STATUS ======================
     pub fn is_busy(&self) -> bool {
         let status: u8;
         unsafe {
             asm!("in al, dx", out("al") status, in("dx") STATUS_COMMAND_REGISTER);
         }
-
-        //if bsy bit is not 0 return true
         (status & STATUS_BSY) != 0
     }
 
-    //check if disk is ready
     pub fn is_ready(&self) -> bool {
         let status: u8;
         unsafe {
             asm!("in al, dx", out("al") status, in("dx") STATUS_COMMAND_REGISTER);
         }
-
-        //if rdy bit is not 0 return true
         (status & STATUS_RDY) != 0
     }
 
-    //check if ata drive is working
+    pub fn is_drq(&self) -> bool {
+        let status: u8;
+        unsafe {
+            asm!("in al, dx", out("al") status, in("dx") STATUS_COMMAND_REGISTER);
+        }
+        (status & STATUS_DRQ) != 0
+    }
+
+    // ====================== CHECK ======================
     pub fn check(&mut self) {
+        self.select_drive(0); // выбираем диск (LBA не важен для check)
+
         let status: u8;
         unsafe {
             asm!("in al, dx", out("al") status, in("dx") STATUS_COMMAND_REGISTER);
@@ -175,34 +172,23 @@ impl Disk {
 
         if status != 0 && status != 0xff {
             self.enabled = true;
-            println!("[!] ATA drive found! Status register: {:X}", status);
+            println!("[!] ATA {} drive found! Status: {:X}",
+                     if self.is_master { "MASTER" } else { "SLAVE" }, status);
         } else {
             self.enabled = false;
-            println!(
-                "[ERROR] ATA drive not working! Status register: {:X}",
-                status
-            );
+            println!("[ERROR] ATA {} drive not working! Status: {:X}",
+                     if self.is_master { "MASTER" } else { "SLAVE" }, status);
         }
     }
 
     pub fn reset(&self) {
         unsafe {
-            asm!("out dx, al", in("dx") 0x3f6, in("al") 0b00000110 as u8);
-            asm!("out dx, al", in("dx") 0x3f6, in("al") 0b00000010 as u8);
+            asm!("out dx, al", in("dx") 0x3f6, in("al") 0b00000110u8); // reset
+            asm!("out dx, al", in("dx") 0x3f6, in("al") 0b00000010u8); // normal
         }
     }
 }
 
-/*#[naked]
-pub extern "C" fn ata_interrupt() {
-    unsafe {
-        asm!("call ata_handler", "iretd", options(noreturn));
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn ata_handler() {
-    println!("0x2e int");
-
-    PICS.end_interrupt(0x2e);
-}*/
+// ====================== ГЛОБАЛЬНЫЕ ДИСКИ ======================
+pub static mut DISK: Disk = Disk::new(true);
+pub static mut DISK_SLAVE: Disk = Disk::new(false);
