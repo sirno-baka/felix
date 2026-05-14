@@ -1,5 +1,7 @@
 //FAT16 FILESYSTEM IMPLEMENTATION
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use crate::drivers::disk::DISK;
 use core::mem;
 use crate::{print, println};
@@ -88,7 +90,7 @@ pub struct Entry {
     modified_time: u16,
     modified_date: u16,
     first_cluster_low: u16,
-    size: u32,
+    pub size: u32,
 }
 
 static NULL_ENTRY: Entry = Entry {
@@ -147,34 +149,267 @@ impl FatDriver {
         }
     }
 
-    //list each entry in root direcotry
-    //list each entry in root directory (теперь игнорирует удалённые файлы)
-    pub fn list_entries(&self) {
-        println!("Listing root directory entries:");
+    // Загрузка содержимого ЛЮБОЙ директории (root или поддиректории)
+    pub fn load_entries_from_cluster(&mut self, dir_cluster: u16) {
+        let target = &mut self.entries as *mut Entry;
 
-        println!("Name          Size          Cluster number");
+        let lba: u64 = if dir_cluster == 0 {
+            // root directory
+            FAT_START as u64
+                + (self.header.reserved_sectors
+                + self.header.sectors_per_fat * self.header.fat_count as u16) as u64
+        } else {
+            self.cluster_to_lba(dir_cluster)
+        };
 
-        for i in 0..ENTRY_COUNT {
-            let name0 = self.entries[i].name[0];
-            if name0 == 0 || name0 == 0xE5 {
-                continue; // пропускаем пустые и удалённые записи
-            }
+        let sectors: u16 = self.header.sectors_per_cluster as u16;
 
-            //print name
-            for c in self.entries[i].name {
-                print!("{}", c as char);
-            }
-            //print size
-            let size = self.entries[i].size;
-            print!("   {} bytes", size);
-
-            //print cluster
-            let cluster = self.entries[i].first_cluster_low;
-            print!("     {}", cluster);
-            println!();
+        unsafe {
+            DISK.read(target, lba, sectors);
         }
     }
 
+    pub fn resolve_path(&mut self, path: &str) -> Option<(usize, u16)> {
+        if path.is_empty() {
+            return None;
+        }
+
+        let mut current_cluster = 0u16; // начинаем с root
+        let mut parts = path.split('/').filter(|s| !s.is_empty());
+        while let Some(part) = parts.next() {
+            let fat_name = Self::string_to_fat_name(part);
+            println!("fat_name: {:?}", fat_name);
+            self.load_entries_from_cluster(current_cluster);
+
+            let mut found_index = None;
+            for (i, entry) in self.entries.iter().enumerate() {
+                println!("  {} entry:  {:?}",i,  core::str::from_utf8(&entry.name).unwrap());
+                if entry.name == fat_name && entry.name[0] != 0 && entry.name[0] != 0xE5 {
+                    found_index = Some(i);
+                    println!("found_index: {:?}", found_index);
+                    break;
+                }
+            }
+
+            let idx = match found_index {
+                Some(i) => i,
+                None => return None,
+            };
+
+            let entry = &self.entries[idx];
+
+            // Если это последний компонент пути — возвращаем его
+            if parts.clone().next().is_none() {
+                return Some((idx, current_cluster));
+            }
+
+            // Иначе переходим в следующую директорию
+            if (entry.attributes & 0x10) == 0 {
+                return None; // не директория
+            }
+            current_cluster = entry.first_cluster_low;
+        }
+
+        None
+    }
+    pub unsafe fn rmdir(&mut self, dirname: &str) -> bool {
+        if !DISK.enabled {
+            println!("[FAT ERROR] Disk not enabled");
+            return false;
+        }
+
+        self.load_table();
+
+        let fat_name = Self::string_to_fat_name(dirname);
+
+        // Ищем директорию
+        let mut entry_index = None;
+        for (i, entry) in self.entries.iter().enumerate() {
+            if entry.name == fat_name && entry.name[0] != 0 && entry.name[0] != 0xE5 {
+                if (entry.attributes & 0x10) == 0 {
+                    println!("[FAT WARN] '{}' is not a directory", dirname);
+                    return false;
+                }
+                entry_index = Some(i);
+                break;
+            }
+        }
+
+        let entry_index = match entry_index {
+            Some(idx) => idx,
+            None => {
+                println!("[FAT WARN] Directory '{}' not found", dirname);
+                return false;
+            }
+        };
+
+        let first_cluster = self.entries[entry_index].first_cluster_low;
+
+        // Освобождаем кластер(ы) директории
+        if first_cluster >= 2 {
+            let mut cluster = first_cluster;
+            while cluster != 0xFFFF && cluster != 0 {
+                let next = self.table[cluster as usize];
+                self.table[cluster as usize] = 0;   // помечаем как свободный
+                cluster = next;
+            }
+        }
+
+        // Помечаем запись как удалённую
+        self.entries[entry_index].name[0] = 0xE5;
+        self.entries[entry_index].size = 0;
+        self.entries[entry_index].first_cluster_low = 0;
+
+        // Сохраняем изменения
+        self.save_table();
+        self.save_entries();
+
+        println!("[FAT OK] Directory '{}' successfully removed", dirname);
+        true
+    }
+    pub fn mkdir(&mut self, dirname: &str) -> bool {
+        self.load_table();
+
+        let fat_name = Self::string_to_fat_name(dirname);
+
+        // Проверяем, что такой директории/файла уже нет
+        for entry in &self.entries {
+            if entry.name == fat_name && entry.name[0] != 0 && entry.name[0] != 0xE5 {
+                println!("[FAT WARN] '{}' already exists", dirname);
+                return false;
+            }
+        }
+
+        // Ищем свободный слот в root directory
+        let entry_index = match self.find_free_entry() {
+            Some(idx) => idx,
+            None => {
+                println!("[FAT ERROR] No free directory entry");
+                return false;
+            }
+        };
+
+        // Выделяем 1 кластер под директорию
+        let cluster = match self.allocate_clusters(1) {
+            Some(c) => c,
+            None => {
+                println!("[FAT ERROR] Not enough space for directory");
+                return false;
+            }
+        };
+
+        // Создаём запись директории
+        self.entries[entry_index] = Entry {
+            name: fat_name,
+            attributes: 0x10,                    // Directory
+            reserved: 0,
+            created_time_tenths: 0,
+            created_time: 0,
+            created_date: 0x21C0,
+            accessed_date: 0x21C0,
+            first_cluster_high: 0,
+            modified_time: 0,
+            modified_date: 0x21C0,
+            first_cluster_low: cluster,
+            size: 0,
+        };
+
+        // Сохраняем изменения
+        self.save_table();
+        self.save_entries();
+
+        println!("[FAT OK] Directory '{}' created (cluster {})", dirname, cluster);
+        true
+    }
+
+    // Обновлённый list_entries — теперь красиво показывает директории
+    // Новый list_entries с поддержкой пути (stateless)
+    // Примеры:
+    //   list_entries("/")       → root
+    //   list_entries("/mydir")  → содержимое mydir
+    //   list_entries("mydir")   → содержимое mydir
+    //   list_entries("")        → root (по умолчанию)
+    pub fn list_entries(&mut self, path: &str) {
+        // Нормализуем путь
+        let path = path.trim();
+        let display_path = if path.is_empty() || path == "/" {
+            "/"
+        } else {
+            path
+        };
+
+        println!("Listing directory: {}", display_path);
+
+        // Получаем кластер директории, которую нужно показать
+        let dir_cluster = if path.is_empty() || path == "/" {
+            0u16
+        } else {
+            // Ищем директорию по пути
+            match self.resolve_path(path) {
+                Some((idx, _parent_cluster)) => {
+                    // resolve_path уже загрузил entries, но мы перезагрузим нужную директорию
+                    self.load_entries_from_cluster(0); // временно, чтобы прочитать entry
+                    let entry = &self.entries[idx];
+                    if (entry.attributes & 0x10) != 0 {
+                        entry.first_cluster_low
+                    } else {
+                        // Если передали путь к файлу — просто показываем информацию о нём
+                        self.print_single_entry(entry);
+                        return;
+                    }
+                }
+                None => {
+                    println!("[FAT] Directory '{}' not found", display_path);
+                    return;
+                }
+            }
+        };
+
+        // Загружаем содержимое нужной директории
+        self.load_entries_from_cluster(dir_cluster);
+
+        // Выводим таблицу
+        println!("Name               Size           Cluster");
+        for entry in &self.entries {
+            let name0 = entry.name[0];
+            if name0 == 0 || name0 == 0xE5 {
+                continue;
+            }
+
+            // Имя файла/папки
+            for &c in &entry.name {
+                if c == b' ' {
+                    break;
+                }
+                print!("{}", c as char);
+            }
+
+            // Слеш для директорий
+            if (entry.attributes & 0x10) != 0 {
+                print!("/");
+            }
+
+            let size = entry.size;
+            let cluster = entry.first_cluster_low;
+
+            if (entry.attributes & 0x10) != 0 {
+                print!("{:>15} ", "<DIR>");
+            } else {
+                print!("{:>15} bytes", size);
+            }
+            println!("     {}", cluster);
+        }
+    }
+
+    // Вспомогательный метод (для случая, когда ls вызвали на файл)
+    fn print_single_entry(&self, entry: &Entry) {
+        for &c in &entry.name {
+            if c == b' ' { break; }
+            print!("{}", c as char);
+        }
+        let size = entry.size;
+        println!("   {} bytes", size);
+    }
     // === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 
     // Преобразует "file.txt" → [u8;11] в формате 8.3 FAT (uppercase + пробелы)
@@ -273,38 +508,16 @@ impl FatDriver {
         data_start_lba + ((cluster as u64 - 2) * self.header.sectors_per_cluster as u64)
     }
 
-    // Запись данных в цепочку кластеров
-    fn write_data_to_clusters(&self, mut cluster: u16, data: &[u8]) {
-        let cluster_size = self.header.sectors_per_cluster as usize * self.header.bytes_per_sector as usize;
-        let mut offset = 0;
-
-        while offset < data.len() && cluster != 0xFFFF {
-            let chunk_len = (data.len() - offset).min(cluster_size);
-            let chunk = &data[offset..offset + chunk_len];
-
-            let lba = self.cluster_to_lba(cluster);
-
-            // Пишем целый кластер (последний может быть частично заполнен — остаток останется как есть)
-            unsafe {
-                DISK.write(chunk.as_ptr() as *const u32, lba, self.header.sectors_per_cluster as u16);
-            }
-
-            offset += chunk_len;
-            cluster = self.table[cluster as usize];
-        }
-    }
 
     // Открыть файл → возвращает fd (>= 3) или -1
-    pub fn open(&mut self, filename: &str) -> i32 {
-        let fat_name = Self::string_to_fat_name(filename);
-
-        for (i, entry) in self.entries.iter().enumerate() {
-            if entry.name == fat_name && entry.name[0] != 0 && entry.name[0] != 0xE5 {
-                return (i as i32) + 3;
+    pub fn open(&mut self, path: &str) -> i32 {
+        match self.resolve_path(path) {
+            Some((idx, _)) => (idx as i32) + 3,   // fd
+            None => {
+                println!("[FAT] open_path: '{}' not found", path);
+                -1
             }
         }
-        println!("[FAT] open: file '{}' not found", filename);
-        -1
     }
 
     // Запись по file descriptor (перезаписывает файл полностью)
@@ -406,28 +619,107 @@ impl FatDriver {
         true
     }
 
-    // === ОСНОВНОЙ МЕТОД: СОЗДАНИЕ + ЗАПИСЬ ФАЙЛА ===
-    // Если файл уже существует — перезаписывает его
-    pub fn write_file(&mut self, filename: &str, data: &[u8]) -> bool {
-        // if !DISK.enabled {
-        //     println!("[FAT ERROR] Disk not enabled");
-        //     return false;
-        // }
+    pub fn save_entries_to_cluster(&self, dir_cluster: u16) {
+        let source = &self.entries as *const Entry;
 
-        self.load_table();   // загружаем актуальную таблицу
+        let lba: u64 = if dir_cluster == 0 {
+            FAT_START as u64
+                + (self.header.reserved_sectors
+                + self.header.sectors_per_fat * self.header.fat_count as u16) as u64
+        } else {
+            self.cluster_to_lba(dir_cluster)
+        };
 
+        let sectors: u16 = self.header.sectors_per_cluster as u16;
+
+        unsafe {
+            DISK.write(source, lba, sectors);
+        }
+    }
+
+    // Полноценная запись файла по любому пути (создаёт файл, перезаписывает существующий)
+    // Запись данных в цепочку кластеров (самая важная правка)
+    fn write_data_to_clusters(&self, mut cluster: u16, data: &[u8]) {
+        let cluster_size = self.header.sectors_per_cluster as usize * self.header.bytes_per_sector as usize;
+        let mut offset = 0usize;
+
+        while offset < data.len() && cluster != 0xFFFF && cluster != 0 {
+            let chunk_len = (data.len() - offset).min(cluster_size);
+            let chunk = &data[offset..offset + chunk_len];
+
+            let lba = self.cluster_to_lba(cluster);
+
+            unsafe {
+                DISK.write(chunk.as_ptr() as *const u32, lba, self.header.sectors_per_cluster as u16);
+            }
+
+            offset += chunk_len;
+            cluster = self.table[cluster as usize];
+        }
+    }
+
+    // Полноценная запись файла по пути (исправленная и упрощённая версия)
+    pub fn write_path(&mut self, path: &str, data: &[u8]) -> bool {
+        self.load_table();
+
+        if path.is_empty() {
+            return false;
+        }
+
+        let clean_path = path.trim_start_matches('/');
+        let mut parts: Vec<&str> = clean_path.split('/').filter(|s| !s.is_empty()).collect();
+
+        if parts.is_empty() {
+            return false;
+        }
+        println!("Parts = {:?}", parts);
+        let filename = parts.pop().unwrap();
+        let parent_path: String = if parts.is_empty() {
+            "".parse().unwrap()                                            // root
+        } else {
+            parts.join("/")
+        };
+
+        println!("parent_path = {:?}", parent_path);
+
+        // === Находим кластер родительской директории ===
+        let parent_cluster = if parent_path.is_empty() {
+            0u16
+        } else {
+            match self.resolve_path(&parent_path) {
+                Some((idx, _)) => {
+                    // Загружаем root, чтобы получить метаданные записи
+                    self.load_entries_from_cluster(0);
+                    let entry = &self.entries[idx];
+                    if (entry.attributes & 0x10) == 0 {
+                        println!("[FAT ERROR] '{}' is not a directory", parent_path);
+                        return false;
+                    }
+                    entry.first_cluster_low
+                }
+                None => {
+                    println!("[FAT ERROR] Parent directory '{}' not found", parent_path);
+                    return false;
+                }
+            }
+        };
+        println!("parent_cluster = {:?}", parent_cluster);
+
+        // === Загружаем содержимое родительской директории ===
+        self.load_entries_from_cluster(parent_cluster);
+
+        // === Ищем существующий файл или свободный слот ===
         let fat_name = Self::string_to_fat_name(filename);
-
-        // 1. Ищем существующий файл (иммутабельный поиск)
         let mut entry_index = None;
+        println!("fat_name: {:?}", fat_name);
         for (i, entry) in self.entries.iter().enumerate() {
-            if entry.name == fat_name {
+            if entry.name == fat_name && entry.name[0] != 0 && entry.name[0] != 0xE5 {
                 entry_index = Some(i);
                 break;
             }
         }
+        println!("entry_index: {:?}", entry_index);
 
-        // 2. Если файла нет — ищем свободный слот
         if entry_index.is_none() {
             entry_index = self.find_free_entry();
         }
@@ -435,16 +727,15 @@ impl FatDriver {
         let entry_index = match entry_index {
             Some(idx) => idx,
             None => {
-                println!("[FAT ERROR] No free directory entry");
+                println!("[FAT ERROR] No free directory entry in parent");
                 return false;
             }
         };
 
-        // 3. Сколько кластеров нужно?
+        // === Выделяем кластеры ===
         let bytes_per_cluster = self.header.sectors_per_cluster as usize * self.header.bytes_per_sector as usize;
         let num_clusters = if data.is_empty() { 0 } else { (data.len() + bytes_per_cluster - 1) / bytes_per_cluster };
 
-        // 4. Выделяем кластеры (теперь borrow'ов нет)
         let first_cluster = if num_clusters > 0 {
             match self.allocate_clusters(num_clusters) {
                 Some(c) => c,
@@ -457,19 +748,19 @@ impl FatDriver {
             0
         };
 
-        // 5. Записываем данные в кластеры
+        // === Записываем данные ===
         if num_clusters > 0 {
             self.write_data_to_clusters(first_cluster, data);
         }
-
-        // 6. Заполняем/обновляем запись в директории (только сейчас)
+        println!("data length = {}", data.len());
+        // === Обновляем запись в директории ===
         self.entries[entry_index] = Entry {
             name: fat_name,
-            attributes: 0x20,                    // Archive
+            attributes: 0x20,
             reserved: 0,
             created_time_tenths: 0,
             created_time: 0,
-            created_date: 0x21C0,                // dummy дата
+            created_date: 0x21C0,
             accessed_date: 0x21C0,
             first_cluster_high: 0,
             modified_time: 0,
@@ -478,12 +769,11 @@ impl FatDriver {
             size: data.len() as u32,
         };
 
-        // 7. Сохраняем изменения на диск
+        // === Сохраняем всё на диск ===
         self.save_table();
-        self.save_entries();
+        self.save_entries_to_cluster(parent_cluster);
 
-        println!("[FAT OK] File '{}' written ({} bytes, start cluster {})",
-                 filename, data.len(), first_cluster);
+        println!("[FAT OK] File '{}' written ({} bytes, cluster {})", path, data.len(), first_cluster);
         true
     }
 
@@ -535,7 +825,20 @@ impl FatDriver {
             DISK.write(source, lba, sectors);
         }
     }
+    pub fn read_file_to_ptr(&self, entry: &Entry, target: *mut u8) {
+        let data_lba: u64 = FAT_START as u64
+            + (self.header.reserved_sectors
+            + self.header.sectors_per_fat * self.header.fat_count as u16
+            + 32) as u64;
+        let lba: u64 = data_lba
+            + ((entry.first_cluster_low - 2) * self.header.sectors_per_cluster as u16) as u64;
 
+        let sectors: u16 = self.header.sectors_per_cluster as u16;
+
+        unsafe {
+            DISK.read(target, lba, sectors);
+        }
+    }
     //read first cluster of file to buffer
     pub fn read_file_to_buffer(&self, entry: &Entry) {
         let target = self.buffer.as_ptr() as *mut u8;
@@ -592,19 +895,19 @@ impl FatDriver {
     }
 
     //search by filename, returns found root entry
-    pub fn search_file(&self, name: &[char]) -> &Entry {
+    pub fn search_file(&self, name: &str) -> &Entry {
         for entry in self.entries.iter() {
             let mut found = true;
             let mut i = 0;
 
-            for n in name {
+            for n in name.chars() {
                 let mut c = n.clone();
 
                 if c.is_ascii_lowercase() {
                     c = c.to_ascii_uppercase();
                 }
 
-                if (c != entry.name[i] as char) && (name[i] != '\0') {
+                if (c != entry.name[i] as char) && (name.as_bytes()[i] != b'\0') {
                     found = false;
                 }
 
