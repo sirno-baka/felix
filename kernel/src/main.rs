@@ -16,6 +16,8 @@ pub mod print;
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::panic::PanicInfo;
@@ -26,7 +28,6 @@ use interrupts::idt::IDT;
 use memory::paging::PAGING;
 use shell::shell::SHELL;
 use print::PRINTER;
-use filesystem::fat::FAT;
 use filesystem::ext2::Ext2;
 
 use multitasking::task::TASK_MANAGER;
@@ -59,7 +60,7 @@ pub extern "C" fn _start() -> ! {
 
         //setup idt
         IDT.init(); //init idt  
-        IDT.add_exceptions(); //add CPU exceptions to idt 
+        // IDT.add_exceptions(); //add CPU exceptions to idt
         IDT.add(
             interrupts::timer::TIMER_INT as usize,
             interrupts::timer::timer as u32,
@@ -76,32 +77,52 @@ pub extern "C" fn _start() -> ! {
 
         //init programmable interrupt controllers
         PICS.init();
-
-        //enable ata disk if present
-        DISK.check();
-
-
         let mut vfs = Vfs::new();
-
-        DISK.check();
-        if DISK.enabled {
-            let mut fat = FAT.lock();
-            fat.load_header();
-            fat.load_table();
-            fat.load_entries();
-            vfs.set_root(Box::new(fat.clone()));   // или без clone, если сделаешь move
-        }
-
-        // Монтируем EXT2 (если диск есть)
+        //enable ata disk if present
+        // DISK.check();
+        // if DISK.enabled {
+        //     DISK.check();
+        //     if DISK.enabled {
+        //         let mut ext2 = Ext2::new(&mut DISK);
+        //         ext2.mount();
+        //         vfs.set_root(Box::new(ext2));
+        //     }
+        //
+        //      // clone нужен, потому что lock держит mutable
+        // }
         DISK_SLAVE.check();
+        let filename = "/test";
+
         if DISK_SLAVE.enabled {
-            let mut ext2 = Ext2::new(&mut DISK_SLAVE);
-            ext2.mount();
-            vfs.mount("/mnt/ext2", Box::new(ext2));
+        // Монтируем EXT2
+            if DISK_SLAVE.enabled {
+                let mut ext2 = Ext2::new(&mut DISK_SLAVE);
+                ext2.mount();
+                vfs.set_root(Box::new(ext2));
+            }
+        }
+        *crate::filesystem::VFS.lock() = Some(vfs);
+        if let Some(vfs) = crate::filesystem::VFS.lock().as_ref() {  // ← as_ref
+            let data:Vec<u8> = vec![1,2,3,4,5];
+            let success = vfs.write_file(filename, data.as_slice());
+            if success {
+                println!("Written to");
+            }
         }
 
-        crate::filesystem::VFS.insert(Mutex::new(vfs));
-        println!("[VFS] Virtual filesystem initialized");
+        if let Some(vfs) = crate::filesystem::VFS.lock().as_ref() {  // ← as_ref
+            let success = vfs.read_file(filename);
+            if success.is_some() {
+                println!("Written to {:?}", success.unwrap());
+            }
+        }
+
+        if let Some(vfs) = crate::filesystem::VFS.lock().as_ref() {  // ← as_ref
+            vfs.list_directory("/");
+        }
+        println!("[VFS] Virtual filesystem initialized successfully");
+
+
 
         // //init filesystem
         // if DISK.enabled {
@@ -142,8 +163,18 @@ pub extern "C" fn _start() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    println!("\n\n=== KERNEL PANIC ===");
+    println!("Panic message: {}", info);
 
-    loop {}
+    if let Some(location) = info.location() {
+        println!("Location: {}:{}:{}",
+                 location.file(), location.line(), location.column());
+    }
+
+    println!("\nSystem halted (press Ctrl+C or reset button)");
+    loop {
+        unsafe { core::arch::asm!("hlt"); }
+    }
 }
 
 fn print_info() {

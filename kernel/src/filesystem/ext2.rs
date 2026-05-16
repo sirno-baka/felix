@@ -1,8 +1,8 @@
 use alloc::vec::Vec;
 // fs/ext2.rs
 use core::mem;
-use crate::drivers::disk::{Disk, DISK};
-use crate::println;
+use crate::drivers::disk::{Disk};
+use crate::{print, println};
 
 // ====================== ОСНОВНЫЕ СТРУКТУРЫ EXT2 ======================
 
@@ -116,6 +116,34 @@ impl Ext2 {
         }
     }
 
+    // ====================== БЕЗОПАСНЫЕ HELPERS (главное исправление) ======================
+
+    /// Читает структуру из блока по смещению (использует read_unaligned)
+    unsafe fn read_struct_from_disk<T: Copy>(&self, block: u32, offset_in_block: usize) -> T {
+        if self.block_size == 0 {
+            return mem::zeroed();
+        }
+        let mut block_buf = [0u8; 4096]; // достаточно для 1024/2048/4096
+        self.read_blocks(block, block_buf.as_mut_ptr(), 1);
+
+        let src = block_buf.as_ptr().add(offset_in_block);
+        core::ptr::read_unaligned(src as *const T)
+    }
+
+    /// Записывает структуру в блок по смещению (read-modify-write)
+    unsafe fn write_struct_to_disk<T: Copy>(&self, block: u32, offset_in_block: usize, value: &T) {
+        if self.block_size == 0 {
+            return;
+        }
+        let mut block_buf = [0u8; 4096];
+        self.read_blocks(block, block_buf.as_mut_ptr(), 1);
+
+        let dst = block_buf.as_mut_ptr().add(offset_in_block);
+        core::ptr::write_unaligned(dst as *mut T, *value);
+
+        self.write_blocks(block, block_buf.as_ptr(), 1);
+    }
+
     // ====================== НИЗКОУРОВНЕВЫЕ ЧТЕНИЕ/ЗАПИСЬ ======================
 
     /// Читаем блоки ext2
@@ -129,7 +157,7 @@ impl Ext2 {
         self.disk.read(buf as *mut u32, lba, (sectors_per_block * count) as u16);
     }
 
-    /// Записываем блоки ext2 (симметрично read_blocks)
+    /// Записываем блоки ext2
     unsafe fn write_blocks(&self, block: u32, buf: *const u8, count: u32) {
         if self.block_size == 0 {
             println!("[EXT2] Ошибка: write_blocks вызван до mount()!");
@@ -177,19 +205,36 @@ impl Ext2 {
 
     // ====================== BLOCK GROUP & INODE ======================
 
+    /// Исправленная версия — теперь правильно работает с несколькими блоками BGD-таблицы
     pub fn get_bg_descriptor(&self, group: u32) -> Ext2BlockGroupDescriptor {
-        let bgd_block = if self.superblock.s_first_data_block == 0 { 1 } else { self.superblock.s_first_data_block };
-        let bgd_offset = bgd_block as u64 * self.block_size as u64 / 512;
-
-        let mut bgd: Ext2BlockGroupDescriptor = unsafe { mem::zeroed() };
-        unsafe {
-            let lba = bgd_offset + (group as u64 * mem::size_of::<Ext2BlockGroupDescriptor>() as u64 / 512);
-            self.disk.read(&mut bgd as *mut _ as *mut u32, lba, 1);
+        if !self.mounted {
+            return unsafe { mem::zeroed() };
         }
-        bgd
+
+        let bgd_table_block = if self.superblock.s_first_data_block == 0 {
+            1u32
+        } else {
+            self.superblock.s_first_data_block
+        };
+
+        let desc_size = core::mem::size_of::<Ext2BlockGroupDescriptor>() as u32;
+        let bgds_per_block = self.block_size / desc_size;
+
+        let block_in_table = group / bgds_per_block;
+        let block = bgd_table_block + block_in_table;
+        let index_in_block = group % bgds_per_block;
+        let byte_offset = (index_in_block * desc_size) as usize;
+
+        unsafe {
+            self.read_struct_from_disk(block, byte_offset)
+        }
     }
 
     pub fn read_inode(&self, inode_num: u32) -> Ext2Inode {
+        if !self.mounted {
+            return unsafe { mem::zeroed() };
+        }
+
         let group = (inode_num - 1) / self.superblock.s_inodes_per_group;
         let bgd = self.get_bg_descriptor(group);
 
@@ -198,26 +243,17 @@ impl Ext2 {
         let inode_offset = index_in_group as u64 * self.superblock.s_inode_size as u64;
 
         let block_offset = inode_offset / self.block_size as u64;
-        let byte_offset = inode_offset % self.block_size as u64;
-
-        let mut inode: Ext2Inode = unsafe { mem::zeroed() };
+        let byte_offset_in_block = (inode_offset % self.block_size as u64) as usize;
 
         unsafe {
-            let lba = (inode_table_block as u64 + block_offset) * (self.block_size / 512) as u64;
-            let mut block_buf = [0u8; 4096];
-            self.disk.read(block_buf.as_mut_ptr() as *mut u32, lba, (self.block_size / 512) as u16);
-
-            core::ptr::copy_nonoverlapping(
-                block_buf.as_ptr().add(byte_offset as usize),
-                &mut inode as *mut _ as *mut u8,
-                mem::size_of::<Ext2Inode>(),
-            );
+            self.read_struct_from_disk(inode_table_block + block_offset as u32, byte_offset_in_block)
         }
-        inode
     }
 
     pub fn write_inode(&self, inode_num: u32, inode: &Ext2Inode) {
-        if !self.mounted { return; }
+        if !self.mounted {
+            return;
+        }
 
         let group = (inode_num - 1) / self.superblock.s_inodes_per_group;
         let bgd = self.get_bg_descriptor(group);
@@ -227,27 +263,20 @@ impl Ext2 {
         let inode_offset = index_in_group as u64 * self.superblock.s_inode_size as u64;
 
         let block_offset = inode_offset / self.block_size as u64;
-        let byte_offset = inode_offset % self.block_size as u64;
+        let byte_offset_in_block = (inode_offset % self.block_size as u64) as usize;
 
         unsafe {
-            let lba = (inode_table_block as u64 + block_offset) * (self.block_size / 512) as u64;
-            let mut block_buf = [0u8; 4096];
-
-            self.disk.read(block_buf.as_mut_ptr() as *mut u32, lba, (self.block_size / 512) as u16);
-
-            core::ptr::copy_nonoverlapping(
-                inode as *const Ext2Inode as *const u8,
-                block_buf.as_mut_ptr().add(byte_offset as usize),
-                mem::size_of::<Ext2Inode>(),
+            self.write_struct_to_disk(
+                inode_table_block + block_offset as u32,
+                byte_offset_in_block,
+                inode,
             );
-
-            self.write_blocks(inode_table_block + block_offset as u32, block_buf.as_ptr(), 1);
         }
     }
 
     // ====================== DIRECTORY HELPERS ======================
 
-    /// Найти inode по имени внутри директории (только direct блоки)
+    /// Найти inode по имени внутри директории (только direct блоки + защита от OOB)
     fn find_dir_entry(&self, dir_inode_num: u32, name: &str) -> Option<u32> {
         let inode = self.read_inode(dir_inode_num);
         if (inode.i_mode & 0xF000) != 0x4000 {
@@ -255,15 +284,20 @@ impl Ext2 {
         }
 
         for i in 0..12 {
-            if inode.i_block[i] == 0 { break; }
+            if inode.i_block[i] == 0 {
+                break;
+            }
 
             let mut block_buf = [0u8; 4096];
             unsafe { self.read_blocks(inode.i_block[i], block_buf.as_mut_ptr(), 1); }
 
             let mut offset = 0usize;
-            while offset < self.block_size as usize {
+            while offset + 8 <= self.block_size as usize {
                 let entry = unsafe { &*(block_buf.as_ptr().add(offset) as *const Ext2DirEntry) };
-                if entry.inode == 0 { break; }
+
+                if entry.rec_len == 0 || (entry.rec_len as usize) > self.block_size as usize - offset {
+                    break; // защита от повреждённых/нулевых записей
+                }
 
                 let name_slice = &block_buf[offset + 8..offset + 8 + entry.name_len as usize];
                 if core::str::from_utf8(name_slice).unwrap_or("") == name {
@@ -271,7 +305,6 @@ impl Ext2 {
                 }
 
                 offset += entry.rec_len as usize;
-                if entry.rec_len == 0 { break; }
             }
         }
         None
@@ -280,7 +313,6 @@ impl Ext2 {
     // ====================== PATH RESOLVER ======================
 
     /// Разрешает путь вида "/dir/subdir/file.txt" в номер inode
-    /// Поддерживает только абсолютные пути (начинаются с /)
     pub fn resolve_path(&self, path: &str) -> Option<u32> {
         if !self.mounted {
             return None;
@@ -316,11 +348,12 @@ impl Ext2 {
 
         let file_size = inode.i_size as usize;
         let mut data = alloc::vec::Vec::with_capacity(file_size);
-
         let blocks_to_read = (file_size + self.block_size as usize - 1) / self.block_size as usize;
 
         for i in 0..core::cmp::min(blocks_to_read, 12) {
-            if inode.i_block[i] == 0 { break; }
+            if inode.i_block[i] == 0 {
+                break;
+            }
 
             let mut block_buf = [0u8; 4096];
             unsafe {
@@ -331,7 +364,6 @@ impl Ext2 {
             let end = core::cmp::min(start + self.block_size as usize, file_size);
             data.extend_from_slice(&block_buf[0..(end - start)]);
         }
-
         Some(data)
     }
 
@@ -377,7 +409,7 @@ impl Ext2 {
     // ====================== FILE I/O ПО PATH ======================
 
     /// Прочитать файл по пути
-    pub fn read_file(&self, path: &str) -> Option<alloc::vec::Vec<u8>> {
+    pub fn read_file_path(&self, path: &str) -> Option<alloc::vec::Vec<u8>> {
         if let Some(inode_num) = self.resolve_path(path) {
             self.read_file_by_inode(inode_num)
         } else {
@@ -387,7 +419,7 @@ impl Ext2 {
     }
 
     /// Записать файл по пути (перезаписывает существующий файл)
-    pub fn write_file(&mut self, path: &str, data: &[u8]) -> bool {
+    pub fn write_file_path(&self, path: &str, data: &[u8]) -> bool {
         if let Some(inode_num) = self.resolve_path(path) {
             if self.write_file_by_inode(inode_num, data) {
                 println!("[EXT2] Successfully wrote {} bytes to {}", data.len(), path);
@@ -412,15 +444,20 @@ impl Ext2 {
 
         println!("[EXT2] Directory listing for inode {}:", inode_num);
         for i in 0..12 {
-            if inode.i_block[i] == 0 { break; }
+            if inode.i_block[i] == 0 {
+                break;
+            }
 
             let mut block_buf = [0u8; 4096];
             unsafe { self.read_blocks(inode.i_block[i], block_buf.as_mut_ptr(), 1); }
 
             let mut offset = 0usize;
-            while offset < self.block_size as usize {
+            while offset + 8 <= self.block_size as usize {
                 let entry = unsafe { &*(block_buf.as_ptr().add(offset) as *const Ext2DirEntry) };
-                if entry.inode == 0 { break; }
+
+                if entry.rec_len == 0 || (entry.rec_len as usize) > self.block_size as usize - offset {
+                    break;
+                }
 
                 let name_slice = &block_buf[offset + 8..offset + 8 + entry.name_len as usize];
                 let name = core::str::from_utf8(name_slice).unwrap_or("???");
@@ -429,7 +466,6 @@ impl Ext2 {
                 println!("  [{:4}] {:<20} type={}", inode, name, file_type);
 
                 offset += entry.rec_len as usize;
-                if entry.rec_len == 0 { break; }
             }
         }
     }
@@ -438,6 +474,7 @@ impl Ext2 {
     pub fn list_directory_path(&self, path: &str) {
         if let Some(inode) = self.resolve_path(path) {
             self.list_directory(inode);
+            println!("[EXT2] Directory listing complete");
         } else {
             println!("[EXT2] Directory not found: {}", path);
         }
@@ -445,15 +482,15 @@ impl Ext2 {
 }
 
 impl crate::filesystem::Filesystem for Ext2 {
-    fn read_file(&mut self, path: &str) -> Option<Vec<u8>> {
-        self.read_file(path)
+    fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        self.read_file_path(path)
     }
 
-    fn write_file(&mut self, path: &str, data: &[u8]) -> bool {
-        self.write_file(path, data)
+    fn write_file(&self, path: &str, data: &[u8]) -> bool {
+        self.write_file_path(path, data)
     }
 
-    fn list_directory(&mut self, path: &str) {
+    fn list_directory(&self, path: &str) {
         self.list_directory_path(path);
     }
 

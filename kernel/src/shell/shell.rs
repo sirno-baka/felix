@@ -4,7 +4,6 @@
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use crate::filesystem::fat::FAT;
 use crate::multitasking::task::TASK_MANAGER;
 use crate::print::PRINTER;
 
@@ -12,7 +11,6 @@ use crate::memory::paging::{PAGING, TABLES};
 
 use core::arch::asm;
 use crate::{filesystem, print, println};
-use crate::filesystem::EXT2_SLAVE;
 
 const APP_TARGET: u32 = 0x00a0_0000;
 const APP_SIZE: u32 = 0x0001_0000;
@@ -107,16 +105,21 @@ impl Shell {
                 println!("vec allocated! len = {}", v.len());
             }
 
-            "ls" => unsafe {
+            "ls" => {
                 let path = args.get(1).map(|s| s.as_str()).unwrap_or("/");
-                if let Some(vfs) = &filesystem::VFS {
-                    if let mut vfs = vfs.lock() {
+                println!("[DEBUG] ls started: {}", path);
+                {
+                    if let Some(vfs) = crate::filesystem::VFS.lock().as_ref() {
                         vfs.list_directory(path);
+                        println!("[VFS] Listing directory");
+                    } else {
+                        println!("[VFS] Not initialized");
                     }
                 }
+                println!("[DEBUG] ls command fully completed");
             },
 
-            "cat" => unsafe {
+            "cat" => {
                 if let Some(filename) = args.get(1) {
                     self.cat(filename.as_str());
                 } else {
@@ -124,102 +127,93 @@ impl Shell {
                 }
             },
 
-            "write" => unsafe {
+            "write" => {
                 if let Some(filename) = args.get(1) {
                     if let Some(data) = args.get(2) {
-                        if let Some(vfs) = &filesystem::VFS {
-                            let success = vfs.lock().write_file(filename.as_str(), data.as_bytes());
+                        if let Some(vfs) = crate::filesystem::VFS.lock().as_ref() {
+                            let success = vfs.write_file(filename.as_str(), data.as_bytes());
                             if success {
                                 println!("Written to {}", filename);
                             }
                         }
+                    } else {
+                        println!("Usage: write <file> <data>");
                     }
-                } else {
-                    println!("Usage: write <file> <data>");
                 }
             },
 
             "ps" => unsafe { TASK_MANAGER.list_tasks(); },
             "help" => println!("{}", HELP),
-
-            "rt" => unsafe { /* ... твой старый код ... */ },
-
             "mkdir" => unsafe {
                 if let Some(name) = args.get(1) {
-                    let mut f = FAT.lock();
-                    f.mkdir(name);
+
                 } else {
                     println!("Usage: mkdir <name>");
                 }
             },
-
-            "rmdir" => unsafe {
-                if let Some(name) = args.get(1) {
-                    let mut f = FAT.lock();
-                    f.rmdir(name);
-                } else {
-                    println!("Usage: rmdir <name>");
-                }
-            },
-
-            "write" => unsafe {
-                if let Some(filename) = args.get(1) {
-                    if let Some(data) = args.get(2) {
-                        let mut f = FAT.lock();
-                        f.write_path(filename, data.to_string().as_bytes());
+            "test" => unsafe {
+                println!("write");
+                let filename = "test";
+                if let Some(vfs) = crate::filesystem::VFS.lock().as_ref() {
+                    let success = vfs.read_file(filename);
+                    if success.is_some() {
+                        println!("Written to {:?}", success.unwrap());
                     }
-                } else {
-                    println!("Usage: write <file>");
                 }
             },
-
-            "run" => unsafe { /* ... твой код ... */ },
-            "test" => unsafe { /* ... твой код ... */ },
 
             _ => println!("Unknown command: {}", args[0]),
         }
     }
 
     // показывает содержимое файла (теперь БЕЗ unsafe и с with_ext2_slave)
-    pub unsafe fn cat(&self, filename: &str) {
-        if let Some(vfs) = &filesystem::VFS {
-            let data = vfs.lock().read_file(filename);
-            match data {
-                None => println!("File not found: {}", filename),
-                Some(data) => {
-                    if let Ok(text) = alloc::string::String::from_utf8(data) {
-                        println!("{}", text);
-                    } else {
-                        println!("<binary file>");
+    pub fn cat(&self, filename: &str) {
+        println!("[DEBUG] cat started: {}", filename);
+        {
+            if let Some(vfs) = crate::filesystem::VFS.lock().as_mut() {
+                let data = vfs.read_file(filename);
+                match data {
+                    None => println!("File not found: {}", filename),
+                    Some(data) => {
+                        println!("data: {:?}", data.len());
+                        println!("data: {:?}", data);
+                        if let Ok(text) = alloc::string::String::from_utf8(data) {
+                            println!("{}", text);
+                        } else {
+                            println!("<binary file>");
+                        }
                     }
                 }
+            } else {
+                println!("[VFS] Not initialized");
             }
         }
+        println!("[DEBUG] cat command fully completed");
     }
 
     // запускает исполняемый файл как задачу
     pub unsafe fn run(&self, filename: &str) {
-        let fat = FAT.lock();
-        let entry = fat.search_file(filename);   // аналогично cat
-
-        if entry.name[0] != 0 {
-            let slot = TASK_MANAGER.get_free_slot();
-            let target = APP_TARGET + (slot as u32 * APP_SIZE);
-
-            // map table 8
-            TABLES[8].set(target);
-            PAGING.set_table(8, &TABLES[8]);
-
-            fat.read_file_to_target(&entry, target as *mut u32);
-
-            let signature = *(target as *mut u32);
-            if signature == APP_SIGNATURE {
-                TASK_MANAGER.add_task((target + 4) as u32);
-            } else {
-                println!("File is not a valid executable!");
-            }
-        } else {
-            println!("Program not found: {}", filename);
-        }
+        // let fat = FAT.lock();
+        // let entry = fat.search_file(filename);   // аналогично cat
+        //
+        // if entry.name[0] != 0 {
+        //     let slot = TASK_MANAGER.get_free_slot();
+        //     let target = APP_TARGET + (slot as u32 * APP_SIZE);
+        //
+        //     // map table 8
+        //     TABLES[8].set(target);
+        //     PAGING.set_table(8, &TABLES[8]);
+        //
+        //     fat.read_file_to_target(&entry, target as *mut u32);
+        //
+        //     let signature = *(target as *mut u32);
+        //     if signature == APP_SIGNATURE {
+        //         TASK_MANAGER.add_task((target + 4) as u32);
+        //     } else {
+        //         println!("File is not a valid executable!");
+        //     }
+        // } else {
+        //     println!("Program not found: {}", filename);
+        // }
     }
 }

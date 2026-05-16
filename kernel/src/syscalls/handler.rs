@@ -8,7 +8,6 @@ use core::slice;
 use core::str;
 
 pub const SYSCALL_INT: u8 = 0x80;
-use crate::filesystem::fat::FAT;
 
 #[naked]
 pub extern "C" fn syscall() {
