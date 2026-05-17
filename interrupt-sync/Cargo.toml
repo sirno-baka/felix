@@ -1,0 +1,11 @@
+[package]
+name = "interrupt-sync"
+version = "0.1.0"
+edition = "2021"
+authors = ["sirno"]
+description = "Synchronization primitives for 32-bit x86 kernels (x86 version of hermit-sync)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+lock_api = "0.4"
+spinning_top = "0.3"

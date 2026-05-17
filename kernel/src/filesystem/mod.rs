@@ -1,4 +1,3 @@
-use spin::Mutex;
 use crate::filesystem::ext2::Ext2;
 
 pub mod ext2;

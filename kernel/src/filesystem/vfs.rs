@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use crate::{print, println};
-use spin::Mutex;
+use interrupt_sync::InterruptSpinMutex;
 
 // ====================== ТРЕЙТ ДЛЯ ЛЮБОЙ ФАЙЛОВОЙ СИСТЕМЫ ======================
 pub trait Filesystem: Send + Sync {
@@ -88,4 +88,4 @@ impl Vfs {
 }
 
 // ====================== ГЛОБАЛЬНЫЙ VFS ======================
-pub static VFS: Mutex<Option<Vfs>> = Mutex::new(None);
+pub static VFS: InterruptSpinMutex<Option<Vfs>> = InterruptSpinMutex::new(None);

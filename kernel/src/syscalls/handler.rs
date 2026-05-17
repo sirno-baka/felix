@@ -48,7 +48,8 @@ pub extern "C" fn syscall_handler(
             if fd == 1 || fd == 2 {  // stdout / stderr
                 let slice = slice::from_raw_parts(buf as *const u8, len);
                 if let Ok(s) = str::from_utf8(slice) {
-                    print::PRINTER.prints(s);
+                    let mut p = print::PRINTER.lock();
+                    p.prints(s);
                 }
                 len as u32
             } else {

@@ -2,8 +2,9 @@
 // Нормальная, высокоуровневая версия без хаков
 
 use crate::drivers::pic::PICS;
-use crate::shell::shell::SHELL;
 use core::arch::asm;
+use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
+use crate::println;
 
 // Warning! Mutable static here
 // TODO: заменить на spin::Mutex или lock-free структуру
@@ -60,67 +61,69 @@ pub extern "C" fn keyboard() {
 }
 
 // ===================================================================
-// Главный обработчик
+// ИСПРАВЛЕННАЯ версия — правильное сопоставление сканкодов
+// ===================================================================
+fn scancode_to_char(scancode: u8, shift: bool) -> u8 {
+    if scancode >= 128 {
+        return 0; // release-коды игнорируем
+    }
+
+    let index = match scancode {
+        // Пробел
+        0x39 => return b' ',
+        // Backspace
+        0x0e => return 0x08,
+        //enter
+        0x1c => return b'\n',
+        // Цифры и символы в верхнем ряду
+        0x02..=0x0d => (scancode - 0) as usize,      // 1..0
+        // Буквы
+        0x10..=0x21 => (scancode - 0) as usize,      // q..p
+        0x1e..=0x30 => (scancode - 0) as usize,     // a..l
+        0x2c..=0x35 => (scancode - 0) as usize,     // z..m
+
+
+
+        _ => return 0,
+    };
+
+    if index >= UNSHIFTED.len() {
+        return 0;
+    }
+
+    if shift {
+        SHIFTED[index]
+    } else {
+        UNSHIFTED[index]
+    }
+}
+
+// ===================================================================
+// Главный обработчик (исправленный)
 // ===================================================================
 #[no_mangle]
 pub extern "C" fn keyboard_handler() {
-    // Читаем scancode
     let scancode: u8 = unsafe {
         let mut sc: u8;
         asm!("in al, dx", out("al") sc, in("dx") KEYBOARD_PORT);
         sc
     };
 
-    // Уведомляем PIC
-    PICS.end_interrupt(KEYBOARD_INT);
-
+    // Обработка Shift (только press/release)
     unsafe {
         match scancode {
-            // Left Shift press / release
-            0x2a => { KEYBOARD.shift = true; return; }
-            0xaa => { KEYBOARD.shift = false; return; }
-
-            // Right Shift press / release (добавлено для полноты)
-            0x36 => { KEYBOARD.shift = true; return; }
-            0xb6 => { KEYBOARD.shift = false; return; }
-
-            // Backspace
-            0x0e => {
-                SHELL.backspace();
-                return;
-            }
-            // Enter
-            0x1c => {
-                SHELL.enter();
-                return;
-            }
+            0x2a | 0x36 => { KEYBOARD.shift = true; }
+            0xaa | 0xb6 => { KEYBOARD.shift = false; }
             _ => {}
         }
     }
 
-    // Получаем символ с учётом Shift
-    let key_byte = scancode_to_char(scancode);
+    let key_byte = scancode_to_char(scancode, unsafe { KEYBOARD.shift });
 
     if key_byte != 0 {
-        unsafe {
-            SHELL.add(char::from(key_byte));
-        }
-    }
-}
-
-// ===================================================================
-// НОВАЯ функция — супер-чистая и расширяемая
-// ===================================================================
-fn scancode_to_char(scancode: u8) -> u8 {
-    if scancode >= 128 {
-        return 0; // release-коды игнорируем
+        KEYBOARD_BUFFER.push(key_byte);
     }
 
-    unsafe {
-        if KEYBOARD.shift {
-            SHIFTED[scancode as usize]
-        } else {
-            UNSHIFTED[scancode as usize]
-        }
-    }
+    // EOI в самом конце
+    PICS.end_interrupt(KEYBOARD_INT);
 }

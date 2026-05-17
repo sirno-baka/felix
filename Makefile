@@ -87,10 +87,13 @@ run: all
 	@echo "Running Felix..."
 	@qemu-system-i386 -drive file=build/disk.img,index=0,media=disk,format=raw,if=ide -drive format=raw,file=disk.img,if=ide,index=1 -no-reboot \
                                                                                                                                        -no-shutdown \
-                                                                                                                                       -m 32M \
+                                                                                                                                       -m 64M \
                                                                                                                                        -serial stdio
 
 .PHONY: debug
 debug: all
 	@echo "Debugging Felix..."
-	@bochs -q -f bochs.conf
+	@qemu-system-i386 -drive file=build/disk.img,index=0,media=disk,format=raw,if=ide -drive format=raw,file=disk.img,if=ide,index=1 -no-reboot \
+                                                                                                                                           -no-shutdown \
+                                                                                                                                           -m 64M \
+                                                                                                                                           -serial stdio -s -S

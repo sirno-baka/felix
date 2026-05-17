@@ -1,7 +1,9 @@
 // kernel/src/memory/allocator.rs
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{self, null_mut};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, AtomicPtr, Ordering};
+use interrupt_sync::SpinMutex;
+use interrupt_sync::SpinMutexGuard;
 use crate::println;
 
 /// Заголовок свободного блока
@@ -12,8 +14,9 @@ struct FreeBlock {
 }
 
 pub struct Allocator {
+    lock: SpinMutex<()>,
     bump_next: AtomicUsize,
-    free_list: AtomicUsize, // *mut FreeBlock
+    free_list: AtomicPtr<FreeBlock>,
 }
 
 impl Allocator {
@@ -25,8 +28,9 @@ impl Allocator {
 
     pub const fn new() -> Self {
         Allocator {
+            lock: SpinMutex::new(()),
             bump_next: AtomicUsize::new(Self::HEAP_START),
-            free_list: AtomicUsize::new(0),
+            free_list: AtomicPtr::new(null_mut()),
         }
     }
 
@@ -40,7 +44,6 @@ impl Allocator {
         let size = layout.size().max(Self::HEADER_SIZE);
         let size = Self::align_up(size, align);
 
-        // Безопасно, т.к. оригинальный Layout был валидным
         unsafe { Layout::from_size_align_unchecked(size, align) }
     }
 
@@ -48,43 +51,77 @@ impl Allocator {
     unsafe fn add_free_block(&self, ptr: *mut u8, size: usize) {
         let block = ptr as *mut FreeBlock;
         (*block).size = size;
-        (*block).next = self.free_list.load(Ordering::Relaxed) as *mut FreeBlock;
 
-        self.free_list.store(block as usize, Ordering::Release);
+        let mut current_head = self.free_list.load(Ordering::Acquire);
+        loop {
+            (*block).next = current_head;
+            match self.free_list.compare_exchange(
+                current_head,
+                block,
+                Ordering::Release,
+                Ordering::Relaxed
+            ) {
+                Ok(_) => break,
+                Err(head) => current_head = head,
+            }
+        }
     }
 }
 
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let layout = Self::adjust_layout(layout); // ← главный фикс
+        let _guard: SpinMutexGuard<()> = self.lock.lock();
+        let layout = Self::adjust_layout(layout);
         let size = layout.size();
         let align = layout.align();
-        // 1. Сначала ищем в free list (с проверкой выравнивания!)
+
+        // 1. Ищем в free list
         let mut prev: *mut FreeBlock = null_mut();
-        let mut current: *mut FreeBlock = self.free_list.load(Ordering::Acquire) as *mut FreeBlock;
+        let mut current = self.free_list.load(Ordering::Acquire);
 
         while !current.is_null() {
             let block_size = (*current).size;
             let block_ptr = current as *mut u8;
 
-            // Теперь учитываем и размер, и требуемое выравнивание
             if block_size >= size && (block_ptr as usize) % align == 0 {
-                // удаляем из списка
+                let next_block = (*current).next;
+
                 if prev.is_null() {
-                    self.free_list.store((*current).next as usize, Ordering::Release);
+                    match self.free_list.compare_exchange(
+                        current,
+                        next_block,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed
+                    ) {
+                        Ok(_) => {
+                            let remaining = block_size - size;
+                            if remaining > Self::HEADER_SIZE * 2 {
+                                let remainder_ptr = block_ptr.add(size);
+                                self.add_free_block(remainder_ptr, remaining);
+                            }
+                            return block_ptr;
+                        }
+                        Err(_) => {
+                            current = self.free_list.load(Ordering::Acquire);
+                            prev = null_mut();
+                            continue;
+                        }
+                    }
                 } else {
-                    (*prev).next = (*current).next;
+                    if (*prev).next == current {
+                        (*prev).next = next_block;
+                        let remaining = block_size - size;
+                        if remaining > Self::HEADER_SIZE * 2 {
+                            let remainder_ptr = block_ptr.add(size);
+                            self.add_free_block(remainder_ptr, remaining);
+                        }
+                        return block_ptr;
+                    } else {
+                        current = self.free_list.load(Ordering::Acquire);
+                        prev = null_mut();
+                        continue;
+                    }
                 }
-
-                // сплитим остаток, если он достаточно большой
-                let remaining = block_size - size;
-                if remaining > Self::HEADER_SIZE * 2 {
-                    let remainder_ptr = block_ptr.add(size);
-                    // remainder_ptr теперь гарантированно выровнен
-                    self.add_free_block(remainder_ptr, remaining);
-                }
-
-                return block_ptr;
             }
 
             prev = current;
@@ -92,26 +129,35 @@ unsafe impl GlobalAlloc for Allocator {
         }
 
         // 2. Bump allocation
-        let current = self.bump_next.load(Ordering::Relaxed);
-        let aligned = Self::align_up(current, align);
-        let new_next = aligned + size;
+        let mut current_bump = self.bump_next.load(Ordering::Acquire);
+        loop {
+            let aligned = Self::align_up(current_bump, align);
+            let new_next = aligned + size;
 
-        if new_next > Self::HEAP_END {
-            return null_mut(); // Out of memory
+            if new_next > Self::HEAP_END {
+                return null_mut();
+            }
+
+            match self.bump_next.compare_exchange(
+                current_bump,
+                new_next,
+                Ordering::AcqRel,
+                Ordering::Relaxed
+            ) {
+                Ok(_) => return aligned as *mut u8,
+                Err(val) => current_bump = val,
+            }
         }
-
-        self.bump_next.store(new_next, Ordering::Relaxed);
-        aligned as *mut u8
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if ptr.is_null() {
             return;
         }
+        let _guard: SpinMutexGuard<()> = self.lock.lock();
         let layout = Self::adjust_layout(layout);
         let size = layout.size();
         self.add_free_block(ptr, size);
-        let free = self.free_list.load(Ordering::Acquire);
     }
 }
 

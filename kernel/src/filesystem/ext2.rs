@@ -293,7 +293,7 @@ impl Ext2 {
 
             let mut offset = 0usize;
             while offset + 8 <= self.block_size as usize {
-                let entry = unsafe { &*(block_buf.as_ptr().add(offset) as *const Ext2DirEntry) };
+                let entry = unsafe { core::ptr::read_unaligned(block_buf.as_ptr().add(offset) as *const Ext2DirEntry) };
 
                 if entry.rec_len == 0 || (entry.rec_len as usize) > self.block_size as usize - offset {
                     break; // защита от повреждённых/нулевых записей
@@ -452,15 +452,13 @@ impl Ext2 {
             unsafe { self.read_blocks(inode.i_block[i], block_buf.as_mut_ptr(), 1); }
 
             let mut offset = 0usize;
-            while offset + 8 <= self.block_size as usize {
-                let entry = unsafe { &*(block_buf.as_ptr().add(offset) as *const Ext2DirEntry) };
+            while offset < self.block_size as usize {
+                let entry = unsafe { core::ptr::read_unaligned(block_buf.as_ptr().add(offset) as *const Ext2DirEntry) };
+                if entry.inode == 0 { break; }
 
-                if entry.rec_len == 0 || (entry.rec_len as usize) > self.block_size as usize - offset {
-                    break;
-                }
-
-                let name_slice = &block_buf[offset + 8..offset + 8 + entry.name_len as usize];
-                let name = core::str::from_utf8(name_slice).unwrap_or("???");
+                let name_start = offset + 8;
+                let name_end = name_start + entry.name_len as usize;
+                let name = core::str::from_utf8(&block_buf[name_start..name_end]).unwrap_or("???");
                 let inode = entry.inode;
                 let file_type = entry.file_type;
                 println!("  [{:4}] {:<20} type={}", inode, name, file_type);

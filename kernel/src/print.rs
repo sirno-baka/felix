@@ -3,15 +3,18 @@
 
 use core::arch::asm;
 use core::fmt;
+use interrupt_sync::InterruptSpinMutex;
 
-//Warning! Mutable static here
-//TODO: Implement a mutex to get safe access to this
-pub static mut PRINTER: Printer = Printer {
-    x: 0,
-    y: 0,
-    foreground: 0x7,
-    background: 0,
-};
+pub const fn printer_new() -> Printer {
+    Printer {
+        x: 0,
+        y: 0,
+        foreground: 0x7,
+        background: 0,
+    }
+}
+
+pub static PRINTER: InterruptSpinMutex<Printer> = InterruptSpinMutex::new(printer_new());
 
 
 
@@ -129,15 +132,26 @@ impl Printer {
 
     //copy content of each row to upper row
     pub fn scroll(&mut self) {
-        for a in 0..25 {
-            for i in (80 * a)..((80 * a) + 80) {
-                let new = (VGA_START + i * 2) as *mut u8;
-                let old = (VGA_START + (i + 80) * 2) as *const u8;
+        // Сдвигаем строки 1..24 → 0..23 (правильно!)
+        for a in 0..24 {
+            for i in 0..80 {
+                let pos = (a * 80 + i) as u32;
+                let new = (VGA_START + pos * 2) as *mut u8;
+                let old = (VGA_START + (pos + 80) * 2) as *const u8;
 
                 unsafe {
                     *new = *old;
                     *new.byte_add(1) = *old.byte_add(1);
                 }
+            }
+        }
+
+        // Очищаем последнюю (24-ю) строку
+        let last_line_start = (VGA_START + 24 * 80 * 2) as *mut u8;
+        for i in 0..80 {
+            unsafe {
+                *last_line_start.add(i * 2) = b' ';                    // пробел
+                *last_line_start.add(i * 2 + 1) = (self.background << 4) | self.foreground;
             }
         }
     }
@@ -156,8 +170,8 @@ impl Printer {
         self.x = 0;
         self.y += 1;
 
-        if self.y == HEIGHT {
-            self.y -= 1;
+        if self.y >= HEIGHT {           // >= вместо ==
+            self.y = HEIGHT - 1;
             self.scroll();
         }
 
@@ -183,18 +197,16 @@ macro_rules! print {
 #[macro_export]
 macro_rules! println {
     () => {
-        unsafe { $crate::print::PRINTER.prints("\n"); }
+        $crate::print::print!("\n");
     };
 
-    ($($arg:tt)*) => {
+    ($($arg:tt)*) => {{
         $crate::print!("{}\n", format_args!($($arg)*));
-        // unsafe { $crate::print::PRINTER.prints("\n"); }
-    };
+    }};
 }
 
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
-    unsafe {
-        PRINTER.write_fmt(args).unwrap();
-    }
+    let mut p = super::PRINTER.lock();
+    p.write_fmt(args).unwrap();
 }
