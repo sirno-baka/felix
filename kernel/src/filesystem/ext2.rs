@@ -583,7 +583,6 @@ impl Ext2 {
 
         let group = 0;
         let bgd = self.get_bg_descriptor(group);
-
         let block_bitmap_block = bgd.bg_block_bitmap;
         let mut bitmap = unsafe { self.read_bitmap(block_bitmap_block) };
 
@@ -592,28 +591,24 @@ impl Ext2 {
         for i in 0..blocks_per_group {
             let byte = i / 8;
             let bit = i % 8;
-
             if byte >= bitmap.len() { break; }
 
             if (bitmap[byte] & (1 << bit)) == 0 {
                 bitmap[byte] |= 1 << bit;
-
                 unsafe { self.write_bitmap(block_bitmap_block, &bitmap); }
 
                 let mut bgd_mut = bgd;
                 bgd_mut.bg_free_blocks_count -= 1;
                 self.write_bg_descriptor(group, &bgd_mut);
-
                 self.update_superblock_free_blocks();
 
-                // реальный номер блока
-                let real_block = bgd.bg_block_bitmap + i as u32; // грубо, но работает для первой группы
+                // ПРАВИЛЬНЫЙ номер блока (для группы 0)
+                let real_block = i as u32;           // ← вот это исправление
                 return Some(real_block);
             }
         }
         None
     }
-
     // ====================== ВСПОМОГАТЕЛЬНЫЕ ======================
 
     fn write_bg_descriptor(&self, group: u32, bgd: &Ext2BlockGroupDescriptor) {
@@ -889,25 +884,21 @@ impl Ext2 {
         // TODO: indirect blocks позже
     }
 
-    /// Освобождаем один блок (через block bitmap)
     fn free_block(&mut self, block: u32) {
         if block == 0 { return; }
-
-        let group = 0; // пока только первая группа
+        let group = 0;
         let bgd = self.get_bg_descriptor(group);
         let block_bitmap_block = bgd.bg_block_bitmap;
-
         let mut bitmap = unsafe { self.read_bitmap(block_bitmap_block) };
 
-        let bit_index = (block - bgd.bg_block_bitmap) as usize; // грубый расчёт
+        let bit_index = block as usize;   // ← исправлено
         let byte = bit_index / 8;
         let bit = bit_index % 8;
 
         if byte < bitmap.len() {
-            bitmap[byte] &= !(1 << bit); // помечаем как свободный
+            bitmap[byte] &= !(1 << bit);
             unsafe { self.write_bitmap(block_bitmap_block, &bitmap); }
 
-            // обновляем счётчики
             let mut bgd_mut = bgd;
             bgd_mut.bg_free_blocks_count += 1;
             self.write_bg_descriptor(group, &bgd_mut);
