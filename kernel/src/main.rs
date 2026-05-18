@@ -76,8 +76,7 @@ pub extern "C" fn _start() -> ! {
 
         *crate::filesystem::VFS.lock() = Some(vfs);
         if let Some(vfs) = crate::filesystem::VFS.lock().as_mut() {
-            let data: Vec<u8> = vec![1, 2, 3, 4, 5];
-            let success = vfs.write_file("/test", data.as_slice());
+            let success = vfs.write_file("/test", b"1234567");
             if success {
                 println!("Written to");
             }

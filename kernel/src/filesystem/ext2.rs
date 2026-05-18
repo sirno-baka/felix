@@ -459,21 +459,22 @@ impl Ext2 {
 
         let name_bytes = name.as_bytes();
         let name_len = name_bytes.len() as u8;
-        let rec_len = ((8 + name_len + 3) & !3) as u16; // выравнивание 4 байта
+        let rec_len = ((8 + name_len as usize + 3) & !3) as u16;
 
-        // Проходим по всем 12 direct блокам директории
         for i in 0..12 {
             if dir_inode_data.i_block[i] == 0 {
-                // Нужно выделить новый блок для директории
                 let new_block = match self.alloc_block() {
                     Some(b) => b,
-                    None => {
-                        println!("[EXT2] No free block for directory");
-                        return false;
-                    }
+                    None => { println!("[EXT2] No free block for directory"); return false; }
                 };
                 dir_inode_data.i_block[i] = new_block;
+                // ← КРИТИЧНО: обновляем метаданные директории
+                dir_inode_data.i_size += self.block_size;
+                dir_inode_data.i_blocks += (self.block_size / 512);
                 self.write_inode(dir_inode, &dir_inode_data);
+
+                let zeros = [0u8; 4096];
+                unsafe { self.write_blocks(new_block, zeros.as_ptr(), 1); }
             }
 
             let block = dir_inode_data.i_block[i];
@@ -481,43 +482,57 @@ impl Ext2 {
             unsafe { self.read_blocks(block, block_buf.as_mut_ptr(), 1); }
 
             let mut offset = 0usize;
+            let mut last_entry_offset = 0usize;
+
             while offset + 8 <= self.block_size as usize {
                 let entry = unsafe {
                     core::ptr::read_unaligned(block_buf.as_ptr().add(offset) as *const Ext2DirEntry)
                 };
-                if entry.rec_len == 0 {
+                if entry.rec_len == 0 || entry.rec_len as usize > self.block_size as usize - offset {
                     break;
                 }
+                last_entry_offset = offset;
                 offset += entry.rec_len as usize;
             }
 
-            // Если в этот блок влезает новая запись
             if offset + rec_len as usize <= self.block_size as usize {
-                let new_entry = Ext2DirEntry {
-                    inode: inode_num,
-                    rec_len,
-                    name_len,
-                    file_type,
-                };
+                if last_entry_offset != offset {
+                    let prev_entry = unsafe {
+                        core::ptr::read_unaligned(block_buf.as_ptr().add(last_entry_offset) as *const Ext2DirEntry)
+                    };
+                    let prev_min_len = ((8 + prev_entry.name_len as usize + 3) & !3) as u16;
 
-                unsafe {
-                    core::ptr::write_unaligned(
-                        block_buf.as_mut_ptr().add(offset) as *mut Ext2DirEntry,
-                        new_entry,
-                    );
-                    core::ptr::copy_nonoverlapping(
-                        name_bytes.as_ptr(),
-                        block_buf.as_mut_ptr().add(offset + 8),
-                        name_len as usize,
-                    );
+                    if prev_entry.rec_len > prev_min_len {
+                        let mut prev_mut = prev_entry;
+                        prev_mut.rec_len = prev_min_len;
+                        unsafe {
+                            core::ptr::write_unaligned(
+                                block_buf.as_mut_ptr().add(last_entry_offset) as *mut Ext2DirEntry,
+                                prev_mut,
+                            );
+                        }
+                        offset = last_entry_offset + prev_min_len as usize;
+                    }
                 }
 
-                unsafe { self.write_blocks(block, block_buf.as_ptr(), 1); }
-                return true;
+                if offset + rec_len as usize <= self.block_size as usize {
+                    let new_entry = Ext2DirEntry {
+                        inode: inode_num,
+                        rec_len: (self.block_size as u16 - offset as u16),
+                        name_len,
+                        file_type,
+                    };
+                    unsafe {
+                        core::ptr::write_unaligned(block_buf.as_mut_ptr().add(offset) as *mut Ext2DirEntry, new_entry);
+                        core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), block_buf.as_mut_ptr().add(offset + 8), name_len as usize);
+                        self.write_blocks(block, block_buf.as_ptr(), 1);
+                    }
+                    return true;
+                }
             }
         }
 
-        println!("[EXT2] Directory is full (all 12 direct blocks used)");
+        println!("[EXT2] Directory is full");
         false
     }
 
@@ -548,7 +563,7 @@ impl Ext2 {
         let inodes_per_group = self.superblock.s_inodes_per_group as usize;
 
         // Начинаем с 11 (inodes 0-10 зарезервированы)
-        for i in 11..inodes_per_group {
+        for i in 12..inodes_per_group {
             let byte = i / 8;
             let bit = i % 8;
 
@@ -577,38 +592,6 @@ impl Ext2 {
 
     // ====================== ALLOC BLOCK ======================
 
-    /// Выделяем свободный блок через block bitmap
-    fn alloc_block(&mut self) -> Option<u32> {
-        if !self.mounted { return None; }
-
-        let group = 0;
-        let bgd = self.get_bg_descriptor(group);
-        let block_bitmap_block = bgd.bg_block_bitmap;
-        let mut bitmap = unsafe { self.read_bitmap(block_bitmap_block) };
-
-        let blocks_per_group = self.superblock.s_blocks_per_group as usize;
-
-        for i in 0..blocks_per_group {
-            let byte = i / 8;
-            let bit = i % 8;
-            if byte >= bitmap.len() { break; }
-
-            if (bitmap[byte] & (1 << bit)) == 0 {
-                bitmap[byte] |= 1 << bit;
-                unsafe { self.write_bitmap(block_bitmap_block, &bitmap); }
-
-                let mut bgd_mut = bgd;
-                bgd_mut.bg_free_blocks_count -= 1;
-                self.write_bg_descriptor(group, &bgd_mut);
-                self.update_superblock_free_blocks();
-
-                // ПРАВИЛЬНЫЙ номер блока (для группы 0)
-                let real_block = i as u32;           // ← вот это исправление
-                return Some(real_block);
-            }
-        }
-        None
-    }
     // ====================== ВСПОМОГАТЕЛЬНЫЕ ======================
 
     fn write_bg_descriptor(&self, group: u32, bgd: &Ext2BlockGroupDescriptor) {
@@ -884,19 +867,80 @@ impl Ext2 {
         // TODO: indirect blocks позже
     }
 
-    fn free_block(&mut self, block: u32) {
-        if block == 0 { return; }
-        let group = 0;
+    /// Выделяем свободный data-блок (правильный динамический расчёт)
+    fn alloc_block(&mut self) -> Option<u32> {
+        if !self.mounted {
+            println!("[EXT2] alloc_block: FS not mounted");
+            return None;
+        }
+
+        let group = 0u32;
         let bgd = self.get_bg_descriptor(group);
+
         let block_bitmap_block = bgd.bg_block_bitmap;
         let mut bitmap = unsafe { self.read_bitmap(block_bitmap_block) };
 
-        let bit_index = block as usize;   // ← исправлено
-        let byte = bit_index / 8;
-        let bit = bit_index % 8;
+        let blocks_per_group = self.superblock.s_blocks_per_group as usize;
+
+        // Динамически вычисляем, где начинаются data-блоки после inode table
+        let inode_table_size_in_blocks =
+            ((self.superblock.s_inodes_per_group as u64 *
+                self.superblock.s_inode_size as u64) +
+                (self.block_size as u64 - 1)) / self.block_size as u64;
+
+        let first_data_block = bgd.bg_inode_table as u64 + inode_table_size_in_blocks;
+
+        println!("[EXT2] alloc_block: first data block = {}", first_data_block);
+
+        // Ищем свободный блок начиная с first_data_block
+        for i in (first_data_block as usize)..blocks_per_group {
+            let byte = i / 8;
+            let bit = i % 8;
+
+            if byte >= bitmap.len() {
+                break;
+            }
+
+            if (bitmap[byte] & (1 << bit)) == 0 {
+                // Нашли свободный
+                bitmap[byte] |= 1 << bit;
+
+                unsafe { self.write_bitmap(block_bitmap_block, &bitmap); }
+
+                let mut bgd_mut = bgd;
+                if bgd_mut.bg_free_blocks_count > 0 {
+                    bgd_mut.bg_free_blocks_count -= 1;
+                }
+                self.write_bg_descriptor(group, &bgd_mut);
+                self.update_superblock_free_blocks();
+
+                return Some(i as u32);
+            }
+        }
+
+        println!("[EXT2] alloc_block: no free blocks found");
+        None
+    }
+
+    /// Освобождаем блок
+    fn free_block(&mut self, block: u32) {
+        if block == 0 {
+            return;
+        }
+
+        let group = 0u32;
+        let bgd = self.get_bg_descriptor(group);
+        let block_bitmap_block = bgd.bg_block_bitmap;
+
+        let mut bitmap = unsafe { self.read_bitmap(block_bitmap_block) };
+
+        let i = block as usize;
+        let byte = i / 8;
+        let bit = i % 8;
 
         if byte < bitmap.len() {
             bitmap[byte] &= !(1 << bit);
+
             unsafe { self.write_bitmap(block_bitmap_block, &bitmap); }
 
             let mut bgd_mut = bgd;
@@ -905,7 +949,6 @@ impl Ext2 {
             self.update_superblock_free_blocks();
         }
     }
-
     /// Освобождаем inode (через inode bitmap)
     fn free_inode(&mut self, inode_num: u32) {
         let group = (inode_num - 1) / self.superblock.s_inodes_per_group;
@@ -1224,7 +1267,7 @@ impl crate::filesystem::Filesystem for Ext2 {
     }
 
     fn list_directory_entries(&self, path: &str) -> Option<Vec<DirEntry>> {
-        self.list_directory_entries(path)
+        Ext2::list_directory_entries(self, path)
     }
 
     fn is_mounted(&self) -> bool {
