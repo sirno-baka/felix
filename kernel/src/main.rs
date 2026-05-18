@@ -27,6 +27,7 @@ use filesystem::ext2::Ext2;
 
 use multitasking::task::TASK_MANAGER;
 use crate::drivers::disk::DISK_SLAVE;
+use crate::drivers::pic::wait;
 use crate::filesystem::vfs::Vfs;
 
 const KERNEL_START: u32 = 0x0010_0000;
@@ -61,9 +62,9 @@ pub extern "C" fn _start() -> ! {
 
         PICS.init();
 
-        unsafe {
-            asm!("out 0x21, al", in("al") 0xfd_u8);
-        }
+        // unsafe {
+        //     asm!("out 0x21, al", in("al") 0xfd_u8);
+        // }
 
         let mut vfs = Vfs::new();
         DISK_SLAVE.check();
@@ -87,12 +88,27 @@ pub extern "C" fn _start() -> ! {
         print_info();
         TASK_MANAGER.init();
 
-        asm!("xchg bx, bx");
+        TASK_MANAGER.add_task(exampletask1 as u32);
+
+        // asm!("xchg bx, bx");
         asm!("sti");
-        let mut shell = shell::shell::Shell::new();
+
         loop {
-            shell.run()
+
         }
+    }
+}
+
+unsafe fn exampletask1() {
+    let mut shell = shell::shell::Shell::new();
+    loop {
+        shell.run();
+    }
+}
+fn exampletask2() {
+    loop {
+        println!("[Task Example 2]");
+        wait();
     }
 }
 

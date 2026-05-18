@@ -66,6 +66,6 @@ pub extern "C" fn timer_handler(esp: u32) -> u32 {
 
         PICS.end_interrupt(TIMER_INT);
 
-        return new_esp;
+        new_esp
     }
 }
