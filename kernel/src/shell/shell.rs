@@ -122,7 +122,7 @@ impl Shell {
             "write" => {
                 if let Some(filename) = args.get(1) {
                     if let Some(data) = args.get(2) {
-                        if let Some(vfs) = crate::filesystem::VFS.lock().as_ref() {
+                        if let Some(vfs) = crate::filesystem::VFS.lock().as_mut() {
                             let success = vfs.write_file(filename.as_str(), data.as_bytes());
                             if success {
                                 println!("Written to {}", filename);
@@ -130,6 +130,17 @@ impl Shell {
                         }
                     } else {
                         println!("Usage: write <file> <data>");
+                    }
+                }
+            },
+
+            "rm" => {
+                if let Some(filename) = args.get(1) {
+                    if let Some(vfs) = crate::filesystem::VFS.lock().as_mut() {
+                        let success = vfs.remove_file(filename.as_str());
+                        if success {
+                            println!("remove {}", filename);
+                        }
                     }
                 }
             },

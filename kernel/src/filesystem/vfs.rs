@@ -9,7 +9,9 @@ use interrupt_sync::InterruptSpinMutex;
 // ====================== ТРЕЙТ ДЛЯ ЛЮБОЙ ФАЙЛОВОЙ СИСТЕМЫ ======================
 pub trait Filesystem: Send + Sync {
     fn read_file(&self, path: &str) -> Option<Vec<u8>>;
-    fn write_file(&self, path: &str, data: &[u8]) -> bool;
+    fn write_file(&mut self, path: &str, data: &[u8]) -> bool;
+    fn create_file(&mut self, path: &str, data: &[u8]) -> bool;
+    fn remove_file(&mut self, path: &str) -> bool;
     fn list_directory(&self, path: &str);
     fn is_mounted(&self) -> bool;
 }
@@ -41,6 +43,8 @@ impl Vfs {
         println!("[VFS] Mounted at {}", mount_point);
     }
 
+    // ====================== RESOLVE ======================
+
     // ИСПРАВЛЕНО: теперь &self + &dyn Filesystem
     fn resolve(&self, path: &str) -> (&dyn Filesystem, String) {
         let path = if path.is_empty() { "/" } else { path };
@@ -61,7 +65,7 @@ impl Vfs {
 
         let relative = if path == best_prefix {
             "/"
-        } else if path.starts_with(best_prefix) {
+        } else if path.starts_with(best_prefix) && best_prefix != "/" {
             &path[best_prefix.len()..]
         } else {
             path
@@ -71,14 +75,56 @@ impl Vfs {
         (best_fs, relative.to_string())
     }
 
+    /// Mutable resolve (для write / create)
+    fn resolve_mut(&mut self, path: &str) -> (&mut dyn Filesystem, String) {
+        let path = if path.is_empty() { "/" } else { path };
+
+        let mut best_fs: &mut dyn Filesystem = self.root_fs
+            .as_mut()
+            .expect("[VFS] No root filesystem set!")
+            .as_mut();
+
+        let mut best_prefix = "/";
+
+        for (mp, fs_box) in &mut self.mounts {
+            if path.starts_with(mp.as_str()) && mp.len() > best_prefix.len() {
+                best_fs = fs_box.as_mut();
+                best_prefix = mp;
+            }
+        }
+
+        let relative = if path == best_prefix {
+            "/"
+        } else if path.starts_with(best_prefix) && best_prefix != "/" {
+            &path[best_prefix.len()..]
+        } else {
+            path
+        };
+
+        let relative = if relative.is_empty() { "/" } else { relative };
+        (best_fs, relative.to_string())
+    }
+
+    // ====================== PUBLIC API ======================
+
     pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         let (fs, rel_path) = self.resolve(path);
         fs.read_file(&rel_path)
     }
 
-    pub fn write_file(&self, path: &str, data: &[u8]) -> bool {
-        let (fs, rel_path) = self.resolve(path);
+    pub fn write_file(&mut self, path: &str, data: &[u8]) -> bool {
+        let (fs, rel_path) = self.resolve_mut(path);
         fs.write_file(&rel_path, data)
+    }
+
+    pub fn remove_file(&mut self, path: &str) -> bool {
+        let (fs, rel_path) = self.resolve_mut(path);
+        fs.remove_file(&rel_path)
+    }
+
+    pub fn create_file(&mut self, path: &str, data: &[u8]) -> bool {
+        let (fs, rel_path) = self.resolve_mut(path);
+        fs.create_file(&rel_path, data)
     }
 
     pub fn list_directory(&self, path: &str) {
