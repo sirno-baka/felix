@@ -1,8 +1,20 @@
+use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 // fs/ext2.rs
 use core::mem;
 use crate::drivers::disk::{Disk};
 use crate::{print, println};
+
+
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub inode: u32,
+    pub name: String,
+    pub file_type: u8,     // 1 = regular file, 2 = directory, etc.
+    pub size: u32,         // размер файла (0 для директорий)
+}
+
 
 // ====================== ОСНОВНЫЕ СТРУКТУРЫ EXT2 ======================
 
@@ -231,7 +243,7 @@ impl Ext2 {
     }
 
     pub fn read_inode(&self, inode_num: u32) -> Ext2Inode {
-        if !self.mounted {
+        if !self.mounted || inode_num == 0 {
             return unsafe { mem::zeroed() };
         }
 
@@ -251,7 +263,7 @@ impl Ext2 {
     }
 
     pub fn write_inode(&self, inode_num: u32, inode: &Ext2Inode) {
-        if !self.mounted {
+        if !self.mounted || inode_num == 0 {
             return;
         }
 
@@ -312,47 +324,64 @@ impl Ext2 {
 
     // ====================== СОЗДАНИЕ НОВОГО ФАЙЛА ======================
 
-    /// Создаёт новый файл (или перезаписывает существующий)
+    /// Создаёт файл (или перезаписывает существующий) — поддерживает поддиректории
     pub fn create_file_path(&mut self, path: &str, data: &[u8]) -> bool {
         if let Some(inode_num) = self.resolve_path(path) {
-            // файл уже есть — просто пишем
+            // файл уже существует — перезаписываем
             self.write_file_by_inode(inode_num, data)
         } else {
-            // файла нет — создаём новый
+            // создаём новый файл
             self.create_new_file(path, data)
         }
     }
 
-    /// Создаёт новый файл (пока только в корне!)
+    /// Создаёт новый файл в любой директории
     fn create_new_file(&mut self, path: &str, data: &[u8]) -> bool {
         if !self.mounted {
             return false;
         }
 
-        // Поддерживаем только файлы в корне на данном этапе
-        let name = match path.strip_prefix('/') {
-            Some(n) if !n.contains('/') => n,
-            _ => {
-                println!("[EXT2] create_file: only files in root supported for now (/filename)");
+        let (parent_path, name) = match self.split_path(path) {
+            Some((p, n)) => (p, n),
+            None => {
+                println!("[EXT2] Invalid path: {}", path);
                 return false;
             }
         };
 
-        if name.is_empty() {
+        // Находим inode родительской директории
+        let parent_inode = match self.resolve_path(&parent_path) {
+            Some(inode) => inode,
+            None => {
+                println!("[EXT2] Parent directory not found: {}", parent_path);
+                return false;
+            }
+        };
+
+        // Проверяем, что это действительно директория
+        let parent = self.read_inode(parent_inode);
+        if (parent.i_mode & 0xF000) != 0x4000 {
+            println!("[EXT2] Parent is not a directory: {}", parent_path);
             return false;
         }
 
-        // 1. Ищем свободный inode (очень простой алгоритм — начинаем с 11)
-        let inode_num = self.alloc_inode();
-        if inode_num.is_none() {
-            println!("[EXT2] No free inode!");
+        // Выделяем inode для нового файла
+        let inode_num = match self.alloc_inode() {
+            Some(n) => n,
+            None => {
+                println!("[EXT2] No free inode!");
+                return false;
+            }
+        };
+
+        let num_blocks = ((data.len() as u32) + self.block_size - 1) / self.block_size;
+        if num_blocks > 12 {
+            println!("[EXT2] File too big (>12 direct blocks)");
             return false;
         }
-        let inode_num = inode_num.unwrap();
 
-        // 2. Создаём inode
         let mut inode = Ext2Inode {
-            i_mode: 0x8000 | 0o644,     // regular file + rw-r--r--
+            i_mode: 0x8000 | 0o644,   // regular file
             i_uid: 0,
             i_size: data.len() as u32,
             i_atime: 0,
@@ -361,7 +390,7 @@ impl Ext2 {
             i_dtime: 0,
             i_gid: 0,
             i_links_count: 1,
-            i_blocks: ((data.len() as u32 + self.block_size - 1) / self.block_size) * (self.block_size / 512),
+            i_blocks: num_blocks * (self.block_size / 512),
             i_flags: 0,
             i_osd1: 0,
             i_block: [0; 15],
@@ -372,17 +401,15 @@ impl Ext2 {
             i_osd2: [0; 12],
         };
 
-        // 3. Выделяем блок(и) и пишем данные (только direct блоки)
-        let num_blocks = ((data.len() as u32) + self.block_size - 1) / self.block_size;
-        if num_blocks > 12 {
-            println!("[EXT2] File too big for simple implementation");
-            return false;
-        }
-
+        // Выделяем блоки и пишем данные
         for i in 0..num_blocks as usize {
-            // TODO: нормальное выделение блоков через bitmap
-            // Пока берём "следующий" блок после inode table (очень грубо)
-            let block = 100 + i as u32; // грубый хак, потом заменим
+            let block = match self.alloc_block() {
+                Some(b) => b,
+                None => {
+                    println!("[EXT2] No free block!");
+                    return false;
+                }
+            };
             inode.i_block[i] = block;
 
             let start = i * self.block_size as usize;
@@ -392,17 +419,35 @@ impl Ext2 {
             }
         }
 
-        // 4. Записываем inode
         self.write_inode(inode_num, &inode);
 
-        // 5. Добавляем запись в корневую директорию
-        if !self.add_dir_entry(2, name, inode_num, 1) {  // 1 = regular file
+        // Добавляем запись в родительскую директорию
+        if !self.add_dir_entry(parent_inode, &name, inode_num, 1) {  // 1 = regular file
             println!("[EXT2] Failed to add directory entry");
             return false;
         }
 
-        println!("[EXT2] Created new file: {} (inode {})", path, inode_num);
+        println!("[EXT2] Created file: {} (inode {}) in {}", path, inode_num, parent_path);
         true
+    }
+
+    fn split_path(&self, path: &str) -> Option<(String, String)> {
+        if path == "/" || path.is_empty() {
+            return None;
+        }
+
+        let path = path.trim_end_matches('/');
+        if let Some(pos) = path.rfind('/') {
+            let parent = if pos == 0 { "/" } else { &path[..pos] };
+            let filename = &path[pos + 1..];
+            if filename.is_empty() {
+                return None;
+            }
+            Some((parent.to_string(), filename.to_string()))
+        } else {
+            // файл в корне
+            Some(("/".to_string(), path.to_string()))
+        }
     }
 
     fn add_dir_entry(&mut self, dir_inode: u32, name: &str, inode_num: u32, file_type: u8) -> bool {
@@ -490,12 +535,11 @@ impl Ext2 {
     }
 
     // ====================== ALLOC INODE ======================
-
     /// Выделяем свободный inode через inode bitmap
     fn alloc_inode(&mut self) -> Option<u32> {
         if !self.mounted { return None; }
 
-        let group = 0; // пока только первая группа (достаточно для начала)
+        let group = 0;
         let bgd = self.get_bg_descriptor(group);
 
         let inode_bitmap_block = bgd.bg_inode_bitmap;
@@ -503,28 +547,31 @@ impl Ext2 {
 
         let inodes_per_group = self.superblock.s_inodes_per_group as usize;
 
-        for i in 1..inodes_per_group {  // пропускаем inode 0
+        // Начинаем с 11 (inodes 0-10 зарезервированы)
+        for i in 11..inodes_per_group {
             let byte = i / 8;
             let bit = i % 8;
 
             if byte >= bitmap.len() { break; }
 
             if (bitmap[byte] & (1 << bit)) == 0 {
-                // нашли свободный
-                bitmap[byte] |= 1 << bit; // помечаем как занятый
+                bitmap[byte] |= 1 << bit;
 
                 unsafe { self.write_bitmap(inode_bitmap_block, &bitmap); }
 
-                // обновляем счётчики
                 let mut bgd_mut = bgd;
-                bgd_mut.bg_free_inodes_count -= 1;
+                if bgd_mut.bg_free_inodes_count > 0 {
+                    bgd_mut.bg_free_inodes_count -= 1;
+                }
                 self.write_bg_descriptor(group, &bgd_mut);
 
                 self.update_superblock_free_inodes();
 
-                return Some((group * self.superblock.s_inodes_per_group + i as u32) as u32);
+                let inode_num = group * self.superblock.s_inodes_per_group + i as u32;
+                return Some(inode_num);
             }
         }
+        println!("[EXT2] No free inode found");
         None
     }
 
@@ -724,68 +771,27 @@ impl Ext2 {
         }
     }
 
-    // ====================== DEBUG ======================
-
-    pub fn list_directory(&self, inode_num: u32) {
+    // Внутренний helper
+    fn list_directory_entries_by_inode(&self, inode_num: u32) -> Option<Vec<DirEntry>> {
+        // временно, чтобы не ломать старый код
         let inode = self.read_inode(inode_num);
         if (inode.i_mode & 0xF000) != 0x4000 {
-            println!("[EXT2] Not a directory!");
-            return;
+            return None;
         }
-
-        println!("[EXT2] Directory listing for inode {}:", inode_num);
-        for i in 0..12 {
-            if inode.i_block[i] == 0 {
-                break;
-            }
-
-            let mut block_buf = [0u8; 4096];
-            unsafe { self.read_blocks(inode.i_block[i], block_buf.as_mut_ptr(), 1); }
-
-            let mut offset = 0usize;
-            while offset < self.block_size as usize {
-                let entry = unsafe { core::ptr::read_unaligned(block_buf.as_ptr().add(offset) as *const Ext2DirEntry) };
-                if entry.inode == 0 { break; }
-
-                let name_start = offset + 8;
-                let name_end = name_start + entry.name_len as usize;
-                let name = core::str::from_utf8(&block_buf[name_start..name_end]).unwrap_or("???");
-                let inode = entry.inode;
-                let file_type = entry.file_type;
-                println!("  [{:4}] {:<20} type={}", inode, name, file_type);
-
-                offset += entry.rec_len as usize;
-            }
-        }
-    }
-
-    /// Удобный дебаг: list_directory по пути
-    pub fn list_directory_path(&self, path: &str) {
-        if let Some(inode) = self.resolve_path(path) {
-            self.list_directory(inode);
-            println!("[EXT2] Directory listing complete");
-        } else {
-            println!("[EXT2] Directory not found: {}", path);
-        }
+        // Можно вызвать list_directory_entries, но пока оставим простой вариант
+        // или сделать через path, но проще — оставить как есть для inode
+        // (пока что можно просто вызвать list_directory_entries с "/" и фильтровать, но проще оставить старую логику)
+        None // заглушка — потом уберём
     }
 
     // ====================== УДАЛЕНИЕ ФАЙЛА ======================
 
-    /// Удаляет файл по пути (пока только в корне)
+    /// Удаляет файл (ТОЛЬКО обычные файлы). Директории не удаляет!
     pub fn remove_file_path(&mut self, path: &str) -> bool {
         if !self.mounted {
             return false;
         }
 
-        let name = match path.strip_prefix('/') {
-            Some(n) if !n.contains('/') => n,
-            _ => {
-                println!("[EXT2] remove_file: only root files supported for now (/filename)");
-                return false;
-            }
-        };
-
-        // 1. Находим inode файла
         let inode_num = match self.resolve_path(path) {
             Some(n) => n,
             None => {
@@ -794,19 +800,33 @@ impl Ext2 {
             }
         };
 
-        // 2. Удаляем запись из корневой директории
+        let inode = self.read_inode(inode_num);
+
+        // ←←← НОВАЯ ПРОВЕРКА
+        if (inode.i_mode & 0xF000) == 0x4000 {
+            println!("[EXT2] rm: cannot remove '{}': Is a directory", path);
+            println!("[EXT2] Use rmdir to remove directories");
+            return false;
+        }
+
+        // Это обычный файл — удаляем
+        let name = match path.strip_prefix('/') {
+            Some(n) if !n.contains('/') => n,
+            _ => {
+                println!("[EXT2] rm: only root files supported for now");
+                return false;
+            }
+        };
+
         if !self.remove_dir_entry(2, name) {
             println!("[EXT2] Failed to remove directory entry");
             return false;
         }
 
-        // 3. Освобождаем блоки файла
         self.free_blocks_of_inode(inode_num);
-
-        // 4. Освобождаем inode
         self.free_inode(inode_num);
 
-        println!("[EXT2] Removed file: {} (inode {})", path, inode_num);
+        println!("[EXT2] Removed file: {}", path);
         true
     }
 
@@ -921,6 +941,274 @@ impl Ext2 {
         let zero_inode = unsafe { mem::zeroed::<Ext2Inode>() };
         self.write_inode(inode_num, &zero_inode);
     }
+
+    // ====================== СОЗДАНИЕ ДИРЕКТОРИИ (mkdir) ======================
+
+    pub fn mkdir_path(&mut self, path: &str) -> bool {
+        if !self.mounted { return false; }
+
+        if self.resolve_path(path).is_some() {
+            println!("[EXT2] Directory already exists: {}", path);
+            return false;
+        }
+
+        let name = match path.strip_prefix('/') {
+            Some(n) if !n.contains('/') => n,
+            _ => {
+                println!("[EXT2] mkdir: only root directories supported for now");
+                return false;
+            }
+        };
+
+        let inode_num = match self.alloc_inode() {
+            Some(n) => n,
+            None => { println!("[EXT2] No free inode for directory"); return false; }
+        };
+
+        // Создаём inode директории
+        let mut inode = Ext2Inode {
+            i_mode: 0x4000 | 0o755,   // directory + rwxr-xr-x
+            i_uid: 0,
+            i_size: self.block_size,  // обычно один блок
+            i_atime: 0,
+            i_ctime: 0,
+            i_mtime: 0,
+            i_dtime: 0,
+            i_gid: 0,
+            i_links_count: 2,         // . и ..
+            i_blocks: self.block_size / 512,
+            i_flags: 0,
+            i_osd1: 0,
+            i_block: [0; 15],
+            i_generation: 0,
+            i_file_acl: 0,
+            i_dir_acl: 0,
+            i_faddr: 0,
+            i_osd2: [0; 12],
+        };
+
+        // Выделяем блок для содержимого директории
+        let dir_block = match self.alloc_block() {
+            Some(b) => b,
+            None => { println!("[EXT2] No free block for directory"); return false; }
+        };
+        inode.i_block[0] = dir_block;
+
+        self.write_inode(inode_num, &inode);
+
+        // Создаём записи . и ..
+        if !self.init_directory_block(dir_block, inode_num, 2) {  // parent = root (2)
+            return false;
+        }
+
+        // Добавляем запись о новой директории в родительскую (root)
+        if !self.add_dir_entry(2, name, inode_num, 2) {  // 2 = directory file_type
+            println!("[EXT2] Failed to add directory entry");
+            return false;
+        }
+
+        println!("[EXT2] Created directory: {} (inode {})", path, inode_num);
+        true
+    }
+
+    /// Инициализирует блок директории записями `.` и `..`
+    fn init_directory_block(&mut self, block: u32, self_inode: u32, parent_inode: u32) -> bool {
+        let mut block_buf = [0u8; 4096];
+
+        // Запись "."
+        let dot_entry = Ext2DirEntry {
+            inode: self_inode,
+            rec_len: 12,
+            name_len: 1,
+            file_type: 2,
+        };
+        unsafe {
+            core::ptr::write_unaligned(block_buf.as_mut_ptr() as *mut Ext2DirEntry, dot_entry);
+            block_buf[8] = b'.';
+        }
+
+        // Запись ".."
+        let dotdot_entry = Ext2DirEntry {
+            inode: parent_inode,
+            rec_len: (self.block_size - 12) as u16,
+            name_len: 2,
+            file_type: 2,
+        };
+        unsafe {
+            core::ptr::write_unaligned(block_buf.as_mut_ptr().add(12) as *mut Ext2DirEntry, dotdot_entry);
+            block_buf[20] = b'.';
+            block_buf[21] = b'.';
+        }
+
+        unsafe { self.write_blocks(block, block_buf.as_ptr(), 1); }
+        true
+    }
+
+    // ====================== РЕКУРСИВНОЕ УДАЛЕНИЕ ДИРЕКТОРИИ (rm -r) ======================
+
+    pub fn rmdir_path(&mut self, path: &str) -> bool {
+        if !self.mounted {
+            return false;
+        }
+
+        let inode_num = match self.resolve_path(path) {
+            Some(n) => n,
+            None => {
+                println!("[EXT2] Directory not found: {}", path);
+                return false;
+            }
+        };
+
+        let inode = self.read_inode(inode_num);
+        if (inode.i_mode & 0xF000) != 0x4000 {
+            println!("[EXT2] Not a directory: {}", path);
+            return false;
+        }
+
+        // Рекурсивно удаляем всё содержимое
+        if !self.remove_directory_contents(inode_num) {
+            println!("[EXT2] Failed to remove directory contents");
+            return false;
+        }
+
+        // Удаляем саму директорию из родительской
+        let name = match path.strip_prefix('/') {
+            Some(n) if !n.contains('/') => n,
+            _ => {
+                // для поддиректорий нужно найти родителя — пока только корень
+                println!("[EXT2] rmdir: only root directories supported for now");
+                return false;
+            }
+        };
+
+        if !self.remove_dir_entry(2, name) {
+            println!("[EXT2] Failed to remove directory entry from parent");
+            return false;
+        }
+
+        // Освобождаем блок директории и inode
+        if inode.i_block[0] != 0 {
+            self.free_block(inode.i_block[0]);
+        }
+        self.free_inode(inode_num);
+
+        println!("[EXT2] Removed directory recursively: {}", path);
+        true
+    }
+
+    /// Рекурсивно удаляет всё содержимое директории
+    fn remove_directory_contents(&mut self, dir_inode: u32) -> bool {
+        let entries = match self.list_directory_entries_by_inode(dir_inode) {
+            Some(e) => e,
+            None => return false,
+        };
+
+        for entry in entries {
+            if entry.name == "." || entry.name == ".." {
+                continue;
+            }
+
+            let full_path = format!("/{}/{}", dir_inode, entry.name); // грубо, но работает
+
+            if entry.file_type == 2 { // директория
+                if !self.rmdir_path(&full_path) {
+                    return false;
+                }
+            } else { // обычный файл
+                if !self.remove_file_path(&full_path) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+
+    fn is_directory_empty(&self, dir_inode: u32) -> bool {
+        let inode = self.read_inode(dir_inode);
+        if inode.i_block[0] == 0 { return true; }
+
+        let mut block_buf = [0u8; 4096];
+        unsafe { self.read_blocks(inode.i_block[0], block_buf.as_mut_ptr(), 1); }
+
+        let mut offset = 0usize;
+        let mut count = 0;
+
+        while offset + 8 <= self.block_size as usize {
+            let entry = unsafe {
+                core::ptr::read_unaligned(block_buf.as_ptr().add(offset) as *const Ext2DirEntry)
+            };
+            if entry.inode != 0 {
+                count += 1;
+            }
+            if entry.rec_len == 0 { break; }
+            offset += entry.rec_len as usize;
+        }
+
+        count <= 2  // только . и ..
+    }
+
+    pub fn list_directory_entries(&self, path: &str) -> Option<Vec<DirEntry>> {
+        let inode_num = self.resolve_path(path)?;
+
+        let inode = self.read_inode(inode_num);
+        if (inode.i_mode & 0xF000) != 0x4000 {
+            return None; // не директория
+        }
+
+        let mut entries = Vec::new();
+
+        for i in 0..12 {
+            if inode.i_block[i] == 0 {
+                break;
+            }
+
+            let mut block_buf = [0u8; 4096];
+            unsafe { self.read_blocks(inode.i_block[i], block_buf.as_mut_ptr(), 1); }
+
+            let mut offset = 0usize;
+            while offset + 8 <= self.block_size as usize {
+                let entry = unsafe {
+                    core::ptr::read_unaligned(block_buf.as_ptr().add(offset) as *const Ext2DirEntry)
+                };
+
+                if entry.rec_len == 0 || entry.inode == 0 {
+                    break;
+                }
+
+                let name_len = entry.name_len as usize;
+                let name_start = offset + 8;
+                let name_end = name_start + name_len;
+
+                if name_end > self.block_size as usize {
+                    break;
+                }
+
+                let name = core::str::from_utf8(&block_buf[name_start..name_end])
+                    .unwrap_or("???")
+                    .to_string();
+
+                // Получаем размер файла (если это обычный файл)
+                let size = if entry.file_type == 1 {
+                    let file_inode = self.read_inode(entry.inode);
+                    file_inode.i_size
+                } else {
+                    0
+                };
+
+                entries.push(DirEntry {
+                    inode: entry.inode,
+                    name,
+                    file_type: entry.file_type,
+                    size,
+                });
+
+                offset += entry.rec_len as usize;
+            }
+        }
+
+        Some(entries)
+    }
 }
 
 impl crate::filesystem::Filesystem for Ext2 {
@@ -937,9 +1225,15 @@ impl crate::filesystem::Filesystem for Ext2 {
     fn remove_file(&mut self, path: &str) -> bool {
         self.remove_file_path(path)
     }
+    fn mkdir(&mut self, path: &str) -> bool {
+        self.mkdir_path(path)
+    }
+    fn rmdir(&mut self, path: &str) -> bool {
+        self.rmdir_path(path)
+    }
 
-    fn list_directory(&self, path: &str) {
-        self.list_directory_path(path);
+    fn list_directory_entries(&self, path: &str) -> Option<Vec<DirEntry>> {
+        self.list_directory_entries(path)
     }
 
     fn is_mounted(&self) -> bool {

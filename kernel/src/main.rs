@@ -83,9 +83,6 @@ pub extern "C" fn _start() -> ! {
             }
         }
 
-        if let Some(vfs) = crate::filesystem::VFS.lock().as_mut() {
-            vfs.list_directory("/");
-        }
         println!("[VFS] Virtual filesystem initialized");
 
         print_info();

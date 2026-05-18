@@ -107,7 +107,15 @@ impl Shell {
                 let path = args.get(1).map(|s| s.as_str()).unwrap_or("/");
                 println!("[DEBUG] ls started: {}", path);
                 if let Some(vfs) = crate::filesystem::VFS.lock().as_ref() {
-                    vfs.list_directory(path);
+                    if let Some(entries) = vfs.list_directory_entries(path) {
+                        println!("[EXT2] Directory listing for: {}", path);
+                        for e in entries {
+                            let typ = if e.file_type == 2 { "dir" } else { "file" };
+                            println!("  [{:4}] {:<20} {:>8} {}", e.inode, e.name, e.size, typ);
+                        }
+                    } else {
+                        println!("[EXT2] Directory not found or error: {}", path);
+                    }
                 }
                 println!("[DEBUG] ls done");
             }
@@ -131,6 +139,27 @@ impl Shell {
                     } else {
                         println!("Usage: write <file> <data>");
                     }
+                }
+            },
+            "mkdir" => {
+                if let Some(name) = args.get(1) {
+                    if let Some(vfs) = crate::filesystem::VFS.lock().as_mut() {
+                        let success = vfs.mkdir(name);
+                        println!("mkdir {}: {}", name, success);
+                    }
+                } else {
+                    println!("Usage: mkdir <name>");
+                }
+            },
+
+            "rmdir" => {
+                if let Some(name) = args.get(1) {
+                    if let Some(vfs) = crate::filesystem::VFS.lock().as_mut() {
+                        let success = vfs.rmdir(name);
+                        println!("rmdir {}: {}", name, success);
+                    }
+                } else {
+                    println!("Usage: rmdir <name>");
                 }
             },
 

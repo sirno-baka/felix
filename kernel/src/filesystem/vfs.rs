@@ -5,6 +5,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use crate::{print, println};
 use interrupt_sync::InterruptSpinMutex;
+use crate::filesystem::ext2::DirEntry;
 
 // ====================== ТРЕЙТ ДЛЯ ЛЮБОЙ ФАЙЛОВОЙ СИСТЕМЫ ======================
 pub trait Filesystem: Send + Sync {
@@ -12,7 +13,10 @@ pub trait Filesystem: Send + Sync {
     fn write_file(&mut self, path: &str, data: &[u8]) -> bool;
     fn create_file(&mut self, path: &str, data: &[u8]) -> bool;
     fn remove_file(&mut self, path: &str) -> bool;
-    fn list_directory(&self, path: &str);
+    fn mkdir(&mut self, path: &str) -> bool;      // ← НОВОЕ
+    fn rmdir(&mut self, path: &str) -> bool;      // ← НОВОЕ
+
+    fn list_directory_entries(&self, path: &str) -> Option<Vec<DirEntry>>;
     fn is_mounted(&self) -> bool;
 }
 
@@ -127,9 +131,19 @@ impl Vfs {
         fs.create_file(&rel_path, data)
     }
 
-    pub fn list_directory(&self, path: &str) {
+    pub fn list_directory_entries(&self, path: &str) -> Option<Vec<DirEntry>> {
         let (fs, rel_path) = self.resolve(path);
-        fs.list_directory(&rel_path);
+        fs.list_directory_entries(&rel_path)
+    }
+
+    pub fn mkdir(&mut self, path: &str) -> bool {
+        let (fs, rel_path) = self.resolve_mut(path);
+        fs.mkdir(&rel_path)
+    }
+
+    pub fn rmdir(&mut self, path: &str) -> bool {
+        let (fs, rel_path) = self.resolve_mut(path);
+        fs.rmdir(&rel_path)
     }
 }
 
