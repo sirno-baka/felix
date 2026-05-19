@@ -58,11 +58,11 @@ impl InterruptDescriptorTable {
 
     // add exception handlers for various cpu exceptions
     pub fn add_exceptions(&mut self) {
-        // self.add(0x0, exceptions::div_error as u32);
-        // self.add(0x6, exceptions::invalid_opcode as u32);
-        // self.add(0x8, exceptions::double_fault as u32);
-        // self.add(0xd, exceptions::general_protection_fault as u32);
-        // self.add(0xe, exceptions::page_fault as u32);
+        self.add(0x0, exceptions::div_error as u32);
+        self.add(0x6, exceptions::invalid_opcode as u32);
+        self.add(0x8, exceptions::double_fault as u32);
+        self.add(0xd, exceptions::general_protection_fault as u32);
+        self.add(0xe, exceptions::page_fault as u32);
     }
 }
 

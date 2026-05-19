@@ -13,6 +13,7 @@ mod multitasking;
 mod print;
 mod syscalls;
 mod shell;
+mod sync;
 
 use alloc::boxed::Box;
 use alloc::vec;
@@ -28,6 +29,7 @@ use filesystem::ext2::Ext2;
 use multitasking::task::TASK_MANAGER;
 use crate::drivers::disk::DISK_SLAVE;
 use crate::drivers::pic::wait;
+use crate::filesystem::VFS;
 use crate::filesystem::vfs::Vfs;
 
 const KERNEL_START: u32 = 0x0010_0000;
@@ -46,6 +48,7 @@ pub extern "C" fn _start() -> ! {
         PAGING.enable();
 
         IDT.init();
+        IDT.add_exceptions();
         IDT.add(
             interrupts::timer::TIMER_INT as usize,
             interrupts::timer::timer as u32,
@@ -62,39 +65,42 @@ pub extern "C" fn _start() -> ! {
 
         PICS.init();
 
-        // unsafe {
-        //     asm!("out 0x21, al", in("al") 0xfd_u8);
-        // }
 
-        let mut vfs = Vfs::new();
+        //only keyboard
+
+        unsafe {
+            // asm!("out 0x21, al", in("al") 0xfd_u8);
+        }
+
         DISK_SLAVE.check();
 
         if DISK_SLAVE.enabled {
             let mut ext2 = Ext2::new(&mut DISK_SLAVE);
             ext2.mount();
-            vfs.set_root(Box::new(ext2));
+            VFS.get().set_root(Box::new(ext2));
         }
 
-        *crate::filesystem::VFS.lock() = Some(vfs);
-        if let Some(vfs) = crate::filesystem::VFS.lock().as_mut() {
-            let success = vfs.write_file("/test", b"1234567");
-            if success {
-                println!("Written to");
-            }
-        }
+
+
 
         println!("[VFS] Virtual filesystem initialized");
 
         print_info();
         TASK_MANAGER.init();
 
+        // TASK_MANAGER.add_task(exampletask3 as u32);
+        // TASK_MANAGER.add_task(exampletask2 as u32);
         TASK_MANAGER.add_task(exampletask1 as u32);
 
         // asm!("xchg bx, bx");
         asm!("sti");
+        // let mut shell = shell::shell::Shell::new();
+        // unsafe { shell.run(); }
+        // shell.init();
 
+        VFS.get().list_directory_entries("/").map(|t| {t.iter().map(|x| { println!("{}", x.name)}).collect::<Vec<_>>()});
         loop {
-
+        //     shell.process_input()
         }
     }
 }
@@ -106,9 +112,30 @@ unsafe fn exampletask1() {
     }
 }
 fn exampletask2() {
+    let mut counter = 0;
     loop {
-        println!("[Task Example 2]");
-        wait();
+        counter += 1;
+        if counter % 1 == 0 {
+            println!("[Task ONE] {}", counter);
+        }
+        for _ in 0..10_000_000 {
+            wait();
+        }
+
+    }
+}
+
+fn exampletask3() {
+    let mut counter = 0;
+    loop {
+        counter += 1;
+        if counter % 1 == 0 {
+            println!("[Task TWO] {}", counter);
+        }
+        for _ in 0..10_000_000 {
+            wait();
+        }
+
     }
 }
 

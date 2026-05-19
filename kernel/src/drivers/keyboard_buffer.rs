@@ -1,6 +1,7 @@
 // kernel/src/drivers/keyboard_buffer.rs
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use interrupt_sync::without_interrupts;
 
 const BUFFER_SIZE: usize = 256;
 
@@ -27,26 +28,33 @@ impl KeyboardBuffer {
         let next_head = (head + 1) % BUFFER_SIZE;
 
         if next_head == self.tail.load(Ordering::Acquire) {
-            return; // буфер полный
+            return; // буфер полон
         }
 
-        let buf = unsafe { &mut *self.buffer.get() };
-        buf[head] = byte;
+        // Доступ через сырой указатель (без создания &mut)
+        unsafe {
+            let buf_ptr = self.buffer.get() as *mut u8;
+            *buf_ptr.add(head) = byte;
+        }
 
         self.head.store(next_head, Ordering::Release);
     }
 
     pub fn pop(&self) -> Option<u8> {
-        let tail = self.tail.load(Ordering::Relaxed);
-        if tail == self.head.load(Ordering::Acquire) {
-            return None;
-        }
+        without_interrupts(|| {
+            let tail = self.tail.load(Ordering::Relaxed);
+            if tail == self.head.load(Ordering::Acquire) {
+                return None;
+            }
 
-        let buf = unsafe { &mut *self.buffer.get() };
-        let byte = buf[tail];
+            let byte = unsafe {
+                let buf_ptr = self.buffer.get() as *const u8;
+                *buf_ptr.add(tail)
+            };
 
-        self.tail.store((tail + 1) % BUFFER_SIZE, Ordering::Release);
-        Some(byte)
+            self.tail.store((tail + 1) % BUFFER_SIZE, Ordering::Release);
+            Some(byte)
+        })
     }
 }
 

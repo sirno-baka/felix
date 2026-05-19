@@ -39,47 +39,53 @@ static NULL_TASK: Task = Task {
 };
 
 impl Task {
+    pub fn sleep(&mut self) {
+        self.running = false;
+    }
+
+    pub fn wake(&mut self) {
+        self.running = true;
+    }
     //setup task stack, zeroing its cpu state and setting entry point
     pub fn init(&mut self, entry_point: u32) {
-        //mark task as running
         self.running = true;
 
-        //set cpu state pointer to the bottom part of its stack
-        let mut state = &self.stack as *const u8;
-        unsafe {
-            state = state.byte_add(STACK_SIZE);
-            state = state.byte_sub(core::mem::size_of::<CPUState>());
-        }
+        // Указатель на CPUState внизу стека
+        let state_ptr = unsafe {
+            (&self.stack as *const u8)
+                .add(STACK_SIZE)
+                .sub(core::mem::size_of::<CPUState>())
+                as *mut CPUState
+        };
 
-        //update cpu state pointer
-        self.cpu_state_ptr = state as u32;
-
-        let cpu_state = self.cpu_state_ptr as *mut CPUState;
+        self.cpu_state_ptr = state_ptr as u32;
 
         unsafe {
-            //init registers
-            (*cpu_state).eax = 0;
-            (*cpu_state).ebx = 0;
-            (*cpu_state).ecx = 0;
-            (*cpu_state).edx = 0;
-            (*cpu_state).esi = 0;
-            (*cpu_state).edi = 0;
-            (*cpu_state).ebp = 0;
+            let state = &mut *state_ptr;
 
-            //set instruction pointer to entry point of task
-            (*cpu_state).eip = entry_point;
+            // manually pushed registers
+            state.eax = 0;
+            state.ebx = 0;
+            state.ecx = 0;
+            state.edx = 0;
+            state.esi = 0;
+            state.edi = 0;
+            state.ebp = 0;
 
-            //set code segment
-            (*cpu_state).cs = 0x8;
+            // interrupt return frame
+            state.eip = entry_point;
+            state.cs  = 0x8;
+            state.eflags = 0x202;
 
-            //set eflags
-            (*cpu_state).eflags = 0x202;
+            // Важно: для kernel task esp и ss должны указывать на этот же стек
+            state.esp = state_ptr as u32;   // или чуть выше, если нужно
+            state.ss  = 0x10;
         }
     }
 }
 
 pub struct TaskManager {
-    tasks: [Task; MAX_TASKS as usize], //arry of tasks
+    pub(crate) tasks: [Task; MAX_TASKS as usize], //arry of tasks
     task_count: i8,                    //how many tasks are in the queue
     current_task: i8,                  //current running task
 }
@@ -93,7 +99,7 @@ pub static mut TASK_MANAGER: TaskManager = TaskManager {
 
 impl TaskManager {
     pub fn init(&mut self) {
-        self.add_task(idle as u32);
+        // self.add_task(idle as u32);
     }
 
     //add given task to next slot
@@ -120,34 +126,39 @@ impl TaskManager {
     //CPU SCHEDULER LOGIC
     //triggers scheduler with round robin scheduling algorithm, returns new cpu state
     pub fn schedule(&mut self, cpu_state: *mut CPUState) -> *mut CPUState {
-        //if no tasks return current state
         if self.task_count <= 0 {
             return cpu_state;
         }
 
-        //save current state of current task
+        // Сохраняем состояние текущего таска
         if self.current_task >= 0 {
             self.tasks[self.current_task as usize].cpu_state_ptr = cpu_state as u32;
         }
 
+        // Выбираем следующий runnable таск
         self.current_task = self.get_next_task();
+
+        // Защита: если почему-то вернули плохой индекс — берём idle (0)
+        if self.current_task < 0 || !self.tasks[self.current_task as usize].running {
+            self.current_task = 0;
+        }
 
         self.tasks[self.current_task as usize].cpu_state_ptr as *mut CPUState
     }
 
     pub fn get_next_task(&self) -> i8 {
-        let mut i = self.current_task + 1;
-        while i < MAX_TASKS {
-            let running = self.tasks[i as usize].running;
-
-            if running {
-                return i;
-            }
-
-            i = (i + 1) % MAX_TASKS;
+        if self.task_count <= 0 {
+            return 0; // хотя бы idle
         }
 
-        -1
+        let mut i = (self.current_task + 1) % MAX_TASKS;
+        for _ in 0..MAX_TASKS {
+            if self.tasks[i as usize].running {
+                return i;
+            }
+            i = (i + 1) % MAX_TASKS;
+        }
+        0 // fallback на idle
     }
 
     pub fn get_free_slot(&self) -> i8 {

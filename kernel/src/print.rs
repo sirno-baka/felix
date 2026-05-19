@@ -4,6 +4,7 @@
 use core::arch::asm;
 use core::fmt;
 use interrupt_sync::InterruptSpinMutex;
+use crate::sync::mutex::Mutex;
 
 pub const fn printer_new() -> Printer {
     Printer {
@@ -14,7 +15,7 @@ pub const fn printer_new() -> Printer {
     }
 }
 
-pub static PRINTER: InterruptSpinMutex<Printer> = InterruptSpinMutex::new(printer_new());
+pub static PRINTER: Mutex<Printer> = Mutex::new(printer_new());
 
 
 

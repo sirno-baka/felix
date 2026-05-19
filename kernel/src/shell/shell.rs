@@ -6,6 +6,8 @@ use crate::multitasking::task::TASK_MANAGER;
 use core::arch::asm;
 use interrupt_sync::SpinMutex;
 use crate::{print, println};
+use crate::filesystem::VFS;
+use crate::filesystem::vfs::Vfs;
 
 const HELP: &'static str = "Available commands:
 ls                  - lists root directory entries
@@ -106,17 +108,16 @@ impl Shell {
             "ls" => {
                 let path = args.get(1).map(|s| s.as_str()).unwrap_or("/");
                 println!("[DEBUG] ls started: {}", path);
-                if let Some(vfs) = crate::filesystem::VFS.lock().as_ref() {
-                    if let Some(entries) = vfs.list_directory_entries(path) {
-                        println!("[EXT2] Directory listing for: {}", path);
-                        for e in entries {
-                            let typ = if e.file_type == 2 { "dir" } else { "file" };
-                            println!("  [{:4}] {:<20} {:>8} {}", e.inode, e.name, e.size, typ);
-                        }
-                    } else {
-                        println!("[EXT2] Directory not found or error: {}", path);
+                if let Some(entries) = VFS.get().list_directory_entries(path) {
+                    println!("[EXT2] Directory listing for: {}", path);
+                    for e in entries {
+                        let typ = if e.file_type == 2 { "dir" } else { "file" };
+                        println!("  [{:4}] {:<20} {:>8} {}", e.inode, e.name, e.size, typ);
                     }
+                } else {
+                    println!("[EXT2] Directory not found or error: {}", path);
                 }
+
                 println!("[DEBUG] ls done");
             }
             "cat" => {
@@ -130,12 +131,11 @@ impl Shell {
             "write" => {
                 if let Some(filename) = args.get(1) {
                     if let Some(data) = args.get(2) {
-                        if let Some(vfs) = crate::filesystem::VFS.lock().as_mut() {
-                            let success = vfs.write_file(filename.as_str(), data.as_bytes());
-                            if success {
-                                println!("Written to {}", filename);
-                            }
+                        let success = VFS.get().write_file(filename.as_str(), data.as_bytes());
+                        if success {
+                            println!("Written to {}", filename);
                         }
+
                     } else {
                         println!("Usage: write <file> <data>");
                     }
@@ -143,10 +143,9 @@ impl Shell {
             },
             "mkdir" => {
                 if let Some(name) = args.get(1) {
-                    if let Some(vfs) = crate::filesystem::VFS.lock().as_mut() {
-                        let success = vfs.mkdir(name);
-                        println!("mkdir {}: {}", name, success);
-                    }
+                    let success = VFS.get().mkdir(name);
+                    println!("mkdir {}: {}", name, success);
+
                 } else {
                     println!("Usage: mkdir <name>");
                 }
@@ -154,10 +153,9 @@ impl Shell {
 
             "rmdir" => {
                 if let Some(name) = args.get(1) {
-                    if let Some(vfs) = crate::filesystem::VFS.lock().as_mut() {
-                        let success = vfs.rmdir(name);
-                        println!("rmdir {}: {}", name, success);
-                    }
+                    let success = VFS.get().rmdir(name);
+                    println!("rmdir {}: {}", name, success);
+
                 } else {
                     println!("Usage: rmdir <name>");
                 }
@@ -165,12 +163,11 @@ impl Shell {
 
             "rm" => {
                 if let Some(filename) = args.get(1) {
-                    if let Some(vfs) = crate::filesystem::VFS.lock().as_mut() {
-                        let success = vfs.remove_file(filename.as_str());
-                        if success {
-                            println!("remove {}", filename);
-                        }
+                    let success = VFS.get().remove_file(filename.as_str());
+                    if success {
+                        println!("remove {}", filename);
                     }
+
                 }
             },
 
@@ -182,18 +179,17 @@ impl Shell {
 
     pub fn cat(&self, filename: &str) {
         println!("[DEBUG] cat: {}", filename);
-        if let Some(vfs) = crate::filesystem::VFS.lock().as_mut() {
-            let data = vfs.read_file(filename);
-            match data {
-                None => println!("File not found: {}", filename),
-                Some(data) => {
-                    if let Ok(text) = alloc::string::String::from_utf8(data) {
-                        println!("{}", text);
-                    } else {
-                        println!("<binary>");
-                    }
+        let data = VFS.get().read_file(filename);
+        match data {
+            None => println!("File not found: {}", filename),
+            Some(data) => {
+                if let Ok(text) = alloc::string::String::from_utf8(data) {
+                    println!("{}", text);
+                } else {
+                    println!("<binary>");
                 }
             }
         }
+
     }
 }

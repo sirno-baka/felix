@@ -2,11 +2,14 @@
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
-
+use core::ptr::read;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lock_api::{RawMutex, Mutex as ApiMutex};
 use spinning_top::RawSpinlock;
 
 /// Отключает прерывания на x86 (32-bit) и восстанавливает предыдущее состояние
+
+static INTERRUPT_NESTING: AtomicUsize = AtomicUsize::new(0);
 #[inline(always)]
 pub fn without_interrupts<F, R>(f: F) -> R
 where
@@ -18,17 +21,21 @@ where
         asm!("cli", options(nomem, nostack));
     }
 
+    INTERRUPT_NESTING.fetch_add(1, Ordering::SeqCst);
+
     let result = f();
 
+    let nesting = INTERRUPT_NESTING.fetch_sub(1, Ordering::SeqCst);
+
     unsafe {
-        if flags & (1 << 9) != 0 {
+        // Включаем прерывания только если это был самый внешний вызов
+        if nesting == 1 && (flags & (1 << 9)) != 0 {
             asm!("sti", options(nomem, nostack));
         }
     }
 
     result
 }
-
 // ====================== RawInterruptMutex ======================
 pub struct RawInterruptMutex<R: RawMutex> {
     inner: R,

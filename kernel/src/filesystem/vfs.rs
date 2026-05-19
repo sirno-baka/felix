@@ -1,151 +1,163 @@
-// Весь файл vfs.rs можно заменить на это:
+// kernel/src/filesystem/vfs.rs
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use crate::{print, println};
-use interrupt_sync::InterruptSpinMutex;
+use interrupt_sync::{InterruptLazy};
+use crate::println;
 use crate::filesystem::ext2::DirEntry;
+use crate::sync::mutex::Mutex;
 
-// ====================== ТРЕЙТ ДЛЯ ЛЮБОЙ ФАЙЛОВОЙ СИСТЕМЫ ======================
 pub trait Filesystem: Send + Sync {
     fn read_file(&self, path: &str) -> Option<Vec<u8>>;
     fn write_file(&mut self, path: &str, data: &[u8]) -> bool;
     fn create_file(&mut self, path: &str, data: &[u8]) -> bool;
     fn remove_file(&mut self, path: &str) -> bool;
-    fn mkdir(&mut self, path: &str) -> bool;      // ← НОВОЕ
-    fn rmdir(&mut self, path: &str) -> bool;      // ← НОВОЕ
-
+    fn mkdir(&mut self, path: &str) -> bool;
+    fn rmdir(&mut self, path: &str) -> bool;
     fn list_directory_entries(&self, path: &str) -> Option<Vec<DirEntry>>;
     fn is_mounted(&self) -> bool;
 }
 
-// ====================== VFS ======================
 pub struct Vfs {
+    inner: Mutex<VfsInner>,
+}
+
+struct VfsInner {
     root_fs: Option<Box<dyn Filesystem>>,
     mounts: Vec<(String, Box<dyn Filesystem>)>,
 }
 
 impl Vfs {
     pub fn new() -> Self {
-        Vfs {
-            root_fs: None,
-            mounts: Vec::new(),
+        Self {
+            inner: Mutex::new(VfsInner {
+                root_fs: None,
+                mounts: Vec::new(),
+            }),
         }
     }
 
-    pub fn set_root(&mut self, fs: Box<dyn Filesystem>) {
-        self.root_fs = Some(fs);
+    pub fn set_root(&self, fs: Box<dyn Filesystem>) {
+        let mut inner = self.inner.lock();
+        inner.root_fs = Some(fs);
     }
 
-    pub fn mount(&mut self, mount_point: &str, fs: Box<dyn Filesystem>) {
+    pub fn mount(&self, mount_point: &str, fs: Box<dyn Filesystem>) {
         if !mount_point.starts_with('/') {
             println!("[VFS] Mount point must start with /");
             return;
         }
-        self.mounts.push((mount_point.to_string(), fs));
+        let mut inner = self.inner.lock();
+        inner.mounts.push((mount_point.to_string(), fs));
         println!("[VFS] Mounted at {}", mount_point);
-    }
-
-    // ====================== RESOLVE ======================
-
-    // ИСПРАВЛЕНО: теперь &self + &dyn Filesystem
-    fn resolve(&self, path: &str) -> (&dyn Filesystem, String) {
-        let path = if path.is_empty() { "/" } else { path };
-
-        let mut best_fs: &dyn Filesystem = self.root_fs
-            .as_ref()
-            .expect("[VFS] No root filesystem set!")
-            .as_ref();
-
-        let mut best_prefix = "/";
-
-        for (mp, fs_box) in &self.mounts {
-            if path.starts_with(mp.as_str()) && mp.len() > best_prefix.len() {
-                best_fs = fs_box.as_ref();
-                best_prefix = mp;
-            }
-        }
-
-        let relative = if path == best_prefix {
-            "/"
-        } else if path.starts_with(best_prefix) && best_prefix != "/" {
-            &path[best_prefix.len()..]
-        } else {
-            path
-        };
-
-        let relative = if relative.is_empty() { "/" } else { relative };
-        (best_fs, relative.to_string())
-    }
-
-    /// Mutable resolve (для write / create)
-    fn resolve_mut(&mut self, path: &str) -> (&mut dyn Filesystem, String) {
-        let path = if path.is_empty() { "/" } else { path };
-
-        let mut best_fs: &mut dyn Filesystem = self.root_fs
-            .as_mut()
-            .expect("[VFS] No root filesystem set!")
-            .as_mut();
-
-        let mut best_prefix = "/";
-
-        for (mp, fs_box) in &mut self.mounts {
-            if path.starts_with(mp.as_str()) && mp.len() > best_prefix.len() {
-                best_fs = fs_box.as_mut();
-                best_prefix = mp;
-            }
-        }
-
-        let relative = if path == best_prefix {
-            "/"
-        } else if path.starts_with(best_prefix) && best_prefix != "/" {
-            &path[best_prefix.len()..]
-        } else {
-            path
-        };
-
-        let relative = if relative.is_empty() { "/" } else { relative };
-        (best_fs, relative.to_string())
     }
 
     // ====================== PUBLIC API ======================
 
     pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
-        let (fs, rel_path) = self.resolve(path);
+        let inner = self.inner.lock();
+        let (fs, rel_path) = resolve(&inner, path);
         fs.read_file(&rel_path)
     }
 
-    pub fn write_file(&mut self, path: &str, data: &[u8]) -> bool {
-        let (fs, rel_path) = self.resolve_mut(path);
+    pub fn write_file(&self, path: &str, data: &[u8]) -> bool {
+        let mut inner = self.inner.lock();
+        let (fs, rel_path) = resolve_mut(&mut inner, path);
         fs.write_file(&rel_path, data)
     }
 
-    pub fn remove_file(&mut self, path: &str) -> bool {
-        let (fs, rel_path) = self.resolve_mut(path);
-        fs.remove_file(&rel_path)
-    }
-
-    pub fn create_file(&mut self, path: &str, data: &[u8]) -> bool {
-        let (fs, rel_path) = self.resolve_mut(path);
+    pub fn create_file(&self, path: &str, data: &[u8]) -> bool {
+        let mut inner = self.inner.lock();
+        let (fs, rel_path) = resolve_mut(&mut inner, path);
         fs.create_file(&rel_path, data)
     }
 
-    pub fn list_directory_entries(&self, path: &str) -> Option<Vec<DirEntry>> {
-        let (fs, rel_path) = self.resolve(path);
-        fs.list_directory_entries(&rel_path)
+    pub fn remove_file(&self, path: &str) -> bool {
+        let mut inner = self.inner.lock();
+        let (fs, rel_path) = resolve_mut(&mut inner, path);
+        fs.remove_file(&rel_path)
     }
 
-    pub fn mkdir(&mut self, path: &str) -> bool {
-        let (fs, rel_path) = self.resolve_mut(path);
+    pub fn mkdir(&self, path: &str) -> bool {
+        let mut inner = self.inner.lock();
+        let (fs, rel_path) = resolve_mut(&mut inner, path);
         fs.mkdir(&rel_path)
     }
 
-    pub fn rmdir(&mut self, path: &str) -> bool {
-        let (fs, rel_path) = self.resolve_mut(path);
+    pub fn rmdir(&self, path: &str) -> bool {
+        let mut inner = self.inner.lock();
+        let (fs, rel_path) = resolve_mut(&mut inner, path);
         fs.rmdir(&rel_path)
+    }
+
+    pub fn list_directory_entries(&self, path: &str) -> Option<Vec<DirEntry>> {
+        let inner = self.inner.lock();
+        let (fs, rel_path) = resolve(&inner, path);
+        fs.list_directory_entries(&rel_path)
     }
 }
 
+// ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
+
+fn resolve<'a>(inner: &'a VfsInner, path: &'a str) -> (&'a dyn Filesystem, String) {
+    let path = if path.is_empty() { "/" } else { path };
+
+    let mut best_fs: &dyn Filesystem = inner
+        .root_fs
+        .as_ref()
+        .expect("[VFS] No root filesystem set!")
+        .as_ref();
+
+    let mut best_prefix = "/";
+
+    for (mp, fs_box) in &inner.mounts {
+        if path.starts_with(mp) && mp.len() > best_prefix.len() {
+            best_fs = fs_box.as_ref();
+            best_prefix = mp;
+        }
+    }
+
+    let relative = if path == best_prefix {
+        "/"
+    } else if path.starts_with(best_prefix) && best_prefix != "/" {
+        &path[best_prefix.len()..]
+    } else {
+        path
+    };
+
+    (best_fs, relative.to_string())
+}
+
+fn resolve_mut<'a>(inner: &'a mut VfsInner, path: &'a str) -> (&'a mut dyn Filesystem, String) {
+    let path = if path.is_empty() { "/" } else { path };
+
+    let mut best_fs: &mut dyn Filesystem = inner
+        .root_fs
+        .as_mut()
+        .expect("[VFS] No root filesystem set!")
+        .as_mut();
+
+    let mut best_prefix = "/";
+
+    for (mp, fs_box) in &mut inner.mounts {
+        if path.starts_with(mp.as_str()) && mp.len() > best_prefix.len() {
+            best_fs = fs_box.as_mut();
+            best_prefix = mp;
+        }
+    }
+
+    let relative = if path == best_prefix {
+        "/"
+    } else if path.starts_with(best_prefix) && best_prefix != "/" {
+        &path[best_prefix.len()..]
+    } else {
+        path
+    };
+
+    (best_fs, relative.to_string())
+}
+
 // ====================== ГЛОБАЛЬНЫЙ VFS ======================
-pub static VFS: InterruptSpinMutex<Option<Vfs>> = InterruptSpinMutex::new(None);
+
+pub static VFS: InterruptLazy<Vfs> = InterruptLazy::new(Vfs::new);

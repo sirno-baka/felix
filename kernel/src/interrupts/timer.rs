@@ -53,16 +53,9 @@ pub extern "C" fn timer() {
 
 #[no_mangle]
 pub extern "C" fn timer_handler(esp: u32) -> u32 {
-    //trigger scheduler and return the esp returned by scheduler
     unsafe {
-        let new_esp: u32 = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
-
-        let slot = TASK_MANAGER.get_current_slot();
-        let target = APP_TARGET + (slot as u32 * APP_SIZE);
-
-        //map table 8 (0x02000000) to the address where the executable is loaded
-        TABLES[8].set(target);
-        PAGING.set_table(8, &TABLES[8]);
+        // Просто вызываем планировщик
+        let new_esp = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
 
         PICS.end_interrupt(TIMER_INT);
 
