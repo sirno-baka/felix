@@ -121,7 +121,10 @@ pub extern "C" fn keyboard_handler() {
     let key_byte = scancode_to_char(scancode, unsafe { KEYBOARD.shift });
 
     if key_byte != 0 {
-        KEYBOARD_BUFFER.push(key_byte);
+        match &mut *KEYBOARD_BUFFER.lock() {
+            Some(buffer) => buffer.push(key_byte),
+            None => {}
+        }
     }
 
     // EOI в самом конце

@@ -2,7 +2,7 @@
 use core::arch::asm;
 use crate::println;
 
-const STACK_SIZE: usize = 4096;
+const STACK_SIZE: usize = 16096;
 const MAX_TASKS: i8 = 32;
 
 //each task has a 4KiB stack containg the cpu state in the bottom part of it
@@ -15,7 +15,7 @@ pub struct Task {
 
 #[repr(C, packed)]
 pub struct CPUState {
-    //manually pushed
+    // Порядок соответствует push'ам в naked handler + то, что пушит CPU
     eax: u32,
     ebx: u32,
     ecx: u32,
@@ -24,11 +24,11 @@ pub struct CPUState {
     edi: u32,
     ebp: u32,
 
-    //automatically pushed by cpu
+    // То, что автоматически пушит процессор при прерывании
     eip: u32,
     cs: u32,
     eflags: u32,
-    esp: u32,
+    esp: u32,      // esp задачи (восстанавливается через iretd)
     ss: u32,
 }
 
@@ -50,20 +50,17 @@ impl Task {
     pub fn init(&mut self, entry_point: u32) {
         self.running = true;
 
-        // Указатель на CPUState внизу стека
-        let state_ptr = unsafe {
-            (&self.stack as *const u8)
-                .add(STACK_SIZE)
-                .sub(core::mem::size_of::<CPUState>())
-                as *mut CPUState
+        let stack_top = unsafe {
+            (&self.stack as *const u8).add(STACK_SIZE) as usize
         };
 
+        let state_ptr = (stack_top - core::mem::size_of::<CPUState>()) as *mut CPUState;
         self.cpu_state_ptr = state_ptr as u32;
 
         unsafe {
             let state = &mut *state_ptr;
 
-            // manually pushed registers
+            // Регистры
             state.eax = 0;
             state.ebx = 0;
             state.ecx = 0;
@@ -72,14 +69,14 @@ impl Task {
             state.edi = 0;
             state.ebp = 0;
 
-            // interrupt return frame
-            state.eip = entry_point;
-            state.cs  = 0x8;
-            state.eflags = 0x202;
+            // Interrupt frame (для iretd)
+            state.eip    = entry_point;
+            state.cs     = 0x08;
+            state.eflags = 0x202;   // IF = 1
+            state.ss     = 0x10;
 
-            // Важно: для kernel task esp и ss должны указывать на этот же стек
-            state.esp = state_ptr as u32;   // или чуть выше, если нужно
-            state.ss  = 0x10;
+            // esp, который будет восстановлен при первом iretd
+            state.esp = stack_top as u32;
         }
     }
 }
@@ -99,15 +96,17 @@ pub static mut TASK_MANAGER: TaskManager = TaskManager {
 
 impl TaskManager {
     pub fn init(&mut self) {
-        // self.add_task(idle as u32);
+        self.add_task(idle as u32);
     }
 
     //add given task to next slot
     pub fn add_task(&mut self, entry_point: u32) {
         let free_slot = self.get_free_slot();
-
+        if free_slot < 0 {
+            println!("[TASK] No free slot!");
+            return;
+        }
         self.tasks[free_slot as usize].init(entry_point);
-
         self.task_count += 1;
     }
 
@@ -189,18 +188,6 @@ impl TaskManager {
             }
         }
     }
-
-    pub fn add_dummy_task_a(&mut self) {
-        self.add_task(task_a as u32);
-    }
-
-    pub fn add_dummy_task_b(&mut self) {
-        self.add_task(task_b as u32);
-    }
-
-    pub fn add_dummy_task_c(&mut self) {
-        self.add_task(task_c as u32);
-    }
 }
 
 fn idle() {
@@ -211,60 +198,3 @@ fn idle() {
     }
 }
 
-//EXAMPLE TASKS
-fn task_a() {
-    let mut a: u32 = 0;
-    let mut b: u8 = 0;
-    loop {
-        if a == 100_000_000 {
-            println!("Process A running. {}% complete.", b);
-            a = 0;
-            b += 1;
-
-            if b == 100 {
-                println!("Process A complete.");
-                break;
-            }
-        }
-        a += 1;
-    }
-    loop {}
-}
-
-fn task_b() {
-    let mut a: u32 = 0;
-    let mut b: u8 = 0;
-    loop {
-        if a == 100_000_000 {
-            println!("Process B running. {}% complete.", b);
-            a = 0;
-            b += 1;
-
-            if b == 100 {
-                println!("Process B complete.");
-                break;
-            }
-        }
-        a += 1;
-    }
-    loop {}
-}
-
-fn task_c() {
-    let mut a: u32 = 0;
-    let mut b: u8 = 0;
-    loop {
-        if a == 100_000_000 {
-            println!("Process C running. {}% complete.", b);
-            a = 0;
-            b += 1;
-
-            if b == 100 {
-                println!("Process C complete.");
-                break;
-            }
-        }
-        a += 1;
-    }
-    loop {}
-}

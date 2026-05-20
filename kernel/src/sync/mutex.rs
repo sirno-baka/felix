@@ -1,8 +1,11 @@
 use alloc::collections::VecDeque;
+use core::arch::asm;
 use core::ops::{Deref, DerefMut};
 
-use interrupt_sync::SpinMutex;
+use interrupt_sync::{without_interrupts, SpinMutex};
 use crate::multitasking::task::TASK_MANAGER;
+use crate::print::{printer_new, PRINTER};
+use crate::println;
 
 pub struct Mutex<T> {
     inner: SpinMutex<T>,
@@ -19,12 +22,15 @@ impl<T> Mutex<T> {
 
     pub fn lock(&self) -> MutexGuard<'_, T> {
         loop {
+            unsafe { asm!("cli") };
             if let Some(guard) = self.inner.try_lock() {
+                unsafe { asm!("sti") };
                 return MutexGuard {
                     guard,
                     parent: self,
                 };
             }
+
 
             unsafe {
                 let current = TASK_MANAGER.get_current_slot();
@@ -41,11 +47,12 @@ impl<T> Mutex<T> {
                     self.waiters.lock().push_back(current);
                 }
             }
-
+            unsafe { asm!("sti") };
             // Останавливаемся. Таймер потом разбудит нас через schedule()
             unsafe {
                 core::arch::asm!("hlt");
             }
+
         }
     }
 

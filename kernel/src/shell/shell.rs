@@ -6,6 +6,7 @@ use crate::multitasking::task::TASK_MANAGER;
 use core::arch::asm;
 use interrupt_sync::SpinMutex;
 use crate::{print, println};
+use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::filesystem::VFS;
 use crate::filesystem::vfs::Vfs;
 
@@ -34,21 +35,34 @@ impl Shell {
     }
 
     pub unsafe fn process_input(&self) {
-        while let Some(byte) = crate::drivers::keyboard_buffer::KEYBOARD_BUFFER.pop() {
-            match byte {
-                b'\n' => {
-                    self.enter();
-                    return;
+        asm!("hlt");
+
+        loop {
+            if KEYBOARD_BUFFER.lock().as_ref().unwrap().is_empty() {
+                unsafe {
+                    crate::wrappers::hlt!();
                 }
-                0x08 => {  // backspace
-                    self.backspace();
+            } else {
+                let event = KEYBOARD_BUFFER.lock().as_mut().unwrap().pop();
+                match event {
+                    b'\n' => {
+                        self.enter();
+                        return;
+                    }
+                    0x08 => {  // backspace
+                        self.backspace();
+                    }
+                    c if c.is_ascii_graphic() || c == b' ' => {
+                        self.add(c as char);
+                    }
+                    _ => {}
                 }
-                c if c.is_ascii_graphic() || c == b' ' => {
-                    self.add(c as char);
-                }
-                _ => {}
             }
         }
+
+        // while let Some(byte) = crate::drivers::keyboard_buffer::KEYBOARD_BUFFER.lock() {
+        //
+        // }
     }
 
     pub fn add(&self, c: char) {

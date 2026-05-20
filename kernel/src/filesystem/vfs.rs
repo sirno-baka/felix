@@ -3,10 +3,12 @@
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::arch::asm;
 use interrupt_sync::{InterruptLazy};
 use crate::println;
 use crate::filesystem::ext2::DirEntry;
 use crate::sync::mutex::Mutex;
+use crate::sync::MutexLazy;
 
 pub trait Filesystem: Send + Sync {
     fn read_file(&self, path: &str) -> Option<Vec<u8>>;
@@ -58,43 +60,50 @@ impl Vfs {
     pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         let inner = self.inner.lock();
         let (fs, rel_path) = resolve(&inner, path);
-        fs.read_file(&rel_path)
+        let res = fs.read_file(&rel_path);
+        res
     }
 
     pub fn write_file(&self, path: &str, data: &[u8]) -> bool {
         let mut inner = self.inner.lock();
         let (fs, rel_path) = resolve_mut(&mut inner, path);
-        fs.write_file(&rel_path, data)
+        let res = fs.write_file(&rel_path, data);
+        res
     }
 
     pub fn create_file(&self, path: &str, data: &[u8]) -> bool {
         let mut inner = self.inner.lock();
         let (fs, rel_path) = resolve_mut(&mut inner, path);
-        fs.create_file(&rel_path, data)
+        let res = fs.create_file(&rel_path, data);
+        res
     }
 
     pub fn remove_file(&self, path: &str) -> bool {
         let mut inner = self.inner.lock();
         let (fs, rel_path) = resolve_mut(&mut inner, path);
-        fs.remove_file(&rel_path)
+        let res = fs.remove_file(&rel_path);
+        res
     }
 
     pub fn mkdir(&self, path: &str) -> bool {
         let mut inner = self.inner.lock();
         let (fs, rel_path) = resolve_mut(&mut inner, path);
-        fs.mkdir(&rel_path)
+        let res = fs.mkdir(&rel_path);
+        res
     }
 
     pub fn rmdir(&self, path: &str) -> bool {
         let mut inner = self.inner.lock();
         let (fs, rel_path) = resolve_mut(&mut inner, path);
-        fs.rmdir(&rel_path)
+        let res = fs.rmdir(&rel_path);
+        res
     }
 
     pub fn list_directory_entries(&self, path: &str) -> Option<Vec<DirEntry>> {
         let inner = self.inner.lock();
         let (fs, rel_path) = resolve(&inner, path);
-        fs.list_directory_entries(&rel_path)
+        let res = fs.list_directory_entries(&rel_path);
+        res
     }
 }
 
@@ -160,4 +169,4 @@ fn resolve_mut<'a>(inner: &'a mut VfsInner, path: &'a str) -> (&'a mut dyn Files
 
 // ====================== ГЛОБАЛЬНЫЙ VFS ======================
 
-pub static VFS: InterruptLazy<Vfs> = InterruptLazy::new(Vfs::new);
+pub static VFS: MutexLazy<Vfs> = MutexLazy::new(Vfs::new);

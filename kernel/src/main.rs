@@ -2,7 +2,8 @@
 #![no_main]
 #![feature(naked_functions)]
 #![feature(pointer_byte_offsets)]
-
+#![feature(unsize)]
+#![feature(coerce_unsized)]
 extern crate alloc;
 
 mod drivers;
@@ -14,6 +15,10 @@ mod print;
 mod syscalls;
 mod shell;
 mod sync;
+mod wrappers;
+
+mod utils;
+mod spin;
 
 use alloc::boxed::Box;
 use alloc::vec;
@@ -28,9 +33,11 @@ use filesystem::ext2::Ext2;
 
 use multitasking::task::TASK_MANAGER;
 use crate::drivers::disk::DISK_SLAVE;
+use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::drivers::pic::wait;
 use crate::filesystem::VFS;
 use crate::filesystem::vfs::Vfs;
+use crate::utils::queue::Queue;
 
 const KERNEL_START: u32 = 0x0010_0000;
 const KERNEL_SIZE: u32 = 0x0010_0000;
@@ -72,6 +79,8 @@ pub extern "C" fn _start() -> ! {
             // asm!("out 0x21, al", in("al") 0xfd_u8);
         }
 
+        *KEYBOARD_BUFFER.lock() = Some(Queue::new());
+
         DISK_SLAVE.check();
 
         if DISK_SLAVE.enabled {
@@ -79,8 +88,6 @@ pub extern "C" fn _start() -> ! {
             ext2.mount();
             VFS.get().set_root(Box::new(ext2));
         }
-
-
 
 
         println!("[VFS] Virtual filesystem initialized");
@@ -98,7 +105,7 @@ pub extern "C" fn _start() -> ! {
         // unsafe { shell.run(); }
         // shell.init();
 
-        VFS.get().list_directory_entries("/").map(|t| {t.iter().map(|x| { println!("{}", x.name)}).collect::<Vec<_>>()});
+        // VFS.get().list_directory_entries("/").map(|t| {t.iter().map(|x| { println!("{}", x.name)}).collect::<Vec<_>>()});
         loop {
         //     shell.process_input()
         }
@@ -117,8 +124,9 @@ fn exampletask2() {
         counter += 1;
         if counter % 1 == 0 {
             println!("[Task ONE] {}", counter);
+            VFS.get().read_file("test");
         }
-        for _ in 0..10_000_000 {
+        for _ in 0..10_000_0 {
             wait();
         }
 
@@ -131,8 +139,9 @@ fn exampletask3() {
         counter += 1;
         if counter % 1 == 0 {
             println!("[Task TWO] {}", counter);
+            VFS.get().read_file("test");
         }
-        for _ in 0..10_000_000 {
+        for _ in 0..10_000_0 {
             wait();
         }
 

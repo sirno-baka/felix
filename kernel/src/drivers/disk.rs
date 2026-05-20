@@ -16,6 +16,7 @@ const WRITE_COMMAND: u8 = 0x30;
 const STATUS_BSY: u8 = 0b10000000;
 const STATUS_RDY: u8 = 0b01000000;
 const STATUS_DRQ: u8 = 0b00001000;
+const STATUS_ERR: u8 = 0x1 ;
 
 #[derive(Copy, Clone)]
 pub struct Disk {
@@ -143,6 +144,14 @@ impl Disk {
             asm!("in al, dx", out("al") status, in("dx") STATUS_COMMAND_REGISTER);
         }
         (status & STATUS_BSY) != 0
+    }
+
+    pub fn is_err(&self) -> bool {
+        let status: u8;
+        unsafe {
+            asm!("in al, dx", out("al") status, in("dx") STATUS_COMMAND_REGISTER);
+        }
+        (status & STATUS_ERR) != 0
     }
 
     pub fn is_ready(&self) -> bool {
