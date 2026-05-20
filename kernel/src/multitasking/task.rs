@@ -1,9 +1,10 @@
 //TASK MANAGER
 use core::arch::asm;
+use crate::filesystem::file::FileDescriptorTable;
 use crate::println;
 
-const STACK_SIZE: usize = 16096;
-const MAX_TASKS: i8 = 32;
+const STACK_SIZE: usize = 32 * 1024;
+const MAX_TASKS: i8 = 8;
 
 //each task has a 4KiB stack containg the cpu state in the bottom part of it
 #[derive(Copy, Debug, Clone)]
@@ -11,7 +12,10 @@ pub struct Task {
     pub stack: [u8; STACK_SIZE],
     pub cpu_state_ptr: u32, //pub cpu_state: *mut CPUState,
     pub running: bool,
+
+    pub fd_table: FileDescriptorTable,
 }
+
 
 #[repr(C, packed)]
 pub struct CPUState {
@@ -36,6 +40,7 @@ static NULL_TASK: Task = Task {
     stack: [0; STACK_SIZE],
     cpu_state_ptr: 0 as u32, //cpu_state: 0 as *mut CPUState,
     running: false,
+    fd_table: FileDescriptorTable::new(),
 };
 
 impl Task {
@@ -78,6 +83,7 @@ impl Task {
             // esp, который будет восстановлен при первом iretd
             state.esp = stack_top as u32;
         }
+        self.fd_table = FileDescriptorTable::new();
     }
 }
 

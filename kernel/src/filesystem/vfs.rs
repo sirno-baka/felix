@@ -18,6 +18,9 @@ pub trait Filesystem: Send + Sync {
     fn mkdir(&mut self, path: &str) -> bool;
     fn rmdir(&mut self, path: &str) -> bool;
     fn list_directory_entries(&self, path: &str) -> Option<Vec<DirEntry>>;
+    fn resolve_path(&self, path: &str) -> Option<u32>;
+    fn read_at(&self, inode: u32, offset: u64, buf: &mut [u8]) -> usize;
+    fn write_at(&mut self, inode: u32, offset: u64, buf: &[u8]) -> usize;
     fn is_mounted(&self) -> bool;
 }
 
@@ -105,7 +108,30 @@ impl Vfs {
         let res = fs.list_directory_entries(&rel_path);
         res
     }
+
+    pub fn resolve_path(&self, path: &str) -> Option<u32> {
+        let inner = self.inner.lock();
+        inner.root_fs.as_ref()?.resolve_path(path)
+    }
+    pub fn read_at(&self, inode: u32, offset: u64, buf: &mut [u8]) -> usize {
+        let inner = self.inner.lock();
+        if let Some(fs) = &inner.root_fs {
+            fs.read_at(inode, offset, buf)
+        } else {
+            0
+        }
+    }
+
+    pub fn write_at(&self, inode: u32, offset: u64, buf: &[u8]) -> usize {
+        let mut inner = self.inner.lock();
+        if let Some(fs) = &mut inner.root_fs {
+            fs.write_at(inode, offset, buf)
+        } else {
+            0
+        }
+    }
 }
+
 
 // ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
 

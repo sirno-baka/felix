@@ -1249,6 +1249,9 @@ impl crate::filesystem::Filesystem for Ext2 {
     fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         self.read_file_path(path)
     }
+    fn resolve_path(&self, path: &str) -> Option<u32> {
+        Ext2::resolve_path(self, path)
+    }
 
     fn write_file(&mut self, path: &str, data: &[u8]) -> bool {
         self.create_file_path(path, data)
@@ -1272,5 +1275,60 @@ impl crate::filesystem::Filesystem for Ext2 {
 
     fn is_mounted(&self) -> bool {
         self.mounted
+    }
+
+
+    fn read_at(&self, inode_num: u32, offset: u64, buf: &mut [u8]) -> usize {
+        let inode = self.read_inode(inode_num);
+        if (inode.i_mode & 0xF000) != 0x8000 {
+            return 0;
+        }
+
+        let file_size = inode.i_size as u64;
+        if offset >= file_size {
+            return 0;
+        }
+
+        let to_read = core::cmp::min(buf.len() as u64, file_size - offset) as usize;
+        let mut bytes_read = 0;
+
+        // Пока поддерживаем только прямые блоки (i_block[0..12])
+        let block_size = self.block_size as u64;
+        let mut current_offset = offset;
+
+        while bytes_read < to_read {
+            let block_index = (current_offset / block_size) as usize;
+            if block_index >= 12 {
+                break; // пока не поддерживаем indirect blocks
+            }
+
+            let block_num = inode.i_block[block_index];
+            if block_num == 0 {
+                break;
+            }
+
+            let mut block_buf = [0u8; 4096];
+            unsafe { self.read_blocks(block_num, block_buf.as_mut_ptr(), 1); }
+
+            let block_offset = (current_offset % block_size) as usize;
+            let can_read = core::cmp::min(
+                to_read - bytes_read,
+                (block_size as usize) - block_offset,
+            );
+
+            buf[bytes_read..bytes_read + can_read]
+                .copy_from_slice(&block_buf[block_offset..block_offset + can_read]);
+
+            bytes_read += can_read;
+            current_offset += can_read as u64;
+        }
+
+        bytes_read
+    }
+
+    fn write_at(&mut self, _inode: u32, _offset: u64, _buf: &[u8]) -> usize {
+        // Пока заглушка. Полноценная запись требует аллокации блоков.
+        println!("[EXT2] write_at пока не реализована");
+        0
     }
 }

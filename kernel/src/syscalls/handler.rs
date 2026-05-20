@@ -1,11 +1,12 @@
 use crate::drivers::pic::PICS;
 use crate::multitasking::task::TASK_MANAGER;
-use crate::print;
+use crate::{print, println};
 use crate::memory::allocator::ALLOCATOR;
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::asm;
-use core::slice;
-use core::str;
+use core::ffi::CStr;
+use crate::filesystem::file::{FileDescriptor, FileMode};
+use crate::filesystem::VFS;
 
 pub const SYSCALL_INT: u8 = 0x80;
 
@@ -13,10 +14,10 @@ pub const SYSCALL_INT: u8 = 0x80;
 pub extern "C" fn syscall() {
     unsafe {
         asm!(
-        "push edx",   // arg3
-        "push ecx",   // arg2
-        "push ebx",   // arg1
-        "push eax",   // syscall number
+        "push edx",
+        "push ecx",
+        "push ebx",
+        "push eax",
         "call syscall_handler",
         "add esp, 16",
         "iretd",
@@ -28,143 +29,35 @@ pub extern "C" fn syscall() {
 #[no_mangle]
 pub extern "C" fn syscall_handler(
     syscall: u32,
-    arg1: u32,   // ebx
-    arg2: u32,   // ecx
-    arg3: u32,   // edx
+    arg1: u32,
+    arg2: u32,
+    arg3: u32,
 ) -> u32 {
     let ret = match syscall {
-        // 1 — exit
-        crate::syscalls::SYS_EXIT => unsafe {
-            TASK_MANAGER.remove_current_task();
+        // === Process control ===
+        crate::syscalls::SYS_EXIT => {
+            unsafe { TASK_MANAGER.remove_current_task(); }
             0
         }
 
-        // 4 — write(fd, buf, len) — теперь поддерживает и файлы!
-        crate::syscalls::SYS_WRITE => unsafe {
-            let fd = arg1 as i32;
-            let buf = arg2;
-            let len = arg3 as usize;
+        // === File descriptors ===
+        crate::syscalls::SYS_OPEN  => sys_open(arg1 as *const u8, arg2 as usize),
+        crate::syscalls::SYS_READ  => sys_read(arg1 as usize, arg2 as *mut u8, arg3 as usize),
+        crate::syscalls::SYS_WRITE => sys_write(arg1 as usize, arg2 as *const u8, arg3 as usize),
+        crate::syscalls::SYS_CLOSE => sys_close(arg1 as usize),
 
-            if fd == 1 || fd == 2 {  // stdout / stderr
-                let slice = slice::from_raw_parts(buf as *const u8, len);
-                if let Ok(s) = str::from_utf8(slice) {
-                    let mut p = print::PRINTER.lock();
-                    p.prints(s);
-                }
-                len as u32
-            } else {
-                1
-            }
+        // === Filesystem operations (новые обработчики) ===
+        crate::syscalls::SYS_MKDIR  => sys_mkdir(arg1 as *const u8),
+        crate::syscalls::SYS_RMDIR  => sys_rmdir(arg1 as *const u8),
+        crate::syscalls::SYS_UNLINK => sys_unlink(arg1 as *const u8),
 
-        }
-
-        // // 5 — open(filename) → fd
-        // crate::syscalls::SYS_OPEN => unsafe {
-        //     let filename_ptr = arg1 as *const u8;
-        //     let filename = unsafe {
-        //         let mut len = 0;
-        //         while *filename_ptr.add(len) != 0 && len < 255 {
-        //             len += 1;
-        //         }
-        //         core::str::from_utf8_unchecked(core::slice::from_raw_parts(filename_ptr, len))
-        //     };
-        //
-        //     FAT.lock(|fat| {
-        //         fat.load_header();
-        //         fat.load_entries();
-        //         fat.open(filename) as u32
-        //     })
-        // }
-
-        // 6 — close(fd)
-        crate::syscalls::SYS_CLOSE => {
-            // Пока просто успех (в будущем можно освободить fd)
-            0
-        }
-
-        // crate::syscalls::SYS_MKDIR => unsafe {
-        //     let filename_ptr = arg1 as *const u8;
-        //     let filename = unsafe {
-        //         let mut len = 0;
-        //         while *filename_ptr.add(len) != 0 && len < 255 {
-        //             len += 1;
-        //         }
-        //         core::str::from_utf8_unchecked(
-        //             core::slice::from_raw_parts(filename_ptr, len)
-        //         )
-        //     };
-        //
-        //     let success = FAT.lock(|fat| {
-        //         fat.load_header();
-        //         fat.load_entries();
-        //         fat.load_table();
-        //         fat.mkdir(filename)
-        //     });
-        //
-        //     if success { 0 } else { u32::MAX } // -1 = ошибка
-        // }
-
-        // crate::syscalls::SYS_RMDIR => unsafe {
-        //     let dirname_ptr = arg1 as *const u8;
-        //     let dirname = unsafe {
-        //         let mut len = 0;
-        //         while *dirname_ptr.add(len) != 0 && len < 255 {
-        //             len += 1;
-        //         }
-        //         core::str::from_utf8_unchecked(
-        //             core::slice::from_raw_parts(dirname_ptr, len)
-        //         )
-        //     };
-        //
-        //     let success = FAT.lock(|fat| {
-        //         fat.load_header();
-        //         fat.load_entries();
-        //         fat.load_table();
-        //         fat.rmdir(dirname)
-        //     });
-        //
-        //     if success { 0 } else { u32::MAX } // -1 при ошибке
-        // }
-
-        // 10 — unlink / delete
-        // crate::syscalls::SYS_UNLINK => unsafe {
-        //     let filename_ptr = arg1 as *const u8;
-        //     let filename = unsafe {
-        //         let mut len = 0;
-        //         while *filename_ptr.add(len) != 0 && len < 255 {
-        //             len += 1;
-        //         }
-        //         core::str::from_utf8_unchecked(core::slice::from_raw_parts(filename_ptr, len))
-        //     };
-        //
-        //     let success = FAT.lock(|fat| {
-        //         fat.load_header();
-        //         fat.load_entries();
-        //         fat.load_table();
-        //         fat.delete_file(filename)
-        //     });
-        //
-        //     if success { 0 } else { u32::MAX }  // -1 в unsigned
-        // }
-
-        // 302 — ls
-        // crate::syscalls::SYS_LS => unsafe {
-        //     FAT.lock(|fat| {
-        //         fat.load_header();
-        //         fat.load_entries();
-        //         fat.list_entries("/");
-        //     });
-        //     0
-        // }
-
-        // 200 — malloc(size, align)
+        // === Memory ===
         crate::syscalls::SYS_MALLOC => {
             let layout = Layout::from_size_align(arg1 as usize, arg2 as usize)
                 .unwrap_or(Layout::new::<u8>());
-            unsafe { ALLOCATOR.alloc(layout) as u32 }
-        }
+            unsafe { ALLOCATOR.alloc(layout) as usize as u32 }
+        } as usize
 
-        // 201 — free(ptr, size, align)
         crate::syscalls::SYS_FREE => {
             let layout = Layout::from_size_align(arg2 as usize, arg3 as usize)
                 .unwrap_or(Layout::new::<u8>());
@@ -176,5 +69,81 @@ pub extern "C" fn syscall_handler(
     };
 
     PICS.end_interrupt(SYSCALL_INT);
-    ret
+    ret as u32
+}
+
+// ====================== FILE DESCRIPTORS ======================
+
+fn sys_open(path_ptr: *const u8, _flags: usize) -> usize {
+    let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
+
+    if let Some(inode) = VFS.get().resolve_path(path) {
+        let current = unsafe { &mut TASK_MANAGER.tasks[TASK_MANAGER.get_current_slot() as usize] };
+
+        if let Some(fd) = current.fd_table.alloc_fd() {
+            let desc = FileDescriptor::new(inode, FileMode::ReadWrite);
+            current.fd_table.insert(fd, desc);
+            return fd;
+        }
+    }
+    usize::MAX
+}
+
+fn sys_read(fd: usize, buf_ptr: *mut u8, count: usize) -> usize {
+    let current = unsafe { &mut TASK_MANAGER.tasks[TASK_MANAGER.get_current_slot() as usize] };
+
+    if let Some(desc) = current.fd_table.get_mut(fd) {
+        if desc.mode == FileMode::WriteOnly { return 0; }
+
+        let mut temp = alloc::vec![0u8; count];
+        let bytes = VFS.get().read_at(desc.inode, desc.offset, &mut temp);
+
+        if bytes > 0 {
+            unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr, bytes); }
+            desc.offset += bytes as u64;
+        }
+        bytes
+    } else {
+        0
+    }
+}
+
+fn sys_write(fd: usize, buf_ptr: *const u8, count: usize) -> usize {
+    let current = unsafe { &mut TASK_MANAGER.tasks[TASK_MANAGER.get_current_slot() as usize] };
+
+    if let Some(desc) = current.fd_table.get_mut(fd) {
+        if desc.mode == FileMode::ReadOnly { return 0; }
+
+        let buf = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
+        let written = VFS.get().write_at(desc.inode, desc.offset, buf);
+        desc.offset += written as u64;
+        written
+    } else {
+        0
+    }
+}
+
+fn sys_close(fd: usize) -> usize {
+    let current = unsafe { &mut TASK_MANAGER.tasks[TASK_MANAGER.get_current_slot() as usize] };
+    if current.fd_table.close(fd) { 0 } else { usize::MAX }
+}
+
+// ====================== FILESYSTEM OPERATIONS ======================
+
+fn sys_mkdir(path_ptr: *const u8) -> usize {
+    let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
+    let success = VFS.get().mkdir(path);
+    if success { 0 } else { usize::MAX }
+}
+
+fn sys_rmdir(path_ptr: *const u8) -> usize {
+    let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
+    let success = VFS.get().rmdir(path);
+    if success { 0 } else { usize::MAX }
+}
+
+fn sys_unlink(path_ptr: *const u8) -> usize {
+    let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
+    let success = VFS.get().remove_file(path);
+    if success { 0 } else { usize::MAX }
 }
