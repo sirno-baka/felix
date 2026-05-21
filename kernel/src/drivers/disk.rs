@@ -1,5 +1,6 @@
 // DISK DRIVER — ATA PIO MODE (Master + Slave)
 use core::arch::asm;
+use core::fmt;
 use crate::println;
 
 const DATA_REGISTER: u16 = 0x1f0;
@@ -195,6 +196,84 @@ impl Disk {
             asm!("out dx, al", in("dx") 0x3f6, in("al") 0b00000110u8); // reset
             asm!("out dx, al", in("dx") 0x3f6, in("al") 0b00000010u8); // normal
         }
+    }
+}
+
+// ====================== PARTITION CONFIG + MBR PARSER ======================
+
+#[derive(Copy, Clone, Debug)]
+pub struct PartitionConfig {
+    pub start_lba: u64,
+}
+
+impl PartitionConfig {
+    /// Использовать весь диск (старый режим, без партишенов)
+    pub const fn whole_disk() -> Self {
+        PartitionConfig { start_lba: 0 }
+    }
+
+    /// Создать конфиг с конкретным смещением
+    pub const fn new(start_lba: u64) -> Self {
+        PartitionConfig { start_lba }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct CHS {
+    /// Cylinder
+    pub cylinder: u8,
+    /// Head
+    pub head: u8,
+    /// Sector
+    pub sector: u8,
+}
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+struct MbrPartitionEntry {
+    pub status: u8,
+    pub chs_start: CHS,
+    pub partition_type: u8,
+    pub chs_end: CHS,
+    pub lba_start: u32,
+    pub num_sectors: u32,
+}
+
+
+
+impl Disk {
+    /// Автоматически ищет первый ext2-партишен (тип 0x83) в MBR
+    /// Если не нашёл — возвращает whole_disk()
+    pub fn find_ext2_partition_config(&self) -> PartitionConfig {
+        let mut mbr_buf = [0u8; 512];
+        self.read(mbr_buf.as_mut_ptr() as *mut u32, 0, 1);
+
+        // Проверка сигнатуры MBR
+        if mbr_buf[510] != 0x55 || mbr_buf[511] != 0xAA {
+            println!("[DISK] Нет валидной MBR (сигнатура отсутствует). Используем весь диск.");
+            return PartitionConfig::whole_disk();
+        }
+
+        let partition_table_offset = 446usize; // 0x1BE
+
+        for i in 0..4 {
+            let entry_offset = partition_table_offset + i * 16;
+            let entry = unsafe {
+                core::ptr::read_unaligned(
+                    mbr_buf.as_ptr().add(entry_offset) as *const MbrPartitionEntry
+                )
+            };
+            println!("{:?}", entry);
+
+            if entry.partition_type == 0x83 {
+                let start_lba = entry.lba_start as u64;
+                println!("[DISK] ✅ Найден ext2-партишен (0x83) на LBA {}", start_lba);
+                return PartitionConfig::new(start_lba);
+            }
+        }
+
+        println!("[DISK] Не найдено ext2-партишенов в MBR. Используем весь диск.");
+        PartitionConfig::whole_disk()
     }
 }
 

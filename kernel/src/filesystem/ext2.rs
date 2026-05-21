@@ -3,7 +3,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 // fs/ext2.rs
 use core::mem;
-use crate::drivers::disk::{Disk};
+use crate::drivers::disk::{Disk, PartitionConfig};
 use crate::{print, println};
 
 
@@ -115,16 +115,23 @@ pub struct Ext2 {
     block_size: u32,
     pub mounted: bool,
     disk: &'static mut Disk,
+    partition_offset: u64,          // ← НОВОЕ
 }
 
 impl Ext2 {
     /// Создаём файловую систему, привязанную к конкретному диску
-    pub fn new(disk: &'static mut Disk) -> Self {
+    pub fn new(disk: &'static mut Disk, config: Option<PartitionConfig>) -> Self {
+        let partition_offset = match config {
+            Some(cfg) => cfg.start_lba,
+            None => 0,
+        };
+
         Ext2 {
             superblock: unsafe { mem::zeroed() },
             block_size: 0,
             mounted: false,
             disk,
+            partition_offset,
         }
     }
 
@@ -158,30 +165,33 @@ impl Ext2 {
 
     // ====================== НИЗКОУРОВНЕВЫЕ ЧТЕНИЕ/ЗАПИСЬ ======================
 
-    /// Читаем блоки ext2
     unsafe fn read_blocks(&self, block: u32, buf: *mut u8, count: u32) {
         if self.block_size == 0 {
             println!("[EXT2] Ошибка: read_blocks вызван до mount()!");
             return;
         }
         let sectors_per_block = self.block_size / 512;
-        let lba = block as u64 * sectors_per_block as u64;
+        let lba = self.partition_offset + (block as u64 * sectors_per_block as u64);
         self.disk.read(buf as *mut u32, lba, (sectors_per_block * count) as u16);
     }
 
-    /// Записываем блоки ext2
     unsafe fn write_blocks(&self, block: u32, buf: *const u8, count: u32) {
         if self.block_size == 0 {
             println!("[EXT2] Ошибка: write_blocks вызван до mount()!");
             return;
         }
         let sectors_per_block = self.block_size / 512;
-        let lba = block as u64 * sectors_per_block as u64;
+        let lba = self.partition_offset + (block as u64 * sectors_per_block as u64);
         self.disk.write(buf as *const u32, lba, (sectors_per_block * count) as u16);
     }
 
     // ====================== MOUNT ======================
-    pub fn mount(&mut self) {
+    pub fn mount(&mut self, config: Option<PartitionConfig>) {
+        if let Some(cfg) = config {
+            self.partition_offset = cfg.start_lba;
+            println!("[EXT2] Переопределён offset партишена: {}", self.partition_offset);
+        }
+
         if !self.disk.enabled {
             println!("[EXT2] Disk not enabled!");
             return;
@@ -190,7 +200,7 @@ impl Ext2 {
         let mut superblock_buf = [0u8; 1024];
 
         unsafe {
-            self.disk.read(superblock_buf.as_mut_ptr() as *mut u32, 2, 2);
+            self.disk.read(superblock_buf.as_mut_ptr() as *mut u32, self.partition_offset + 2, 2);
             core::ptr::copy_nonoverlapping(
                 superblock_buf.as_ptr(),
                 &mut self.superblock as *mut Ext2SuperBlock as *mut u8,
@@ -611,7 +621,7 @@ impl Ext2 {
         unsafe {
             let mut buf = [0u8; 1024];
             core::ptr::copy_nonoverlapping(&sb as *const _ as *const u8, buf.as_mut_ptr(), 1024);
-            self.disk.write(buf.as_ptr() as *const u32, 2, 2);
+            self.disk.write(buf.as_ptr() as *const u32, self.partition_offset + 2, 2);
             self.superblock = sb;
         }
     }
@@ -622,7 +632,7 @@ impl Ext2 {
         unsafe {
             let mut buf = [0u8; 1024];
             core::ptr::copy_nonoverlapping(&sb as *const _ as *const u8, buf.as_mut_ptr(), 1024);
-            self.disk.write(buf.as_ptr() as *const u32, 2, 2);
+            self.disk.write(buf.as_ptr() as *const u32, self.partition_offset + 2, 2);
             self.superblock = sb;
         }
     }

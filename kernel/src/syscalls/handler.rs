@@ -50,13 +50,13 @@ pub extern "C" fn syscall_handler(
         crate::syscalls::SYS_MKDIR  => sys_mkdir(arg1 as *const u8),
         crate::syscalls::SYS_RMDIR  => sys_rmdir(arg1 as *const u8),
         crate::syscalls::SYS_UNLINK => sys_unlink(arg1 as *const u8),
-
+        crate::syscalls::SYS_EXECVE => sys_execve(arg1 as *const u8),
         // === Memory ===
         crate::syscalls::SYS_MALLOC => {
             let layout = Layout::from_size_align(arg1 as usize, arg2 as usize)
                 .unwrap_or(Layout::new::<u8>());
-            unsafe { ALLOCATOR.alloc(layout) as usize as u32 }
-        } as usize
+            unsafe { ALLOCATOR.alloc(layout) as usize }
+        },
 
         crate::syscalls::SYS_FREE => {
             let layout = Layout::from_size_align(arg2 as usize, arg3 as usize)
@@ -146,4 +146,68 @@ fn sys_unlink(path_ptr: *const u8) -> usize {
     let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
     let success = VFS.get().remove_file(path);
     if success { 0 } else { usize::MAX }
+}
+
+use crate::memory::paging::{PAGING, TABLES};   // ← добавь этот импорт
+
+pub fn sys_execve(path_ptr: *const u8) -> usize {
+    // Безопасное чтение пути
+    let path = unsafe {
+        let mut len = 0;
+        while len < 256 && *path_ptr.add(len) != 0 {
+            len += 1;
+        }
+        match core::str::from_utf8(core::slice::from_raw_parts(path_ptr, len)) {
+            Ok(s) => s,
+            Err(_) => {
+                println!("[execve] Invalid UTF-8 in path");
+                return usize::MAX;
+            }
+        }
+    };
+
+    let data = match VFS.get().read_file(path) {
+        Some(d) => d,
+        None => {
+            println!("[execve] File not found: {}", path);
+            return usize::MAX;
+        }
+    };
+
+    let slot = unsafe { TASK_MANAGER.get_free_slot() };
+    if slot < 0 {
+        println!("[execve] No free task slot!");
+        return usize::MAX;
+    }
+
+    // === Фиксированная область приложений (как работало раньше) ===
+    const APP_TARGET: u32 = 0x02000000;   // 32 MiB
+    const APP_SIZE:   u32 = 0x00f00000;   // 2 MiB на приложение
+
+    let target = APP_TARGET + (slot as u32 * APP_SIZE);
+
+    // Маппим память под приложение через 8-ю таблицу страниц
+    unsafe {
+        TABLES[8].set(target);           // заполняем таблицу
+        PAGING.set_table(8, &TABLES[8]); // подключаем в page directory
+    }
+
+    println!("[execve] Mapped {} -> {:#x} (size {})", path, target, data.len());
+
+    // Копируем бинарник
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            target as *mut u8,
+            data.len()
+        );
+    }
+
+    // Запускаем задачу
+    unsafe {
+        TASK_MANAGER.add_task(target as u32);
+    }
+
+    println!("[execve] Started application: {} (entry: {:#x})", path, target);
+    0
 }

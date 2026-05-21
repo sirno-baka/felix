@@ -155,6 +155,23 @@ impl Shell {
                     }
                 }
             },
+            "run" => {
+                if let Some(app) = args.get(1) {
+                    // Можно вызвать через syscall или напрямую
+                    let result = unsafe {
+                        let mut path = app.clone();
+                        path.push('\0');                    // <-- добавляем нуль-терминатор
+                        // Прямой вызов для отладки (позже сделаем через int 0x80)
+                        crate::syscalls::handler::sys_execve(path.as_ptr() as *const u8)
+                    };
+                    if result != 0 {
+                        println!("Failed to run: {}", app);
+                    }
+                } else {
+                    println!("Usage: run <application>");
+                }
+            },
+
             "mkdir" => {
                 if let Some(name) = args.get(1) {
                     let success = VFS.get().mkdir(name);

@@ -79,7 +79,6 @@ pub extern "C" fn _start() {
     let pi3 = pi_gauss_legendre();
     println!("pi_gauss_legendre: {:.8}", pi3);
 
-    loop {}
 }
 
 #[panic_handler]

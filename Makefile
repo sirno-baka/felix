@@ -15,6 +15,17 @@ ifeq ($(UNAME), Linux)
 	OBJCOPY := objcopy
 endif
 
+# ext2 tools
+ifeq ($(UNAME), Darwin)
+	E2MKFS := $(shell brew --prefix e2fsprogs)/sbin/mkfs.ext2
+	E2CP   := $(shell brew --prefix e2tools)/bin/e2cp
+endif
+
+ifeq ($(UNAME), Linux)
+	E2MKFS := mkfs.ext2
+	E2CP   := e2cp
+endif
+
 .PHONY: all
 all: get-deps build objcopy image
 	@echo "Felix has been successfully built!"
@@ -28,12 +39,16 @@ ifeq ($(UNAME), Darwin)
 	@brew list mtools > /dev/null || brew install mtools
 	@brew list binutils > /dev/null || brew install binutils
 	@brew list dosfstools > /dev/null || brew install dosfstools
+	@brew list e2tools > /dev/null || brew install e2tools     # ← добавлено
 endif
 
 ifeq ($(UNAME), Linux)
 	@echo "Downloading Linux build tools..."
-# TODO: Download linux build tools
+	# TODO: Download linux build tools
+	# (на большинстве дистрибутивов достаточно: sudo apt install e2fsprogs e2tools)
 endif
+
+
 
 .PHONY: build
 build:
@@ -60,21 +75,48 @@ objcopy:
 
 .PHONY: image
 image:
-	@dd if=/dev/zero of=build/disk.img bs=67108864 count=1
+	@echo "=== Creating clean 64 MiB disk image ==="
+	@rm -f build/disk.img build/rootfs.img
+	@dd if=/dev/zero of=build/disk.img bs=1M count=64
+
+	@echo "=== Applying partition layout ==="
 	@$(SFDISK) build/disk.img < disk.layout
-	@dd if=build/boot.bin of=build/disk.img conv=notrunc
-	@dd if=build/disk.img of=build/partition.img bs=512 skip=36864
-	@$(MKFS) -F 16 build/partition.img
-	@$(MCOPY) -i build/partition.img pacciani "::pacciani"
-	@$(MCOPY) -i build/partition.img lorem "::lorem"
-	@$(MCOPY) -i build/partition.img build/hello.bin "::hello"
-	@$(MCOPY) -i build/partition.img build/atest.bin "::atest"
-	@$(MCOPY) -i build/partition.img build/btest.bin "::btest"
-	@$(MCOPY) -i build/partition.img build/ctest.bin "::ctest"
-	@dd if=build/partition.img of=build/disk.img bs=512 seek=36864 conv=notrunc
-	@rm -rf build/partition.img
+	@echo "--- Partition table after first sfdisk ---"
+	@$(SFDISK) --list build/disk.img
+
+	@echo "=== Writing boot, bootloader and kernel ==="
+	@dd if=build/boot.bin       of=build/disk.img bs=512 conv=notrunc
 	@dd if=build/bootloader.bin of=build/disk.img bs=512 seek=2048 conv=notrunc
-	@dd if=build/kernel.bin of=build/disk.img bs=512 seek=4096 conv=notrunc
+	@dd if=build/kernel.bin     of=build/disk.img bs=512 seek=4096 conv=notrunc
+
+	@echo "=== Creating ext2 rootfs ==="
+	@dd if=/dev/zero of=build/rootfs.img bs=512 count=94208
+	@$(E2MKFS) -I 128 -O ^64bit,^metadata_csum,^dir_index,^ext_attr,^resize_inode build/rootfs.img
+
+	@echo "=== Preparing files for copying ==="
+	@mkdir -p build/apps
+	@cp -f build/*.bin build/apps/ 2>/dev/null || true
+	@cp -f pacciani lorem build/apps/ 2>/dev/null || true
+
+	@echo "=== Copying files to ext2 partition ==="
+	@for f in build/apps/*; do \
+		if [ -f "$$f" ]; then \
+			$(E2CP) -p "$$f" build/rootfs.img:/$$(basename "$$f"); \
+			echo "  → $$(basename "$$f")"; \
+		fi; \
+	done
+
+	@echo "=== Inserting ext2 partition back into disk ==="
+	@dd if=build/rootfs.img of=build/disk.img bs=512 seek=36864 conv=notrunc
+
+	@echo "=== Re-applying partition table (critical fix) ==="
+	@$(SFDISK) build/disk.img < disk.layout
+
+	@echo "=== FINAL partition table check ==="
+	@$(SFDISK) --list build/disk.img
+
+	@rm -f build/rootfs.img
+	@echo "=== Disk image ready! ==="
 
 .PHONY: clean
 clean:
@@ -87,7 +129,7 @@ run: all
 	@echo "Running Felix..."
 	@killall qemu-system-i386 || true
 
-	@qemu-system-i386 -drive file=build/disk.img,index=0,media=disk,format=raw,if=ide -drive format=raw,file=disk.img,if=ide,index=1 -no-reboot \
+	@qemu-system-i386 -drive file=build/disk.img,index=0,media=disk,format=raw,if=ide -no-reboot \
                                                                                                                                        -no-shutdown \
                                                                                                                                        -m 64M \
                                                                                                                                        -serial stdio
@@ -96,7 +138,7 @@ run: all
 debug: all
 	@echo "Debugging Felix..."
 	@killall qemu-system-i386 || true
-	@qemu-system-i386 -drive file=build/disk.img,index=0,media=disk,format=raw,if=ide -drive format=raw,file=disk.img,if=ide,index=1 -no-reboot \
+	@qemu-system-i386 -drive file=build/disk.img,index=0,media=disk,format=raw,if=ide -no-reboot \
                                                                                                                                            -no-shutdown \
                                                                                                                                            -m 64M \
                                                                                                                                            -serial stdio -s -S &

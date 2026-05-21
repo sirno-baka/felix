@@ -32,7 +32,7 @@ use print::PRINTER;
 use filesystem::ext2::Ext2;
 
 use multitasking::task::TASK_MANAGER;
-use crate::drivers::disk::DISK_SLAVE;
+use crate::drivers::disk::{DISK, DISK_SLAVE};
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::drivers::pic::wait;
 use crate::filesystem::VFS;
@@ -44,6 +44,16 @@ const KERNEL_SIZE: u32 = 0x0010_0000;
 const STACK_SIZE: u32 = 0x0010_0000;
 
 const STACK_START: u32 = KERNEL_START + KERNEL_SIZE + STACK_SIZE;
+
+#[macro_export]
+macro_rules! run {
+    ($app:expr) => {
+        unsafe {
+            let path = concat!($app, "\0");
+            crate::syscalls::handler::sys_execve(path.as_ptr() as *const u8);
+        }
+    };
+}
 
 #[no_mangle]
 #[link_section = ".start"]
@@ -81,11 +91,12 @@ pub extern "C" fn _start() -> ! {
 
         *KEYBOARD_BUFFER.lock() = Some(Queue::new());
 
-        DISK_SLAVE.check();
+        DISK.check();
+        let config = DISK.find_ext2_partition_config();
 
-        if DISK_SLAVE.enabled {
-            let mut ext2 = Ext2::new(&mut DISK_SLAVE);
-            ext2.mount();
+        if DISK.enabled {
+            let mut ext2 = Ext2::new(&mut DISK, Some(config));
+            ext2.mount(None);
             VFS.get().set_root(Box::new(ext2));
         }
 
@@ -113,6 +124,7 @@ pub extern "C" fn _start() -> ! {
 }
 
 unsafe fn exampletask1() {
+
     let mut shell = shell::shell::Shell::new();
     loop {
         shell.run();

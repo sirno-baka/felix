@@ -84,6 +84,10 @@ impl Task {
             state.esp = stack_top as u32;
         }
         self.fd_table = FileDescriptorTable::new();
+        println!("[TASK::init] Task ready | entry = {:#x} | cpu_state_ptr = {:#x} | esp = {:#x}",
+                 entry_point,
+                 self.cpu_state_ptr,
+                 unsafe { (*(self.cpu_state_ptr as *const CPUState)).esp });
     }
 }
 
