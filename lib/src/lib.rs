@@ -1,3 +1,4 @@
+#![feature(pointer_byte_offsets)]
 #![no_std]
 extern crate alloc;
 

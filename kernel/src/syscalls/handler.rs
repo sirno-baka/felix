@@ -180,9 +180,11 @@ pub fn sys_execve(path_ptr: *const u8) -> usize {
         return usize::MAX;
     }
 
+    const APP_TARGET: u32 = 0x00a0_0000;
+    const APP_SIZE: u32 = 4 * 1024 * 1024;
+
     // === Фиксированная область приложений (как работало раньше) ===
-    const APP_TARGET: u32 = 0x02000000;   // 32 MiB
-    const APP_SIZE:   u32 = 0x00f00000;   // 2 MiB на приложение
+
 
     let target = APP_TARGET + (slot as u32 * APP_SIZE);
 
