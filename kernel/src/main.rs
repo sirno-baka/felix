@@ -19,6 +19,7 @@ mod wrappers;
 
 mod utils;
 mod spin;
+mod elf;
 
 use alloc::boxed::Box;
 use alloc::vec;
@@ -108,8 +109,8 @@ pub extern "C" fn _start() -> ! {
 
         // TASK_MANAGER.add_task(exampletask3 as u32);
         // TASK_MANAGER.add_task(exampletask2 as u32);
-        TASK_MANAGER.add_task(exampletask1 as u32);
-
+        // TASK_MANAGER.add_task(exampletask1 as u32, false);
+        run!("hello.bin");
         // asm!("xchg bx, bx");
         asm!("sti");
         // let mut shell = shell::shell::Shell::new();
@@ -136,7 +137,7 @@ fn exampletask2() {
         counter += 1;
         if counter % 1 == 0 {
             println!("[Task ONE] {}", counter);
-            VFS.get().read_file("test");
+            // VFS.get().read_file("test");
         }
         for _ in 0..10_000_0 {
             wait();

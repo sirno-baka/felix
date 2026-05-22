@@ -151,7 +151,7 @@ fn sys_unlink(path_ptr: *const u8) -> usize {
 use crate::memory::paging::{PAGING, TABLES};   // ← добавь этот импорт
 
 pub fn sys_execve(path_ptr: *const u8) -> usize {
-    // Безопасное чтение пути
+    // === Чтение пути (без изменений) ===
     let path = unsafe {
         let mut len = 0;
         while len < 256 && *path_ptr.add(len) != 0 {
@@ -183,33 +183,32 @@ pub fn sys_execve(path_ptr: *const u8) -> usize {
     const APP_TARGET: u32 = 0x00a0_0000;
     const APP_SIZE: u32 = 4 * 1024 * 1024;
 
-    // === Фиксированная область приложений (как работало раньше) ===
-
-
     let target = APP_TARGET + (slot as u32 * APP_SIZE);
 
-    // Маппим память под приложение через 8-ю таблицу страниц
+    // Маппинг
     unsafe {
-        TABLES[8].set(target);           // заполняем таблицу
-        PAGING.set_table(8, &TABLES[8]); // подключаем в page directory
+        TABLES[8].set_user(target);           // ← user pages
+        PAGING.set_table(8, &TABLES[8]);
     }
 
-    println!("[execve] Mapped {} -> {:#x} (size {})", path, target, data.len());
+    // === Вычисляем user stack в конце слота приложения ===
+    let user_stack_top = target + APP_SIZE - 0x2000;  // 8 KiB стек сверху вниз
 
-    // Копируем бинарник
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            data.as_ptr(),
-            target as *mut u8,
-            data.len()
-        );
+    println!("[execve] Mapped {} -> {:#x} (size {}) | user stack @ {:#x}",
+             path, target, data.len(), user_stack_top);
+
+    // ELF загрузка
+    match crate::elf::load_elf(&data, target, APP_SIZE) {
+        Ok(entry_point) => {
+            unsafe {
+                TASK_MANAGER.add_task(entry_point, user_stack_top);   // ← два аргумента!
+            }
+            println!("[execve] Started application: {} (ELF entry: {:#x})", path, entry_point);
+            0
+        }
+        Err(e) => {
+            println!("[execve] ELF load failed: {:?}", e);
+            usize::MAX
+        }
     }
-
-    // Запускаем задачу
-    unsafe {
-        TASK_MANAGER.add_task(target as u32);
-    }
-
-    println!("[execve] Started application: {} (entry: {:#x})", path, target);
-    0
 }

@@ -52,7 +52,8 @@ impl Task {
         self.running = true;
     }
     //setup task stack, zeroing its cpu state and setting entry point
-    pub fn init(&mut self, entry_point: u32) {
+        // Изменённая функция
+    pub fn init(&mut self, entry_point: u32, user_stack_top: u32) {
         self.running = true;
 
         let stack_top = unsafe {
@@ -65,7 +66,6 @@ impl Task {
         unsafe {
             let state = &mut *state_ptr;
 
-            // Регистры
             state.eax = 0;
             state.ebx = 0;
             state.ecx = 0;
@@ -74,21 +74,19 @@ impl Task {
             state.edi = 0;
             state.ebp = 0;
 
-            // Interrupt frame (для iretd)
+            // === USER MODE ===
             state.eip    = entry_point;
-            state.cs     = 0x08;
-            state.eflags = 0x202;   // IF = 1
-            state.ss     = 0x10;
-
-            // esp, который будет восстановлен при первом iretd
-            state.esp = stack_top as u32;
+            state.cs     = 0x1B;      // User Code
+            state.eflags = 0x202;
+            state.esp    = user_stack_top;   // ← теперь user stack!
+            state.ss     = 0x23;      // User Data
         }
+
         self.fd_table = FileDescriptorTable::new();
-        println!("[TASK::init] Task ready | entry = {:#x} | cpu_state_ptr = {:#x} | esp = {:#x}",
-                 entry_point,
-                 self.cpu_state_ptr,
-                 unsafe { (*(self.cpu_state_ptr as *const CPUState)).esp });
+        println!("[TASK::init] Task ready | entry = {:#x} | user_stack = {:#x} | cpu_state_ptr = {:#x}",
+                 entry_point, user_stack_top, self.cpu_state_ptr);
     }
+
 }
 
 pub struct TaskManager {
@@ -106,17 +104,17 @@ pub static mut TASK_MANAGER: TaskManager = TaskManager {
 
 impl TaskManager {
     pub fn init(&mut self) {
-        self.add_task(idle as u32);
+        // self.add_task(idle as u32);
     }
 
     //add given task to next slot
-    pub fn add_task(&mut self, entry_point: u32) {
+    pub fn add_task(&mut self, entry_point: u32, user_stack_top: u32) {
         let free_slot = self.get_free_slot();
         if free_slot < 0 {
             println!("[TASK] No free slot!");
             return;
         }
-        self.tasks[free_slot as usize].init(entry_point);
+        self.tasks[free_slot as usize].init(entry_point, user_stack_top);
         self.task_count += 1;
     }
 

@@ -56,7 +56,7 @@ build:
 	@cargo build --target=x86_16-felix.json --package=felix-boot
 	@cargo build --target=x86_16-felix.json --package=felix-bootloader
 	@cargo build --target=x86_32-felix.json --package=felix-kernel
-	@cargo build --target=x86_32-felix.json --package=hello
+	@cargo build --target=x86_32-felix.json --package=hello --release
 	@cargo build --target=x86_32-felix.json --package=atest
 	@cargo build --target=x86_32-felix.json --package=btest
 	@cargo build --target=x86_32-felix.json --package=ctest
@@ -68,7 +68,7 @@ objcopy:
 	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_16-felix/debug/felix-boot build/boot.bin
 	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_16-felix/debug/felix-bootloader build/bootloader.bin
 	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_32-felix/debug/felix-kernel build/kernel.bin
-	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_32-felix/debug/hello build/hello.bin
+	@cp target/x86_32-felix/release/hello build/hello.bin
 	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_32-felix/debug/atest build/atest.bin
 	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_32-felix/debug/btest build/btest.bin
 	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_32-felix/debug/ctest build/ctest.bin
@@ -138,7 +138,7 @@ run: all
 debug: all
 	@echo "Debugging Felix..."
 	@killall qemu-system-i386 || true
-	@qemu-system-i386 -drive file=build/disk.img,index=0,media=disk,format=raw,if=ide -no-reboot \
+	@qemu-system-i386 -drive file=build/disk.img,index=0,media=disk,format=raw,if=ide -no-reboot -d int,guest_errors -no-reboot -no-shutdown \
                                                                                                                                            -no-shutdown \
                                                                                                                                            -m 64M \
                                                                                                                                            -serial stdio -s -S &

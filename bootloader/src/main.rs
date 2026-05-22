@@ -7,11 +7,13 @@ mod print;
 mod disk;
 mod gdt;
 mod splash;
+mod tss;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
 use disk::DISK;
-use gdt::GDT;
+use gdt::GlobalDescriptorTable;
+use crate::gdt::GDT;
 
 //const VERSION: &str = env!("CARGO_PKG_VERSION");
 const KERNEL_LBA: u64 = 4096; //kernel location logical block address
@@ -20,6 +22,12 @@ const KERNEL_SIZE: u16 = 2048; //kernel size in sectors
 
 const KERNEL_BUFFER: u16 = 0xbe00; //buffer location for copy
 const KERNEL_TARGET: u32 = 0x0010_0000; //where to put kernel in memory
+
+const KERNEL_START: u32 = 0x0010_0000;
+const KERNEL_SIZE_B: u32 = 0x0010_0000;
+const STACK_SIZE: u32 = 0x0010_0000;
+
+const STACK_START: u32 = KERNEL_START + KERNEL_SIZE_B + STACK_SIZE;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
@@ -37,7 +45,7 @@ pub extern "C" fn _start() -> ! {
     //splash::splash();
     //wait_for_key();
     //clear!();
-
+    gdt::GlobalDescriptorTable::init();     // ← инициализируем один раз
     //unreal mode is needed because diskreader needs to copy from buffer to protected mode memory
     println!("[!] Switching to 16bit unreal mode...");
     unreal_mode();
@@ -55,7 +63,11 @@ pub extern "C" fn _start() -> ! {
     //load dgt
     println!("[!] Loading Global Descriptor Table...");
 
-    GDT.load();
+    unsafe {
+        GDT.load();
+        // GDT.load_tss();
+        // GDT.set_kernel_stack(STACK_START);
+    }
 
     //switch to protected mode
     println!("[!] Switching to 32bit protected mode and jumping to kernel...");
@@ -120,7 +132,9 @@ fn unreal_mode() {
     }
 
     //load gdt
-    GDT.load();
+    unsafe {
+        GDT.load();                             // ← старый вызов теперь работает
+    }
 
     unsafe {
         //backup cr0 register

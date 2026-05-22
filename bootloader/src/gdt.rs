@@ -3,7 +3,9 @@ use core::arch::asm;
 use core::mem::size_of;
 use bitflags::bitflags;
 
-const GDT_ENTRIES: usize = 5;
+use crate::tss::TaskStateSegment;   // ← если tss.rs в той же crate
+
+const GDT_ENTRIES: usize = 6;       // было 5
 
 
 bitflags! {
@@ -77,33 +79,6 @@ impl DescriptorFlags {
         Self::from_bits_truncate(Self::KERNEL_CODE32.bits() | Self::DPL_RING_3.bits());
 
 }
-
-pub static GDT: GlobalDescriptorTable = {
-
-    //first entry is always zero
-    //second entry is code segment (default + executable)
-    //third entry is data segment (default)
-    let zero = GdtEntry { entry: 0 };
-    let kcode = GdtEntry {
-        entry: DescriptorFlags::KERNEL_CODE32.bits(),
-    };
-    let kdata = GdtEntry {
-        entry: DescriptorFlags::KERNEL_DATA.bits(),
-    };
-
-    // ←←← ДОБАВЛЯЕМ ЗДЕСЬ ucode и udata
-    let ucode = GdtEntry {
-        entry: DescriptorFlags::USER_CODE32.bits(), // user code segment (ring 3)
-    };
-    let udata = GdtEntry {
-        entry: DescriptorFlags::USER_DATA.bits(),              // user data segment (ring 3)
-    };
-
-    GlobalDescriptorTable {
-        entries: [zero, kcode, kdata, ucode, udata],
-    }
-};
-
 #[derive(Copy, Clone, Debug)]
 #[repr(C, packed)]
 pub struct GdtEntry {
@@ -112,7 +87,7 @@ pub struct GdtEntry {
 
 #[repr(C, packed)]
 pub struct GlobalDescriptorTable {
-    entries: [GdtEntry; GDT_ENTRIES],
+    pub entries: [GdtEntry; GDT_ENTRIES],
 }
 
 #[repr(C, packed)]
@@ -121,7 +96,26 @@ pub struct GdtDescriptor {
     offset: *const GlobalDescriptorTable,
 }
 
+static mut TSS: TaskStateSegment = TaskStateSegment::new();
+
+pub static mut GDT: GlobalDescriptorTable = GlobalDescriptorTable {
+    entries: [GdtEntry { entry: 0 }; GDT_ENTRIES], // временно нули
+};
+
 impl GlobalDescriptorTable {
+    pub fn init() {
+        unsafe {
+            let zero   = GdtEntry { entry: 0 };
+            let kcode  = GdtEntry { entry: DescriptorFlags::KERNEL_CODE32.bits() };
+            let kdata  = GdtEntry { entry: DescriptorFlags::KERNEL_DATA.bits() };
+            let ucode  = GdtEntry { entry: DescriptorFlags::USER_CODE32.bits() };
+            let udata  = GdtEntry { entry: DescriptorFlags::USER_DATA.bits() };
+            let tss_desc = make_tss_descriptor();
+
+            GDT.entries = [zero, kcode, kdata, ucode, udata, tss_desc];
+        }
+    }
+
     pub fn load(&self) {
         let descriptor = GdtDescriptor {
             size: (GDT_ENTRIES * size_of::<GdtEntry>() - 1) as u16,
@@ -132,4 +126,33 @@ impl GlobalDescriptorTable {
             asm!("lgdt [{0:e}]", in(reg) &descriptor);
         }
     }
+
+    pub fn load_tss(&self) {
+        unsafe {
+            asm!("ltr {0:x}", in(reg) 0x28u16); // индекс 5 → 0x28
+        }
+    }
+
+    pub fn set_kernel_stack(&self, stack_top: u32) {
+        unsafe {
+            TSS.esp0 = stack_top;
+            // ss0 можно тоже поставить на kernel data
+            TSS.ss0 = 0x10;
+        }
+    }
+}
+
+fn make_tss_descriptor() -> GdtEntry {
+    let base = unsafe { &TSS as *const TaskStateSegment as u32 };
+    let limit = (size_of::<TaskStateSegment>() - 1) as u32;
+
+    let mut desc: u64 = 0;
+    desc |= (limit & 0xFFFF) as u64;
+    desc |= ((base & 0xFFFF) as u64) << 16;
+    desc |= ((base >> 16 & 0xFF) as u64) << 32;
+    desc |= 0x89u64 << 40;                    // TSS 32-bit available + present
+    desc |= ((limit >> 16 & 0xF) as u64) << 48;
+    desc |= ((base >> 24 & 0xFF) as u64) << 56;
+
+    GdtEntry { entry: desc }
 }

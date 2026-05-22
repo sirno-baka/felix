@@ -19,6 +19,10 @@ impl PageDirectory {
         self.entries[index] = (table as *const PageTable) as u32 | 0b011;
     }
 
+    pub fn set_table_user(&mut self, index: usize, table: &PageTable) {
+        self.entries[index] = (table as *const PageTable) as u32 | 0b111;
+    }
+
     pub fn enable(&self) {
         unsafe {
             let address = (self as *const PageDirectory) as u32;
@@ -49,10 +53,21 @@ pub struct PageTable {
 }
 
 impl PageTable {
+    // Для kernel (supervisor only)
     pub fn set(&mut self, from: u32) {
+        self.set_with_flags(from, 0b011);  // present + write + supervisor
+    }
+
+    // Для user приложений (user + supervisor)
+    pub fn set_user(&mut self, from: u32) {
+        self.set_with_flags(from, 0b111);  // present + write + user
+    }
+
+    // Внутренний helper
+    fn set_with_flags(&mut self, from: u32, flags: u32) {
         for i in 0..1024 {
-            //0b011 (supervisor, write, present)
-            self.entries[i] = (((i * 0x1000) + from as usize) | 0b011) as u32;
+            let addr = (i * 0x1000) + from as usize;
+            self.entries[i] = (addr as u32) | flags;
         }
     }
 }
