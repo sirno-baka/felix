@@ -1,69 +1,106 @@
 //GLOBAL DESCRIPTOR TABLE
-//Tells the CPU about memory segment
-//The default here is a flat memory model,
-//meaning there are only two big segments relative to the whole 4GB memory,
-//one for data, one for code, the first entry is always zero, so three entries in total.
-
 use core::arch::asm;
 use core::mem::size_of;
+use bitflags::bitflags;
 
-const GDT_ENTRIES: usize = 3;
+const GDT_ENTRIES: usize = 5;
+
+
+bitflags! {
+    /// Flags for a GDT descriptor. Not all flags are valid for all descriptor types.
+    #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
+    pub struct DescriptorFlags: u64 {
+        /// Set by the processor if this segment has been accessed. Only cleared by software.
+        /// _Setting_ this bit in software prevents GDT writes on first use.
+        const ACCESSED          = 1 << 40;
+        /// For 32-bit data segments, sets the segment as writable. For 32-bit code segments,
+        /// sets the segment as _readable_. In 64-bit mode, ignored for all segments.
+        const WRITABLE          = 1 << 41;
+        /// For code segments, sets the segment as “conforming”, influencing the
+        /// privilege checks that occur on control transfers. For 32-bit data segments,
+        /// sets the segment as "expand down". In 64-bit mode, ignored for data segments.
+        const CONFORMING        = 1 << 42;
+        /// This flag must be set for code segments and unset for data segments.
+        const EXECUTABLE        = 1 << 43;
+        /// This flag must be set for user segments (in contrast to system segments).
+        const USER_SEGMENT      = 1 << 44;
+        /// These two bits encode the Descriptor Privilege Level (DPL) for this descriptor.
+        /// If both bits are set, the DPL is Ring 3, if both are unset, the DPL is Ring 0.
+        const DPL_RING_3        = 3 << 45;
+        /// Must be set for any segment, causes a segment not present exception if not set.
+        const PRESENT           = 1 << 47;
+        /// Available for use by the Operating System
+        const AVAILABLE         = 1 << 52;
+        /// Must be set for 64-bit code segments, unset otherwise.
+        const LONG_MODE         = 1 << 53;
+        /// Use 32-bit (as opposed to 16-bit) operands. If [`LONG_MODE`][Self::LONG_MODE] is set,
+        /// this must be unset. In 64-bit mode, ignored for data segments.
+        const DEFAULT_SIZE      = 1 << 54;
+        /// Limit field is scaled by 4096 bytes. In 64-bit mode, ignored for all segments.
+        const GRANULARITY       = 1 << 55;
+
+        /// Bits `0..=15` of the limit field (ignored in 64-bit mode)
+        const LIMIT_0_15        = 0xFFFF;
+        /// Bits `16..=19` of the limit field (ignored in 64-bit mode)
+        const LIMIT_16_19       = 0xF << 48;
+        /// Bits `0..=23` of the base field (ignored in 64-bit mode, except for fs and gs)
+        const BASE_0_23         = 0xFF_FFFF << 16;
+        /// Bits `24..=31` of the base field (ignored in 64-bit mode, except for fs and gs)
+        const BASE_24_31        = 0xFF << 56;
+    }
+}
+
+impl DescriptorFlags {
+    // Flags that we set for all our default segments
+    const COMMON: Self = Self::from_bits_truncate(
+        Self::USER_SEGMENT.bits()
+            | Self::PRESENT.bits()
+            | Self::WRITABLE.bits()
+            | Self::ACCESSED.bits()
+            | Self::LIMIT_0_15.bits()
+            | Self::LIMIT_16_19.bits()
+            | Self::GRANULARITY.bits(),
+    );
+    /// A kernel data segment (64-bit or flat 32-bit)
+    pub const KERNEL_DATA: Self =
+        Self::from_bits_truncate(Self::COMMON.bits() | Self::DEFAULT_SIZE.bits());
+    /// A flat 32-bit kernel code segment
+    pub const KERNEL_CODE32: Self = Self::from_bits_truncate(
+        Self::COMMON.bits() | Self::EXECUTABLE.bits() | Self::DEFAULT_SIZE.bits(),
+    );
+
+    /// A user data segment (64-bit or flat 32-bit)
+    pub const USER_DATA: Self =
+        Self::from_bits_truncate(Self::KERNEL_DATA.bits() | Self::DPL_RING_3.bits());
+    /// A flat 32-bit user code segment
+    pub const USER_CODE32: Self =
+        Self::from_bits_truncate(Self::KERNEL_CODE32.bits() | Self::DPL_RING_3.bits());
+
+}
 
 pub static GDT: GlobalDescriptorTable = {
-    //segment lenght (0xffff means all 32bit memory)
-    let limit = {
-        let limit_low = 0xffff << 0;
-        let limit_high = 0xf << 48;
-
-        limit_low | limit_high
-    };
-
-    //base address
-    let base = {
-        let base_low = 0x0000 << 16;
-        let base_high = 0x00 << 56;
-
-        base_low | base_high
-    };
-
-    //access byte
-    let access = {
-        let p = 0b1 << 47; //present bit (1 for any segment)
-        let dpl = 0b00 << 46; //descriptor privilege level (ring, 0 for highest privilege, 3 for lowest)
-        let s = 0b1 << 44; //descriptor type bit
-        let e = 0b0 << 43; //executable bit
-        let dc = 0b0 << 42; //direction bit/conforming bit
-        let rw = 0b1 << 41; //readable bit/writable bit
-        let a = 0b0 << 40; //accessed bit
-
-        p | dpl | s | e | dc | rw | a
-    };
-
-    //flags
-    let flags = {
-        let g = 0b1 << 55; //granularity flag
-        let db = 0b1 << 54; //size flag
-        let l = 0b0 << 53; //long mode flag
-        let r = 0b0 << 52; //reserved
-
-        g | db | l | r
-    };
-
-    let executable = 0b1 << 43; //set only executable flag again, instead of setting all values again
 
     //first entry is always zero
     //second entry is code segment (default + executable)
     //third entry is data segment (default)
     let zero = GdtEntry { entry: 0 };
-    let code = GdtEntry {
-        entry: limit | base | access | flags | executable,
+    let kcode = GdtEntry {
+        entry: DescriptorFlags::KERNEL_CODE32.bits(),
     };
-    let data = GdtEntry {
-        entry: limit | base | access | flags,
+    let kdata = GdtEntry {
+        entry: DescriptorFlags::KERNEL_DATA.bits(),
+    };
+
+    // ←←← ДОБАВЛЯЕМ ЗДЕСЬ ucode и udata
+    let ucode = GdtEntry {
+        entry: DescriptorFlags::USER_CODE32.bits(), // user code segment (ring 3)
+    };
+    let udata = GdtEntry {
+        entry: DescriptorFlags::USER_DATA.bits(),              // user data segment (ring 3)
     };
 
     GlobalDescriptorTable {
-        entries: [zero, code, data],
+        entries: [zero, kcode, kdata, ucode, udata],
     }
 };
 
@@ -80,17 +117,15 @@ pub struct GlobalDescriptorTable {
 
 #[repr(C, packed)]
 pub struct GdtDescriptor {
-    size: u16,                            //gdt size
-    offset: *const GlobalDescriptorTable, //pointer to gdt
+    size: u16,
+    offset: *const GlobalDescriptorTable,
 }
 
-//global descriptor table for flat memory model
 impl GlobalDescriptorTable {
-    //load gdt using lgdt instruction
     pub fn load(&self) {
         let descriptor = GdtDescriptor {
-            size: (GDT_ENTRIES * size_of::<GdtEntry>() - 1) as u16, //calculate size of gdt
-            offset: self,                                           //pointer to gdt
+            size: (GDT_ENTRIES * size_of::<GdtEntry>() - 1) as u16,
+            offset: self,
         };
 
         unsafe {

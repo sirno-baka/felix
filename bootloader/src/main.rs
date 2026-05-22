@@ -95,6 +95,8 @@ fn protected_mode() {
             "mov {0:e}, 0x10",
             "mov ds, {0:e}",
             "mov es, {0:e}",
+            "mov fs, {0:e}",
+            "mov gs, {0:e}",
             "mov ss, {0:e}",
 
             //jump to kernel
