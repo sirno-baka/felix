@@ -6,9 +6,6 @@ use crate::multitasking::task::CPUState;
 use crate::multitasking::task::TASK_MANAGER;
 use core::arch::asm;
 
-use crate::memory::paging::PAGING;
-use crate::memory::paging::TABLES;
-
 pub const TIMER_INT: u8 = 32;
 
 const APP_TARGET: u32 = 0x00a0_0000;
@@ -32,6 +29,7 @@ pub extern "C" fn timer() {
             //call c function with esp as argument
             "push esp",
             "call timer_handler",
+        "add esp, 4",     // <--- ОБЯЗАТЕЛЬНО убираем аргумент со стека
             //set esp to return value of c func
             "mov esp, eax",
             //restore registers

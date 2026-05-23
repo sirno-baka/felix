@@ -7,6 +7,7 @@ use core::arch::asm;
 use core::ffi::CStr;
 use crate::filesystem::file::{FileDescriptor, FileMode};
 use crate::filesystem::VFS;
+use crate::memory::paging::{PTEFlags, PAGING};
 
 pub const SYSCALL_INT: u8 = 0x80;
 
@@ -148,10 +149,8 @@ fn sys_unlink(path_ptr: *const u8) -> usize {
     if success { 0 } else { usize::MAX }
 }
 
-use crate::memory::paging::{PAGING, TABLES};   // ← добавь этот импорт
-
+// ====================== EXECVE (ИСПРАВЛЕННЫЙ) ======================
 pub fn sys_execve(path_ptr: *const u8) -> usize {
-    // === Чтение пути (без изменений) ===
     let path = unsafe {
         let mut len = 0;
         while len < 256 && *path_ptr.add(len) != 0 {
@@ -180,30 +179,27 @@ pub fn sys_execve(path_ptr: *const u8) -> usize {
         return usize::MAX;
     }
 
-    const APP_TARGET: u32 = 0x00a0_0000;
-    const APP_SIZE: u32 = 4 * 1024 * 1024;
-
+    const APP_TARGET: u32 = 0x40000000;
+    const APP_SIZE: u32 = 4 * 1024 * 1024; // 4 MiB на задачу
     let target = APP_TARGET + (slot as u32 * APP_SIZE);
+    let user_stack_top = target + APP_SIZE - 0x2000; // 8 KiB стек
 
-    // Маппинг
+    // ===== НОВЫЙ БЕЗОПАСНЫЙ МАППИНГ =====
+    let pages = (APP_SIZE >> 12) as u32;        // ← оставляем только эту
     unsafe {
-        TABLES[8].set_user(target);           // ← user pages
-        PAGING.set_table(8, &TABLES[8]);
+        for i in 0..pages {
+            let virt_addr = target + (i << 12);
+            PAGING.alloc_and_map(virt_addr);     // теперь работает
+        }
     }
 
-    // === Вычисляем user stack в конце слота приложения ===
-    let user_stack_top = target + APP_SIZE - 0x2000;  // 8 KiB стек сверху вниз
-
-    println!("[execve] Mapped {} -> {:#x} (size {}) | user stack @ {:#x}",
-             path, target, data.len(), user_stack_top);
-
-    // ELF загрузка
+    // ----- Загрузка ELF -----
     match crate::elf::load_elf(&data, target, APP_SIZE) {
         Ok(entry_point) => {
             unsafe {
-                TASK_MANAGER.add_task(entry_point, user_stack_top);   // ← два аргумента!
+                TASK_MANAGER.add_task(entry_point, user_stack_top);
             }
-            println!("[execve] Started application: {} (ELF entry: {:#x})", path, entry_point);
+            println!("[execve] Started: {} (entry {:#x})", path, entry_point);
             0
         }
         Err(e) => {

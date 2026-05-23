@@ -19,21 +19,21 @@ pub struct Task {
 
 #[repr(C, packed)]
 pub struct CPUState {
-    // Порядок соответствует push'ам в naked handler + то, что пушит CPU
-    eax: u32,
-    ebx: u32,
-    ecx: u32,
-    edx: u32,
-    esi: u32,
-    edi: u32,
-    ebp: u32,
+    // Регистры, которые пушит naked timer handler (в обратном порядке)
+    pub ebp: u32,
+    pub edi: u32,
+    pub esi: u32,
+    pub edx: u32,
+    pub ecx: u32,
+    pub ebx: u32,
+    pub eax: u32,
 
-    // То, что автоматически пушит процессор при прерывании
-    eip: u32,
-    cs: u32,
-    eflags: u32,
-    esp: u32,      // esp задачи (восстанавливается через iretd)
-    ss: u32,
+    // То, что CPU автоматически пушит при входе в прерывание (из user mode)
+    pub eip:    u32,
+    pub cs:     u32,
+    pub eflags: u32,
+    pub esp:    u32,   // user stack pointer
+    pub ss:     u32,
 }
 
 static NULL_TASK: Task = Task {
@@ -53,6 +53,7 @@ impl Task {
     }
     //setup task stack, zeroing its cpu state and setting entry point
         // Изменённая функция
+    // ====================== Task::init ======================
     pub fn init(&mut self, entry_point: u32, user_stack_top: u32) {
         self.running = true;
 
@@ -65,21 +66,22 @@ impl Task {
 
         unsafe {
             let state = &mut *state_ptr;
+            *state = CPUState {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+                esi: 0,
+                edi: 0,
+                ebp: 0,
 
-            state.eax = 0;
-            state.ebx = 0;
-            state.ecx = 0;
-            state.edx = 0;
-            state.esi = 0;
-            state.edi = 0;
-            state.ebp = 0;
-
-            // === USER MODE ===
-            state.eip    = entry_point;
-            state.cs     = 0x1B;      // User Code
-            state.eflags = 0x202;
-            state.esp    = user_stack_top;   // ← теперь user stack!
-            state.ss     = 0x23;      // User Data
+                // === USER MODE ===
+                eip:    entry_point,
+                cs:     0x1B,      // User Code (RPL=3)
+                eflags: 0x202,
+                esp:    user_stack_top,
+                ss:     0x23,      // User Data (RPL=3)
+            };
         }
 
         self.fd_table = FileDescriptorTable::new();

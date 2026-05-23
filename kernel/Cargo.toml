@@ -7,3 +7,4 @@ edition.workspace = true
 [dependencies]
 interrupt-sync = { path = "../interrupt-sync" }
 elf = { version = "0.7.4", default-features = false}
+bitflags = "1.3"

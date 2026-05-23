@@ -16,6 +16,8 @@ mod syscalls;
 mod shell;
 mod sync;
 mod wrappers;
+mod gdt;
+mod tss;
 
 mod utils;
 mod spin;
@@ -27,6 +29,7 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::panic::PanicInfo;
 use drivers::pic::PICS;
+use gdt::{GDT, GlobalDescriptorTable};
 use interrupts::idt::IDT;
 use memory::paging::PAGING;
 use print::PRINTER;
@@ -62,8 +65,12 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         asm!("mov esp, {}", in(reg) STACK_START);
 
-        PAGING.identity();
-        PAGING.enable();
+        // GDT setup
+        gdt::GlobalDescriptorTable::init();
+        GDT.set_kernel_stack(STACK_START);
+        GDT.load();
+        GDT.load_tss();           // ←←← ОБЯЗАТЕЛЬНО
+        PAGING.init(STACK_START as u32);
 
         IDT.init();
         IDT.add_exceptions();
@@ -100,6 +107,9 @@ pub extern "C" fn _start() -> ! {
             ext2.mount(None);
             VFS.get().set_root(Box::new(ext2));
         }
+        VFS.get().read_file("/hello.bin").map(|data| {
+            println!("{:?}", &data[0..10]);
+        });
 
 
         println!("[VFS] Virtual filesystem initialized");
@@ -109,8 +119,8 @@ pub extern "C" fn _start() -> ! {
 
         // TASK_MANAGER.add_task(exampletask3 as u32);
         // TASK_MANAGER.add_task(exampletask2 as u32);
-        // TASK_MANAGER.add_task(exampletask1 as u32, false);
-        run!("hello.bin");
+        // TASK_MANAGER.add_task(exampletask1 as u32, );
+        run!("/hello.bin");
         // asm!("xchg bx, bx");
         asm!("sti");
         // let mut shell = shell::shell::Shell::new();
