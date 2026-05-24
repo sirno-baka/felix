@@ -5,6 +5,7 @@ use crate::drivers::pic::PICS;
 use crate::multitasking::task::CPUState;
 use crate::multitasking::task::TASK_MANAGER;
 use core::arch::asm;
+use crate::println;
 
 pub const TIMER_INT: u8 = 32;
 
@@ -52,9 +53,12 @@ pub extern "C" fn timer() {
 #[no_mangle]
 pub extern "C" fn timer_handler(esp: u32) -> u32 {
     unsafe {
+        // println!("[TIMER] tick! current_task={}, esp={:#x}",
+        //          unsafe { TASK_MANAGER.current_task }, esp);
         // Просто вызываем планировщик
         let new_esp = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
-
+        // println!("[TIMER] switched to task {}, new_esp={:#x}",
+        //          unsafe { TASK_MANAGER.current_task }, new_esp);
         PICS.end_interrupt(TIMER_INT);
 
         new_esp

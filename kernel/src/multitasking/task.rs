@@ -1,7 +1,7 @@
 //TASK MANAGER
 use core::arch::asm;
 use crate::filesystem::file::FileDescriptorTable;
-use crate::println;
+use crate::{gdt, print, println};
 
 const STACK_SIZE: usize = 32 * 1024;
 const MAX_TASKS: i8 = 8;
@@ -12,23 +12,23 @@ pub struct Task {
     pub stack: [u8; STACK_SIZE],
     pub cpu_state_ptr: u32, //pub cpu_state: *mut CPUState,
     pub running: bool,
-
+    pub kernel_stack: u32,             // ← НОВОЕ: отдельный kernel stack                                                                                                                                                                                              bootloader/src/gdt.rs           +1 -1
     pub fd_table: FileDescriptorTable,
 }
 
 
 #[repr(C, packed)]
 pub struct CPUState {
-    // Регистры, которые пушит naked timer handler (в обратном порядке)
-    pub ebp: u32,
-    pub edi: u32,
-    pub esi: u32,
-    pub edx: u32,
-    pub ecx: u32,
-    pub ebx: u32,
+    // Порядок точно соответствует тому, на что указывает esp из naked handler
     pub eax: u32,
+    pub ebx: u32,
+    pub ecx: u32,
+    pub edx: u32,
+    pub esi: u32,
+    pub edi: u32,
+    pub ebp: u32,
 
-    // То, что CPU автоматически пушит при входе в прерывание (из user mode)
+    // То, что CPU автоматически пушит при user→kernel
     pub eip:    u32,
     pub cs:     u32,
     pub eflags: u32,
@@ -41,6 +41,7 @@ static NULL_TASK: Task = Task {
     cpu_state_ptr: 0 as u32, //cpu_state: 0 as *mut CPUState,
     running: false,
     fd_table: FileDescriptorTable::new(),
+    kernel_stack: 0 as u32,
 };
 
 impl Task {
@@ -57,36 +58,35 @@ impl Task {
     pub fn init(&mut self, entry_point: u32, user_stack_top: u32) {
         self.running = true;
 
-        let stack_top = unsafe {
-            (&self.stack as *const u8).add(STACK_SIZE) as usize
+        // Верх kernel stack'а задачи (используется TSS.esp0 при прерываниях из user mode)
+        let kernel_stack_top = unsafe {
+            (&self.stack as *const u8).add(STACK_SIZE) as u32
         };
+        self.kernel_stack = kernel_stack_top;
 
-        let state_ptr = (stack_top - core::mem::size_of::<CPUState>()) as *mut CPUState;
+        // CPUState всегда лежит в конце kernel stack'а задачи
+        let state_ptr = (kernel_stack_top as usize - core::mem::size_of::<CPUState>()) as *mut CPUState;
         self.cpu_state_ptr = state_ptr as u32;
 
         unsafe {
             let state = &mut *state_ptr;
             *state = CPUState {
-                eax: 0,
-                ebx: 0,
-                ecx: 0,
-                edx: 0,
-                esi: 0,
-                edi: 0,
-                ebp: 0,
+                eax: 0, ebx: 0, ecx: 0, edx: 0,
+                esi: 0, edi: 0, ebp: 0,
 
                 // === USER MODE ===
                 eip:    entry_point,
                 cs:     0x1B,      // User Code (RPL=3)
                 eflags: 0x202,
-                esp:    user_stack_top,
+                esp:    user_stack_top,   // отдельный user stack из sys_execve
                 ss:     0x23,      // User Data (RPL=3)
             };
         }
 
         self.fd_table = FileDescriptorTable::new();
-        println!("[TASK::init] Task ready | entry = {:#x} | user_stack = {:#x} | cpu_state_ptr = {:#x}",
-                 entry_point, user_stack_top, self.cpu_state_ptr);
+
+        println!("[TASK::init] Task ready | entry={:#x} | user_stack={:#x} | kernel_stack={:#x} | cpu_state={:#x}",
+                 entry_point, user_stack_top, self.kernel_stack, self.cpu_state_ptr);
     }
 
 }
@@ -94,7 +94,7 @@ impl Task {
 pub struct TaskManager {
     pub(crate) tasks: [Task; MAX_TASKS as usize], //arry of tasks
     task_count: i8,                    //how many tasks are in the queue
-    current_task: i8,                  //current running task
+    pub(crate) current_task: i8,                  //current running task
 }
 
 //init null task manager
@@ -106,7 +106,48 @@ pub static mut TASK_MANAGER: TaskManager = TaskManager {
 
 impl TaskManager {
     pub fn init(&mut self) {
-        // self.add_task(idle as u32);
+        // Создаём idle task напрямую в массиве (чтобы stack не был локальной переменной)
+        self.tasks[0] = Task {
+            stack: [0; STACK_SIZE],
+            cpu_state_ptr: 0,
+            running: false,
+            fd_table: FileDescriptorTable::new(),
+            kernel_stack: 0,
+        };
+
+        let stack_top = unsafe {
+            (&self.tasks[0].stack as *const u8).add(STACK_SIZE) as u32
+        };
+
+        let state_ptr = (stack_top - core::mem::size_of::<CPUState>() as u32) as *mut CPUState;
+
+        unsafe {
+            let state = &mut *state_ptr;
+            *state = CPUState {
+                eax: 0, ebx: 0, ecx: 0, edx: 0,
+                esi: 0, edi: 0, ebp: 0,
+                eip: idle as u32,
+                cs: 0x1B,           // user mode (как все остальные таски)
+                eflags: 0x202,
+                esp: stack_top,     // используем kernel stack как user stack для idle
+                ss: 0x23,
+            };
+            self.tasks[0].cpu_state_ptr = state_ptr as u32;
+            self.tasks[0].kernel_stack = stack_top;
+            self.tasks[0].running = true;
+        }
+
+        // <<< КРИТИЧНО: инициализируем TSS до первого таймера >>>
+        unsafe {
+            gdt::TSS.esp0 = self.tasks[0].kernel_stack;
+            gdt::TSS.ss0  = 0x10;           // kernel data segment
+        }
+
+        self.task_count = 1;
+        self.current_task = 0;
+
+        println!("[TASK] Idle task initialized | kernel_stack={:#x} | cpu_state={:#x}",
+                 self.tasks[0].kernel_stack, self.tasks[0].cpu_state_ptr);
     }
 
     //add given task to next slot
@@ -135,24 +176,45 @@ impl TaskManager {
     //CPU SCHEDULER LOGIC
     //triggers scheduler with round robin scheduling algorithm, returns new cpu state
     pub fn schedule(&mut self, cpu_state: *mut CPUState) -> *mut CPUState {
-        if self.task_count <= 0 {
-            return cpu_state;
+        // println!("[SCHEDULE] ENTER: task={}, incoming_esp={:#x}, cs={:#x}, eip={:#x}",
+        //          self.current_task,
+        //          cpu_state as u32,
+        //          unsafe { (*cpu_state).cs },
+        //          unsafe { (*cpu_state).eip });
+
+        // === СПЕЦИАЛЬНАЯ ОБРАБОТКА ПЕРВОГО ПЕРЕКЛЮЧЕНИЯ ===
+        // Первый таймер приходит из kernel mode (boot stack) — не сохраняем его состояние
+        if self.current_task == 0 && unsafe { (*cpu_state).cs } == 0x08 {
+            // println!("[SCHEDULE] FIRST SWITCH from boot → idle (skip save)");
+            let new_cpustate = self.tasks[0].cpu_state_ptr as *mut CPUState;
+            unsafe {
+                gdt::TSS.esp0 = self.tasks[0].kernel_stack;
+            }
+            // println!("[SCHEDULE] SWITCH TO idle, new_cpustate={:#x} (eip={:#x})",
+            //          new_cpustate as u32, unsafe { (*new_cpustate).eip });
+            return new_cpustate;
         }
 
-        // Сохраняем состояние текущего таска
+        // Обычная логика для всех последующих переключений
         if self.current_task >= 0 {
             self.tasks[self.current_task as usize].cpu_state_ptr = cpu_state as u32;
         }
 
-        // Выбираем следующий runnable таск
         self.current_task = self.get_next_task();
 
-        // Защита: если почему-то вернули плохой индекс — берём idle (0)
         if self.current_task < 0 || !self.tasks[self.current_task as usize].running {
             self.current_task = 0;
         }
 
-        self.tasks[self.current_task as usize].cpu_state_ptr as *mut CPUState
+        let new_cpustate = self.tasks[self.current_task as usize].cpu_state_ptr as *mut CPUState;
+        unsafe {
+            gdt::TSS.esp0 = self.tasks[self.current_task as usize].kernel_stack;
+        }
+
+        // println!("[SCHEDULE] SWITCH TO task {}, new_cpustate={:#x} (eip={:#x})",
+        //          self.current_task, new_cpustate as u32, unsafe { (*new_cpustate).eip });
+
+        new_cpustate
     }
 
     pub fn get_next_task(&self) -> i8 {
@@ -203,7 +265,7 @@ impl TaskManager {
 fn idle() {
     loop {
         unsafe {
-            asm!("hlt");
+            asm!("pause")
         }
     }
 }

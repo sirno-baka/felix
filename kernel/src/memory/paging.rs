@@ -318,7 +318,7 @@ impl PageManager {
             self.dir.map_large(
                 virt_page,
                 phys_page,
-                PDEFlags::new().present().writable().accessed().large_page(),
+                PDEFlags::new().present().writable().accessed().user().large_page(),
             );
         }
 
@@ -341,21 +341,32 @@ impl PageManager {
             };
 
             if need_table {
-                let pt_phys = self.alloc_frame(); // <- теперь безопасно
+                let pt_phys = self.alloc_frame();
+
+                // КРИТИЧНО: правильные флаги для PDE (user-mode доступ)
+                let pde_flags = PDEFlags::new()
+                    .present()
+                    .writable()
+                    .user()           // ← вот этого не хватало
+                    .bits();
+
+                let pde = &mut self.dir.entries[pd_idx];
+                *pde = (pt_phys << 12) | pde_flags;
+
+                // Сбрасываем TLB
+                PageDirectory::flush_page((pd_idx as u32) << 22);
+
+                // Очищаем таблицу страниц
                 let pt_ptr = PageDirectory::get_page_table_ptr(pd_idx);
                 unsafe {
                     write_bytes(pt_ptr as *mut u8, 0, 4096);
                 }
-                // Записываем PDE
-                let pde = &mut self.dir.entries[pd_idx];
-                *pde = (pt_phys << 12) | PDEFlags::PRESENT | PDEFlags::WRITABLE;
-                PageDirectory::flush_page((pd_idx as u32) << 22);
             }
 
             // Заполняем PTE
             let pt_ptr = PageDirectory::get_page_table_ptr(pd_idx);
             unsafe {
-                (*pt_ptr)[pt_idx] = (vpage << 12) | PTEFlags::PRESENT | PTEFlags::WRITABLE | PTEFlags::ACCESSED;
+                (*pt_ptr)[pt_idx] = (vpage << 12) | PTEFlags::PRESENT | PTEFlags::WRITABLE | PTEFlags::USER | PTEFlags::ACCESSED;
             }
             PageDirectory::flush_page((vpage << 12) as u32);
         }
@@ -391,7 +402,13 @@ impl PageManager {
 
             // КРИТИЧНО: сначала ставим PDE → рекурсивное отображение заработает
             let pde = &mut self.dir.entries[pd_idx];
-            *pde = (pt_phys << 12) | PDEFlags::PRESENT | PDEFlags::WRITABLE;
+            let pde_flags = PDEFlags::new()
+                .present()
+                .writable()
+                .user()
+                .bits();
+
+            *pde = (pt_phys << 12) | pde_flags;
 
             // Сбрасываем TLB
             PageDirectory::flush_page((pd_idx as u32) << 22);

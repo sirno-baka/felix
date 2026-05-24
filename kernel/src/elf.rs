@@ -1,6 +1,7 @@
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
 use elf::abi::{ET_EXEC, EM_386, PT_LOAD};
+use crate::memory::paging::PAGING;
 use crate::println;
 
 #[derive(Debug)]
@@ -31,15 +32,20 @@ pub fn load_elf(
     let segments = file.segments()
         .ok_or(ElfLoadError::NoProgramHeaders)?;
 
-    // Находим первый PT_LOAD — от него будем считать базовый адрес ELF
-    let mut elf_base = None;
+    let mut elf_base: Option<u32> = None;
     for phdr in segments.iter() {
         if phdr.p_type == PT_LOAD {
-            elf_base = Some(phdr.p_vaddr as u32);
-            break;
+            let vaddr = phdr.p_vaddr as u32;
+            elf_base = Some(match elf_base {
+                Some(base) => base.min(vaddr),
+                None => vaddr,
+            });
         }
     }
     let elf_base = elf_base.ok_or(ElfLoadError::NoProgramHeaders)?;
+
+    println!("[elf] ELF base vaddr: {:#x}, target_base: {:#x}", elf_base, target_base);
+    
 
     // Загружаем все сегменты **относительно** target_base
     for phdr in segments.iter() {

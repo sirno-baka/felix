@@ -52,6 +52,7 @@ endif
 
 .PHONY: build
 build:
+	@cargo clean -p felix-kernel
 	@echo "Building Felix..."
 	@cargo build --target=x86_16-felix.json --package=felix-boot
 	@cargo build --target=x86_16-felix.json --package=felix-bootloader

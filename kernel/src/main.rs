@@ -78,7 +78,7 @@ pub extern "C" fn _start() -> ! {
             interrupts::timer::TIMER_INT as usize,
             interrupts::timer::timer as u32,
         ); //add timer interrupt to idt
-        IDT.add(
+        IDT.add_user_interrupt(
             syscalls::handler::SYSCALL_INT as usize,
             syscalls::handler::syscall as u32,
         );

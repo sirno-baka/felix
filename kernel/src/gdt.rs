@@ -66,7 +66,7 @@ pub struct GdtDescriptor {
     offset: *const GlobalDescriptorTable,
 }
 
-static mut TSS: TaskStateSegment = TaskStateSegment::new();
+pub static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
 pub static mut GDT: GlobalDescriptorTable = GlobalDescriptorTable {
     entries: [GdtEntry { entry: 0 }; GDT_ENTRIES],

@@ -35,16 +35,18 @@ pub struct IdtDescriptor {
 
 impl InterruptDescriptorTable {
     pub fn init(&mut self) {
-        for i in 0..IDT_ENTRIES {
-            // self.add(i, exceptions::generic_handler as u32);
-        }
+        // ничего не делаем — будем добавлять вручную
     }
 
     pub fn add(&mut self, int: usize, handler: u32) {
-        self.entries[int].set(handler);
+        self.entries[int].set(handler, 0);   // kernel interrupts
     }
 
-    //load idt using lidt instruction
+    // Новый метод специально для user-mode syscall
+    pub fn add_user_interrupt(&mut self, int: usize, handler: u32) {
+        self.entries[int].set(handler, 3);   // DPL=3 — разрешаем user mode
+    }
+
     pub fn load(&self) {
         let descriptor = IdtDescriptor {
             size: (IDT_ENTRIES * size_of::<IdtEntry>() - 1) as u16, //calculate size of idt
@@ -66,6 +68,20 @@ impl InterruptDescriptorTable {
     }
 }
 
+impl IdtEntry {
+    // Добавляем параметр dpl
+    pub fn set(&mut self, offset: u32, dpl: u8) {
+        self.offset_low = ((offset << 16) >> 16) as u16;
+        self.offset_high = (offset >> 16) as u16;
+
+        let gate_type = 0xe << 0;  // interrupt gate
+        let zero = 0 << 3;
+        let dpl_bits = (dpl & 3) << 5;
+        let p = 1 << 7;
+
+        self.flags = gate_type | zero | dpl_bits | p;
+    }
+}
 pub static IDT_ENTRY: IdtEntry = {
     let segment_selector: u16 = {
         //segment selector of gdt entry
@@ -96,10 +112,3 @@ pub static IDT_ENTRY: IdtEntry = {
         offset_high: 0,
     }
 };
-
-impl IdtEntry {
-    pub fn set(&mut self, offset: u32) {
-        self.offset_low = ((offset << 16) >> 16) as u16; //calculate lower 16 bits of offset
-        self.offset_high = (offset >> 16) as u16; //calculate higher 16 bits of offset
-    }
-}

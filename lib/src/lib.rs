@@ -5,4 +5,4 @@ extern crate alloc;
 pub mod mutex;
 pub mod print;
 pub mod sys_alloc;
-mod syscall;
+pub mod syscall;

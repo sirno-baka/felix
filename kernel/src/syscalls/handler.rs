@@ -1,5 +1,5 @@
 use crate::drivers::pic::PICS;
-use crate::multitasking::task::TASK_MANAGER;
+use crate::multitasking::task::{CPUState, TASK_MANAGER};
 use crate::{print, println};
 use crate::memory::allocator::ALLOCATOR;
 use core::alloc::{GlobalAlloc, Layout};
@@ -7,7 +7,7 @@ use core::arch::asm;
 use core::ffi::CStr;
 use crate::filesystem::file::{FileDescriptor, FileMode};
 use crate::filesystem::VFS;
-use crate::memory::paging::{PTEFlags, PAGING};
+use crate::memory::paging::{PDEFlags, PTEFlags, PAGING};
 
 pub const SYSCALL_INT: u8 = 0x80;
 
@@ -15,12 +15,30 @@ pub const SYSCALL_INT: u8 = 0x80;
 pub extern "C" fn syscall() {
     unsafe {
         asm!(
+        "cli",
+        // Сохраняем все регистры (точно как в timer)
+        "push ebp",
+        "push edi",
+        "push esi",
         "push edx",
         "push ecx",
         "push ebx",
         "push eax",
+        // Передаём указатель на стек (CPUState)
+        "push esp",
         "call syscall_handler",
-        "add esp, 16",
+        "add esp, 4",
+        // Возвращаем новый esp (handler может вернуть тот же)
+        "mov esp, eax",
+        // Восстанавливаем регистры
+        "pop eax",
+        "pop ebx",
+        "pop ecx",
+        "pop edx",
+        "pop esi",
+        "pop edi",
+        "pop ebp",
+        "sti",
         "iretd",
         options(noreturn)
         );
@@ -28,13 +46,13 @@ pub extern "C" fn syscall() {
 }
 
 #[no_mangle]
-pub extern "C" fn syscall_handler(
-    syscall: u32,
-    arg1: u32,
-    arg2: u32,
-    arg3: u32,
-) -> u32 {
-    let ret = match syscall {
+pub extern "C" fn syscall_handler(esp: u32) -> u32 {
+    let state = unsafe { &mut *(esp as *mut CPUState) };
+
+    // Номер syscall лежит в eax (после push'ей)
+    let syscall_num = state.eax;
+
+    let ret = match syscall_num {
         // === Process control ===
         crate::syscalls::SYS_EXIT => {
             unsafe { TASK_MANAGER.remove_current_task(); }
@@ -42,27 +60,28 @@ pub extern "C" fn syscall_handler(
         }
 
         // === File descriptors ===
-        crate::syscalls::SYS_OPEN  => sys_open(arg1 as *const u8, arg2 as usize),
-        crate::syscalls::SYS_READ  => sys_read(arg1 as usize, arg2 as *mut u8, arg3 as usize),
-        crate::syscalls::SYS_WRITE => sys_write(arg1 as usize, arg2 as *const u8, arg3 as usize),
-        crate::syscalls::SYS_CLOSE => sys_close(arg1 as usize),
+        crate::syscalls::SYS_OPEN  => sys_open(state.ebx as *const u8, state.ecx as usize),
+        crate::syscalls::SYS_READ  => sys_read(state.ebx as usize, state.ecx as *mut u8, state.edx as usize),
+        crate::syscalls::SYS_WRITE => sys_write(state.ebx as usize, state.ecx as *const u8, state.edx as usize),
+        crate::syscalls::SYS_CLOSE => sys_close(state.ebx as usize),
 
-        // === Filesystem operations (новые обработчики) ===
-        crate::syscalls::SYS_MKDIR  => sys_mkdir(arg1 as *const u8),
-        crate::syscalls::SYS_RMDIR  => sys_rmdir(arg1 as *const u8),
-        crate::syscalls::SYS_UNLINK => sys_unlink(arg1 as *const u8),
-        crate::syscalls::SYS_EXECVE => sys_execve(arg1 as *const u8),
+        // === Filesystem operations ===
+        crate::syscalls::SYS_MKDIR  => sys_mkdir(state.ebx as *const u8),
+        crate::syscalls::SYS_RMDIR  => sys_rmdir(state.ebx as *const u8),
+        crate::syscalls::SYS_UNLINK => sys_unlink(state.ebx as *const u8),
+        crate::syscalls::SYS_EXECVE => sys_execve(state.ebx as *const u8),
+
         // === Memory ===
         crate::syscalls::SYS_MALLOC => {
-            let layout = Layout::from_size_align(arg1 as usize, arg2 as usize)
+            let layout = Layout::from_size_align(state.ebx as usize, state.ecx as usize)
                 .unwrap_or(Layout::new::<u8>());
             unsafe { ALLOCATOR.alloc(layout) as usize }
-        },
+        }
 
         crate::syscalls::SYS_FREE => {
-            let layout = Layout::from_size_align(arg2 as usize, arg3 as usize)
+            let layout = Layout::from_size_align(state.ecx as usize, state.edx as usize)
                 .unwrap_or(Layout::new::<u8>());
-            unsafe { ALLOCATOR.dealloc(arg1 as *mut u8, layout); }
+            unsafe { ALLOCATOR.dealloc(state.ebx as *mut u8, layout); }
             0
         }
 
@@ -114,10 +133,18 @@ fn sys_write(fd: usize, buf_ptr: *const u8, count: usize) -> usize {
 
     if let Some(desc) = current.fd_table.get_mut(fd) {
         if desc.mode == FileMode::ReadOnly { return 0; }
-
+        let mut written = 0;
         let buf = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
-        let written = VFS.get().write_at(desc.inode, desc.offset, buf);
-        desc.offset += written as u64;
+        if fd == 0 || fd == 1 {
+            for &byte in buf.iter().take(count) {
+                print!("{}", byte as char);
+                written += 1
+            }
+        } else {
+            written = VFS.get().write_at(desc.inode, desc.offset, buf);
+            desc.offset += written as u64;
+        }
+
         written
     } else {
         0
@@ -191,6 +218,33 @@ pub fn sys_execve(path_ptr: *const u8) -> usize {
             let virt_addr = target + (i << 12);
             PAGING.alloc_and_map(virt_addr);     // теперь работает
         }
+    }
+
+
+    println!("[execve] Mapping done for task {} at {:#x} ({} pages)", slot, target, pages);
+
+    // 1. Kernel может читать/писать (должен работать)
+    unsafe {
+        let test_ptr = target as *mut u32;
+        *test_ptr = 0xDEADBEEF;
+        println!("[execve] Kernel test write/read: {:#x}", *test_ptr);
+    }
+
+    // 2. Проверка translate (должен вернуть Some(phys))
+    if let Some(phys) = unsafe { PAGING.dir.translate(target) } {
+        println!("[execve] translate OK: {:#x} → {:#x}", target, phys);
+    } else {
+        println!("[execve] !!! translate FAILED for {:#x}", target);
+    }
+
+    // 3. Самое важное — проверка PDE (USER бит)
+    let pd_idx = (target >> 22) as usize;
+    let pde_val = unsafe { PAGING.dir.entries[pd_idx] };
+    let has_user = (pde_val & PDEFlags::USER) != 0;
+    println!("[execve] PDE[{}] = {:#x} | USER bit = {}", pd_idx, pde_val, has_user);
+
+    if !has_user {
+        println!("[execve] CRITICAL: PDE missing USER bit → user mode will fault!");
     }
 
     // ----- Загрузка ELF -----

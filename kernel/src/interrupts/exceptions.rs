@@ -89,10 +89,16 @@ pub extern "C" fn general_protection_fault() {
 pub extern "C" fn page_fault() {
     unsafe {
         asm!(
-            "push 0x0e",
-            "call exception_handler",
-            "add esp, 4",
-            "iretd",
+           "mov eax, [esp + 4]",   // eip (пропустить error_code)
+     "push eax",
+     "mov eax, [esp + 8]",   // cs
+     "push eax",
+     "mov eax, [esp + 8]",   // eflags
+     "push eax",
+     "push 0x0e",
+     "call exception_handler",
+     "add esp, 16",
+     "iretd",
             options(noreturn)
         );
     }
