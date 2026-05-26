@@ -6,17 +6,19 @@
 
 use core::arch::asm;
 use core::panic::PanicInfo;
-use libfelix::syscall;
-use libfelix::syscall::write;
+use libfelix::{println, syscall};
+use libfelix::syscall::{open, read, write};
 
 #[no_mangle]
 #[link_section = ".start"]
 pub extern "C" fn _start() {
     unsafe {
-        loop {
-            write(0, b"1".as_ptr(), 1);
-        }
+        println!("Hello, world!");
+
     };
+    loop {
+
+    }
 }
 
 #[panic_handler]

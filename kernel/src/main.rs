@@ -18,7 +18,6 @@ mod sync;
 mod wrappers;
 mod gdt;
 mod tss;
-
 mod utils;
 mod spin;
 mod elf;
@@ -70,8 +69,8 @@ pub extern "C" fn _start() -> ! {
         GDT.set_kernel_stack(STACK_START);
         GDT.load();
         GDT.load_tss();           // ←←← ОБЯЗАТЕЛЬНО
-        PAGING.init(STACK_START as u32);
 
+        PAGING.lock().init(STACK_START as u32);
         IDT.init();
         IDT.add_exceptions();
         IDT.add(
@@ -89,14 +88,7 @@ pub extern "C" fn _start() -> ! {
         IDT.load();
 
         PICS.init();
-
-
-        //only keyboard
-
-        unsafe {
-            // asm!("out 0x21, al", in("al") 0xfd_u8);
-        }
-
+        // drivers::pit::set_period_ms(1000);
         *KEYBOARD_BUFFER.lock() = Some(Queue::new());
 
         DISK.check();
@@ -107,29 +99,34 @@ pub extern "C" fn _start() -> ! {
             ext2.mount(None);
             VFS.get().set_root(Box::new(ext2));
         }
-        VFS.get().read_file("/hello.bin").map(|data| {
-            println!("{:?}", &data[0..10]);
-        });
-
 
         println!("[VFS] Virtual filesystem initialized");
-
         print_info();
+
         TASK_MANAGER.init();
 
         // TASK_MANAGER.add_task(exampletask3 as u32);
         // TASK_MANAGER.add_task(exampletask2 as u32);
-        // TASK_MANAGER.add_task(exampletask1 as u32, );
-        run!("/hello.bin");
+        // let slot = unsafe { TASK_MANAGER.get_free_slot() };
+        // const APP_TARGET: u32 = 0x40000000;
+        // //0x40000000
+        // //  0x400000
+        // const APP_SIZE: u32 = 4 * 1024 * 1024; // 4 MiB на задачу
+        // let target = APP_TARGET + (slot as u32 * APP_SIZE);
+        // let user_stack_top = target + APP_SIZE - 0x2000; // 8 KiB стек
+
+        // TASK_MANAGER.add_task(exampletask1 as u32, user_stack_top);
+
         // asm!("xchg bx, bx");
         asm!("sti");
         // let mut shell = shell::shell::Shell::new();
         // unsafe { shell.run(); }
         // shell.init();
-
+        run!("/hello");
         // VFS.get().list_directory_entries("/").map(|t| {t.iter().map(|x| { println!("{}", x.name)}).collect::<Vec<_>>()});
         loop {
-        //     shell.process_input()
+            // print!("2");
+            // shell.process_input()
         }
     }
 }

@@ -45,7 +45,7 @@ pub fn load_elf(
     let elf_base = elf_base.ok_or(ElfLoadError::NoProgramHeaders)?;
 
     println!("[elf] ELF base vaddr: {:#x}, target_base: {:#x}", elf_base, target_base);
-    
+
 
     // Загружаем все сегменты **относительно** target_base
     for phdr in segments.iter() {
@@ -92,6 +92,7 @@ fn load_program_header_forced(
     if memsz > filesz {
         let bss_start = target_base + dst_offset as u32 + filesz;
         let bss_size = (memsz - filesz) as usize;
+        println!("[elf] .bss {:#x} {}", bss_start, bss_size);
         unsafe {
             core::ptr::write_bytes(bss_start as *mut u8, 0, bss_size);
         }

@@ -49,8 +49,10 @@ pub extern "C" fn syscall() {
 pub extern "C" fn syscall_handler(esp: u32) -> u32 {
     let state = unsafe { &mut *(esp as *mut CPUState) };
 
-    // Номер syscall лежит в eax (после push'ей)
     let syscall_num = state.eax;
+
+    // Фиксируем текущий таск ОДИН раз (чтобы таймер не успел переключить)
+    let current_slot = unsafe { TASK_MANAGER.get_current_slot() } as usize;
 
     let ret = match syscall_num {
         // === Process control ===
@@ -60,10 +62,10 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         }
 
         // === File descriptors ===
-        crate::syscalls::SYS_OPEN  => sys_open(state.ebx as *const u8, state.ecx as usize),
-        crate::syscalls::SYS_READ  => sys_read(state.ebx as usize, state.ecx as *mut u8, state.edx as usize),
-        crate::syscalls::SYS_WRITE => sys_write(state.ebx as usize, state.ecx as *const u8, state.edx as usize),
-        crate::syscalls::SYS_CLOSE => sys_close(state.ebx as usize),
+        crate::syscalls::SYS_OPEN  => sys_open(current_slot, state.ebx as *const u8, state.ecx as usize),
+        crate::syscalls::SYS_READ  => sys_read(current_slot, state.ebx as usize, state.ecx as *mut u8, state.edx as usize),
+        crate::syscalls::SYS_WRITE => sys_write(current_slot, state.ebx as usize, state.ecx as *const u8, state.edx as usize),
+        crate::syscalls::SYS_CLOSE => sys_close(current_slot, state.ebx as usize),
 
         // === Filesystem operations ===
         crate::syscalls::SYS_MKDIR  => sys_mkdir(state.ebx as *const u8),
@@ -87,19 +89,25 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
 
         _ => 0,
     };
+    
 
-    PICS.end_interrupt(SYSCALL_INT);
-    ret as u32
+    // КЛАДЁМ результат обратно в eax (чтобы пользовательская программа его получила)
+    state.eax = ret as u32;
+
+    // Для int 0x80 EOI на PIC НЕ нужен!
+    // PICS.end_interrupt(SYSCALL_INT);  ← УДАЛИТЬ
+
+    // Возвращаем ESP — стек НЕ ломается
+    esp
 }
 
 // ====================== FILE DESCRIPTORS ======================
 
-fn sys_open(path_ptr: *const u8, _flags: usize) -> usize {
+fn sys_open(current_slot: usize, path_ptr: *const u8, _flags: usize) -> usize {
+    let current = unsafe { &mut TASK_MANAGER.tasks[current_slot] };
     let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
 
     if let Some(inode) = VFS.get().resolve_path(path) {
-        let current = unsafe { &mut TASK_MANAGER.tasks[TASK_MANAGER.get_current_slot() as usize] };
-
         if let Some(fd) = current.fd_table.alloc_fd() {
             let desc = FileDescriptor::new(inode, FileMode::ReadWrite);
             current.fd_table.insert(fd, desc);
@@ -109,9 +117,9 @@ fn sys_open(path_ptr: *const u8, _flags: usize) -> usize {
     usize::MAX
 }
 
-fn sys_read(fd: usize, buf_ptr: *mut u8, count: usize) -> usize {
-    let current = unsafe { &mut TASK_MANAGER.tasks[TASK_MANAGER.get_current_slot() as usize] };
-
+fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) -> usize {
+    let current = unsafe { &mut TASK_MANAGER.tasks[current_slot] };
+    let real_buf_ptr = (buf_ptr as u32 + 0x40000000) as *mut u8;
     if let Some(desc) = current.fd_table.get_mut(fd) {
         if desc.mode == FileMode::WriteOnly { return 0; }
 
@@ -119,7 +127,7 @@ fn sys_read(fd: usize, buf_ptr: *mut u8, count: usize) -> usize {
         let bytes = VFS.get().read_at(desc.inode, desc.offset, &mut temp);
 
         if bytes > 0 {
-            unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr, bytes); }
+            unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), real_buf_ptr, bytes); }
             desc.offset += bytes as u64;
         }
         bytes
@@ -128,22 +136,25 @@ fn sys_read(fd: usize, buf_ptr: *mut u8, count: usize) -> usize {
     }
 }
 
-fn sys_write(fd: usize, buf_ptr: *const u8, count: usize) -> usize {
-    let current = unsafe { &mut TASK_MANAGER.tasks[TASK_MANAGER.get_current_slot() as usize] };
+fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usize) -> usize {
+    // Отладка: что реально лежит по этому адресу
+    let real_buf_ptr = (buf_ptr as u32 + 0x40000000) as *const u8;
+    let buf = unsafe { core::slice::from_raw_parts(real_buf_ptr, count) };
+    if fd == 0 || fd == 1 {
+        for &byte in buf.iter().take(count) {
+            print!("{}", byte as char);
+        }
+        return 0
+    }
+    let current = unsafe { &mut TASK_MANAGER.tasks[current_slot] };
 
     if let Some(desc) = current.fd_table.get_mut(fd) {
         if desc.mode == FileMode::ReadOnly { return 0; }
         let mut written = 0;
-        let buf = unsafe { core::slice::from_raw_parts(buf_ptr, count) };
-        if fd == 0 || fd == 1 {
-            for &byte in buf.iter().take(count) {
-                print!("{}", byte as char);
-                written += 1
-            }
-        } else {
-            written = VFS.get().write_at(desc.inode, desc.offset, buf);
-            desc.offset += written as u64;
-        }
+
+        written = VFS.get().write_at(desc.inode, desc.offset, buf);
+        desc.offset += written as u64;
+
 
         written
     } else {
@@ -151,8 +162,8 @@ fn sys_write(fd: usize, buf_ptr: *const u8, count: usize) -> usize {
     }
 }
 
-fn sys_close(fd: usize) -> usize {
-    let current = unsafe { &mut TASK_MANAGER.tasks[TASK_MANAGER.get_current_slot() as usize] };
+fn sys_close(current_slot: usize, fd: usize) -> usize {
+    let current = unsafe { &mut TASK_MANAGER.tasks[current_slot] };
     if current.fd_table.close(fd) { 0 } else { usize::MAX }
 }
 
@@ -192,6 +203,8 @@ pub fn sys_execve(path_ptr: *const u8) -> usize {
         }
     };
 
+    println!("[execve] Start exec: {:}", path);
+
     let data = match VFS.get().read_file(path) {
         Some(d) => d,
         None => {
@@ -199,53 +212,60 @@ pub fn sys_execve(path_ptr: *const u8) -> usize {
             return usize::MAX;
         }
     };
+    println!("1");
 
     let slot = unsafe { TASK_MANAGER.get_free_slot() };
     if slot < 0 {
         println!("[execve] No free task slot!");
         return usize::MAX;
     }
+    println!("2");
 
     const APP_TARGET: u32 = 0x40000000;
+    //0x40000000
+    //  0x400000
     const APP_SIZE: u32 = 4 * 1024 * 1024; // 4 MiB на задачу
     let target = APP_TARGET + (slot as u32 * APP_SIZE);
     let user_stack_top = target + APP_SIZE - 0x2000; // 8 KiB стек
-
+    println!("3");
     // ===== НОВЫЙ БЕЗОПАСНЫЙ МАППИНГ =====
     let pages = (APP_SIZE >> 12) as u32;        // ← оставляем только эту
     unsafe {
+        let mut paging = PAGING.lock();
         for i in 0..pages {
             let virt_addr = target + (i << 12);
-            PAGING.alloc_and_map(virt_addr);     // теперь работает
+            paging.alloc_and_map(virt_addr);
+
         }
     }
+    println!("4");
 
 
-    println!("[execve] Mapping done for task {} at {:#x} ({} pages)", slot, target, pages);
-
-    // 1. Kernel может читать/писать (должен работать)
-    unsafe {
-        let test_ptr = target as *mut u32;
-        *test_ptr = 0xDEADBEEF;
-        println!("[execve] Kernel test write/read: {:#x}", *test_ptr);
-    }
-
-    // 2. Проверка translate (должен вернуть Some(phys))
-    if let Some(phys) = unsafe { PAGING.dir.translate(target) } {
-        println!("[execve] translate OK: {:#x} → {:#x}", target, phys);
-    } else {
-        println!("[execve] !!! translate FAILED for {:#x}", target);
-    }
+    // println!("[execve] Mapping done for task {} at {:#x} ({} pages)", slot, target, pages);
+    //
+    // // 1. Kernel может читать/писать (должен работать)
+    // unsafe {
+    //     let test_ptr = target as *mut u32;
+    //     *test_ptr = 0xDEADBEEF;
+    //     println!("[execve] Kernel test write/read: {:#x}", *test_ptr);
+    // }
+    //
+    // // 2. Проверка translate (должен вернуть Some(phys))
+    // if let Some(phys) = unsafe { PAGING.dir.translate(target) } {
+    //     println!("[execve] translate OK: {:#x} → {:#x}", target, phys);
+    // } else {
+    //     println!("[execve] !!! translate FAILED for {:#x}", target);
+    // }
 
     // 3. Самое важное — проверка PDE (USER бит)
-    let pd_idx = (target >> 22) as usize;
-    let pde_val = unsafe { PAGING.dir.entries[pd_idx] };
-    let has_user = (pde_val & PDEFlags::USER) != 0;
-    println!("[execve] PDE[{}] = {:#x} | USER bit = {}", pd_idx, pde_val, has_user);
-
-    if !has_user {
-        println!("[execve] CRITICAL: PDE missing USER bit → user mode will fault!");
-    }
+    // let pd_idx = (target >> 22) as usize;
+    // let pde_val = unsafe { PAGING.dir.entries[pd_idx] };
+    // let has_user = (pde_val & PDEFlags::USER) != 0;
+    // println!("[execve] PDE[{}] = {:#x} | USER bit = {}", pd_idx, pde_val, has_user);
+    //
+    // if !has_user {
+    //     println!("[execve] CRITICAL: PDE missing USER bit → user mode will fault!");
+    // }
 
     // ----- Загрузка ELF -----
     match crate::elf::load_elf(&data, target, APP_SIZE) {

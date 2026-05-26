@@ -1,5 +1,7 @@
 use core::arch::asm;
 use core::ptr::write_bytes;
+use interrupt_sync::SpinMutex;
+use crate::sync::mutex::Mutex;
 
 const PAGE_SHIFT: usize = 12;
 pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
@@ -174,7 +176,14 @@ impl PageDirectory {
                 write_bytes(pt_ptr as *mut u8, 0, 4096);
             }
             // Записываем PDE с флагами
-            *pde = (pt_phys << 12) | PDEFlags::PRESENT | PDEFlags::WRITABLE;
+
+            let pde_flags = PDEFlags::new()
+                .present()
+                .writable()
+                .user()
+                .bits();
+
+            *pde = (pt_phys << 12) | pde_flags;
             // Сбросим TLB для этого адреса (не обязательно, но безопаснее)
             PageDirectory::flush_page((virtual_page << 12) as u32);
         }
@@ -411,7 +420,9 @@ impl PageManager {
             *pde = (pt_phys << 12) | pde_flags;
 
             // Сбрасываем TLB
-            PageDirectory::flush_page((pd_idx as u32) << 22);
+            PageDirectory::flush_page((pd_idx as u32) << 22);           // пользовательская область
+            let pt_virt = VIRT_PT_BASE + (pd_idx as u32) * PAGE_SIZE as u32;  // рекурсивное отображение PT
+            PageDirectory::flush_page(pt_virt);
 
             // Теперь можно безопасно обнулять таблицу через рекурсию
             let pt_ptr = PageDirectory::get_page_table_ptr(pd_idx);
@@ -444,4 +455,4 @@ impl PageManager {
 }
 
 // Глобальный экземпляр менеджера страниц
-pub static mut PAGING: PageManager = PageManager::new();
+pub static mut PAGING: SpinMutex<PageManager> = SpinMutex::new(PageManager::new());

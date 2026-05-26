@@ -1,25 +1,19 @@
-//TIMER INTERRUPT HANDLER
-//Used to trigger the cpu scheduler and to context switch
+// TIMER INTERRUPT HANDLER
+// Triggers the scheduler and performs context switching
 
 use crate::drivers::pic::PICS;
-use crate::multitasking::task::CPUState;
-use crate::multitasking::task::TASK_MANAGER;
+use crate::multitasking::task::{CPUState, TASK_MANAGER};
 use core::arch::asm;
-use crate::println;
 
 pub const TIMER_INT: u8 = 32;
 
-const APP_TARGET: u32 = 0x00a0_0000;
-const APP_SIZE: u32 = 0x0001_0000;
-
-//TIMER IRQ
+/// Naked interrupt handler for timer (IRQ0)
 #[naked]
 pub extern "C" fn timer() {
     unsafe {
         asm!(
-            //disable interrupts
             "cli",
-            //save registers
+            // Save registers (must match CPUState layout)
             "push ebp",
             "push edi",
             "push esi",
@@ -27,13 +21,13 @@ pub extern "C" fn timer() {
             "push ecx",
             "push ebx",
             "push eax",
-            //call c function with esp as argument
+            // Pass current stack pointer to handler
             "push esp",
             "call timer_handler",
-        "add esp, 4",     // <--- ОБЯЗАТЕЛЬНО убираем аргумент со стека
-            //set esp to return value of c func
+            "add esp, 4",        // cleanup pushed argument
+            // Switch to new task's kernel stack
             "mov esp, eax",
-            //restore registers
+            // Restore registers
             "pop eax",
             "pop ebx",
             "pop ecx",
@@ -41,24 +35,19 @@ pub extern "C" fn timer() {
             "pop esi",
             "pop edi",
             "pop ebp",
-            //re-enable interrupts
             "sti",
-            //return irq
             "iretd",
             options(noreturn)
         );
     }
 }
 
+/// Called from assembly. Returns new stack pointer (new task's CPUState)
 #[no_mangle]
 pub extern "C" fn timer_handler(esp: u32) -> u32 {
     unsafe {
-        // println!("[TIMER] tick! current_task={}, esp={:#x}",
-        //          unsafe { TASK_MANAGER.current_task }, esp);
-        // Просто вызываем планировщик
         let new_esp = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
-        // println!("[TIMER] switched to task {}, new_esp={:#x}",
-        //          unsafe { TASK_MANAGER.current_task }, new_esp);
+
         PICS.end_interrupt(TIMER_INT);
 
         new_esp

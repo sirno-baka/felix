@@ -52,15 +52,14 @@ endif
 
 .PHONY: build
 build:
-	@cargo clean -p felix-kernel
+	@cargo clean -p felix-kernel -p hello
 	@echo "Building Felix..."
 	@cargo build --target=x86_16-felix.json --package=felix-boot
 	@cargo build --target=x86_16-felix.json --package=felix-bootloader
 	@cargo build --target=x86_32-felix.json --package=felix-kernel
 	@cargo build --target=x86_32-felix.json --package=hello --release
-	@cargo build --target=x86_32-felix.json --package=atest
-	@cargo build --target=x86_32-felix.json --package=btest
-	@cargo build --target=x86_32-felix.json --package=ctest
+	@cargo build --target=x86_32-felix.json --package=shell --release
+
 
 .PHONY: objcopy
 objcopy:
@@ -69,10 +68,9 @@ objcopy:
 	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_16-felix/debug/felix-boot build/boot.bin
 	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_16-felix/debug/felix-bootloader build/bootloader.bin
 	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_32-felix/debug/felix-kernel build/kernel.bin
-	@cp target/x86_32-felix/release/hello build/hello.bin
-	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_32-felix/debug/atest build/atest.bin
-	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_32-felix/debug/btest build/btest.bin
-	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_32-felix/debug/ctest build/ctest.bin
+	@cp target/x86_32-felix/release/hello build/hello
+	@cp target/x86_32-felix/release/shell build/shell
+
 
 .PHONY: image
 image:
@@ -97,7 +95,8 @@ image:
 	@echo "=== Preparing files for copying ==="
 	@mkdir -p build/apps
 	@cp -f build/*.bin build/apps/ 2>/dev/null || true
-	@cp -f pacciani lorem build/apps/ 2>/dev/null || true
+	@cp -f build/shell build/apps/ 2>/dev/null || true
+	@cp -f build/hello build/apps/ 2>/dev/null || true
 
 	@echo "=== Copying files to ext2 partition ==="
 	@for f in build/apps/*; do \
@@ -130,10 +129,7 @@ run: all
 	@echo "Running Felix..."
 	@killall qemu-system-i386 || true
 
-	@qemu-system-i386 -drive file=build/disk.img,index=0,media=disk,format=raw,if=ide -no-reboot \
-                                                                                                                                       -no-shutdown \
-                                                                                                                                       -m 64M \
-                                                                                                                                       -serial stdio
+	@qemu-system-i386 -drive file=build/disk.img,index=0,media=disk,format=raw,if=ide -no-reboot -no-shutdown -m 64M -serial stdio
 
 .PHONY: debug
 debug: all

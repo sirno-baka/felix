@@ -17,7 +17,7 @@ pub struct Task {
 }
 
 
-#[repr(C, packed)]
+#[repr(C)]
 pub struct CPUState {
     // Порядок точно соответствует тому, на что указывает esp из naked handler
     pub eax: u32,
@@ -27,7 +27,7 @@ pub struct CPUState {
     pub esi: u32,
     pub edi: u32,
     pub ebp: u32,
-
+    _dummy_pushed_esp: u32,          // ← добавить
     // То, что CPU автоматически пушит при user→kernel
     pub eip:    u32,
     pub cs:     u32,
@@ -73,7 +73,7 @@ impl Task {
             *state = CPUState {
                 eax: 0, ebx: 0, ecx: 0, edx: 0,
                 esi: 0, edi: 0, ebp: 0,
-
+                _dummy_pushed_esp: 0,          // ← добавить
                 // === USER MODE ===
                 eip:    entry_point,
                 cs:     0x1B,      // User Code (RPL=3)
@@ -126,6 +126,7 @@ impl TaskManager {
             *state = CPUState {
                 eax: 0, ebx: 0, ecx: 0, edx: 0,
                 esi: 0, edi: 0, ebp: 0,
+                _dummy_pushed_esp: 0,          // ← добавить
                 eip: idle as u32,
                 cs: 0x1B,           // user mode (как все остальные таски)
                 eflags: 0x202,
@@ -157,8 +158,10 @@ impl TaskManager {
             println!("[TASK] No free slot!");
             return;
         }
+        // unsafe { asm!("cli") };
         self.tasks[free_slot as usize].init(entry_point, user_stack_top);
         self.task_count += 1;
+        // unsafe { asm!("sti") };
     }
 
     //remove task
@@ -176,22 +179,22 @@ impl TaskManager {
     //CPU SCHEDULER LOGIC
     //triggers scheduler with round robin scheduling algorithm, returns new cpu state
     pub fn schedule(&mut self, cpu_state: *mut CPUState) -> *mut CPUState {
-        // println!("[SCHEDULE] ENTER: task={}, incoming_esp={:#x}, cs={:#x}, eip={:#x}",
-        //          self.current_task,
-        //          cpu_state as u32,
-        //          unsafe { (*cpu_state).cs },
-        //          unsafe { (*cpu_state).eip });
+        println!("[SCHEDULE] ENTER: task={}, incoming_esp={:#x}, cs={:#x}, eip={:#x}",
+                 self.current_task,
+                 cpu_state as u32,
+                 unsafe { (*cpu_state).cs },
+                 unsafe { (*cpu_state).eip });
 
         // === СПЕЦИАЛЬНАЯ ОБРАБОТКА ПЕРВОГО ПЕРЕКЛЮЧЕНИЯ ===
         // Первый таймер приходит из kernel mode (boot stack) — не сохраняем его состояние
         if self.current_task == 0 && unsafe { (*cpu_state).cs } == 0x08 {
-            // println!("[SCHEDULE] FIRST SWITCH from boot → idle (skip save)");
+            println!("[SCHEDULE] FIRST SWITCH from boot → idle (skip save)");
             let new_cpustate = self.tasks[0].cpu_state_ptr as *mut CPUState;
             unsafe {
                 gdt::TSS.esp0 = self.tasks[0].kernel_stack;
             }
-            // println!("[SCHEDULE] SWITCH TO idle, new_cpustate={:#x} (eip={:#x})",
-            //          new_cpustate as u32, unsafe { (*new_cpustate).eip });
+            println!("[SCHEDULE] SWITCH TO idle, new_cpustate={:#x} (eip={:#x})",
+                     new_cpustate as u32, unsafe { (*new_cpustate).eip });
             return new_cpustate;
         }
 
@@ -211,8 +214,8 @@ impl TaskManager {
             gdt::TSS.esp0 = self.tasks[self.current_task as usize].kernel_stack;
         }
 
-        // println!("[SCHEDULE] SWITCH TO task {}, new_cpustate={:#x} (eip={:#x})",
-        //          self.current_task, new_cpustate as u32, unsafe { (*new_cpustate).eip });
+        println!("[SCHEDULE] SWITCH TO task {}, new_cpustate={:#x} (eip={:#x})",
+                 self.current_task, new_cpustate as u32, unsafe { (*new_cpustate).eip });
 
         new_cpustate
     }
@@ -264,9 +267,7 @@ impl TaskManager {
 
 fn idle() {
     loop {
-        unsafe {
-            asm!("pause")
-        }
+        unsafe { core::arch::asm!("hlt") };
     }
 }
 
