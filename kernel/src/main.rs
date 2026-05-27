@@ -72,7 +72,7 @@ pub extern "C" fn _start() -> ! {
 
         PAGING.lock().init(STACK_START as u32);
         IDT.init();
-        IDT.add_exceptions();
+        // IDT.add_exceptions();
         IDT.add(
             interrupts::timer::TIMER_INT as usize,
             interrupts::timer::timer as u32,
@@ -85,7 +85,7 @@ pub extern "C" fn _start() -> ! {
             drivers::keyboard::KEYBOARD_INT as usize,
             drivers::keyboard::keyboard as u32,
         );
-        IDT.load();
+
 
         PICS.init();
         // drivers::pit::set_period_ms(1000);
@@ -118,6 +118,7 @@ pub extern "C" fn _start() -> ! {
         // TASK_MANAGER.add_task(exampletask1 as u32, user_stack_top);
 
         // asm!("xchg bx, bx");
+        IDT.load();
         asm!("sti");
         // let mut shell = shell::shell::Shell::new();
         // unsafe { shell.run(); }

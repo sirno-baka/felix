@@ -7,14 +7,14 @@
 use core::arch::asm;
 use core::panic::PanicInfo;
 use libfelix::{println, syscall};
-use libfelix::syscall::{open, read, write};
+use libfelix::syscall::{open, write};
 
 #[no_mangle]
 #[link_section = ".start"]
 pub extern "C" fn _start() {
     unsafe {
-        println!("Hello, world!");
-
+        let data = "helloo000o".as_ptr();
+        write(0, data, 11);
     };
     loop {
 

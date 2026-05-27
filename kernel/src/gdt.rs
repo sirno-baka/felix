@@ -75,11 +75,13 @@ pub static mut GDT: GlobalDescriptorTable = GlobalDescriptorTable {
 impl GlobalDescriptorTable {
     pub fn init() {
         unsafe {
-            let zero   = GdtEntry { entry: 0 };
-            let kcode  = GdtEntry { entry: DescriptorFlags::KERNEL_CODE32.bits() };
-            let kdata  = GdtEntry { entry: DescriptorFlags::KERNEL_DATA.bits() };
-            let ucode  = GdtEntry { entry: DescriptorFlags::USER_CODE32.bits() };
-            let udata  = GdtEntry { entry: DescriptorFlags::USER_DATA.bits() };
+            let zero = GdtEntry { entry: 0 };
+
+            // Стандартные flat 4 GiB дескрипторы (проверены тысячами осей)
+            let kcode  = GdtEntry { entry: 0x00CF9A000000FFFF }; // kernel code   (0x08)
+            let kdata  = GdtEntry { entry: 0x00CF92000000FFFF }; // kernel data   (0x10)
+            let ucode  = GdtEntry { entry: 0x00CFFA000000FFFF }; // user code     (0x18 → 0x1B)
+            let udata  = GdtEntry { entry: 0x00CFF2000000FFFF }; // user data     (0x20 → 0x23)
             let tss_desc = make_tss_descriptor();
 
             GDT.entries = [zero, kcode, kdata, ucode, udata, tss_desc, zero];

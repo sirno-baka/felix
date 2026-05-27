@@ -226,8 +226,7 @@ pub fn sys_execve(path_ptr: *const u8) -> usize {
     //  0x400000
     const APP_SIZE: u32 = 4 * 1024 * 1024; // 4 MiB на задачу
     let target = APP_TARGET + (slot as u32 * APP_SIZE);
-    let user_stack_top = target + APP_SIZE - 0x2000; // 8 KiB стек
-    println!("3");
+    let user_stack_top = target + APP_SIZE - 0x10000;  // 64 KiB стек        println!("3");
     // ===== НОВЫЙ БЕЗОПАСНЫЙ МАППИНГ =====
     let pages = (APP_SIZE >> 12) as u32;        // ← оставляем только эту
     unsafe {
@@ -241,31 +240,31 @@ pub fn sys_execve(path_ptr: *const u8) -> usize {
     println!("4");
 
 
-    // println!("[execve] Mapping done for task {} at {:#x} ({} pages)", slot, target, pages);
-    //
-    // // 1. Kernel может читать/писать (должен работать)
-    // unsafe {
-    //     let test_ptr = target as *mut u32;
-    //     *test_ptr = 0xDEADBEEF;
-    //     println!("[execve] Kernel test write/read: {:#x}", *test_ptr);
-    // }
-    //
-    // // 2. Проверка translate (должен вернуть Some(phys))
-    // if let Some(phys) = unsafe { PAGING.dir.translate(target) } {
-    //     println!("[execve] translate OK: {:#x} → {:#x}", target, phys);
-    // } else {
-    //     println!("[execve] !!! translate FAILED for {:#x}", target);
-    // }
+    println!("[execve] Mapping done for task {} at {:#x} ({} pages)", slot, target, pages);
+
+    // 1. Kernel может читать/писать (должен работать)
+    unsafe {
+        let test_ptr = target as *mut u32;
+        *test_ptr = 0xDEADBEEF;
+        println!("[execve] Kernel test write/read: {:#x}", *test_ptr);
+    }
+
+    // 2. Проверка translate (должен вернуть Some(phys))
+    if let Some(phys) = unsafe { PAGING.lock().dir.translate(target) } {
+        println!("[execve] translate OK: {:#x} → {:#x}", target, phys);
+    } else {
+        println!("[execve] !!! translate FAILED for {:#x}", target);
+    }
 
     // 3. Самое важное — проверка PDE (USER бит)
-    // let pd_idx = (target >> 22) as usize;
-    // let pde_val = unsafe { PAGING.dir.entries[pd_idx] };
-    // let has_user = (pde_val & PDEFlags::USER) != 0;
-    // println!("[execve] PDE[{}] = {:#x} | USER bit = {}", pd_idx, pde_val, has_user);
-    //
-    // if !has_user {
-    //     println!("[execve] CRITICAL: PDE missing USER bit → user mode will fault!");
-    // }
+    let pd_idx = (target >> 22) as usize;
+    let pde_val = unsafe { PAGING.lock().dir.entries[pd_idx] };
+    let has_user = (pde_val & PDEFlags::USER) != 0;
+    println!("[execve] PDE[{}] = {:#x} | USER bit = {}", pd_idx, pde_val, has_user);
+
+    if !has_user {
+        println!("[execve] CRITICAL: PDE missing USER bit → user mode will fault!");
+    }
 
     // ----- Загрузка ELF -----
     match crate::elf::load_elf(&data, target, APP_SIZE) {

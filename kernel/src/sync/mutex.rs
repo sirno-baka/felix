@@ -21,38 +21,53 @@ impl<T> Mutex<T> {
     }
 
     pub fn lock(&self) -> MutexGuard<'_, T> {
+        // Сохраняем исходное состояние Interrupt Flag (IF)
+        let eflags: u32;
+        unsafe {
+            asm!("pushfd; pop {}", out(reg) eflags);
+        }
+        let was_enabled = (eflags & (1 << 9)) != 0;  // бит IF
+
+        unsafe { asm!("cli") };
+
         loop {
-            unsafe { asm!("cli") };
             if let Some(guard) = self.inner.try_lock() {
-                unsafe { asm!("sti") };
+                // Восстанавливаем то состояние, которое было ДО вызова lock()
+                if was_enabled {
+                    unsafe { asm!("sti") };
+                }
                 return MutexGuard {
                     guard,
                     parent: self,
                 };
             }
 
-
+            // === contended path ===
             unsafe {
                 let current = TASK_MANAGER.get_current_slot();
                 if current >= 0 {
-                    // === Сохраняем текущий контекст перед засыпанием ===
+                    // Сохраняем контекст задачи
                     let current_esp: u32;
                     core::arch::asm!("mov {}, esp", out(reg) current_esp);
 
-                    // Обновляем указатель на стек таска
                     TASK_MANAGER.tasks[current as usize].cpu_state_ptr = current_esp;
                     TASK_MANAGER.tasks[current as usize].sleep();
 
-                    // Добавляем таск в очередь ожидающих
                     self.waiters.lock().push_back(current);
                 }
             }
-            unsafe { asm!("sti") };
-            // Останавливаемся. Таймер потом разбудит нас через schedule()
-            unsafe {
-                core::arch::asm!("hlt");
-            }
 
+            // Важно: sti + hlt только если прерывания должны быть включены
+            if was_enabled {
+                unsafe {
+                    asm!("sti");
+                    asm!("hlt");
+                }
+            } else {
+                // Во время boot (прерывания выключены) — просто спин
+                // (не hlt, иначе можем зависнуть навсегда)
+                core::hint::spin_loop();
+            }
         }
     }
 
