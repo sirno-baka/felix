@@ -63,20 +63,25 @@ macro_rules! run {
 pub extern "C" fn _start() -> ! {
     unsafe {
         asm!("mov esp, {}", in(reg) STACK_START);
-
-        // GDT setup
+        let mut mask: u8;
+        asm!("in al, 0x21", out("al") mask);     // читаем текущую маску master PIC
+        asm!("out 0x21, al", in("al") mask | 1); // устанавливаем бит 0 (IRQ0 = timer)
+        // 1. GDT + TSS
         gdt::GlobalDescriptorTable::init();
         GDT.set_kernel_stack(STACK_START);
         GDT.load();
-        GDT.load_tss();           // ←←← ОБЯЗАТЕЛЬНО
+        GDT.load_tss();
 
+        // 2. Paging
         PAGING.lock().init(STACK_START as u32);
+
+        // 3. IDT — загружаем ОЧЕНЬ РАНО
         IDT.init();
         // IDT.add_exceptions();
         IDT.add(
             interrupts::timer::TIMER_INT as usize,
             interrupts::timer::timer as u32,
-        ); //add timer interrupt to idt
+        );
         IDT.add_user_interrupt(
             syscalls::handler::SYSCALL_INT as usize,
             syscalls::handler::syscall as u32,
@@ -85,15 +90,17 @@ pub extern "C" fn _start() -> ! {
             drivers::keyboard::KEYBOARD_INT as usize,
             drivers::keyboard::keyboard as u32,
         );
+        IDT.load();                     // ← ПЕРЕМЕСТИТЬ СЮДА
 
-
+        // 4. PIC
         PICS.init();
-        // drivers::pit::set_period_ms(1000);
+
+        // 5. Keyboard buffer
         *KEYBOARD_BUFFER.lock() = Some(Queue::new());
 
+        // 6. Диск + VFS
         DISK.check();
         let config = DISK.find_ext2_partition_config();
-
         if DISK.enabled {
             let mut ext2 = Ext2::new(&mut DISK, Some(config));
             ext2.mount(None);
@@ -103,32 +110,19 @@ pub extern "C" fn _start() -> ! {
         println!("[VFS] Virtual filesystem initialized");
         print_info();
 
+        // 7. Task Manager (после IDT!)
         TASK_MANAGER.init();
-
-        // TASK_MANAGER.add_task(exampletask3 as u32);
-        // TASK_MANAGER.add_task(exampletask2 as u32);
-        // let slot = unsafe { TASK_MANAGER.get_free_slot() };
-        // const APP_TARGET: u32 = 0x40000000;
-        // //0x40000000
-        // //  0x400000
-        // const APP_SIZE: u32 = 4 * 1024 * 1024; // 4 MiB на задачу
-        // let target = APP_TARGET + (slot as u32 * APP_SIZE);
-        // let user_stack_top = target + APP_SIZE - 0x2000; // 8 KiB стек
-
-        // TASK_MANAGER.add_task(exampletask1 as u32, user_stack_top);
-
-        // asm!("xchg bx, bx");
-        IDT.load();
-        asm!("sti");
-        // let mut shell = shell::shell::Shell::new();
-        // unsafe { shell.run(); }
-        // shell.init();
-        run!("/hello");
-        // VFS.get().list_directory_entries("/").map(|t| {t.iter().map(|x| { println!("{}", x.name)}).collect::<Vec<_>>()});
-        loop {
-            // print!("2");
-            // shell.process_input()
+        for i in 0..5000 {
+            wait();
         }
+
+        // === ВКЛЮЧАЕМ ТАЙМЕР И ПРЕРЫВАНИЯ ТОЛЬКО В КОНЦЕ ===
+        asm!("in al, 0x21", out("al") mask);
+        asm!("out 0x21, al", in("al") mask & !1u8); // снимаем бит 0
+        asm!("sti");
+        run!("/hello");
+
+        loop {}
     }
 }
 

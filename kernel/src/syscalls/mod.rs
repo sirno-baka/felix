@@ -14,4 +14,5 @@ pub const SYS_EXECVE: u32 = 11;
 
 pub const SYS_MALLOC: u32 = 200;
 pub const SYS_FREE: u32 = 201;
+pub const SYS_REALLOC: u32 = 202;   // ← добавь
 pub const SYS_LS:     u32 = 302; // ls()

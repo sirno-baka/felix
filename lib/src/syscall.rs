@@ -13,7 +13,7 @@ pub const SYS_EXECVE: u32 = 13;
 
 pub const SYS_MALLOC: u32 = 200;
 pub const SYS_FREE:   u32 = 201;
-
+pub const SYS_REALLOC: u32 = 202;
 // ====================== WRAPPERS ======================
 
 pub unsafe fn exit() -> ! {
@@ -112,27 +112,4 @@ pub unsafe fn execve(path: *const u8) -> usize {
     options(nostack, preserves_flags)
     );
     ret
-}
-
-pub unsafe fn malloc(size: usize, align: usize) -> *mut u8 {
-    let ret: usize;
-    asm!(
-    "int 0x80",
-    inlateout("eax") SYS_MALLOC => ret,
-    in("ebx") size,
-    in("ecx") align,
-    options(nostack, preserves_flags)
-    );
-    ret as *mut u8
-}
-
-pub unsafe fn free(ptr: *mut u8, size: usize, align: usize) {
-    asm!(
-    "int 0x80",
-    in("eax") SYS_FREE,
-    in("ebx") ptr,
-    in("ecx") size,
-    in("edx") align,
-    options(nostack, preserves_flags)
-    );
 }

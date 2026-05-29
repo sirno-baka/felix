@@ -197,16 +197,6 @@ pub extern "C" fn page_fault() {
 
 #[no_mangle]
 pub extern "C" fn page_fault_handler(esp: u32) -> u32 {
-    let mut buffer = [0u8; 64];
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            esp as *const u8,
-            buffer.as_mut_ptr(),
-            64
-        );
-    }
-    println!("{:02x?}", buffer);
-
     let state = unsafe { &*((esp as usize ) as *const CPUState) };
     println!("PAGE FAULT!");
     let eip = state.eip;

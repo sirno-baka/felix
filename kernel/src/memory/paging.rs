@@ -13,6 +13,8 @@ const RECURSIVE_INDEX: usize = 1023;
 const VIRT_PT_BASE: u32 = 0xFFC00000;
 // Виртуальный адрес самого каталога страниц (через рекурсию)
 const VIRT_PD_BASE: u32 = 0xFFFFF000;
+                               //0xFFC00000
+static mut USER_HEAP_NEXT: u32 = 0x20000000; // начало user heap (после типичного ELF)
 
 #[derive(Copy, Clone)]
 pub struct PTEFlags(u32);
@@ -206,6 +208,10 @@ impl PageDirectory {
     /// Удаляет отображение для заданного виртуального адреса (выравненного по странице).
     pub fn unmap(&mut self, virtual_addr: u32) {
         let pd_index = (virtual_addr >> 22) as usize;
+        if pd_index >= ENTRIES {
+            return;
+        }
+        let pd_index = (virtual_addr >> 22) as usize;
         let pt_index = ((virtual_addr >> 12) & 0x3FF) as usize;
 
         let entry = self.entries[pd_index];
@@ -395,6 +401,27 @@ impl PageManager {
         }
     }
 
+    pub fn alloc_user_memory(&mut self, size: u32) -> u32 {
+        if size == 0 {
+            return 0;
+        }
+
+        let start = unsafe { USER_HEAP_NEXT };
+
+        // Выделяем нужное количество страниц
+        let pages = (size + 4095) / 4096;
+        for i in 0..pages {
+            let virt_addr = start + (i as u32 * 4096);
+            self.alloc_and_map(virt_addr);
+        }
+
+        unsafe {
+            USER_HEAP_NEXT = start + (pages as u32 * 4096);
+        }
+
+        start
+    }
+
     pub fn alloc_and_map(&mut self, virt: u32) -> u32 {
         let vpage = virt >> 12;
         let pd_idx = (vpage >> 10) as usize;
@@ -445,6 +472,14 @@ impl PageManager {
         }
 
         PageDirectory::flush_page(virt);
+
+        // <<< КРИТИЧНО: ОБНУЛЯЕМ ЧЕРЕЗ ВИРТУАЛЬНЫЙ АДРЕС >>>
+        // virt уже отмаплен на phys_frame, поэтому пишем сюда
+        unsafe {
+            core::ptr::write_bytes(virt as *mut u8, 0, PAGE_SIZE);
+        }
+        PageDirectory::flush_page(virt);   // ещё раз после обнуления
+
         phys_frame
     }
 

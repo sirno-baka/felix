@@ -18,6 +18,7 @@ pub struct Task {
     pub running: bool,
     pub kernel_stack: u32,             // ← НОВОЕ: отдельный kernel stack                                                                                                                                                                                              bootloader/src/gdt.rs           +1 -1
     pub fd_table: FileDescriptorTable,
+    pub heap_next: u32,          // ← НОВОЕ
 }
 
 
@@ -45,6 +46,7 @@ static NULL_TASK: Task = Task {
     running: false,
     fd_table: FileDescriptorTable::new(),
     kernel_stack: 0 as u32,
+    heap_next: 0,                // ←
 };
 
 impl Task {
@@ -58,7 +60,7 @@ impl Task {
     //setup task stack, zeroing its cpu state and setting entry point
         // Изменённая функция
     // ====================== Task::init ======================
-    pub fn init(&mut self, entry_point: u32, user_stack_top: u32) {
+    pub fn init(&mut self, entry_point: u32, user_stack_top: u32, heap_start: u32) {
         self.running = true;
 
         let kernel_stack_top = unsafe {
@@ -83,6 +85,7 @@ impl Task {
         }
 
         self.fd_table = FileDescriptorTable::new();
+        self.heap_next = heap_start;   // ←
 
         println!("[TASK::init] Task ready | entry={:#x} | user_stack={:#x} | kernel_stack={:#x} | cpu_state={:#x}",
                  entry_point, user_stack_top, self.kernel_stack, self.cpu_state_ptr);
@@ -114,6 +117,7 @@ impl TaskManager {
             running: false,
             fd_table: FileDescriptorTable::new(),
             kernel_stack: 0,
+            heap_next: 0,
         };
 
         let stack_top = unsafe {
@@ -152,14 +156,14 @@ impl TaskManager {
     }
 
     //add given task to next slot
-    pub fn add_task(&mut self, entry_point: u32, user_stack_top: u32) {
+    pub fn add_task(&mut self, entry_point: u32, user_stack_top: u32, heap_start: u32) {
         let free_slot = self.get_free_slot();
         if free_slot < 0 {
             println!("[TASK] No free slot!");
             return;
         }
         // unsafe { asm!("cli") };
-        self.tasks[free_slot as usize].init(entry_point, user_stack_top);
+        self.tasks[free_slot as usize].init(entry_point, user_stack_top, heap_start);
         self.task_count += 1;
         // unsafe { asm!("sti") };
     }
@@ -288,6 +292,7 @@ fn idle() {
         if a % 10000000 == 0 {
             a += 1;
         }
+        unsafe { asm!("hlt"); }
     }
 }
 

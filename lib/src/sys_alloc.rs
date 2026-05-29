@@ -1,4 +1,6 @@
 use core::alloc::{GlobalAlloc, Layout};
+use core::arch::asm;
+use crate::syscall::{write, SYS_MALLOC};
 
 pub struct SyscallAllocator;
 
@@ -7,15 +9,15 @@ unsafe impl GlobalAlloc for SyscallAllocator {
         let size = layout.size() as u32;
         let align = layout.align() as u32;
 
-        let ptr: u32;
-        core::arch::asm!(
+        let ret: usize;
+        asm!(
         "int 0x80",
-        inlateout("eax") 200 => ptr,   // SYS_MALLOC = 200
+        inlateout("eax") SYS_MALLOC => ret,
         in("ebx") size,
         in("ecx") align,
         options(nostack, preserves_flags)
         );
-        ptr as *mut u8
+        ret as *mut u8
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -30,6 +32,26 @@ unsafe impl GlobalAlloc for SyscallAllocator {
         in("edx") align,
         options(nostack, preserves_flags)
         );
+    }
+    // ←←← НОВОЕ
+    unsafe fn realloc(
+        &self,
+        ptr: *mut u8,
+        layout: Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        let align = layout.align();
+        let ret: usize;
+        asm!(
+        "int 0x80",
+        inlateout("eax") crate::syscall::SYS_REALLOC => ret,
+        in("ebx") ptr as u32,
+        in("ecx") layout.size(),
+        in("edx") new_size,
+        // in("esi") align,          // можно передать align
+        options(nostack, preserves_flags)
+        );
+        ret as *mut u8
     }
 }
 #[global_allocator]
