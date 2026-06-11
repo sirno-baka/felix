@@ -1,37 +1,47 @@
-//HELLO
 #![no_std]
 #![no_main]
 extern crate alloc;
 
-use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
-use libfelix::syscall::{write};
+use core::str::FromStr;
+use libfelix::syscall::write;
+
 
 #[no_mangle]
 #[link_section = ".start"]
 pub extern "C" fn _start() {
-    for i in 0..90000000 {
-
+    // Статическая строка (для сравнения)
+    let static_hello: &[u8] = b"HELLO";
+    let mut v = Vec::with_capacity(32);
+    for c in static_hello.iter(){
+        v.push(*c)
     }
-    // === Самый надёжный способ сейчас ===
-    let text = b"123!\n";
 
-    let mut v = alloc::vec::Vec::with_capacity(4);
-    v.extend_from_slice(text);
+    unsafe {
+        write(0, v.as_ptr(), v.len());
+    }
 
-    unsafe { write(0, v.as_ptr(), v.len()); }
+    let mut s = String::with_capacity(32);
+    for c in static_hello.iter(){
+        s.push((*c) as char)
+    }
+    unsafe {
+        write(0, s.as_ptr(), s.len());
+    }
 
+    let mut v = Vec::with_capacity(32);
+    for c in static_hello.iter(){
+        v.push(*c)
+    }
 
-    // === Или через String (через into_bytes — форсирует реальный heap) ===
-    let s = String::from("Hello from String via into_bytes!");
-    let bytes = s.into_bytes();
-    unsafe { write(0, bytes.as_ptr(), bytes.len()); }
+    unsafe {
+        write(0, v.as_ptr(), v.len());
+    }
+
     loop {}
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
+fn panic(_info: &PanicInfo) -> ! { loop {} }

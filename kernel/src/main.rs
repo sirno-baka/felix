@@ -72,12 +72,24 @@ pub extern "C" fn _start() -> ! {
         GDT.load();
         GDT.load_tss();
 
-        // 2. Paging
-        PAGING.lock().init(STACK_START as u32);
+       // 2. Paging
+        {
+            let mut pm = PAGING.lock();
+            pm.init(STACK_START as u32);
+
+            // setup_kernel_page_dir больше не нужен — init() уже всё сделал
+            let end_page = pm.next_free_page;
+            let pd_phys = pm.dir_phys();
+
+            unsafe {
+                crate::memory::paging::KERNEL_END_PAGE = end_page;
+                crate::memory::paging::KERNEL_PD_PHYS = pd_phys;
+            }
+        }
 
         // 3. IDT — загружаем ОЧЕНЬ РАНО
         IDT.init();
-        // IDT.add_exceptions();
+        IDT.add_exceptions();
         IDT.add(
             interrupts::timer::TIMER_INT as usize,
             interrupts::timer::timer as u32,
@@ -120,9 +132,13 @@ pub extern "C" fn _start() -> ! {
         asm!("in al, 0x21", out("al") mask);
         asm!("out 0x21, al", in("al") mask & !1u8); // снимаем бит 0
         asm!("sti");
-        run!("/hello");
-
-        loop {}
+        run!("/test");
+        // run!("/shell");
+        loop {
+            unsafe {
+                asm!("hlt");        // даём CPU спать до следующего таймера
+            }
+        }
     }
 }
 

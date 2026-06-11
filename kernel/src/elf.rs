@@ -44,7 +44,7 @@ pub fn load_elf(
     }
     let elf_base = elf_base.ok_or(ElfLoadError::NoProgramHeaders)?;
 
-    // println!("[elf] ELF base vaddr: {:#x}, target_base: {:#x}", elf_base, target_base);
+    println!("[elf] ELF base vaddr: {:#x}, target_base: {:#x}", elf_base, target_base);
 
 
     // Загружаем все сегменты **относительно** target_base
@@ -56,6 +56,7 @@ pub fn load_elf(
 
     // Правильная точка входа с учётом сдвига
     let entry_point = target_base + (header.e_entry as u32 - elf_base);
+    println!("[elf DEBUG] {:#x} {:#x} {:#x}", target_base, header.e_entry, (header.e_entry as u32 - elf_base));
     let rodata_addr = target_base + 0xf4u32;   // начало .rodata из readelf
     // unsafe {
     //     let dump = core::slice::from_raw_parts(rodata_addr as *const u8, 80);
@@ -79,8 +80,8 @@ fn load_program_header_forced(
     // Сдвиг относительно начала ELF
     let dst_offset = (vaddr - elf_base) as usize;
 
-    // println!("[elf] Loading segment vaddr={:#x} → target={:#x} (offset {:#x})",
-    //          vaddr, target_base + dst_offset as u32, dst_offset);
+    println!("[elf] Loading segment vaddr={:#x} → target={:#x} (offset {:#x})",
+             vaddr, target_base + dst_offset as u32, dst_offset);
 
     // 1. Копируем данные
     if filesz > 0 {

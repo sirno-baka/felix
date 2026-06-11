@@ -4,6 +4,7 @@
 use crate::drivers::pic::PICS;
 use crate::multitasking::task::{CPUState, TASK_MANAGER};
 use core::arch::asm;
+use crate::println;
 
 pub const TIMER_INT: u8 = 32;
 
@@ -47,7 +48,7 @@ pub extern "C" fn timer() {
 pub extern "C" fn timer_handler(esp: u32) -> u32 {
     unsafe {
         let new_esp = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
-
+        // println!("TH");
         PICS.end_interrupt(TIMER_INT);
 
         new_esp

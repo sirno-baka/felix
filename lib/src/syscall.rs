@@ -18,7 +18,6 @@ pub const SYS_REALLOC: u32 = 202;
 
 pub unsafe fn exit() -> ! {
     asm!("int 0x80", in("eax") SYS_EXIT, options(noreturn));
-    unreachable!()
 }
 
 pub unsafe fn write(fd: u32, buf: *const u8, len: usize) -> usize {

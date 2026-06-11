@@ -46,12 +46,13 @@ impl<T> Mutex<T> {
             unsafe {
                 let current = TASK_MANAGER.get_current_slot();
                 if current >= 0 {
-                    // Сохраняем контекст задачи
                     let current_esp: u32;
                     core::arch::asm!("mov {}, esp", out(reg) current_esp);
 
-                    TASK_MANAGER.tasks[current as usize].cpu_state_ptr = current_esp;
-                    TASK_MANAGER.tasks[current as usize].sleep();
+                    if let Some(ref mut task) = TASK_MANAGER.tasks[current as usize] {
+                        task.cpu_state_ptr = current_esp;
+                        task.running = false;
+                    }
 
                     self.waiters.lock().push_back(current);
                 }
@@ -75,7 +76,9 @@ impl<T> Mutex<T> {
         if let Some(id) = self.waiters.lock().pop_front() {
             unsafe {
                 if id >= 0 && (id as usize) < TASK_MANAGER.tasks.len() {
-                    TASK_MANAGER.tasks[id as usize].wake();
+                    if let Some(ref mut task) = TASK_MANAGER.tasks[id as usize] {
+                        task.running = true;
+                    }
                 }
             }
         }

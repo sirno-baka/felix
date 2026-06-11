@@ -3,28 +3,29 @@
 use core::arch::asm;
 use core::u32::MAX;
 use crate::filesystem::file::FileDescriptorTable;
+use crate::memory::paging::{PageDirectory, PDEFlags, copy_kernel_mappings, PhysAddr, VirtAddr};
 use crate::{gdt, print, println};
 use crate::drivers::pic::wait;
 
-const STACK_SIZE: usize = 32 * 1024;
+pub const STACK_SIZE: usize = 32 * 1024;
+pub const HEADROOM: usize = 16 * 1024;
 const MAX_TASKS: i8 = 8;
-const HEADROOM: usize = 16384;
 
 //each task has a 4KiB stack containg the cpu state in the bottom part of it
-#[derive(Copy, Debug, Clone)]
+#[derive(Copy, Clone)]
 pub struct Task {
     pub stack: [u8; STACK_SIZE],
-    pub cpu_state_ptr: u32, //pub cpu_state: *mut CPUState,
+    pub page_dir: PageDirectory,
+    pub cpu_state_ptr: u32,
     pub running: bool,
-    pub kernel_stack: u32,             // ← НОВОЕ: отдельный kernel stack                                                                                                                                                                                              bootloader/src/gdt.rs           +1 -1
+    pub kernel_stack: u32,
     pub fd_table: FileDescriptorTable,
-    pub heap_next: u32,          // ← НОВОЕ
+    pub heap_next: u32,
 }
 
 
 #[repr(C)]
 pub struct CPUState {
-    // Порядок точно соответствует тому, на что указывает esp из naked handler
     pub eax: u32,
     pub ebx: u32,
     pub ecx: u32,
@@ -32,22 +33,12 @@ pub struct CPUState {
     pub esi: u32,
     pub edi: u32,
     pub ebp: u32,
-    // То, что CPU автоматически пушит при user→kernel
     pub eip:    u32,
     pub cs:     u32,
     pub eflags: u32,
-    pub esp:    u32,   // user stack pointer
+    pub esp:    u32,
     pub ss:     u32,
 }
-
-static NULL_TASK: Task = Task {
-    stack: [0; STACK_SIZE],
-    cpu_state_ptr: 0 as u32, //cpu_state: 0 as *mut CPUState,
-    running: false,
-    fd_table: FileDescriptorTable::new(),
-    kernel_stack: 0 as u32,
-    heap_next: 0,                // ←
-};
 
 impl Task {
     pub fn sleep(&mut self) {
@@ -57,8 +48,30 @@ impl Task {
     pub fn wake(&mut self) {
         self.running = true;
     }
-    //setup task stack, zeroing its cpu state and setting entry point
-        // Изменённая функция
+
+    pub fn new_idle() -> Self {
+        Task {
+            stack: [0; STACK_SIZE],
+            page_dir: PageDirectory::new(),
+            cpu_state_ptr: 0,
+            running: false,
+            fd_table: FileDescriptorTable::new(),
+            kernel_stack: 0,
+            heap_next: 0,
+        }
+    }
+
+    pub fn new_task() -> Self {
+        Task {
+            stack: [0; STACK_SIZE],
+            page_dir: PageDirectory::new(),
+            cpu_state_ptr: 0,
+            running: false,
+            fd_table: FileDescriptorTable::new(),
+            kernel_stack: 0,
+            heap_next: 0,
+        }
+    }
     // ====================== Task::init ======================
     pub fn init(&mut self, entry_point: u32, user_stack_top: u32, heap_start: u32) {
         self.running = true;
@@ -77,51 +90,53 @@ impl Task {
                 eax: 0, ebx: 0, ecx: 0, edx: 0,
                 esi: 0, edi: 0, ebp: 0,
                 eip:    entry_point,
-                cs:     0x1B,                    // ← USER CODE (RPL=3)
+                cs:     0x1B,
                 eflags: 0x202,
-                esp:    user_stack_top,          // ← user stack
-                ss:     0x23,                    // ← USER DATA (RPL=3)
+                esp:    user_stack_top,
+                ss:     0x23,
             };
         }
 
-        self.fd_table = FileDescriptorTable::new();
-        self.heap_next = heap_start;   // ←
+        // let recursive_pde = self.page_dir.entries[1023];
+        // if (recursive_pde & PDEFlags::PRESENT) == 0 {
+        //     copy_kernel_mappings(&mut self.page_dir);
+        // }
 
-        println!("[TASK::init] Task ready | entry={:#x} | user_stack={:#x} | kernel_stack={:#x} | cpu_state={:#x}",
-                 entry_point, user_stack_top, self.kernel_stack, self.cpu_state_ptr);
+        self.fd_table = FileDescriptorTable::new();
+        self.heap_next = heap_start;
+
+        println!("[TASK::init] Task ready | entry={:#x} | user_stack={:#x} | kernel_stack={:#x} | cpu_state={:#x} | page_dir={:#x}",
+                 entry_point, user_stack_top, self.kernel_stack, self.cpu_state_ptr,
+                 &self.page_dir as *const PageDirectory as u32);
     }
 
 }
 
 pub struct TaskManager {
-    pub(crate) tasks: [Task; MAX_TASKS as usize], //arry of tasks
-    task_count: i8,                    //how many tasks are in the queue
-    pub(crate) current_task: i8,                  //current running task
-    first_switch: bool,          // ← НОВОЕ ПОЛЕ
+    pub(crate) tasks: [Option<Task>; MAX_TASKS as usize],
+    pub(crate) task_count: i8,
+    pub(crate) current_task: i8,
+    first_switch: bool,
 }
 
-//init null task manager
 pub static mut TASK_MANAGER: TaskManager = TaskManager {
-    tasks: [NULL_TASK; MAX_TASKS as usize],
+    tasks: [None; MAX_TASKS as usize],
     task_count: 0,
     current_task: -1,
-    first_switch: true,          // ← true
+    first_switch: true,
 };
 
 impl TaskManager {
     pub fn init(&mut self) {
-        // Создаём idle task напрямую в массиве (чтобы stack не был локальной переменной)
-        self.tasks[0] = Task {
-            stack: [0; STACK_SIZE],
-            cpu_state_ptr: 0,
-            running: false,
-            fd_table: FileDescriptorTable::new(),
-            kernel_stack: 0,
-            heap_next: 0,
-        };
+        self.tasks[0] = Some(Task::new_idle());
+        let task = self.tasks[0].as_mut().unwrap();
+
+        // === НОВОЕ: инициализируем PageDirectory idle-задачи ===
+        let pd_phys = &task.page_dir as *const PageDirectory as u32;
+        copy_kernel_mappings(&mut task.page_dir, pd_phys);
 
         let stack_top = unsafe {
-            (&self.tasks[0].stack as *const u8).add(STACK_SIZE) as u32
+            (&task.stack as *const u8).add(STACK_SIZE) as u32
         };
 
         let state_ptr = (stack_top as usize - HEADROOM - core::mem::size_of::<CPUState>()) as *mut CPUState;
@@ -132,27 +147,27 @@ impl TaskManager {
                 eax: 0, ebx: 0, ecx: 0, edx: 0,
                 esi: 0, edi: 0, ebp: 0,
                 eip: idle as u32,
-                cs:     0x08,           // ← kernel code
+                cs:     0x08,
                 eflags: 0x202,
-                esp:    stack_top,      // kernel stack
-                ss:     0x10,           // ← kernel data
+                esp:    stack_top,
+                ss:     0x10,
             };
-            self.tasks[0].cpu_state_ptr = state_ptr as u32;
-            self.tasks[0].kernel_stack = stack_top;
-            self.tasks[0].running = true;
+            task.cpu_state_ptr = state_ptr as u32;
+            task.kernel_stack = stack_top;
+            task.running = true;
         }
 
-        // <<< КРИТИЧНО: инициализируем TSS до первого таймера >>>
         unsafe {
-            gdt::TSS.esp0 = self.tasks[0].kernel_stack;
-            gdt::TSS.ss0  = 0x10;           // kernel data segment
+            gdt::TSS.esp0 = task.kernel_stack;
+            gdt::TSS.ss0  = 0x10;
         }
 
         self.task_count = 1;
         self.current_task = 0;
         self.first_switch = true;
-        println!("[TASK] Idle task initialized | kernel_stack={:#x} | cpu_state={:#x}",
-                 self.tasks[0].kernel_stack, self.tasks[0].cpu_state_ptr);
+
+        println!("[TASK] Idle task initialized | kernel_stack={:#x} | cpu_state={:#x} | pd_phys={:#x}",
+                 task.kernel_stack, task.cpu_state_ptr, pd_phys);
     }
 
     //add given task to next slot
@@ -162,17 +177,19 @@ impl TaskManager {
             println!("[TASK] No free slot!");
             return;
         }
-        // unsafe { asm!("cli") };
-        self.tasks[free_slot as usize].init(entry_point, user_stack_top, heap_start);
+        let mut task = Task::new_task();
+        task.init(entry_point, user_stack_top, heap_start);
+        self.tasks[free_slot as usize] = Some(task);
         self.task_count += 1;
-        // unsafe { asm!("sti") };
     }
 
     //remove task
     pub fn remove_task(&mut self, id: usize) {
         if id != 0 {
-            self.tasks[id] = NULL_TASK;
-            self.task_count -= 1;
+            if self.tasks[id].is_some() {
+                self.tasks[id] = None;
+                self.task_count -= 1;
+            }
         }
     }
 
@@ -181,89 +198,73 @@ impl TaskManager {
     }
 
     //CPU SCHEDULER LOGIC
-    //triggers scheduler with round robin scheduling algorithm, returns new cpu state
     pub fn schedule(&mut self, cpu_state: *mut CPUState) -> *mut CPUState {
-        // println!("[SCHEDULE] ENTER: task={}, incoming_esp={:#x}, cs={:#x}, eip={:#x}",
-        //          self.current_task,
-        //          cpu_state as u32,
-        //          unsafe { (*cpu_state).cs },
-        //          unsafe { (*cpu_state).eip });
-
-        // === СПЕЦИАЛЬНАЯ ОБРАБОТКА ПЕРВОГО ПЕРЕКЛЮЧЕНИЯ ===
-        // Первый таймер приходит из kernel mode (boot stack) — не сохраняем его состояние
-        // === СПЕЦИАЛЬНАЯ ОБРАБОТКА ТОЛЬКО ПЕРВОГО ПЕРЕКЛЮЧЕНИЯ ИЗ BOOT ===
         if self.first_switch {
-            // println!("[SCHEDULE] FIRST SWITCH from boot → idle (skip save)");
             self.first_switch = false;
 
-            let new_cpustate = self.tasks[0].cpu_state_ptr as *mut CPUState;
+            let task = unsafe { self.tasks[0].as_ref().unwrap() };
+            let new_cpustate = task.cpu_state_ptr as *mut CPUState;
             unsafe {
-                gdt::TSS.esp0 = self.tasks[0].kernel_stack;
+                gdt::TSS.esp0 = task.kernel_stack;
+                task.page_dir.switch();        // ← правильно: &self, без копирования
             }
-            // println!("[SCHEDULE] SWITCH TO idle, new_cpustate={:#x} (eip={:#x})",
-            //          new_cpustate as u32, unsafe { (*new_cpustate).eip });
             return new_cpustate;
         }
 
-        // Обычная логика для всех последующих переключений
+        // Сохраняем состояние текущей задачи
         if self.current_task >= 0 {
-            self.tasks[self.current_task as usize].cpu_state_ptr = cpu_state as u32;
+            if let Some(ref mut task) = self.tasks[self.current_task as usize] {
+                task.cpu_state_ptr = cpu_state as u32;
+            }
         }
 
+        // Выбираем следующую задачу
         self.current_task = self.get_next_task();
 
-        if self.current_task < 0 || !self.tasks[self.current_task as usize].running {
+        if self.current_task < 0
+            || self.tasks[self.current_task as usize].is_none()
+            || !self.tasks[self.current_task as usize].as_ref().unwrap().running
+        {
             self.current_task = 0;
         }
 
-        let new_cpustate = self.tasks[self.current_task as usize].cpu_state_ptr as *mut CPUState;
-
-        // ←←← НОВАЯ ОТЛАДКА
-        // unsafe {
-        //     let s = &*new_cpustate;
-        //     println!("[DEBUG] SWITCH TO task {} → eip={:#x} cs={:#x} ss={:#x} user_esp={:#x} eflags={:#x} | cpu_state_ptr={:#x}",
-        //              self.current_task,
-        //              s.eip, s.cs, s.ss, s.esp, s.eflags,
-        //              new_cpustate as u32);
-        // }
+        let task = unsafe { self.tasks[self.current_task as usize].as_ref().unwrap() };
+        // println!("[SCHEDULE] switching to task {} | pd_phys={:#x} | eip={:#x}",
+        //          self.current_task, &task.page_dir as *const _ as u32, task.cpu_state_ptr);
+        let new_cpustate = task.cpu_state_ptr as *mut CPUState;
 
         unsafe {
-            gdt::TSS.esp0 = self.tasks[self.current_task as usize].kernel_stack;
+            gdt::TSS.esp0 = task.kernel_stack;
+            task.page_dir.switch();            // ← главное исправление
         }
-
-        // println!("[SCHEDULE] SWITCH TO task {}, new_cpustate={:#x} (eip={:#x})",
-        //          self.current_task, new_cpustate as u32, unsafe { (*new_cpustate).eip });
 
         new_cpustate
     }
 
     pub fn get_next_task(&self) -> i8 {
         if self.task_count <= 0 {
-            return 0; // хотя бы idle
+            return 0;
         }
 
         let mut i = (self.current_task + 1) % MAX_TASKS;
         for _ in 0..MAX_TASKS {
-            if self.tasks[i as usize].running {
-                return i;
+            if let Some(ref task) = self.tasks[i as usize] {
+                if task.running {
+                    return i;
+                }
             }
             i = (i + 1) % MAX_TASKS;
         }
-        0 // fallback на idle
+        0
     }
 
     pub fn get_free_slot(&self) -> i8 {
-        let mut slot: i8 = -1;
-
         for i in 0..MAX_TASKS {
-            let running = self.tasks[i as usize].running;
-            if running == false {
-                slot = i as i8;
-                return slot;
+            if self.tasks[i as usize].is_none() {
+                return i as i8;
             }
         }
-
-        slot
+        -1
     }
 
     pub fn get_current_slot(&self) -> i8 {
@@ -274,9 +275,10 @@ impl TaskManager {
         println!("Running tasks:");
 
         for i in 0..MAX_TASKS {
-            let running = self.tasks[i as usize].running;
-            if running {
-                println!("ID: {}", i);
+            if let Some(ref task) = self.tasks[i as usize] {
+                if task.running {
+                    println!("ID: {} | page_dir={:#x}", i, &task.page_dir as *const PageDirectory as u32);
+                }
             }
         }
     }
