@@ -132,7 +132,7 @@ pub extern "C" fn _start() -> ! {
         asm!("in al, 0x21", out("al") mask);
         asm!("out 0x21, al", in("al") mask & !1u8); // снимаем бит 0
         asm!("sti");
-        run!("/test");
+        run!("/hello");
         // run!("/shell");
         loop {
             unsafe {
@@ -149,35 +149,7 @@ unsafe fn exampletask1() {
         shell.run();
     }
 }
-fn exampletask2() {
-    let mut counter = 0;
-    loop {
-        counter += 1;
-        if counter % 1 == 0 {
-            println!("[Task ONE] {}", counter);
-            // VFS.get().read_file("test");
-        }
-        for _ in 0..10_000_0 {
-            wait();
-        }
 
-    }
-}
-
-fn exampletask3() {
-    let mut counter = 0;
-    loop {
-        counter += 1;
-        if counter % 1 == 0 {
-            println!("[Task TWO] {}", counter);
-            VFS.get().read_file("test");
-        }
-        for _ in 0..10_000_0 {
-            wait();
-        }
-
-    }
-}
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
