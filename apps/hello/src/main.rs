@@ -13,7 +13,7 @@ use libfelix::syscall::write;
 #[link_section = ".start"]
 pub extern "C" fn _start() {
     // Статическая строка (для сравнения)
-    let static_hello: &[u8] = b"HELLO";
+    let static_hello: &[u8] = b"ZDAROVA ZAEABL";
     let mut v = Vec::with_capacity(32);
     for c in static_hello.iter(){
         v.push(*c)

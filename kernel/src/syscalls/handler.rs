@@ -108,12 +108,7 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                             task.page_dir.alloc_and_map_user_page(addr);
                             addr += page_size;
                         }
-                        // === ДОБАВЬ ЭТО ===
-                        // Во время syscall CR3 = пользовательский, поэтому писать можно напрямую
-                        if size > 0 {
-                            core::ptr::write_bytes(start as *mut u8, 0, size);
-                        }
-                        // =====================
+                        core::ptr::write_bytes(start as *mut u8, 0, size);
                     }
 
                     task.heap_next = start + size as u32;
@@ -124,7 +119,7 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         }
 
         crate::syscalls::SYS_REALLOC => {
-            let old_ptr = state.ebx as *mut u8;
+            let old_ptr = state.ebx;
             let old_size = state.ecx as usize;
             let new_size = state.edx as usize;
 
@@ -150,16 +145,22 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                             task.page_dir.alloc_and_map_user_page(addr);
                             addr += page_size;
                         }
-                    }
 
-                    if old_size > 0 && !old_ptr.is_null() {
-                        let copy_len = old_size.min(new_size);
-                        let src = old_ptr as *const u8;
-                        let dst = new_start as *mut u8;
-                        core::ptr::copy_nonoverlapping(src, dst, copy_len);
+                        core::ptr::write_bytes(new_start as *mut u8, 0, new_size);
+
+                        if old_ptr != 0 && old_size > 0 {
+                            let copy_len = old_size.min(new_size);
+                            core::ptr::copy_nonoverlapping(
+                                old_ptr as *const u8,
+                                new_start as *mut u8,
+                                copy_len,
+                            );
+                        }
                     }
 
                     task.heap_next = new_start + new_size as u32;
+                    println!("[REALLOC RET] task={} old_ptr={:#x} old_size={} new_size={} returning={:#x}",
+                             current_slot, old_ptr, old_size, new_size, new_start);
                     new_start as usize
                 }
             }
@@ -365,7 +366,7 @@ pub fn sys_execve(path_ptr: *const u8) -> usize {
     const APP_SIZE: u32 = 4 * 1024 * 1024;        // 1 МБ для начала
     let target = APP_TARGET + (slot as u32 * APP_SIZE);
     let user_stack_top = target + APP_SIZE - 0x8000;
-    let heap_start = 0x20000000 + (slot as u32 * 0x10000000);
+    let heap_start = 0x80000000 + (slot as u32 * 0x10000000);
 
     unsafe {
         asm!("cli");
@@ -401,7 +402,7 @@ pub fn sys_execve(path_ptr: *const u8) -> usize {
         // === ВРЕМЕННО ПЕРЕКЛЮЧАЕМСЯ НА НОВУЮ ТАБЛИЦУ СТРАНИЦ ===
         // println!("[execve] Switching to task PD for ELF loading...");
         task.page_dir.switch();
-
+        println!("data size: {}", data.len());
         match crate::elf::load_elf(&data, target, APP_SIZE) {
             Ok(entry_point) => {
                 // Загрузка прошла успешно — возвращаемся обратно в kernel PD
@@ -424,7 +425,7 @@ pub fn sys_execve(path_ptr: *const u8) -> usize {
             }
             Err(e) => {
                 // Если ошибка — тоже возвращаемся в kernel PD
-                // println!("[execve] ELF load failed: {:?}", e);
+                println!("[execve] ELF load failed: {:?}", e);
                 if kernel_pd_phys != 0 {
                     unsafe {
                         asm!("mov cr3, {}", in(reg) kernel_pd_phys);
