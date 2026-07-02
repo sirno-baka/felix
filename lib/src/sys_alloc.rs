@@ -40,18 +40,33 @@ unsafe impl GlobalAlloc for SyscallAllocator {
         layout: Layout,
         new_size: usize,
     ) -> *mut u8 {
+        if ptr.is_null() {
+            return self.alloc(layout);
+        }
+        if new_size == 0 {
+            self.dealloc(ptr, layout);
+            return self.alloc(Layout::from_size_align_unchecked(1, layout.align()));
+        }
+
+        let old_size = layout.size();
         let align = layout.align();
+
         let ret: usize;
         asm!(
         "int 0x80",
         inlateout("eax") crate::syscall::SYS_REALLOC => ret,
         in("ebx") ptr as u32,
-        in("ecx") layout.size(),
+        in("ecx") old_size as u32,
         in("edx") new_size,
-        // in("esi") align,          // можно передать align
         options(nostack, preserves_flags)
         );
-        ret as *mut u8
+        let new_ptr = ret as *mut u8;
+
+        let copy_len = old_size.min(new_size);
+        core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_len);
+        self.dealloc(ptr, layout);
+
+        new_ptr
     }
 }
 #[global_allocator]

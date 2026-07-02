@@ -127,12 +127,14 @@ pub extern "C" fn _start() -> ! {
         for i in 0..5000 {
             wait();
         }
+        crate::syscalls::handler::sys_execve("/hello\0".as_ptr() as *const u8);
+
 
         // === ВКЛЮЧАЕМ ТАЙМЕР И ПРЕРЫВАНИЯ ТОЛЬКО В КОНЦЕ ===
         asm!("in al, 0x21", out("al") mask);
         asm!("out 0x21, al", in("al") mask & !1u8); // снимаем бит 0
         asm!("sti");
-        run!("/hello");
+        // run!("/hello");
         // run!("/shell");
         loop {
             unsafe {

@@ -225,6 +225,118 @@ impl Ext2 {
         println!("      Inodes: {}", s_inodes_count);
     }
 
+    fn resolve_block(&self, inode: &Ext2Inode, logical_block: usize) -> Option<u32> {
+        let num_ptrs = (self.block_size as usize) / 4; // u32 pointers per indirect block
+        let direct_blocks = 12;
+
+        if logical_block < direct_blocks {
+            return if inode.i_block[logical_block] == 0 {
+                None
+            } else {
+                Some(inode.i_block[logical_block])
+            };
+        }
+
+        let offset = logical_block - direct_blocks;
+
+        // single indirect
+        if offset < num_ptrs {
+            let indirect_block = inode.i_block[12];
+            if indirect_block == 0 {
+                return None;
+            }
+            let mut indirect_buf = alloc::vec![0u8; self.block_size as usize];
+            unsafe { self.read_blocks(indirect_block, indirect_buf.as_mut_ptr(), 1); }
+            let ptr_offset = offset * 4;
+            let physical_block = u32::from_le_bytes([
+                indirect_buf[ptr_offset],
+                indirect_buf[ptr_offset + 1],
+                indirect_buf[ptr_offset + 2],
+                indirect_buf[ptr_offset + 3],
+            ]);
+            return if physical_block == 0 { None } else { Some(physical_block) };
+        }
+
+        // double indirect
+        let offset = offset - num_ptrs;
+        if offset < num_ptrs * num_ptrs {
+            let indirect_block = inode.i_block[13];
+            if indirect_block == 0 {
+                return None;
+            }
+            let mut indirect_buf = alloc::vec![0u8; self.block_size as usize];
+            unsafe { self.read_blocks(indirect_block, indirect_buf.as_mut_ptr(), 1); }
+            let first_level = offset / num_ptrs;
+            let second_level = offset % num_ptrs;
+
+            let ptr_offset = first_level * 4;
+            let first_physical = u32::from_le_bytes([
+                indirect_buf[ptr_offset],
+                indirect_buf[ptr_offset + 1],
+                indirect_buf[ptr_offset + 2],
+                indirect_buf[ptr_offset + 3],
+            ]);
+            if first_physical == 0 {
+                return None;
+            }
+
+            unsafe { self.read_blocks(first_physical, indirect_buf.as_mut_ptr(), 1); }
+            let ptr_offset = second_level * 4;
+            let physical_block = u32::from_le_bytes([
+                indirect_buf[ptr_offset],
+                indirect_buf[ptr_offset + 1],
+                indirect_buf[ptr_offset + 2],
+                indirect_buf[ptr_offset + 3],
+            ]);
+            return if physical_block == 0 { None } else { Some(physical_block) };
+        }
+
+        // triple indirect
+        let offset = offset - num_ptrs * num_ptrs;
+        if offset < num_ptrs * num_ptrs * num_ptrs {
+            let indirect_block = inode.i_block[14];
+            if indirect_block == 0 {
+                return None;
+            }
+            let mut indirect_buf = alloc::vec![0u8; self.block_size as usize];
+            unsafe { self.read_blocks(indirect_block, indirect_buf.as_mut_ptr(), 1); }
+            let first = offset / (num_ptrs * num_ptrs);
+            let second = (offset / num_ptrs) % num_ptrs;
+            let third = offset % num_ptrs;
+
+            let ptr_offset = first * 4;
+            let first_phys = u32::from_le_bytes([
+                indirect_buf[ptr_offset],
+                indirect_buf[ptr_offset + 1],
+                indirect_buf[ptr_offset + 2],
+                indirect_buf[ptr_offset + 3],
+            ]);
+            if first_phys == 0 { return None; }
+
+            unsafe { self.read_blocks(first_phys, indirect_buf.as_mut_ptr(), 1); }
+            let ptr_offset = second * 4;
+            let second_phys = u32::from_le_bytes([
+                indirect_buf[ptr_offset],
+                indirect_buf[ptr_offset + 1],
+                indirect_buf[ptr_offset + 2],
+                indirect_buf[ptr_offset + 3],
+            ]);
+            if second_phys == 0 { return None; }
+
+            unsafe { self.read_blocks(second_phys, indirect_buf.as_mut_ptr(), 1); }
+            let ptr_offset = third * 4;
+            let physical_block = u32::from_le_bytes([
+                indirect_buf[ptr_offset],
+                indirect_buf[ptr_offset + 1],
+                indirect_buf[ptr_offset + 2],
+                indirect_buf[ptr_offset + 3],
+            ]);
+            return if physical_block == 0 { None } else { Some(physical_block) };
+        }
+
+        None
+    }
+
     // ====================== BLOCK GROUP & INODE ======================
 
     /// Исправленная версия — теперь правильно работает с несколькими блоками BGD-таблицы
@@ -676,19 +788,20 @@ impl Ext2 {
         let mut data = alloc::vec::Vec::with_capacity(file_size);
         let blocks_to_read = (file_size + self.block_size as usize - 1) / self.block_size as usize;
 
-        for i in 0..core::cmp::min(blocks_to_read, 12) {
-            if inode.i_block[i] == 0 {
-                break;
-            }
+        for i in 0..blocks_to_read {
+            match self.resolve_block(&inode, i) {
+                Some(block_num) => {
+                    let mut block_buf = alloc::vec![0u8; self.block_size as usize];
+                    unsafe {
+                        self.read_blocks(block_num, block_buf.as_mut_ptr(), 1);
+                    }
 
-            let mut block_buf = [0u8; 4096];
-            unsafe {
-                self.read_blocks(inode.i_block[i], block_buf.as_mut_ptr(), 1);
+                    let start = i * self.block_size as usize;
+                    let end = core::cmp::min(start + self.block_size as usize, file_size);
+                    data.extend_from_slice(&block_buf[0..(end - start)]);
+                }
+                None => break,
             }
-
-            let start = i * self.block_size as usize;
-            let end = core::cmp::min(start + self.block_size as usize, file_size);
-            data.extend_from_slice(&block_buf[0..(end - start)]);
         }
         Some(data)
     }
@@ -1301,36 +1414,31 @@ impl crate::filesystem::Filesystem for Ext2 {
 
         let to_read = core::cmp::min(buf.len() as u64, file_size - offset) as usize;
         let mut bytes_read = 0;
-
-        // Пока поддерживаем только прямые блоки (i_block[0..12])
         let block_size = self.block_size as u64;
         let mut current_offset = offset;
 
         while bytes_read < to_read {
             let block_index = (current_offset / block_size) as usize;
-            if block_index >= 12 {
-                break; // пока не поддерживаем indirect blocks
+
+            match self.resolve_block(&inode, block_index) {
+                Some(block_num) => {
+                    let mut block_buf = alloc::vec![0u8; self.block_size as usize];
+                    unsafe { self.read_blocks(block_num, block_buf.as_mut_ptr(), 1); }
+
+                    let block_offset = (current_offset % block_size) as usize;
+                    let can_read = core::cmp::min(
+                        to_read - bytes_read,
+                        (self.block_size as usize) - block_offset,
+                    );
+
+                    buf[bytes_read..bytes_read + can_read]
+                        .copy_from_slice(&block_buf[block_offset..block_offset + can_read]);
+
+                    bytes_read += can_read;
+                    current_offset += can_read as u64;
+                }
+                None => break,
             }
-
-            let block_num = inode.i_block[block_index];
-            if block_num == 0 {
-                break;
-            }
-
-            let mut block_buf = [0u8; 4096];
-            unsafe { self.read_blocks(block_num, block_buf.as_mut_ptr(), 1); }
-
-            let block_offset = (current_offset % block_size) as usize;
-            let can_read = core::cmp::min(
-                to_read - bytes_read,
-                (block_size as usize) - block_offset,
-            );
-
-            buf[bytes_read..bytes_read + can_read]
-                .copy_from_slice(&block_buf[block_offset..block_offset + can_read]);
-
-            bytes_read += can_read;
-            current_offset += can_read as u64;
         }
 
         bytes_read
