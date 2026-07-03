@@ -127,7 +127,7 @@ pub extern "C" fn _start() -> ! {
         for i in 0..5000 {
             wait();
         }
-        crate::syscalls::handler::sys_execve("/hello\0".as_ptr() as *const u8);
+        crate::syscalls::handler::sys_execve("/shell\0".as_ptr() as *const u8);
 
 
         // === ВКЛЮЧАЕМ ТАЙМЕР И ПРЕРЫВАНИЯ ТОЛЬКО В КОНЦЕ ===

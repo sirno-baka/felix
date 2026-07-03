@@ -270,7 +270,7 @@ fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usize) -
 
     let buf = &kernel_buf[..];
 
-    println!("KERNEL WRITE: fd={} ptr={:p} ptr_usr={:p} len={} task={} {:02x?}", fd, buf_ptr, src_ptr, count, current_slot, &buf[0..buf.len().min(32)]);
+    // println!("KERNEL WRITE: fd={} ptr={:p} ptr_usr={:p} len={} task={} {:02x?}", fd, buf_ptr, src_ptr, count, current_slot, &buf[0..buf.len().min(32)]);
 
 
 
@@ -363,8 +363,10 @@ pub fn sys_execve(path_ptr: *const u8) -> usize {
     let slot = slot_i8 as usize;
 
     const APP_TARGET: u32 = 0x40000000;
-    const APP_SIZE: u32 = 4 * 1024 * 1024;        // 1 МБ для начала
-    let target = APP_TARGET + (slot as u32 * APP_SIZE);
+    const APP_SIZE: u32 = 4 * 1024 * 1024;
+    // Каждая задача имеет собственный page directory — все приложения
+    // грузятся по одному виртуальному адресу (== линковому адресу ELF).
+    let target = APP_TARGET;
     let user_stack_top = target + APP_SIZE - 0x8000;
     let heap_start = 0x80000000 + (slot as u32 * 0x10000000);
 
