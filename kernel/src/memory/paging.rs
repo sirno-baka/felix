@@ -377,12 +377,17 @@ impl PageDirectory {
             }
         }
 
-        // Всегда выделяем новый фрейм и ставим PTE
-        let phys_frame = self.alloc_frame();
-
         let pde = self.entries[pd_idx];
         let pt_phys = (pde >> 12) << 12;
         let pt_virt = pt_phys as *mut [u32; ENTRIES];
+
+        // Если страница уже смаплена — не трогаем (не теряем данные!).
+        let existing_pte = unsafe { (*pt_virt)[pt_idx] };
+        if existing_pte & PTEFlags::PRESENT != 0 {
+            return;
+        }
+
+        let phys_frame = self.alloc_frame();
 
         unsafe {
             (*pt_virt)[pt_idx] = (phys_frame << 12)

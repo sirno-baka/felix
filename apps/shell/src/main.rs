@@ -22,7 +22,6 @@ pub extern "C" fn _start() {
         if line.trim().is_empty() {
             continue;
         }
-
         interpret(line);
     }
 }
@@ -47,7 +46,7 @@ fn read_line() -> String {
             0x08 | 0x7f => { // backspace
                 if !buf.is_empty() {
                     buf.pop();
-                    print!("\x08 \x08");
+                    print!("\x08\x08");
                 }
             }
             c if c.is_ascii_graphic() || c == b' ' => {
@@ -144,9 +143,26 @@ fn print_help() {
     );
 }
 
-fn ls(_path: &str) {
-    // TODO: добавить syscall SYS_LS позже
-    println!("ls not fully implemented yet");
+fn ls(path: &str) {
+    let mut path_buf = String::from(path);
+    if path_buf.is_empty() {
+        path_buf.push('/');
+    }
+    path_buf.push('\0');
+
+    let mut buf = [0u8; 4096];
+    let n = unsafe { syscall::ls(path_buf.as_ptr() as *const u8, buf.as_mut_ptr(), buf.len()) };
+    if n == 0 {
+        println!("ls: cannot read directory");
+        return;
+    }
+
+    let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    for entry in text.lines() {
+        if !entry.is_empty() {
+            println!("{}", entry);
+        }
+    }
 }
 
 fn cat(filename: &str) {

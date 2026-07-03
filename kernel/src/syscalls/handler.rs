@@ -1,4 +1,5 @@
 use crate::drivers::pic::PICS;
+use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::multitasking::task::{CPUState, Task, TASK_MANAGER};
 use crate::{print, println};
 use crate::memory::allocator::ALLOCATOR;
@@ -71,6 +72,7 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         crate::syscalls::SYS_RMDIR  => sys_rmdir(state.ebx as *const u8),
         crate::syscalls::SYS_UNLINK => sys_unlink(state.ebx as *const u8),
         crate::syscalls::SYS_EXECVE => sys_execve(state.ebx as *const u8),
+        crate::syscalls::SYS_LS => sys_ls(state.ebx as *const u8, state.ecx as *mut u8, state.edx as usize),
         // === Memory ===
         crate::syscalls::SYS_MALLOC => {
             let size = state.ebx as usize;
@@ -112,7 +114,6 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                     }
 
                     task.heap_next = start + size as u32;
-                    println!("[MALLOC RET] task={} returning=0x{:x}", current_slot, start);
                     start as usize
                 }
             }
@@ -159,8 +160,6 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                     }
 
                     task.heap_next = new_start + new_size as u32;
-                    println!("[REALLOC RET] task={} old_ptr={:#x} old_size={} new_size={} returning={:#x}",
-                             current_slot, old_ptr, old_size, new_size, new_start);
                     new_start as usize
                 }
             }
@@ -225,11 +224,10 @@ fn sys_open(current_slot: usize, path_ptr: *const u8, _flags: usize) -> usize {
 }
 
 fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) -> usize {
-    let real_buf_ptr = if (buf_ptr as u32) < 0x40000000 {
-        (buf_ptr as u32 + 0x40000000) as *mut u8
-    } else {
-        buf_ptr
-    };
+    // fd 0 = stdin — читаем из буфера клавиатуры (блокирующий ввод)
+    if fd == 0 {
+        return sys_read_stdin(buf_ptr, count);
+    }
 
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
@@ -240,7 +238,7 @@ fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) -> u
                 let bytes = VFS.get().read_at(desc.inode, desc.offset, &mut temp);
 
                 if bytes > 0 {
-                    core::ptr::copy_nonoverlapping(temp.as_ptr(), real_buf_ptr, bytes);
+                    core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr, bytes);
                     desc.offset += bytes as u64;
                 }
                 return bytes;
@@ -250,22 +248,56 @@ fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) -> u
     0
 }
 
+/// Блокирующее чтение из stdin (буфер клавиатуры).
+///
+/// Сигналы `sti` чтобы прерывания клавиатуры (IRQ1) и таймера (IRQ0)
+/// могли срабатывать. Когда буфер пуст, `hlt` усыпляет CPU до следующего
+/// прерывания. KMutex буфера сам делает `cli`/`sti` при lock/unlock,
+/// поэтому гонки между чтением и обработчиком клавиатуры нет.
+fn sys_read_stdin(buf_ptr: *mut u8, count: usize) -> usize {
+    let mut read = 0;
+
+    // Включаем прерывания — обработчик клавиатуры сможет наполнять буфер
+    unsafe { asm!("sti"); }
+
+    while read < count {
+        let byte = {
+            // KMutex: lock → cli, drop → sti
+            let mut guard = KEYBOARD_BUFFER.lock();
+            match &mut *guard {
+                Some(b) if !b.is_empty() => Some(b.pop()),
+                _ => None,
+            }
+        };
+
+        match byte {
+            Some(b) => {
+                unsafe { *buf_ptr.add(read) = b; }
+                read += 1;
+            }
+            None => {
+                // Буфер пуст — спим до следующего прерывания
+                unsafe { asm!("hlt"); }
+            }
+        }
+    }
+
+    // Восстанавливаем состояние (syscall entry сделал cli)
+    unsafe { asm!("cli"); }
+    read
+}
+
 fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usize) -> usize {
     if count == 0 {
         return 0;
     }
 
     let mut kernel_buf = alloc::vec![0u8; count];
-    let user_addr = buf_ptr as u32;
-    let src_ptr = if user_addr >= 0x20000000 {
-        buf_ptr as *const u8
-    } else {
-        (user_addr.wrapping_add(0x40000000)) as *const u8
-    };
 
-
+    // Адреса пользовательских буферов всегда доступны через PD задачи
+    // (таск PD активен во время syscall). Трансляция не нужна.
     unsafe {
-        core::ptr::copy_nonoverlapping(src_ptr, kernel_buf.as_mut_ptr(), count);
+        core::ptr::copy_nonoverlapping(buf_ptr, kernel_buf.as_mut_ptr(), count);
     }
 
     let buf = &kernel_buf[..];
@@ -277,7 +309,7 @@ fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usize) -
     // ====================== STDOUT / STDERR ======================
     if fd == 0 || fd == 1 {
         match core::str::from_utf8(buf) {
-            Ok(v) => println!("{}", v),
+            Ok(v) => print!("{}", v),
             Err(_) => {
                 println!("[write] invalid utf8! addr={:p} len={} first 32 bytes: {:02x?}",
                          buf_ptr, count, &buf[0..buf.len().min(32)]);
@@ -329,6 +361,44 @@ fn sys_unlink(path_ptr: *const u8) -> usize {
     let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
     let success = VFS.get().remove_file(path);
     if success { 0 } else { usize::MAX }
+}
+
+/// Читает содержимое директории и записывает имена файлов
+/// (разделённые '\n') в пользовательский буфер.
+/// Возвращает количество записанных байт или 0 при ошибке.
+fn sys_ls(path_ptr: *const u8, buf_ptr: *mut u8, buf_size: usize) -> usize {
+    let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("/") };
+    let path = if path.is_empty() { "/" } else { path };
+
+    let entries = match VFS.get().list_directory_entries(path) {
+        Some(e) => e,
+        None => return 0,
+    };
+
+    // Сериализуем: "name\nname\n..." + помечаем директории символом '/'
+    let mut pos = 0usize;
+    for entry in &entries {
+        let name = entry.name.as_bytes();
+        let is_dir = entry.file_type == 2;
+        let entry_len = name.len() + if is_dir { 1 } else { 0 } + 1; // +1 for '\n'
+
+        if pos + entry_len > buf_size {
+            break;
+        }
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(name.as_ptr(), buf_ptr.add(pos), name.len());
+            pos += name.len();
+            if is_dir {
+                *buf_ptr.add(pos) = b'/';
+                pos += 1;
+            }
+            *buf_ptr.add(pos) = b'\n';
+            pos += 1;
+        }
+    }
+
+    pos
 }
 
 // ====================== EXECVE ======================

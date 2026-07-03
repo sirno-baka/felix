@@ -1,19 +1,23 @@
 use core::arch::asm;
 
+// Должны совпадать с kernel/src/syscalls/mod.rs
 pub const SYS_EXIT:   u32 = 1;
-pub const SYS_OPEN:   u32 = 2;
 pub const SYS_READ:   u32 = 3;
 pub const SYS_WRITE:  u32 = 4;
-pub const SYS_CLOSE:  u32 = 5;
+pub const SYS_OPEN:   u32 = 5;
+pub const SYS_CLOSE:  u32 = 6;
 
-pub const SYS_MKDIR:  u32 = 10;
-pub const SYS_RMDIR:  u32 = 11;
-pub const SYS_UNLINK: u32 = 12;
-pub const SYS_EXECVE: u32 = 13;
+pub const SYS_MKDIR:  u32 = 7;
+pub const SYS_RMDIR:  u32 = 8;
+pub const SYS_UNLINK: u32 = 10;
+pub const SYS_EXECVE: u32 = 11;
 
 pub const SYS_MALLOC: u32 = 200;
 pub const SYS_FREE:   u32 = 201;
 pub const SYS_REALLOC: u32 = 202;
+
+pub const SYS_LS:     u32 = 302;
+
 // ====================== WRAPPERS ======================
 
 pub unsafe fn exit() -> ! {
@@ -108,6 +112,22 @@ pub unsafe fn execve(path: *const u8) -> usize {
     "int 0x80",
     inlateout("eax") SYS_EXECVE => ret,
     in("ebx") path,
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+/// Читает содержимое директории.
+/// Записывает имена файлов (разделённые '\n') в `buf`.
+/// Возвращает количество записанных байт или 0 при ошибке.
+pub unsafe fn ls(path: *const u8, buf: *mut u8, buf_size: usize) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_LS => ret,
+    in("ebx") path,
+    in("ecx") buf,
+    in("edx") buf_size,
     options(nostack, preserves_flags)
     );
     ret

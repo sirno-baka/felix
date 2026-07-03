@@ -1,6 +1,6 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::asm;
-use crate::syscall::{write, SYS_MALLOC};
+use crate::syscall::SYS_MALLOC;
 
 pub struct SyscallAllocator;
 
@@ -20,20 +20,11 @@ unsafe impl GlobalAlloc for SyscallAllocator {
         ret as *mut u8
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let size = layout.size() as u32;
-        let align = layout.align() as u32;
-
-        core::arch::asm!(
-        "int 0x80",
-        in("eax") 201,                 // SYS_FREE = 201
-        in("ebx") ptr as u32,
-        in("ecx") size,
-        in("edx") align,
-        options(nostack, preserves_flags)
-        );
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+        // No-op: bump-аллокатор ядра не переиспользует память.
+        // Размапливание страниц здесь ломает соседние выделения на той же странице.
     }
-    // ←←← НОВОЕ
+
     unsafe fn realloc(
         &self,
         ptr: *mut u8,
@@ -45,11 +36,10 @@ unsafe impl GlobalAlloc for SyscallAllocator {
         }
         if new_size == 0 {
             self.dealloc(ptr, layout);
-            return self.alloc(Layout::from_size_align_unchecked(1, layout.align()));
+            return core::ptr::null_mut();
         }
 
         let old_size = layout.size();
-        let align = layout.align();
 
         let ret: usize;
         asm!(
@@ -60,13 +50,10 @@ unsafe impl GlobalAlloc for SyscallAllocator {
         in("edx") new_size,
         options(nostack, preserves_flags)
         );
-        let new_ptr = ret as *mut u8;
-
-        let copy_len = old_size.min(new_size);
-        core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_len);
-        self.dealloc(ptr, layout);
-
-        new_ptr
+        // Ядро уже копирует старые данные в новый блок.
+        // Не вызываем dealloc — старая память на той же странице
+        // может содержать новое выделение.
+        ret as *mut u8
     }
 }
 #[global_allocator]
