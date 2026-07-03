@@ -4,6 +4,7 @@
 #![feature(pointer_byte_offsets)]
 #![feature(unsize)]
 #![feature(coerce_unsized)]
+#![feature(inline_const)]
 extern crate alloc;
 
 mod drivers;

@@ -1,5 +1,6 @@
 //TASK MANAGER
 
+use alloc::vec::Vec;
 use core::arch::asm;
 use core::u32::MAX;
 use crate::filesystem::file::FileDescriptorTable;
@@ -11,8 +12,50 @@ pub const STACK_SIZE: usize = 32 * 1024;
 pub const HEADROOM: usize = 16 * 1024;
 const MAX_TASKS: i8 = 8;
 
+/// Отслеживает сколько выделений памяти используют каждую страницу.
+/// Страница размапливается только когда счётчик достигает 0.
+#[derive(Clone)]
+pub struct PageRefcounts {
+    entries: Vec<(u32, u32)>, // (page_addr, refcount)
+}
+
+impl PageRefcounts {
+    pub const fn new() -> Self {
+        PageRefcounts { entries: Vec::new() }
+    }
+
+    /// Увеличивает счётчик для страницы. Возвращает true если страница
+    /// была новой (нужно смапить).
+    pub fn inc(&mut self, page_addr: u32) -> bool {
+        for (addr, count) in &mut self.entries {
+            if *addr == page_addr {
+                *count += 1;
+                return false;
+            }
+        }
+        self.entries.push((page_addr, 1));
+        true
+    }
+
+    /// Уменьшает счётчик для страницы. Возвращает true если страница
+    /// больше не используется (можно размапить).
+    pub fn dec(&mut self, page_addr: u32) -> bool {
+        for i in 0..self.entries.len() {
+            if self.entries[i].0 == page_addr {
+                self.entries[i].1 -= 1;
+                if self.entries[i].1 == 0 {
+                    self.entries.swap_remove(i);
+                    return true;
+                }
+                return false;
+            }
+        }
+        false
+    }
+}
+
 //each task has a 4KiB stack containg the cpu state in the bottom part of it
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub struct Task {
     pub stack: [u8; STACK_SIZE],
     pub page_dir: PageDirectory,
@@ -21,6 +64,7 @@ pub struct Task {
     pub kernel_stack: u32,
     pub fd_table: FileDescriptorTable,
     pub heap_next: u32,
+    pub page_refcounts: PageRefcounts,
 }
 
 
@@ -58,6 +102,7 @@ impl Task {
             fd_table: FileDescriptorTable::new(),
             kernel_stack: 0,
             heap_next: 0,
+            page_refcounts: PageRefcounts::new(),
         }
     }
 
@@ -70,6 +115,7 @@ impl Task {
             fd_table: FileDescriptorTable::new(),
             kernel_stack: 0,
             heap_next: 0,
+            page_refcounts: PageRefcounts::new(),
         }
     }
     // ====================== Task::init ======================
@@ -120,11 +166,15 @@ pub struct TaskManager {
 }
 
 pub static mut TASK_MANAGER: TaskManager = TaskManager {
-    tasks: [None; MAX_TASKS as usize],
+    tasks: init_tasks_array(),
     task_count: 0,
     current_task: -1,
     first_switch: true,
 };
+
+const fn init_tasks_array() -> [Option<Task>; MAX_TASKS as usize] {
+    [const { None }; MAX_TASKS as usize]
+}
 
 impl TaskManager {
     pub fn init(&mut self) {

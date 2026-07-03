@@ -79,13 +79,6 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
             let align = state.ecx as usize;
 
             let current_slot = unsafe { TASK_MANAGER.get_current_slot() } as usize;
-            // unsafe {
-            //     println!("[MALLOC] task={} size={} align={} heap_next_before=0x{:x}",
-            //              current_slot, size, align,
-            //              if let Some(t) = TASK_MANAGER.tasks.get(current_slot) {
-            //                  t.as_ref().map_or(0, |tt| tt.heap_next)
-            //              } else { 0 });
-            // }
             if current_slot == 0 || current_slot >= 8 {
                 0
             } else {
@@ -107,7 +100,10 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
 
                         let mut addr = start_page;
                         while addr < end_page {
-                            task.page_dir.alloc_and_map_user_page(addr);
+                            let need_map = task.page_refcounts.inc(addr);
+                            if need_map {
+                                task.page_dir.alloc_and_map_user_page(addr);
+                            }
                             addr += page_size;
                         }
                         core::ptr::write_bytes(start as *mut u8, 0, size);
@@ -131,6 +127,7 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                 unsafe {
                     let task = TASK_MANAGER.tasks[current_slot].as_mut().unwrap();
 
+                    // Аллоцируем новый блок
                     let mut new_start = task.heap_next;
                     let align_mask = 7u32;
                     new_start = (new_start + align_mask) & !align_mask;
@@ -143,7 +140,10 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
 
                         let mut addr = start_page;
                         while addr < end_page {
-                            task.page_dir.alloc_and_map_user_page(addr);
+                            let need_map = task.page_refcounts.inc(addr);
+                            if need_map {
+                                task.page_dir.alloc_and_map_user_page(addr);
+                            }
                             addr += page_size;
                         }
 
@@ -160,6 +160,24 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                     }
 
                     task.heap_next = new_start + new_size as u32;
+
+                    // Освобождаем старый блок
+                    if old_ptr != 0 && old_size > 0 {
+                        let page_size = crate::memory::paging::PAGE_SIZE as u32;
+                        let old_start_page = old_ptr & !(page_size - 1);
+                        let old_end = old_ptr + old_size as u32;
+                        let old_end_page = (old_end + page_size - 1) & !(page_size - 1);
+
+                        let mut addr = old_start_page;
+                        while addr < old_end_page {
+                            let should_unmap = task.page_refcounts.dec(addr);
+                            if should_unmap {
+                                task.page_dir.unmap(addr);
+                            }
+                            addr += page_size;
+                        }
+                    }
+
                     new_start as usize
                 }
             }
@@ -176,14 +194,21 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                 0
             } else {
                 unsafe {
-                    let pages = (size + 4095) / 4096;
-                    for i in 0..pages {
-                        let virt_addr = ptr + i * 4096;
-                        if let Some(ref mut task) = TASK_MANAGER.tasks[current_slot] {
-                            task.page_dir.unmap(virt_addr);
+                    let page_size = crate::memory::paging::PAGE_SIZE as u32;
+                    let start_page = ptr & !(page_size - 1);
+                    let end = ptr + size;
+                    let end_page = (end + page_size - 1) & !(page_size - 1);
+
+                    if let Some(ref mut task) = TASK_MANAGER.tasks[current_slot] {
+                        let mut addr = start_page;
+                        while addr < end_page {
+                            let should_unmap = task.page_refcounts.dec(addr);
+                            if should_unmap {
+                                task.page_dir.unmap(addr);
+                            }
+                            addr += page_size;
                         }
                     }
-                    // println!("free: 0x{:x} ({} bytes) task={}", ptr, size, current_slot);
                 }
                 0
             }

@@ -1,6 +1,6 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::asm;
-use crate::syscall::SYS_MALLOC;
+use crate::syscall::{SYS_MALLOC, SYS_FREE, SYS_REALLOC};
 
 pub struct SyscallAllocator;
 
@@ -20,9 +20,21 @@ unsafe impl GlobalAlloc for SyscallAllocator {
         ret as *mut u8
     }
 
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // No-op: bump-аллокатор ядра не переиспользует память.
-        // Размапливание страниц здесь ломает соседние выделения на той же странице.
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if ptr.is_null() {
+            return;
+        }
+        let size = layout.size() as u32;
+        let align = layout.align() as u32;
+
+        asm!(
+        "int 0x80",
+        in("eax") SYS_FREE,
+        in("ebx") ptr as u32,
+        in("ecx") size,
+        in("edx") align,
+        options(nostack, preserves_flags)
+        );
     }
 
     unsafe fn realloc(
@@ -44,15 +56,13 @@ unsafe impl GlobalAlloc for SyscallAllocator {
         let ret: usize;
         asm!(
         "int 0x80",
-        inlateout("eax") crate::syscall::SYS_REALLOC => ret,
+        inlateout("eax") SYS_REALLOC => ret,
         in("ebx") ptr as u32,
         in("ecx") old_size as u32,
         in("edx") new_size,
         options(nostack, preserves_flags)
         );
-        // Ядро уже копирует старые данные в новый блок.
-        // Не вызываем dealloc — старая память на той же странице
-        // может содержать новое выделение.
+        // Ядро копирует данные и освобождает старые страницы (с refcounting).
         ret as *mut u8
     }
 }
