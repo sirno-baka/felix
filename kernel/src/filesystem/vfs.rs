@@ -7,9 +7,17 @@ use core::arch::asm;
 use interrupt_sync::{InterruptLazy};
 use crate::drivers::disk::Disk;
 use crate::println;
-use crate::filesystem::ext2::{DirEntry, Ext2, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Inode, Ext2SuperBlock};
+use crate::filesystem::ext2::{ Ext2, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Inode, Ext2SuperBlock};
 use crate::sync::mutex::Mutex;
 use crate::sync::MutexLazy;
+
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub inode: u32,
+    pub name: String,
+    pub file_type: u8,     // 1 = regular file, 2 = directory, etc.
+    pub size: u32,         // размер файла (0 для директорий)
+}
 
 pub trait Filesystem: Send + Sync {
     fn read_file(&self, path: &str) -> Option<Vec<u8>>;
@@ -23,11 +31,9 @@ pub trait Filesystem: Send + Sync {
     fn read_at(&self, inode: u32, offset: u64, buf: &mut [u8]) -> usize;
     fn write_at(&mut self, inode: u32, offset: u64, buf: &[u8]) -> usize;
     fn is_mounted(&self) -> bool;
-    /// Форматирует раздел как пустую ext2-файзовую систему
-    /// total_sectors — размер раздела в 512-байтных секторах
-    /// block_size — размер блока (1024, 2048 или 4096)
-    fn format(disk: &mut Disk, partition_offset: u64, total_sectors: u64, block_size: u32) -> Self;
+
 }
+
 
 pub struct Vfs {
     inner: Mutex<VfsInner>,

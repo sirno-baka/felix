@@ -5,17 +5,7 @@ use alloc::vec::Vec;
 use core::mem;
 use crate::drivers::disk::{Disk, PartitionConfig};
 use crate::{print, println};
-
-
-#[derive(Debug, Clone)]
-pub struct DirEntry {
-    pub inode: u32,
-    pub name: String,
-    pub file_type: u8,     // 1 = regular file, 2 = directory, etc.
-    pub size: u32,         // размер файла (0 для директорий)
-}
-
-
+use crate::filesystem::vfs::DirEntry;
 // ====================== ОСНОВНЫЕ СТРУКТУРЫ EXT2 ======================
 
 #[repr(C, packed)]
@@ -1446,52 +1436,325 @@ impl crate::filesystem::Filesystem for Ext2 {
 
     /// Форматирует раздел как пустую ext2-файловую систему
     /// Возвращает готовый к использованию экземпляр Ext2
-    fn format(disk: &mut Disk, partition_offset: u64, total_sectors: u64, block_size: u32) -> Self {
+    // fn format(disk: &mut Disk, partition_offset: u64, total_sectors: u64, block_size: u32) -> Self {
+    //     let sectors_per_block = block_size / 512;
+    //     let total_blocks = (total_sectors / sectors_per_block as u64) as u32;
+    //
+    //     if total_blocks < 10 {
+    //         println!("[EXT2 FORMAT] Раздел слишком маленький!");
+    //         panic!("Partition too small for ext2");
+    //     }
+    //
+    //     // Параметры одной block group (упрощённо — поддерживаем только group 0)
+    //     let blocks_per_group = total_blocks; // для простоты всё в одной группе
+    //     let inodes_per_group = core::cmp::min((total_blocks / 4) as u32, 8192); // ~1 inode на 4 блока
+    //     let inodes_per_group = core::cmp::max(inodes_per_group, 32);
+    //
+    //     let first_data_block = if block_size == 1024 { 1u32 } else { 0u32 };
+    //
+    //     // Размер структур
+    //     let bgd_size = core::mem::size_of::<Ext2BlockGroupDescriptor>();
+    //     let bgd_blocks = ((bgd_size + block_size as usize - 1) / block_size as usize) as u32;
+    //
+    //     let inode_size = 128u64; // стандарт для rev 0/1
+    //     let inode_table_blocks = (((inodes_per_group as u64 * inode_size) + block_size as u64 - 1) / block_size as u64) as u32;
+    //
+    //     // Layout block group 0
+    //     let superblock_block = if block_size == 1024 { 1 } else { 0 };
+    //     let bgd_table_block = superblock_block + 1;           // обычно сразу после superblock
+    //     let block_bitmap_block = bgd_table_block + bgd_blocks;
+    //     let inode_bitmap_block = block_bitmap_block + 1;
+    //     let inode_table_block = inode_bitmap_block + 1;
+    //     let first_free_block = inode_table_block + inode_table_blocks;
+    //
+    //     println!("[EXT2 FORMAT] block_size={}, total_blocks={}, inodes={}",
+    //              block_size, total_blocks, inodes_per_group);
+    //     println!("[EXT2 FORMAT] inode_table_blocks={}, first_free_block={}",
+    //              inode_table_blocks, first_free_block);
+    //
+    //     // ====================== 1. SUPERBLOCK ======================
+    //     let mut sb = Ext2SuperBlock {
+    //         s_inodes_count: inodes_per_group,
+    //         s_blocks_count: total_blocks,
+    //         s_r_blocks_count: 0,
+    //         s_free_blocks_count: total_blocks.saturating_sub(first_free_block + 1), // +1 для root block
+    //         s_free_inodes_count: inodes_per_group.saturating_sub(12), // 0-11 reserved + root
+    //         s_first_data_block: first_data_block,
+    //         s_log_block_size: match block_size { 1024 => 0, 2048 => 1, 4096 => 2, _ => 0 },
+    //         s_log_frag_size: match block_size { 1024 => 0, 2048 => 1, 4096 => 2, _ => 0 },
+    //         s_blocks_per_group: blocks_per_group,
+    //         s_frags_per_group: blocks_per_group,
+    //         s_inodes_per_group: inodes_per_group,
+    //         s_mtime: 0,
+    //         s_wtime: 0,
+    //         s_mnt_count: 0,
+    //         s_max_mnt_count: 0xFFFF,
+    //         s_magic: EXT2_MAGIC,
+    //         s_state: 1, // EXT2_VALID_FS
+    //         s_errors: 1,
+    //         s_minor_rev_level: 0,
+    //         s_lastcheck: 0,
+    //         s_checkinterval: 0,
+    //         s_creator_os: 0,
+    //         s_rev_level: 0,
+    //         s_def_resuid: 0,
+    //         s_def_resgid: 0,
+    //         s_first_ino: 11,
+    //         s_inode_size: 128,
+    //         s_block_group_nr: 0,
+    //         s_feature_compat: 0,
+    //         s_feature_incompat: 0,
+    //         s_feature_ro_compat: 0,
+    //         s_uuid: [0; 16],
+    //         s_volume_name: [0; 16],
+    //         _padding: [0; 896],
+    //     };
+    //
+    //     let name = b"RustOS\0";
+    //     sb.s_volume_name[..name.len()].copy_from_slice(name);
+    //
+    //     unsafe {
+    //         let sb_ptr = &sb as *const Ext2SuperBlock as *const u8;
+    //         disk.write(sb_ptr as *const u32, partition_offset + 2, 2); // superblock всегда по LBA+2
+    //     }
+    //     println!("[EXT2 FORMAT] Superblock written");
+    //
+    //     // ====================== 2. BLOCK GROUP DESCRIPTOR ======================
+    //     let bgd = Ext2BlockGroupDescriptor {
+    //         bg_block_bitmap: block_bitmap_block,
+    //         bg_inode_bitmap: inode_bitmap_block,
+    //         bg_inode_table: inode_table_block,
+    //         bg_free_blocks_count: (total_blocks.saturating_sub(first_free_block + 1)) as u16,
+    //         bg_free_inodes_count: (inodes_per_group.saturating_sub(12)) as u16,
+    //         bg_used_dirs_count: 1,
+    //         bg_pad: 0,
+    //         _reserved: [0; 12],
+    //     };
+    //
+    //     unsafe {
+    //         let bgd_ptr = &bgd as *const Ext2BlockGroupDescriptor as *const u8;
+    //         let bgd_lba = partition_offset + (bgd_table_block as u64 * sectors_per_block as u64);
+    //         let bgd_sectors = ((bgd_size + 511) / 512) as u16;
+    //         disk.write(bgd_ptr as *const u32, bgd_lba, bgd_sectors);
+    //     }
+    //     println!("[EXT2 FORMAT] Block Group Descriptor written");
+    //
+    //     // ====================== 3. BLOCK BITMAP ======================
+    //     let mut block_bitmap = [0u8; 4096];
+    //     // Помечаем все метаданные как занятые
+    //     for i in 0..first_free_block {
+    //         let byte = (i / 8) as usize;
+    //         let bit = (i % 8) as usize;
+    //         if byte < block_bitmap.len() {
+    //             block_bitmap[byte] |= 1 << bit;
+    //         }
+    //     }
+    //     // Блоки за пределами FS тоже заняты
+    //     for i in total_blocks..blocks_per_group.min(block_bitmap.len() as u32 * 8) {
+    //         let byte = (i / 8) as usize;
+    //         let bit = (i % 8) as usize;
+    //         if byte < block_bitmap.len() {
+    //             block_bitmap[byte] |= 1 << bit;
+    //         }
+    //     }
+    //
+    //     unsafe {
+    //         let lba = partition_offset + (block_bitmap_block as u64 * sectors_per_block as u64);
+    //         disk.write(block_bitmap.as_ptr() as *const u32, lba, sectors_per_block as u16);
+    //     }
+    //     println!("[EXT2 FORMAT] Block bitmap written");
+    //
+    //     // ====================== 4. INODE BITMAP ======================
+    //     let mut inode_bitmap = [0u8; 4096];
+    //     for i in 0..12 { // reserved + root
+    //         let byte = (i / 8) as usize;
+    //         let bit = (i % 8) as usize;
+    //         inode_bitmap[byte] |= 1 << bit;
+    //     }
+    //
+    //     unsafe {
+    //         let lba = partition_offset + (inode_bitmap_block as u64 * sectors_per_block as u64);
+    //         disk.write(inode_bitmap.as_ptr() as *const u32, lba, sectors_per_block as u16);
+    //     }
+    //     println!("[EXT2 FORMAT] Inode bitmap written");
+    //
+    //     // ====================== 5. INODE TABLE (zero) ======================
+    //     let zeros = [0u8; 4096];
+    //     unsafe {
+    //         let start_lba = partition_offset + (inode_table_block as u64 * sectors_per_block as u64);
+    //         for i in 0..inode_table_blocks {
+    //             let lba = start_lba + (i as u64 * sectors_per_block as u64);
+    //             disk.write(zeros.as_ptr() as *const u32, lba, sectors_per_block as u16);
+    //         }
+    //     }
+    //     println!("[EXT2 FORMAT] Inode table zeroed");
+    //
+    //     // ====================== 6. ROOT DIRECTORY (inode 2) ======================
+    //     let root_block = first_free_block;
+    //     let mut root_inode = Ext2Inode {
+    //         i_mode: 0x4000 | 0o755,
+    //         i_uid: 0,
+    //         i_size: block_size,
+    //         i_atime: 0,
+    //         i_ctime: 0,
+    //         i_mtime: 0,
+    //         i_dtime: 0,
+    //         i_gid: 0,
+    //         i_links_count: 2,
+    //         i_blocks: block_size / 512,
+    //         i_flags: 0,
+    //         i_osd1: 0,
+    //         i_block: [0; 15],
+    //         i_generation: 0,
+    //         i_file_acl: 0,
+    //         i_dir_acl: 0,
+    //         i_faddr: 0,
+    //         i_osd2: [0; 12],
+    //     };
+    //     root_inode.i_block[0] = root_block;
+    //
+    //     // Записываем inode 2
+    //     unsafe {
+    //         let inode_offset_bytes = 2 * 128u64; // inode #2
+    //         let inode_block_offset = (inode_offset_bytes / block_size as u64) as u64;
+    //         let inode_byte_in_block = (inode_offset_bytes % block_size as u64) as u64;
+    //
+    //         let inode_lba = partition_offset
+    //             + (inode_table_block as u64 + inode_block_offset) * sectors_per_block as u64
+    //             + (inode_byte_in_block / 512);
+    //
+    //         let inode_ptr = &root_inode as *const Ext2Inode as *const u8;
+    //         disk.write(inode_ptr as *const u32, inode_lba, 1);
+    //     }
+    //
+    //     // Записываем содержимое root directory
+    //     let mut dir_block_buf = [0u8; 4096];
+    //
+    //     // "."
+    //     let dot = Ext2DirEntry { inode: 2, rec_len: 12, name_len: 1, file_type: 2 };
+    //     unsafe {
+    //         core::ptr::write_unaligned(dir_block_buf.as_mut_ptr() as *mut Ext2DirEntry, dot);
+    //     }
+    //     dir_block_buf[8] = b'.';
+    //
+    //     // ".."
+    //     let dotdot = Ext2DirEntry {
+    //         inode: 2,
+    //         rec_len: (block_size - 12) as u16,
+    //         name_len: 2,
+    //         file_type: 2
+    //     };
+    //     unsafe {
+    //         core::ptr::write_unaligned(dir_block_buf.as_mut_ptr().add(12) as *mut Ext2DirEntry, dotdot);
+    //     }
+    //     dir_block_buf[20] = b'.';
+    //     dir_block_buf[21] = b'.';
+    //
+    //     unsafe {
+    //         let dir_lba = partition_offset + (root_block as u64 * sectors_per_block as u64);
+    //         disk.write(dir_block_buf.as_ptr() as *const u32, dir_lba, sectors_per_block as u16);
+    //     }
+    //
+    //     println!("[EXT2 FORMAT] Root directory (inode 2, block {}) created", root_block);
+    //
+    //     // ====================== 7. Возвращаем FS ======================
+    //     let mut fs = Ext2 {
+    //         superblock: sb,
+    //         block_size,
+    //         mounted: true,
+    //         disk,
+    //         partition_offset,
+    //     };
+    //
+    //     fs.superblock.s_free_blocks_count = total_blocks.saturating_sub(first_free_block + 1);
+    //     println!("[EXT2 FORMAT] ✅ Форматирование завершено! Free blocks: {}, Free inodes: {}",
+    //              fs.superblock.s_free_blocks_count, fs.superblock.s_free_inodes_count);
+    //
+    //     fs
+    // }
+
+    fn write_at(&mut self, _inode: u32, _offset: u64, _buf: &[u8]) -> usize {
+        // Пока заглушка. Полноценная запись требует аллокации блоков.
+        println!("[EXT2] write_at пока не реализована");
+        0
+    }
+}
+
+
+
+// ====================== ФОРМАТИРОВАНИЕ ======================
+
+impl Ext2 {
+    /// Создаёт и форматирует новую ext2 ФС на указанном разделе
+    /// Форматирует раздел как чистую ext2-файловую систему.
+    ///
+    /// # Параметры
+    /// - `disk` — диск
+    /// - `partition_offset` — LBA начала раздела
+    /// - `total_sectors` — размер раздела в секторах (512 байт)
+    /// - `block_size` — 1024, 2048 или 4096
+    pub fn format(
+        disk: &'static mut Disk,
+        partition_offset: u64,
+        total_sectors: u64,
+        block_size: u32,
+    ) -> Self {
+        assert!(matches!(block_size, 1024 | 2048 | 4096), "block_size must be 1024, 2048 or 4096");
+
         let sectors_per_block = block_size / 512;
         let total_blocks = (total_sectors / sectors_per_block as u64) as u32;
 
-        if total_blocks < 10 {
-            println!("[EXT2 FORMAT] Раздел слишком маленький!");
+        if total_blocks < 32 {
+            println!("[EXT2 FORMAT] Ошибка: раздел слишком маленький (нужно минимум ~128 КБ)");
             panic!("Partition too small for ext2");
         }
 
-        // Параметры одной block group (упрощённо — поддерживаем только group 0)
-        let blocks_per_group = total_blocks; // для простоты всё в одной группе
-        let inodes_per_group = core::cmp::min((total_blocks / 4) as u32, 8192); // ~1 inode на 4 блока
-        let inodes_per_group = core::cmp::max(inodes_per_group, 32);
+        // ====================== Параметры ======================
+        let blocks_per_group = total_blocks; // одна block group для простоты
+        let inodes_per_group = core::cmp::min((total_blocks / 4).max(64), 16384);
 
         let first_data_block = if block_size == 1024 { 1u32 } else { 0u32 };
 
-        // Размер структур
-        let bgd_size = core::mem::size_of::<Ext2BlockGroupDescriptor>();
-        let bgd_blocks = ((bgd_size + block_size as usize - 1) / block_size as usize) as u32;
+        let bgd_size = core::mem::size_of::<Ext2BlockGroupDescriptor>() as u32;
+        let bgd_blocks = (bgd_size + block_size - 1) / block_size;
 
-        let inode_size = 128u64; // стандарт для rev 0/1
-        let inode_table_blocks = (((inodes_per_group as u64 * inode_size) + block_size as u64 - 1) / block_size as u64) as u32;
+        let inode_table_blocks =
+            ((inodes_per_group as u64 * 128 + block_size as u64 - 1) / block_size as u64) as u32;
 
-        // Layout block group 0
-        let superblock_block = if block_size == 1024 { 1 } else { 0 };
-        let bgd_table_block = superblock_block + 1;           // обычно сразу после superblock
-        let block_bitmap_block = bgd_table_block + bgd_blocks;
+        // Layout:
+        // block 0 (или 1 при 1K): Superblock
+        // затем: BGD table → Block Bitmap → Inode Bitmap → Inode Table → Data...
+        let block_bitmap_block = first_data_block + 1 + bgd_blocks;
         let inode_bitmap_block = block_bitmap_block + 1;
         let inode_table_block = inode_bitmap_block + 1;
         let first_free_block = inode_table_block + inode_table_blocks;
 
         println!("[EXT2 FORMAT] block_size={}, total_blocks={}, inodes={}",
                  block_size, total_blocks, inodes_per_group);
-        println!("[EXT2 FORMAT] inode_table_blocks={}, first_free_block={}",
-                 inode_table_blocks, first_free_block);
+        let dw = total_blocks.saturating_sub(first_free_block + 1);
+        println!("{}", dw);
+        println!("[EXT2 FORMAT] first_free_block={}", first_free_block);
 
-        // ====================== 1. SUPERBLOCK ======================
+        // ====================== 1. Superblock ======================
         let mut sb = Ext2SuperBlock {
             s_inodes_count: inodes_per_group,
             s_blocks_count: total_blocks,
             s_r_blocks_count: 0,
-            s_free_blocks_count: total_blocks.saturating_sub(first_free_block + 1), // +1 для root block
+            s_free_blocks_count: total_blocks.saturating_sub(first_free_block + 1), // +1 root block
             s_free_inodes_count: inodes_per_group.saturating_sub(12), // 0-11 reserved + root
             s_first_data_block: first_data_block,
-            s_log_block_size: match block_size { 1024 => 0, 2048 => 1, 4096 => 2, _ => 0 },
-            s_log_frag_size: match block_size { 1024 => 0, 2048 => 1, 4096 => 2, _ => 0 },
+            s_log_block_size: match block_size {
+                1024 => 0,
+                2048 => 1,
+                4096 => 2,
+                _ => 0,
+            },
+            s_log_frag_size: match block_size {
+                1024 => 0,
+                2048 => 1,
+                4096 => 2,
+                _ => 0,
+            },
             s_blocks_per_group: blocks_per_group,
             s_frags_per_group: blocks_per_group,
             s_inodes_per_group: inodes_per_group,
@@ -1519,17 +1782,19 @@ impl crate::filesystem::Filesystem for Ext2 {
             s_volume_name: [0; 16],
             _padding: [0; 896],
         };
-
+        println!("1");
         let name = b"RustOS\0";
+        println!("2");
         sb.s_volume_name[..name.len()].copy_from_slice(name);
-
+        println!("3");
+        // Superblock всегда лежит по байтовому смещению 1024
         unsafe {
             let sb_ptr = &sb as *const Ext2SuperBlock as *const u8;
-            disk.write(sb_ptr as *const u32, partition_offset + 2, 2); // superblock всегда по LBA+2
+            disk.write(sb_ptr as *const u32, partition_offset + 2, 2);
         }
         println!("[EXT2 FORMAT] Superblock written");
 
-        // ====================== 2. BLOCK GROUP DESCRIPTOR ======================
+        // ====================== 2. Block Group Descriptor ======================
         let bgd = Ext2BlockGroupDescriptor {
             bg_block_bitmap: block_bitmap_block,
             bg_inode_bitmap: inode_bitmap_block,
@@ -1543,14 +1808,17 @@ impl crate::filesystem::Filesystem for Ext2 {
 
         unsafe {
             let bgd_ptr = &bgd as *const Ext2BlockGroupDescriptor as *const u8;
-            let bgd_lba = partition_offset + (bgd_table_block as u64 * sectors_per_block as u64);
+            // BGD table начинается сразу после superblock
+            let bgd_block = first_data_block + 1;
+            let bgd_lba = partition_offset + (bgd_block as u64 * sectors_per_block as u64);
             let bgd_sectors = ((bgd_size + 511) / 512) as u16;
             disk.write(bgd_ptr as *const u32, bgd_lba, bgd_sectors);
         }
-        println!("[EXT2 FORMAT] Block Group Descriptor written");
+        println!("[EXT2 FORMAT] BGD written");
 
-        // ====================== 3. BLOCK BITMAP ======================
+        // ====================== 3. Block Bitmap ======================
         let mut block_bitmap = [0u8; 4096];
+
         // Помечаем все метаданные как занятые
         for i in 0..first_free_block {
             let byte = (i / 8) as usize;
@@ -1559,8 +1827,9 @@ impl crate::filesystem::Filesystem for Ext2 {
                 block_bitmap[byte] |= 1 << bit;
             }
         }
-        // Блоки за пределами FS тоже заняты
-        for i in total_blocks..blocks_per_group.min(block_bitmap.len() as u32 * 8) {
+
+        // Блоки за пределами ФС тоже заняты
+        for i in total_blocks..(blocks_per_group.min(block_bitmap.len() as u32 * 8)) {
             let byte = (i / 8) as usize;
             let bit = (i % 8) as usize;
             if byte < block_bitmap.len() {
@@ -1574,9 +1843,10 @@ impl crate::filesystem::Filesystem for Ext2 {
         }
         println!("[EXT2 FORMAT] Block bitmap written");
 
-        // ====================== 4. INODE BITMAP ======================
+        // ====================== 4. Inode Bitmap ======================
         let mut inode_bitmap = [0u8; 4096];
-        for i in 0..12 { // reserved + root
+        // inodes 0-11 зарезервированы + inode 2 (root) используется
+        for i in 0..12 {
             let byte = (i / 8) as usize;
             let bit = (i % 8) as usize;
             inode_bitmap[byte] |= 1 << bit;
@@ -1588,7 +1858,7 @@ impl crate::filesystem::Filesystem for Ext2 {
         }
         println!("[EXT2 FORMAT] Inode bitmap written");
 
-        // ====================== 5. INODE TABLE (zero) ======================
+        // ====================== 5. Inode Table (обнуляем) ======================
         let zeros = [0u8; 4096];
         unsafe {
             let start_lba = partition_offset + (inode_table_block as u64 * sectors_per_block as u64);
@@ -1599,10 +1869,11 @@ impl crate::filesystem::Filesystem for Ext2 {
         }
         println!("[EXT2 FORMAT] Inode table zeroed");
 
-        // ====================== 6. ROOT DIRECTORY (inode 2) ======================
+        // ====================== 6. Root Directory (inode 2) ======================
         let root_block = first_free_block;
+
         let mut root_inode = Ext2Inode {
-            i_mode: 0x4000 | 0o755,
+            i_mode: 0x4000 | 0o755, // directory
             i_uid: 0,
             i_size: block_size,
             i_atime: 0,
@@ -1610,7 +1881,7 @@ impl crate::filesystem::Filesystem for Ext2 {
             i_mtime: 0,
             i_dtime: 0,
             i_gid: 0,
-            i_links_count: 2,
+            i_links_count: 2, // . и ..
             i_blocks: block_size / 512,
             i_flags: 0,
             i_osd1: 0,
@@ -1625,47 +1896,57 @@ impl crate::filesystem::Filesystem for Ext2 {
 
         // Записываем inode 2
         unsafe {
-            let inode_offset_bytes = 2 * 128u64; // inode #2
-            let inode_block_offset = (inode_offset_bytes / block_size as u64) as u64;
-            let inode_byte_in_block = (inode_offset_bytes % block_size as u64) as u64;
+            // inode №2 находится по смещению 2 * 128 = 256 байт от начала inode table
+            let inode_offset_in_table = 2 * 128u64;
+            let block_in_table = inode_offset_in_table / block_size as u64;
+            let offset_in_block = (inode_offset_in_table % block_size as u64) as usize;
 
-            let inode_lba = partition_offset
-                + (inode_table_block as u64 + inode_block_offset) * sectors_per_block as u64
-                + (inode_byte_in_block / 512);
+            let mut inode_buf = [0u8; 4096];
+            // читаем блок inode table (он уже обнулён, но на всякий)
+            // пишем только нужный inode
+            core::ptr::write_unaligned(
+                inode_buf.as_mut_ptr().add(offset_in_block) as *mut Ext2Inode,
+                root_inode,
+            );
 
-            let inode_ptr = &root_inode as *const Ext2Inode as *const u8;
-            disk.write(inode_ptr as *const u32, inode_lba, 1);
+            let lba = partition_offset
+                + ((inode_table_block as u64 + block_in_table) * sectors_per_block as u64);
+            disk.write(inode_buf.as_ptr() as *const u32, lba, sectors_per_block as u16);
         }
 
-        // Записываем содержимое root directory
-        let mut dir_block_buf = [0u8; 4096];
+        // Записываем содержимое корневой директории
+        let mut dir_buf = [0u8; 4096];
 
         // "."
-        let dot = Ext2DirEntry { inode: 2, rec_len: 12, name_len: 1, file_type: 2 };
+        let dot = Ext2DirEntry {
+            inode: 2,
+            rec_len: 12,
+            name_len: 1,
+            file_type: 2,
+        };
         unsafe {
-            core::ptr::write_unaligned(dir_block_buf.as_mut_ptr() as *mut Ext2DirEntry, dot);
+            core::ptr::write_unaligned(dir_buf.as_mut_ptr() as *mut Ext2DirEntry, dot);
         }
-        dir_block_buf[8] = b'.';
+        dir_buf[8] = b'.';
 
         // ".."
         let dotdot = Ext2DirEntry {
             inode: 2,
             rec_len: (block_size - 12) as u16,
             name_len: 2,
-            file_type: 2
+            file_type: 2,
         };
         unsafe {
-            core::ptr::write_unaligned(dir_block_buf.as_mut_ptr().add(12) as *mut Ext2DirEntry, dotdot);
+            core::ptr::write_unaligned(dir_buf.as_mut_ptr().add(12) as *mut Ext2DirEntry, dotdot);
         }
-        dir_block_buf[20] = b'.';
-        dir_block_buf[21] = b'.';
+        dir_buf[20] = b'.';
+        dir_buf[21] = b'.';
 
         unsafe {
             let dir_lba = partition_offset + (root_block as u64 * sectors_per_block as u64);
-            disk.write(dir_block_buf.as_ptr() as *const u32, dir_lba, sectors_per_block as u16);
+            disk.write(dir_buf.as_ptr() as *const u32, dir_lba, sectors_per_block as u16);
         }
-
-        println!("[EXT2 FORMAT] Root directory (inode 2, block {}) created", root_block);
+        println!("[EXT2 FORMAT] Root directory created (inode 2, block {})", root_block);
 
         // ====================== 7. Возвращаем FS ======================
         let mut fs = Ext2 {
@@ -1676,16 +1957,25 @@ impl crate::filesystem::Filesystem for Ext2 {
             partition_offset,
         };
 
+        // Корректируем free_blocks (root block уже учтён)
         fs.superblock.s_free_blocks_count = total_blocks.saturating_sub(first_free_block + 1);
-        println!("[EXT2 FORMAT] ✅ Форматирование завершено! Free blocks: {}, Free inodes: {}",
-                 fs.superblock.s_free_blocks_count, fs.superblock.s_free_inodes_count);
+
+        println!(
+            "[EXT2 FORMAT] Done",
+        );
 
         fs
     }
 
-    fn write_at(&mut self, _inode: u32, _offset: u64, _buf: &[u8]) -> usize {
-        // Пока заглушка. Полноценная запись требует аллокации блоков.
-        println!("[EXT2] write_at пока не реализована");
-        0
+    /// Удобная обёртка: форматирование на N гигабайт
+    pub fn format_gb(
+        disk: &'static mut Disk,
+        partition_offset: u64,
+        gb: u64,
+        block_size: u32,
+    ) -> Self {
+        let total_sectors = gb * 1024 * 1024 * 1024 / 512;
+        println!("[EXT2] Форматирование {} GB ({} секторов)", gb, total_sectors);
+        Self::format(disk, partition_offset, total_sectors, block_size)
     }
 }
