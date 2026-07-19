@@ -16,18 +16,12 @@ use gdt::GlobalDescriptorTable;
 use crate::gdt::GDT;
 
 //const VERSION: &str = env!("CARGO_PKG_VERSION");
-const KERNEL_LBA: u64 = 4096; //kernel location logical block address
+const KERNEL_LBA: u64 = 65; //kernel location logical block address
 
 const KERNEL_SIZE: u16 = 2048; //kernel size in sectors
 
 const KERNEL_BUFFER: u16 = 0xbe00; //buffer location for copy
-const KERNEL_TARGET: u32 = 0x0010_0000; //where to put kernel in memory
-
-const KERNEL_START: u32 = 0x0010_0000;
-const KERNEL_SIZE_B: u32 = 0x0010_0000;
-const STACK_SIZE: u32 = 0x0010_0000;
-
-const STACK_START: u32 = KERNEL_START + KERNEL_SIZE_B + STACK_SIZE;
+const KERNEL_TARGET: u32 = 0x0100_0000; //where to put kernel in memory
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
@@ -47,27 +41,42 @@ pub extern "C" fn _start() -> ! {
     //clear!();
     gdt::GlobalDescriptorTable::init();     // ← инициализируем один раз
     //unreal mode is needed because diskreader needs to copy from buffer to protected mode memory
-    println!("[!] Switching to 16bit unreal mode...");
-    unreal_mode();
-
-    //load kernel
-    print!("[!] Loading kernel");
-
-    unsafe {
-        DISK.init(KERNEL_LBA, KERNEL_BUFFER);
-        DISK.read_sectors(KERNEL_SIZE, KERNEL_TARGET);
-    }
-
-    println!("[!] Kernel loaded to memory.");
-
-    //load dgt
-    println!("[!] Loading Global Descriptor Table...");
 
     unsafe {
         GDT.load();
         // GDT.load_tss();
         // GDT.set_kernel_stack(STACK_START);
     }
+    //load kernel
+    print!("[!] Loading kernel");
+    enable_a20();
+    println!("[!] Switching to 16bit unreal mode...");
+    unreal_mode();
+    println!("[!] Checking memory...");
+
+
+    unsafe {
+        DISK.init(KERNEL_LBA as u32, KERNEL_BUFFER);
+        DISK.read_sectors(KERNEL_SIZE, KERNEL_TARGET);
+    }
+
+    println!("[!] Kernel loaded to memory.");
+    fn calculate_checksum(addr: u32, len: usize) -> u32 {
+        let mut sum = 0u32;
+        let ptr = addr as *const u8;
+        for i in 0..len {
+            sum = sum.wrapping_add(unsafe { *ptr.add(i) } as u32);
+        }
+        sum
+    }
+
+    // В _start() после загрузки:
+    let checksum = calculate_checksum(KERNEL_TARGET, (KERNEL_SIZE as usize) * 512);
+    println!("[!] Kernel checksum: 0x{:08x}", checksum);
+    //load dgt
+    println!("[!] Loading Global Descriptor Table...");
+
+
 
     //switch to protected mode
     println!("[!] Switching to 32bit protected mode and jumping to kernel...");
@@ -76,7 +85,24 @@ pub extern "C" fn _start() -> ! {
     //loop in case kernel returns
     loop {}
 }
+/// Печатает содержимое памяти в hex (работает в unreal mode / protected mode)
+fn hexdump(addr: u32, len: usize) {
+    unsafe {
+        let ptr = addr as *const u8;
 
+        for i in 0..len {
+            if i % 16 == 0 {
+                if i != 0 {
+                    println!();
+                }
+                print!("{:08x}: ", addr + i as u32);
+            }
+            let byte = *ptr.add(i);
+            print!("{:02x} ", byte);
+        }
+        println!();
+    }
+}
 #[no_mangle]
 pub extern "C" fn fail() -> ! {
     println!("[!] Read fail!");
@@ -89,7 +115,7 @@ fn protected_mode() {
     unsafe {
         //enable protected mode in cr0 register
         asm!("mov eax, cr0", "or al, 1", "mov cr0, eax");
-
+        // println!("Protected mode enabled");
         //push kernel address
         asm!(
             "push {0:e}",
@@ -98,7 +124,7 @@ fn protected_mode() {
 
         //jump to protected mode
         asm!("ljmp $0x8, $2f", "2:", options(att_syntax));
-
+        // println!("Protected mode entrer");
         //protected mode start
         asm!(
             ".code32",
@@ -121,7 +147,6 @@ fn protected_mode() {
     }
 }
 
-//switch to 16bit unreal mode, this mode allows to use 32bit registers in 16bit mode
 fn unreal_mode() {
     //backup segment registers
     let ds: u16;
@@ -156,7 +181,59 @@ fn unreal_mode() {
         asm!("mov ss, {0:x}", in(reg) ss);
     }
 }
+//
+// fn unreal_mode() {
+//     unsafe {
+//         // Загружаем GDT (можно делать в real mode)
+//         GDT.load();
+//
+//         // Сохраняем CR0
+//         let mut cr0: u32;
+//         asm!("mov {0:e}, cr0", out(reg) cr0);
+//
+//         // Входим в protected mode
+//         let cr0_protected = cr0 | 1;
+//         asm!("mov cr0, {0:e}", in(reg) cr0_protected);
+//
+//         // Загружаем плоский data-селектор (0x10) во ВСЕ сегментные регистры данных
+//         asm!(
+//         "mov {0:x}, 0x10",
+//         "mov ds, {0:x}",
+//         "mov es, {0:x}",
+//         "mov fs, {0:x}",
+//         "mov gs, {0:x}",
+//         "mov ss, {0:x}",
+//         out(reg) _,
+//         );
+//
+//         // Выходим обратно в real mode, но кэшированные дескрипторы остаются 4GB
+//         asm!("mov cr0, {0:e}", in(reg) cr0);
+//     }
+//     // НЕ ВОССТАНАВЛИВАЕМ старые DS/SS — это и было ошибкой!
+// }
 
+fn enable_a20() {
+    unsafe {
+        // 1. Fast A20 (порт 0x92) - самый надежный способ
+        let mut val: u8;
+        asm!("in al, 0x92", out("al") val);
+        if (val & 2) == 0 {
+            val |= 2;       // Включить A20
+            val &= !1;      // Не сбросить CPU (бит 0)
+            asm!("out 0x92, al", in("al") val);
+        }
+
+        // 2. Fallback на BIOS
+        let mut ax: u16;
+        asm!(
+        "mov ax, 0x2401",
+        "int 0x15",
+        "mov {0:x}, ax",
+        lateout(reg) ax,
+        options(nostack, preserves_flags),
+        );
+    }
+}
 #[allow(dead_code)]
 fn wait_for_key() {
     unsafe {

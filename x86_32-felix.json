@@ -17,5 +17,5 @@
     "os": "none",
     "vendor": "unknown",
     "relocation-model": "static",
-    "features": "+soft-float,-sse,-mmx"
+    "features": "+soft-float,-mmx"
 }

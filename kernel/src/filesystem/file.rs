@@ -36,7 +36,10 @@ impl FileDescriptorTable {
 
     /// Находит свободный дескриптор
     pub fn alloc_fd(&mut self) -> Option<usize> {
-        self.fds.iter().position(|slot| slot.is_none())
+        if let Some(fd) = self.fds.iter().position(|slot| slot.is_none()) {
+            return Some(fd + 5);
+        }
+        None
     }
 
     pub fn get(&self, fd: usize) -> Option<&FileDescriptor> {

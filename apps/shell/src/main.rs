@@ -175,9 +175,11 @@ fn cat(filename: &str) {
         return;
     }
 
+    println!("fd: {:?}", fd);
     let mut buf = [0u8; 512];
     loop {
         let n = unsafe { read(fd as u32, buf.as_mut_ptr(), buf.len()) };
+        println!("n: {:?}", n);
         if n == 0 {
             break;
         }

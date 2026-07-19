@@ -8,10 +8,10 @@ use core::arch::global_asm;
 use core::panic::PanicInfo;
 use disk::DiskReader;
 
-const BOOTLOADER_LBA: u64 = 2048; //bootloader location logical block address
-const BOOTLOADER_SIZE: u16 = 64; //bootloader size in sectors
+// Floppy: sector 0 = boot, 1..64 = bootloader, 65+ = kernel
+const BOOTLOADER_LBA: u16 = 1;
+const BOOTLOADER_SIZE: u16 = 64;
 
-//set data segments to zero and setup stack
 global_asm!(include_str!("boot.asm"));
 
 extern "C" {
@@ -21,36 +21,21 @@ extern "C" {
 #[no_mangle]
 pub extern "C" fn main() -> ! {
     clear();
+    print(b"[!] Felix\r\n\0");
+    print(b"[!] Load\r\n\0");
 
-    print("[!] Starting Felix...\r\n\0");
-    print("[!] Loading bootloader...\r\n\0");
-
-    //get bootloader address from linker
-    let bootloader_start: *const u16 = unsafe { &_bootloader_start };
-
-    //init disk read
-    let target = bootloader_start as u16;
-    let mut disk = DiskReader::new(BOOTLOADER_LBA, target);
-
-    //read bootloader to target
+    let start = unsafe { &_bootloader_start as *const u16 };
+    let mut disk = DiskReader::new(BOOTLOADER_LBA, start as u16);
     disk.read_sectors(BOOTLOADER_SIZE);
-
-    //jump to first bootloader instruction
-    jump(bootloader_start);
-
-    //loop in case bootloader returns
+    jump(start);
     loop {}
 }
 
-//set bios video mode to clear the screen
 fn clear() {
-    unsafe {
-        asm!("mov ah, 0x00", "mov al, 0x03", "int 0x10");
-    }
+    unsafe { asm!("mov ax, 0x0003", "int 0x10", options(nostack)); }
 }
 
-//bios interrupt to print to the screen
-fn print(message: &str) {
+fn print(msg: &[u8]) {
     unsafe {
         asm!("mov si, {0:x}", //move given string address to si
             "2:",
@@ -65,25 +50,19 @@ fn print(message: &str) {
 
             "jmp 2b", //start again
             "1:",
-            in(reg) message.as_ptr());
+            in(reg) msg.as_ptr());
     }
 }
 
-//jump execution to given address
-fn jump(address: *const u16) {
-    unsafe {
-        asm!("jmp {0:x}", in(reg) address as u16);
-    }
+fn jump(addr: *const u16) {
+    unsafe { asm!("jmp {0:x}", in(reg) addr as u16, options(nostack)); }
 }
 
 #[no_mangle]
 pub extern "C" fn fail() -> ! {
-    print("[!] Failed loading bootloader!");
-
+    print(b"Fail\r\n\0");
     loop {}
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
+fn panic(_: &PanicInfo) -> ! { loop {} }

@@ -336,8 +336,7 @@ fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usize) -
         match core::str::from_utf8(buf) {
             Ok(v) => print!("{}", v),
             Err(_) => {
-                println!("[write] invalid utf8! addr={:p} len={} first 32 bytes: {:02x?}",
-                         buf_ptr, count, &buf[0..buf.len().min(32)]);
+                println!("{:02x?}", &buf);
             }
         }
         return count;

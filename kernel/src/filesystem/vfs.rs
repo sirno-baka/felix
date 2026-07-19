@@ -5,8 +5,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::arch::asm;
 use interrupt_sync::{InterruptLazy};
+use crate::drivers::disk::Disk;
 use crate::println;
-use crate::filesystem::ext2::DirEntry;
+use crate::filesystem::ext2::{DirEntry, Ext2, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Inode, Ext2SuperBlock};
 use crate::sync::mutex::Mutex;
 use crate::sync::MutexLazy;
 
@@ -22,6 +23,10 @@ pub trait Filesystem: Send + Sync {
     fn read_at(&self, inode: u32, offset: u64, buf: &mut [u8]) -> usize;
     fn write_at(&mut self, inode: u32, offset: u64, buf: &[u8]) -> usize;
     fn is_mounted(&self) -> bool;
+    /// Форматирует раздел как пустую ext2-файзовую систему
+    /// total_sectors — размер раздела в 512-байтных секторах
+    /// block_size — размер блока (1024, 2048 или 4096)
+    fn format(disk: &mut Disk, partition_offset: u64, total_sectors: u64, block_size: u32) -> Self;
 }
 
 pub struct Vfs {

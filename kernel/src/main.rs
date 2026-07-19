@@ -43,7 +43,7 @@ use crate::filesystem::VFS;
 use crate::filesystem::vfs::Vfs;
 use crate::utils::queue::Queue;
 
-const KERNEL_START: u32 = 0x0010_0000;
+const KERNEL_START: u32 = 0x100_0000;
 const KERNEL_SIZE: u32 = 0x0010_0000;
 const STACK_SIZE: u32 = 0x0010_0000;
 
@@ -115,7 +115,9 @@ pub extern "C" fn _start() -> ! {
         DISK.check();
         let config = DISK.find_ext2_partition_config();
         if DISK.enabled {
+
             let mut ext2 = Ext2::new(&mut DISK, Some(config));
+
             ext2.mount(None);
             VFS.get().set_root(Box::new(ext2));
         }

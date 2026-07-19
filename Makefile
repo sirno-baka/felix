@@ -52,11 +52,13 @@ endif
 
 .PHONY: build
 build:
-	@cargo clean -p felix-kernel -p hello -p libfelix
+	@cargo clean -p felix-kernel -p hello -p libfelix -p felix-boot
 	@echo "Building Felix..."
-	@cargo build --target=x86_16-felix.json --package=felix-boot
+	@cargo build --target=x86_16-felix.json --package=felix-boot --release
 	@cargo build --target=x86_16-felix.json --package=felix-bootloader
+	@cargo build --target=x86_16-felix.json --package=felix-bootloader --release
 	@cargo build --target=x86_32-felix.json --package=felix-kernel
+	@cargo build --target=x86_32-felix.json --package=felix-kernel --release
 	@cargo build --target=x86_32-felix.json --package=hello --release
 	@cargo build --target=x86_32-felix.json --package=shell --release
 
@@ -65,12 +67,33 @@ build:
 objcopy:
 	@echo "Copying Felix..."
 	@mkdir -p build
-	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_16-felix/debug/felix-boot build/boot.bin
+	@$(OBJCOPY) -I elf32-i386 -O binary -S --strip-all \
+        target/x86_16-felix/release/felix-boot build/boot.bin
 	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_16-felix/debug/felix-bootloader build/bootloader.bin
 	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_32-felix/debug/felix-kernel build/kernel.bin
 	@cp target/x86_32-felix/release/hello build/hello
 	@cp target/x86_32-felix/release/shell build/shell
 
+.PHONY: floppy-image
+floppy-image:
+	@echo "=== Creating 1.44 MB floppy image ==="
+	@rm -f build/floppy.img
+
+	@echo "=== Creating empty 1.44 MB image (2880 sectors) ==="
+	@dd if=/dev/zero of=build/floppy.img bs=1K count=1440 status=none
+
+	@echo "=== Writing boot sector (sector 0) ==="
+	@dd if=build/boot.bin of=build/floppy.img bs=512 conv=notrunc status=none
+
+	@echo "=== Writing bootloader (starting from sector 1) ==="
+	@dd if=build/bootloader.bin of=build/floppy.img bs=512 seek=1 conv=notrunc status=none
+
+	@echo "=== Writing kernel ==="
+	@dd if=build/kernel.bin of=build/floppy.img bs=512 seek=65 conv=notrunc status=none
+
+	@echo "=== Floppy image ready ==="
+	@ls -lh build/floppy.img
+	@echo "Image size: 1.44 MB (standard floppy)"
 
 .PHONY: image
 image:
@@ -123,6 +146,15 @@ clean:
 	@echo "Cleaning Felix..."
 	@cargo clean
 	@rm -rf build
+
+.PHONY: run-floppy
+run-floppy: all floppy-image
+	@echo "Running Felix..."
+	@killall qemu-system-i386 || true
+
+	@qemu-system-i386 -drive file=build/floppy.img,index=0,format=raw,if=floppy -no-reboot -no-shutdown -m 64M -serial stdio -s -S &
+	@sleep 2
+
 
 .PHONY: run
 run: all
