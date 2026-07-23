@@ -14,6 +14,7 @@ pub extern "C" fn timer() {
     unsafe {
         asm!(
             "cli",
+            "call jiffies_inc",
             // Save registers (must match CPUState layout)
             "push ebp",
             "push edi",

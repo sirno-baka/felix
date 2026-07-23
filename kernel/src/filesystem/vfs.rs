@@ -5,7 +5,6 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::arch::asm;
 use interrupt_sync::{InterruptLazy};
-use crate::drivers::disk::Disk;
 use crate::println;
 use crate::filesystem::ext2::{ Ext2, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Inode, Ext2SuperBlock};
 use crate::sync::mutex::Mutex;

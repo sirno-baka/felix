@@ -91,9 +91,28 @@ floppy-image:
 	@echo "=== Writing kernel ==="
 	@dd if=build/kernel.bin of=build/floppy.img bs=512 seek=65 conv=notrunc status=none
 
+	@echo "=== Creating ext2 partition in remaining space ==="
+	@KERNEL_BYTES=$$(wc -c < build/kernel.bin); \
+	KERNEL_SECTORS=$$(( (KERNEL_BYTES + 511) / 512 )); \
+	EXT2_START_SECTOR=$$((65 + KERNEL_SECTORS)); \
+	EXT2_SIZE_SECTORS=$$((2880 - EXT2_START_SECTOR)); \
+	EXT2_SIZE_BYTES=$$((EXT2_SIZE_SECTORS * 512)); \
+	echo "Kernel size: $$KERNEL_BYTES bytes ($$KERNEL_SECTORS sectors)"; \
+	echo "EXT2 starts at sector: $$EXT2_START_SECTOR, size: $$EXT2_SIZE_BYTES bytes"; \
+	dd if=/dev/zero of=build/ext2.img bs=1 count=$$EXT2_SIZE_BYTES status=none; \
+	mkfs.ext2 -I 128 -O ^64bit,^metadata_csum,^dir_index,^ext_attr,^resize_inode build/ext2.img; \
+	dd if=build/ext2.img of=build/floppy.img bs=512 seek=$$EXT2_START_SECTOR conv=notrunc status=none; \
+	rm -f build/ext2.img
+
+	@echo "=== Проверка суперблока в образе (должно показать '53ef' на смещении 56) ==="
+	@KERNEL_BYTES=$$(wc -c < build/kernel.bin); \
+	KERNEL_SECTORS=$$(( (KERNEL_BYTES + 511) / 512 )); \
+	EXT2_START_SECTOR=$$((65 + KERNEL_SECTORS)); \
+	OFFSET_BYTES=$$(( (EXT2_START_SECTOR + 2) * 512 + 56 )); \
+	xxd -s $$OFFSET_BYTES -l 2 build/floppy.img || od -A x -t x1 -j $$OFFSET_BYTES -N 2 build/floppy.img
+
 	@echo "=== Floppy image ready ==="
 	@ls -lh build/floppy.img
-	@echo "Image size: 1.44 MB (standard floppy)"
 
 .PHONY: image
 image:
@@ -152,8 +171,8 @@ run-floppy: all floppy-image
 	@echo "Running Felix..."
 	@killall qemu-system-i386 || true
 
-	@qemu-system-i386 -drive file=build/floppy.img,index=0,format=raw,if=floppy -no-reboot -no-shutdown -m 64M -serial stdio -s -S &
-	@sleep 2
+	@qemu-system-i386 -drive file=build/floppy.img,index=0,format=raw,if=floppy -drive file=disk.img,index=0,media=disk,format=raw,if=ide -no-reboot -no-shutdown -m 64M -serial stdio -s -S &
+	@sleep 1
 
 
 .PHONY: run

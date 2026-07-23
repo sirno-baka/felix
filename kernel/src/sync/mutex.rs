@@ -7,13 +7,16 @@ use crate::multitasking::task::TASK_MANAGER;
 use crate::print::{printer_new, PRINTER};
 use crate::println;
 
-pub struct Mutex<T> {
-    inner: SpinMutex<T>,
+pub struct Mutex<T: ?Sized> {
     waiters: SpinMutex<VecDeque<i8>>,
+    inner: SpinMutex<T>,
 }
 
-impl<T> Mutex<T> {
-    pub const fn new(data: T) -> Self {
+impl<T: ?Sized> Mutex<T> {
+    pub const fn new(data: T) -> Self
+    where
+        T: Sized,
+    {
         Self {
             inner: SpinMutex::new(data),
             waiters: SpinMutex::new(VecDeque::new()),
@@ -26,7 +29,7 @@ impl<T> Mutex<T> {
         unsafe {
             asm!("pushfd; pop {}", out(reg) eflags);
         }
-        let was_enabled = (eflags & (1 << 9)) != 0;  // бит IF
+        let was_enabled = (eflags & (1 << 9)) != 0; // бит IF
 
         unsafe { asm!("cli") };
 
@@ -66,7 +69,6 @@ impl<T> Mutex<T> {
                 }
             } else {
                 // Во время boot (прерывания выключены) — просто спин
-                // (не hlt, иначе можем зависнуть навсегда)
                 core::hint::spin_loop();
             }
         }
@@ -83,27 +85,31 @@ impl<T> Mutex<T> {
             }
         }
     }
+
     pub unsafe fn yield_current(&mut self) {
-        // Можно вызвать из кода таска, если нужно добровольно отдать CPU
         core::arch::asm!("hlt");
     }
 }
 
-pub struct MutexGuard<'a, T> {
+pub struct MutexGuard<'a, T: ?Sized> {
     guard: interrupt_sync::SpinMutexGuard<'a, T>,
     parent: &'a Mutex<T>,
 }
 
-impl<T> Deref for MutexGuard<'_, T> {
+impl<T: ?Sized> Deref for MutexGuard<'_, T> {
     type Target = T;
-    fn deref(&self) -> &T { &self.guard }
+    fn deref(&self) -> &T {
+        &self.guard
+    }
 }
 
-impl<T> DerefMut for MutexGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T { &mut self.guard }
+impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
 }
 
-impl<T> Drop for MutexGuard<'_, T> {
+impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
         self.parent.wake_one();
     }

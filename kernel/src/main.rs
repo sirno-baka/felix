@@ -22,8 +22,13 @@ mod tss;
 mod utils;
 mod spin;
 mod elf;
+mod pci;
+mod time;
+mod io;
+mod disk;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::asm;
@@ -36,13 +41,17 @@ use print::PRINTER;
 use filesystem::ext2::Ext2;
 
 use multitasking::task::TASK_MANAGER;
-use crate::drivers::disk::{DISK, DISK_SLAVE};
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::drivers::pic::wait;
+// use crate::drivers::ramfs::RamFs;
 use crate::filesystem::VFS;
 use crate::filesystem::vfs::Vfs;
+use crate::io::{inb, outb};
+use crate::pci::ide::IDE;
+use crate::sync::mutex::Mutex;
 use crate::utils::queue::Queue;
-
+static mut TEST_WRITE: [u32; 128] = [0; 128];
+static mut TEST_READ:  [u32; 128] = [0; 128];
 const KERNEL_START: u32 = 0x100_0000;
 const KERNEL_SIZE: u32 = 0x0010_0000;
 const STACK_SIZE: u32 = 0x0010_0000;
@@ -59,6 +68,8 @@ macro_rules! run {
     };
 }
 
+
+
 #[no_mangle]
 #[link_section = ".start"]
 pub extern "C" fn _start() -> ! {
@@ -73,7 +84,7 @@ pub extern "C" fn _start() -> ! {
         GDT.load();
         GDT.load_tss();
 
-       // 2. Paging
+        // 2. Paging
         {
             let mut pm = PAGING.lock();
             pm.init(STACK_START as u32);
@@ -111,16 +122,61 @@ pub extern "C" fn _start() -> ! {
         // 5. Keyboard buffer
         *KEYBOARD_BUFFER.lock() = Some(Queue::new());
 
+        // IDE init
+        IDE.lock().initialize().expect("Cannot read from disks");
+
+        let first = IDE.lock().get_device(0).unwrap();
+        let mut ext2 = Ext2::new(first.clone(), None);
+        //Ext2::format_gb(first, 0, 64, 4096);
+        ext2.mount(None);
+        VFS.get().set_root(Box::new(ext2));
+
         // 6. Диск + VFS
-        DISK.check();
-        let config = DISK.find_ext2_partition_config();
-        if DISK.enabled {
+        // DISK.check();
+        // let config = DISK.find_ext2_partition_config();
+        // if DISK.enabled {
+        //     let mut ext2 = Ext2::new(&mut DISK, Some(config));
+        //     ext2.mount(None);
+        //     VFS.get().set_root(Box::new(ext2));
+        // }
+        // let ram_fs = Box::new(RamFs::new());
+        // VFS.get().set_root(ram_fs);
+        // if DISK.enabled {
+        //     let test_lba = 100; // Безопасный LBA, не трогаем MBR
+        //
+        //     unsafe {
+        //         // заполняем
+        //         for i in 0..128 {
+        //             TEST_WRITE[i] = 0xDEADBEEF + i as u32;
+        //         }
+        //         println!("read_buf addr = {:p}", TEST_READ.as_ptr());
+        //         println!("[TEST] write LBA {}...", test_lba);
+        //         DISK.write(TEST_WRITE.as_ptr(), test_lba, 1);
+        //
+        //         println!("[TEST] read  LBA {}...", test_lba);
+        //         DISK.read(TEST_READ.as_mut_ptr(), test_lba, 1);
+        //
+        //         // сравнение
+        //         let mut ok = true;
+        //         for i in 0..128 {
+        //             if TEST_WRITE[i] != TEST_READ[i] {
+        //                 println!("[TEST] err index {}: wrote {:08X}, read {:08X}",
+        //                          i, TEST_WRITE[i], TEST_READ[i]);
+        //                 ok = false;
+        //                 break;
+        //             }
+        //         }
+        //
+        //         if ok {
+        //             println!("[TEST] OKK");
+        //         } else {
+        //             println!("[TEST] FAIL");
+        //         }
+        //     }
 
-            let mut ext2 = Ext2::new(&mut DISK, Some(config));
+        // let mut fs = Ext2::format_gb(&mut DISK, 0, 1, 4096);
+        // VFS.get().set_root(Box::new(fs));
 
-            ext2.mount(None);
-            VFS.get().set_root(Box::new(ext2));
-        }
 
         println!("[VFS] Virtual filesystem initialized");
         print_info();
