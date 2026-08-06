@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::mem;
 use core::ops::Deref;
 use crate::{print, println};
-use crate::disk::ide::BlockDevice;
+use crate::disk::interface::BlockDevice;
 use crate::disk::PartitionConfig;
 use crate::filesystem::vfs::DirEntry;
 use crate::spin::Mutex;
@@ -225,7 +225,6 @@ impl Ext2 {
         let sectors_per_block = self.block_size / 512;
         let total_sectors = (sectors_per_block * count) as u8;
         let lba = self.partition_offset as u32 + (block * sectors_per_block);
-
         let disk = self.disk.lock();
         if let Err(e) = disk.read_sectors(total_sectors, lba, buf as u32) {
             println!("[EXT2] read_sectors error: {}", e);
@@ -260,10 +259,9 @@ impl Ext2 {
             // Читаем 2 сектора (1024 байта) начиная с LBA = partition_offset + 2
             let disk = self.disk.lock();
             if let Err(e) = disk.read_sectors(2, (self.partition_offset + 2) as u32, superblock_buf.as_mut_ptr() as u32) {
-                println!("[EXT2] Не удалось прочитать superblock: {}", e);
+                println!("[EXT2]  {}", e);
                 return;
             }
-
             core::ptr::copy_nonoverlapping(
                 superblock_buf.as_ptr(),
                 &mut self.superblock as *mut Ext2SuperBlock as *mut u8,

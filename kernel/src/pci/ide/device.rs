@@ -6,7 +6,7 @@ use crate::println;
 use crate::utils::arcm::Arcm;
 use core::cell::RefCell;
 use core::ffi::CStr;
-use crate::disk::ide::BlockDevice;
+use crate::disk::interface::BlockDevice;
 
 #[derive(Clone)]
 pub struct IDEDevice {

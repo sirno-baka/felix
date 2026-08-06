@@ -2,7 +2,7 @@ use crate::alloc::boxed::Box;
 use crate::alloc::vec::Vec;
 use crate::pci::ide::IDE;
 
-pub mod ide;
+pub mod interface;
 
 // ====================== PARTITION CONFIG + MBR PARSER ======================
 
