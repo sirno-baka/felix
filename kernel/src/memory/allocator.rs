@@ -20,8 +20,8 @@ pub struct Allocator {
 }
 
 impl Allocator {
-    const HEAP_START: usize = 0x0140_0000;
-    const HEAP_END:   usize = 0x0f00_0000;
+    const HEAP_START: usize = 0xC010_0000;  // Сразу после ядра (ядро занимает ~1MB)
+    const HEAP_END:   usize = 0xF000_0000;  // До верхней границы для задач пользователя
 
     const HEADER_SIZE: usize = core::mem::size_of::<FreeBlock>();
     const HEADER_ALIGN: usize = core::mem::align_of::<FreeBlock>();

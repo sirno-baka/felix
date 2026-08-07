@@ -1,26 +1,18 @@
 ```
-# Compiled and build artifacts
-*.o
-*.obj
-*.exe
-*.dll
-*.so
-*.a
-*.out
+# Build artifacts
+target/
 
 # Dependencies
-target/
+Cargo.lock
 
 # Logs and temp files
 *.log
 *.tmp
 
-# Editors
+# Editor/IDE
 .vscode/
 .idea/
 
-# Environment
-.env
-.env.local
-.env.*
+# Generated files
+**/*.rs.bk
 ```
