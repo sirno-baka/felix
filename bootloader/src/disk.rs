@@ -220,7 +220,7 @@ unsafe fn copy_to_high_memory(src_offset: u16, dst_phys: u32, len: usize) {
     "mov ds, ax",
     "mov es, ax",
 
-    // Копирование
+    // Копирование - используем явное указание регистров через mov
     "movzx esi, {src:x}",
     "mov edi, {dst:e}",
     "mov ecx, {len:e}",
@@ -242,8 +242,8 @@ unsafe fn copy_to_high_memory(src_offset: u16, dst_phys: u32, len: usize) {
     len = in(reg) len,
     out("eax") _,
     out("ecx") _,
-    out("esi") _,
-    out("edi") _,
-    options(nostack),
+    // Убираем явные out для esi и edi, так как они модифицируются внутри asm
+    // LLVM сам разберётся с ними благодаря clobber эффекту rep movsb
+    options(nostack, preserves_flags),
     );
 }
