@@ -1,6 +1,18 @@
-/build
-/target
-bx_enh_dbg.ini
-out.txt
+```
+# Build artifacts
+target/
 
-.idea
+# Dependencies
+Cargo.lock
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Editor/IDE
+.vscode/
+.idea/
+
+# Generated files
+**/*.rs.bk
+```
