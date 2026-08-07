@@ -202,48 +202,33 @@ impl Disk {
 // Вставь эту функцию где-нибудь в disk.rs или в main.rs
 
 unsafe fn copy_to_high_memory(src_offset: u16, dst_phys: u32, len: usize) {
-    print!(".");
+    // В unreal mode сегменты уже настроены на 4GB, просто копируем
+    // ES уже должен быть установлен в 0x10 (плоский data-сегмент)
     asm!(
-    "cli",                    // отключаем прерывания на время
-    "push ds",
-    "push es",
-    "push fs",
-    "push gs",
-
-    // Входим в protected mode
-    "mov eax, cr0",
-    "or al, 1",
-    "mov cr0, eax",
-
-    // Плоские сегменты
+    "push eax",
+    "push ecx",
+    "push edi",
+    "push esi",
+    
+    // ES уже должен быть 0x10 из unreal_mode(), но убедимся
     "mov ax, 0x10",
-    "mov ds, ax",
     "mov es, ax",
-
-    // Копирование - используем явное указание регистров через mov
-    "movzx esi, {src:x}",
-    "mov edi, {dst:e}",
-    "mov ecx, {len:e}",
-    "rep movsb",
-
-    // Выходим из protected mode
-    "mov eax, cr0",
-    "and al, 0xfe",
-    "mov cr0, eax",
-
-    "pop gs",
-    "pop fs",
-    "pop es",
-    "pop ds",
-    "sti",                    // включаем прерывания обратно
-
+    
+    // Копирование
+    "movzx esi, {src:x}",   // SI = смещение в реальном режиме (сегмент * 16 + offset)
+    "xor esi, esi",         // SI = 0 (начало буфера в сегменте ES)
+    "mov edi, {dst:e}",     // DI = физический адрес назначения
+    "mov ecx, {len:e}",     // CX = количество байт
+    "rep movsb",            // Копируем ECX байт из [ES:ESI] в [DS:EDI]
+    
+    "pop esi",
+    "pop edi",
+    "pop ecx",
+    "pop eax",
+    
     src = in(reg) src_offset,
     dst = in(reg) dst_phys,
     len = in(reg) len,
-    out("eax") _,
-    out("ecx") _,
-    // Убираем явные out для esi и edi, так как они модифицируются внутри asm
-    // LLVM сам разберётся с ними благодаря clobber эффекту rep movsb
     options(nostack, preserves_flags),
     );
 }
