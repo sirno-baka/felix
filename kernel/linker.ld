@@ -1,7 +1,7 @@
 ENTRY(_start)
 
 SECTIONS {
-    . = 0x01000000;
+    . = 0xC0000000;
 
     _kernel_start = .;
 
