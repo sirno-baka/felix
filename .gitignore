@@ -1,18 +1,4 @@
 ```
-# Build artifacts
 target/
-
-# Dependencies
-Cargo.lock
-
-# Logs and temp files
-*.log
-*.tmp
-
-# Editor/IDE
-.vscode/
-.idea/
-
-# Generated files
 **/*.rs.bk
 ```

@@ -450,10 +450,13 @@ impl PageManager {
         self.dir.setup_recursive(pd_phys);
         self.dir.switch();
 
-        let start_page = (32 * 1024 * 1024) >> 12;
-        let end_page = (kernel_end + 4095) >> 12;
-
-        for vpage in start_page..end_page {
+        // Маппим первые 8MB (включая VGA 0xB8000) и область ядра 0xC000_0000
+        let start_page = 0; // Начинаем с нуля для VGA и низкой памяти
+        let kernel_start_page = (0xC000_0000 >> 12) as usize;
+        let kernel_end_page = ((kernel_end + 4095) >> 12) as usize;
+        
+        // Сначала маппим низкую память (0 - 8MB) для VGA и пользовательских задач
+        for vpage in start_page..(8 * 1024 / 4) {
             let pd_idx = (vpage >> 10) as usize;
             let pt_idx = (vpage & 0x3FF) as usize;
 
@@ -488,8 +491,46 @@ impl PageManager {
             }
             PageDirectory::flush_page((vpage << 12) as u32);
         }
+        
+        // Теперь маппим ядро по адресу 0xC000_0000
+        for vpage in kernel_start_page..kernel_end_page {
+            let phys_page = vpage - kernel_start_page; // Физически ядро начинается с 0 после загрузчика
+            let pd_idx = (vpage >> 10) as usize;
+            let pt_idx = (vpage & 0x3FF) as usize;
 
-        self.next_free_page = end_page;
+            let need_table = {
+                let pde = self.dir.entries[pd_idx];
+                pde == 0 || (pde & PDEFlags::PRESENT) == 0
+            };
+
+            if need_table {
+                let pt_phys = self.alloc_frame();
+
+                let pde = &mut self.dir.entries[pd_idx];
+                let pde_flags = PDEFlags::new()
+                    .present()
+                    .writable()
+                    .user()
+                    .bits();
+
+                *pde = (pt_phys << 12) | pde_flags;
+
+                PageDirectory::flush_page((pd_idx as u32) << 22);
+
+                let pt_ptr = PageDirectory::get_page_table_ptr(pd_idx);
+                unsafe {
+                    write_bytes(pt_ptr as *mut u8, 0, 4096);
+                }
+            }
+
+            let pt_ptr = PageDirectory::get_page_table_ptr(pd_idx);
+            unsafe {
+                (*pt_ptr)[pt_idx] = (phys_page << 12) | PTEFlags::PRESENT | PTEFlags::WRITABLE | PTEFlags::USER | PTEFlags::ACCESSED;
+            }
+            PageDirectory::flush_page((vpage << 12) as u32);
+        }
+
+        self.next_free_page = kernel_end_page as u32;
 
         self.dir.switch();
 
