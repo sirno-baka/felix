@@ -175,28 +175,21 @@ impl Disk {
             let pos_in_track = (self.lba % SPT as u32) as u16;
             let sectors_to_track_end = SPT - pos_in_track;
 
-            // Берём минимум из: оставшихся, 2 (максимум за раз), и сколько влезет в трек
+            // Берём минимум из: оставшихся, 8 (максимум за раз), и сколько влезет в трек
             let batch = core::cmp::min(remaining, core::cmp::min(8, sectors_to_track_end));
 
             // Читаем batch секторов (1 или 2)
             self.read_sectors_safe(batch);
 
-            // Копируем прочитанное (у тебя сейчас байтовый цикл на 1024 байта)
+            // Копируем прочитанное в высокую память через защищённый режим
             let bytes_to_copy = (batch as u32) * SECTOR_SIZE;
-            let mut src = self.buffer as u32;
-
-            for _ in 0..bytes_to_copy {
-                unsafe {
-                    let mut b: u8;
-                    asm!("mov {0}, [{1:e}]", out(reg_byte) b, in(reg) src, options(nostack));
-                    asm!("mov [{0:e}], {1}", in(reg) dst, in(reg_byte) b, options(nostack));
-                }
-                src += 1;
-                dst += 1;
+            unsafe {
+                copy_to_high_memory(self.buffer, dst, bytes_to_copy as usize);
             }
 
             self.lba += batch as u32;
             remaining -= batch;
+            dst += bytes_to_copy;
 
             if (total_sectors - remaining) % 64 == 0 {
                 print!(".");
@@ -208,7 +201,7 @@ impl Disk {
 
 // Вставь эту функцию где-нибудь в disk.rs или в main.rs
 
-unsafe fn copy_to_high_memory(src_offset: u16, dst_phys: u32) {
+unsafe fn copy_to_high_memory(src_offset: u16, dst_phys: u32, len: usize) {
     print!(".");
     asm!(
     "cli",                    // отключаем прерывания на время
@@ -216,8 +209,6 @@ unsafe fn copy_to_high_memory(src_offset: u16, dst_phys: u32) {
     "push es",
     "push fs",
     "push gs",
-
-    // На всякий случай перезагружаем GDT (дешево на этапе загрузки)
 
     // Входим в protected mode
     "mov eax, cr0",
@@ -232,7 +223,7 @@ unsafe fn copy_to_high_memory(src_offset: u16, dst_phys: u32) {
     // Копирование
     "movzx esi, {src:x}",
     "mov edi, {dst:e}",
-    "mov ecx, 512",
+    "mov ecx, {len:e}",
     "rep movsb",
 
     // Выходим из protected mode
@@ -248,7 +239,11 @@ unsafe fn copy_to_high_memory(src_offset: u16, dst_phys: u32) {
 
     src = in(reg) src_offset,
     dst = in(reg) dst_phys,
+    len = in(reg) len,
     out("eax") _,
-    options(nostack, preserves_flags),
+    out("ecx") _,
+    out("esi") _,
+    out("edi") _,
+    options(nostack),
     );
 }

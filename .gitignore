@@ -1,4 +1,1 @@
-```
-target/
-**/*.rs.bk
-```
+Nothing needs to be added to the .gitignore file based on the provided file changes. The modification of 'bootloader/src/disk.rs' is a source code file that should not be ignored.
