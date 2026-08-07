@@ -493,8 +493,11 @@ impl PageManager {
         }
         
         // Теперь маппим ядро по адресу 0xC000_0000
+        // Физически ядро загружено по адресу 0x00100000 (1MB)
+        let kernel_phys_start = 0x00100000u32;
         for vpage in kernel_start_page..kernel_end_page {
-            let phys_page = vpage - kernel_start_page; // Физически ядро начинается с 0 после загрузчика
+            let phys_addr = kernel_phys_start + ((vpage - kernel_start_page) as u32 * 4096);
+            let phys_page = phys_addr >> 12;
             let pd_idx = (vpage >> 10) as usize;
             let pt_idx = (vpage & 0x3FF) as usize;
 

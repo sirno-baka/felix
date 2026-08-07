@@ -52,7 +52,7 @@ use crate::sync::mutex::Mutex;
 use crate::utils::queue::Queue;
 static mut TEST_WRITE: [u32; 128] = [0; 128];
 static mut TEST_READ:  [u32; 128] = [0; 128];
-const KERNEL_START: u32 = 0x100_0000;
+const KERNEL_START: u32 = 0xC000_0000;
 const KERNEL_SIZE: u32 = 0x0010_0000;
 const STACK_SIZE: u32 = 0x0010_0000;
 
