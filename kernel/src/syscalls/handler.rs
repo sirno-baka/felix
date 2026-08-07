@@ -456,13 +456,13 @@ pub fn sys_execve(path_ptr: *const u8) -> usize {
     }
     let slot = slot_i8 as usize;
 
-    const APP_TARGET: u32 = 0x40000000;
+    const APP_TARGET: u32 = 0x0010_0000;  // Пользовательские задачи загружаются в нижнюю память (после нулевой страницы)
     const APP_SIZE: u32 = 4 * 1024 * 1024;
     // Каждая задача имеет собственный page directory — все приложения
     // грузятся по одному виртуальному адресу (== линковому адресу ELF).
     let target = APP_TARGET;
     let user_stack_top = target + APP_SIZE - 0x8000;
-    let heap_start = 0x80000000 + (slot as u32 * 0x10000000);
+    let heap_start = target + APP_SIZE;  // Куча сразу после кода задачи
 
     unsafe {
         asm!("cli");

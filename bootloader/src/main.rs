@@ -21,7 +21,7 @@ const KERNEL_LBA: u64 = 65; //kernel location logical block address
 const KERNEL_SIZE: u16 = 2048; //kernel size in sectors
 
 const KERNEL_BUFFER: u16 = 0xbe00; //buffer location for copy
-const KERNEL_TARGET: u32 = 0x0100_0000; //where to put kernel in memory
+const KERNEL_TARGET: u32 = 0xC000_0000; //where to put kernel in memory
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
