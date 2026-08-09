@@ -90,7 +90,7 @@ const VIRT_PT_BASE: u32 = 0xFFC00000;
 // Виртуальный адрес самого каталога страниц (через рекурсию)
 const VIRT_PD_BASE: u32 = 0xFFFFF000;
 
-static mut USER_HEAP_NEXT: u32 = 0x0010_0000; // Начало памяти для пользовательских задач (после нулевой страницы)
+static mut USER_HEAP_NEXT: u32 = 0x20000000;
 
 #[derive(Copy, Clone)]
 pub struct PTEFlags(u32);
