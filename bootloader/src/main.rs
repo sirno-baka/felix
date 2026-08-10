@@ -23,6 +23,10 @@ const KERNEL_SIZE: u16 = 2048; //kernel size in sectors
 const KERNEL_BUFFER: u16 = 0xbe00; //buffer location for copy
 const KERNEL_TARGET: u32 = 0x0100_0000; //where to put kernel in memory
 
+const RAMFS_LBA: u64 = 2114; //kernel location logical block address
+const RAMFS_TARGET: u32 = 0x0060_0000; //where to put kernel in memory
+const RAMFS_SIZE: u16 = 766; //kernel size in sectors
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("PANIC! Info: {}", info);
@@ -57,6 +61,8 @@ pub extern "C" fn _start() -> ! {
 
     unsafe {
         DISK.init(KERNEL_LBA as u32, KERNEL_BUFFER);
+        DISK.reset();
+        DISK.delay();
         DISK.read_sectors(KERNEL_SIZE, KERNEL_TARGET);
     }
 
@@ -74,6 +80,15 @@ pub extern "C" fn _start() -> ! {
     let checksum = calculate_checksum(KERNEL_TARGET, (KERNEL_SIZE as usize) * 512);
     println!("[!] Kernel checksum: 0x{:08x}", checksum);
     //load dgt
+
+    unsafe {
+        DISK.init(RAMFS_LBA as u32, KERNEL_BUFFER);
+        DISK.read_sectors(RAMFS_SIZE, RAMFS_TARGET);
+    }
+    println!("[!] RamFS loaded to memory.");
+    // В _start() после загрузки:
+    let checksum = calculate_checksum(RAMFS_TARGET, (RAMFS_SIZE as usize) * 512);
+    println!("[!] RamFS checksum: 0x{:08x}", checksum);
     println!("[!] Loading Global Descriptor Table...");
 
 

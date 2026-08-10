@@ -42,11 +42,12 @@ use filesystem::ext2::Ext2;
 
 use multitasking::task::TASK_MANAGER;
 use crate::disk::interface::BlockDevice;
-use crate::disk::PartitionConfig;
+use crate::disk::{copy_sectors, PartitionConfig};
+use crate::disk::ramdisk::RamDisk;
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::drivers::pic::wait;
 // use crate::drivers::ramfs::RamFs;
-use crate::filesystem::VFS;
+use crate::filesystem::{Filesystem, VFS};
 use crate::filesystem::vfs::Vfs;
 use crate::io::{inb, outb};
 use crate::pci::floppy::disk::Floppy;
@@ -137,35 +138,46 @@ pub extern "C" fn _start() -> ! {
         IDE.lock().initialize().expect("Cannot read from disks");
 
         // let first = IDE.lock().get_device(0).unwrap();
-        // let mut ext2 = Ext2::new(first.clone(), None);
+        // let mut ext2d = Ext2::new(first.clone(), None);
         // //Ext2::format_gb(first, 0, 64, 4096);
-        // ext2.mount(None);
-        // VFS.get().set_root(Box::new(ext2));
-        let floppy = Floppy::new(0);
-        let disk = Arc::new(spin::Mutex::new(floppy));
+        // ext2d.mount(None);
+        // let disk = Arc::new(spin::Mutex::new(floppy));
         // let mut superblock_buf = [0u8; 1024];
         // match disk.lock().read_sectors(2, 2113, superblock_buf.as_mut_ptr() as u32) {
         //     Ok(_) => {println!("{:02x?}", &superblock_buf);}
         //     Err(e) => { print!("err: {:02x?}", e);}
         // };
-
-        let mut ext2 = Ext2::new(disk.clone(), Some(PartitionConfig{start_lba: 2114}));
+        // Буфер достаточного размера
+        let mut rd = RamDisk::new();
+        let disk = Arc::new(spin::Mutex::new(rd));
+        let mut ext2 = Ext2::new(disk.clone(), None);
         ext2.mount(None);
-        VFS.get().set_root(Box::new(ext2));
 
+        VFS.get().set_root(Box::new(ext2));
 
         println!("[VFS] Virtual filesystem initialized");
         print_info();
-
+        fn calculate_checksum(data: Vec<u8>) -> u32 {
+            println!("Size: {}", data.len());
+            let mut sum = 0u32;
+            for i in data  {
+                // print!("{:02x}", i);
+                sum = sum.wrapping_add(unsafe { i } as u32);
+            }
+            sum
+        }
         // 7. Task Manager (после IDT!)
         TASK_MANAGER.init();
         for i in 0..5000 {
             wait();
         }
 
-        let entries = VFS.get().list_directory_entries("/");
+        // let entries = VFS.get().list_directory_entries("/");
+        let data= VFS.get().read_file("/shell").unwrap();
+        let sum = calculate_checksum(data.clone());
+        println!("[!] Shell checksum: 0x{:08x}", sum);
+        crate::syscalls::handler::sys_execve(data.as_ptr(), data.len());
 
-        crate::syscalls::handler::sys_execve("/shell\0".as_ptr() as *const u8);
 
 
         // === ВКЛЮЧАЕМ ТАЙМЕР И ПРЕРЫВАНИЯ ТОЛЬКО В КОНЦЕ ===

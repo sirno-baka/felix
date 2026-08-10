@@ -419,8 +419,8 @@ impl Floppy {
             }
         }
 
-        println!("dma_buf {:02x?}", (dma_buf as *const u8));
-        println!("buf {:02x?}", buf as *mut u8);
+        // println!("dma_buf {:02x?}", (dma_buf as *const u8));
+        // println!("buf {:02x?}", buf as *mut u8);
 
         Ok(())
     }

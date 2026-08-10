@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use crate::drivers::pic::PICS;
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::multitasking::task::{CPUState, Task, TASK_MANAGER};
@@ -71,7 +72,7 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         crate::syscalls::SYS_MKDIR  => sys_mkdir(state.ebx as *const u8),
         crate::syscalls::SYS_RMDIR  => sys_rmdir(state.ebx as *const u8),
         crate::syscalls::SYS_UNLINK => sys_unlink(state.ebx as *const u8),
-        crate::syscalls::SYS_EXECVE => sys_execve(state.ebx as *const u8),
+        crate::syscalls::SYS_EXECVE => sys_execve(state.ebx as *const u8, state.ecx as usize),
         crate::syscalls::SYS_LS => sys_ls(state.ebx as *const u8, state.ecx as *mut u8, state.edx as usize),
         // === Memory ===
         crate::syscalls::SYS_MALLOC => {
@@ -426,28 +427,14 @@ fn sys_ls(path_ptr: *const u8, buf_ptr: *mut u8, buf_size: usize) -> usize {
 }
 
 // ====================== EXECVE ======================
-pub fn sys_execve(path_ptr: *const u8) -> usize {
-    let path = unsafe {
-        let mut len = 0;
-        while len < 256 && *path_ptr.add(len) != 0 {
-            len += 1;
-        }
-        match core::str::from_utf8(core::slice::from_raw_parts(path_ptr, len)) {
-            Ok(s) => s,
-            Err(_) => {
-                println!("[execve] Invalid UTF-8 in path");
-                return usize::MAX;
-            }
-        }
-    };
+pub fn sys_execve(buf_ptr: *const u8, count: usize) -> usize {
+    let mut kernel_buf = alloc::vec![0u8; count];
 
-    let data = match VFS.get().read_file(path) {
-        Some(d) => d,
-        None => {
-            println!("[execve] File not found: {}", path);
-            return usize::MAX;
-        }
-    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf_ptr, kernel_buf.as_mut_ptr(), count);
+    }
+
+    let buf = &kernel_buf[..];
 
     let slot_i8 = unsafe { TASK_MANAGER.get_free_slot() };
     if slot_i8 < 0 {
@@ -494,12 +481,10 @@ pub fn sys_execve(path_ptr: *const u8) -> usize {
             let heap_page = heap_start + (i * PAGE_SIZE as u32);
             task.page_dir.alloc_and_map_user_page(heap_page);
         }
-
         // === ВРЕМЕННО ПЕРЕКЛЮЧАЕМСЯ НА НОВУЮ ТАБЛИЦУ СТРАНИЦ ===
         // println!("[execve] Switching to task PD for ELF loading...");
         task.page_dir.switch();
-        println!("data size: {}", data.len());
-        match crate::elf::load_elf(&data, target, APP_SIZE) {
+        match crate::elf::load_elf(buf, target, APP_SIZE) {
             Ok(entry_point) => {
                 // Загрузка прошла успешно — возвращаемся обратно в kernel PD
                 if kernel_pd_phys != 0 {

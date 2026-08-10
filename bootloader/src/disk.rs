@@ -1,6 +1,7 @@
 // DISK READER for FLOPPY — real hardware friendly
 // INT 13h AH=02 (CHS), no DAP
 use core::arch::asm;
+use crate::print::PRINTER;
 
 pub static mut DISK: Disk = Disk { lba: 0, buffer: 0 };
 const SECTOR_SIZE: u32 = 512;
@@ -18,8 +19,7 @@ impl Disk {
         self.lba = lba;
         self.buffer = buffer;
 
-        self.reset();
-        self.delay();
+        
     }
 
     fn check_ready(&self) {
@@ -43,7 +43,7 @@ impl Disk {
         println!(" ready-status=0x{:x}", status);
     }
 
-    fn reset(&self) {
+    pub(crate) fn reset(&self) {
         unsafe {
             asm!(
             "xor ax, ax",
@@ -54,9 +54,10 @@ impl Disk {
             options(nostack),
             );
         }
+        println!("reset")
     }
 
-    fn delay(&self) {
+    pub(crate) fn delay(&self) {
         print!(".");
         unsafe {
             asm!(
