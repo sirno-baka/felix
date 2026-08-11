@@ -22,7 +22,7 @@ pub static PRINTER: Mutex<Printer> = Mutex::new(printer_new());
 const WIDTH: u16 = 80;
 const HEIGHT: u16 = 25;
 
-const VGA_START: u32 = 0x000b8000;
+const VGA_START: u32 = 0xC00B_8000;
 
 pub struct Printer {
     x: u16,

@@ -90,7 +90,12 @@ const VIRT_PT_BASE: u32 = 0xFFC00000;
 // Виртуальный адрес самого каталога страниц (через рекурсию)
 const VIRT_PD_BASE: u32 = 0xFFFFF000;
 
-static mut USER_HEAP_NEXT: u32 = 0x20000000;
+pub const KERNEL_OFFSET: u32 = 0xC000_0000;
+pub const KERNEL_PHYS:   u32 = 0x0100_0000;
+pub const KERNEL_VIRT:   u32 = KERNEL_PHYS + KERNEL_OFFSET; // 0xC100_0000
+
+// замени существующий USER_HEAP_NEXT:
+static mut USER_HEAP_NEXT: u32 = 0x1000_0000; // низкий адрес — теперь свободно
 
 #[derive(Copy, Clone)]
 pub struct PTEFlags(u32);
@@ -329,12 +334,27 @@ impl PageDirectory {
     }
 
     pub fn switch(&self) {
-        let pd_phys = &self.entries as *const [u32; ENTRIES] as u32;
+        // После higher-half &self — это virtual address.
+        // CR3 всегда должен получать physical.
+        let virt = &self.entries as *const [u32; ENTRIES] as u32;
+        let pd_phys = if virt >= KERNEL_OFFSET {
+            virt - KERNEL_OFFSET
+        } else {
+            virt
+        };
         unsafe {
-            asm!("mov cr3, {}", in(reg) pd_phys);
+            core::arch::asm!("mov cr3, {}", in(reg) pd_phys);
         }
     }
 
+    pub fn dir_phys(&self) -> u32 {
+        let virt = &self.entries as *const [u32; ENTRIES] as u32;
+        if virt >= KERNEL_OFFSET {
+            virt - KERNEL_OFFSET
+        } else {
+            virt
+        }
+    }
     pub fn flush_all() {
         unsafe {
             let cr3: u32;
@@ -360,44 +380,34 @@ impl PageDirectory {
         };
 
         if need_table {
-            let pt_phys = self.alloc_frame();
-            let pde_flags = PDEFlags::new()
-                .present()
-                .writable()
-                .user()
-                .bits();
+            let pt_frame = self.alloc_frame();
+            let pt_phys = pt_frame << 12;
+            self.entries[pd_idx] = pt_phys
+                | PDEFlags::PRESENT
+                | PDEFlags::WRITABLE
+                | PDEFlags::USER;
 
-            self.entries[pd_idx] = (pt_phys << 12) | pde_flags;
-            PageDirectory::flush_page((pd_idx as u32) << 22);
-
-            // Старый способ обнуления PT (через физический адрес)
-            let pt_virt = (pt_phys << 12) as *mut u8;
-            unsafe {
-                write_bytes(pt_virt, 0, 4096);
-            }
+            let pt_virt = phys_to_virt(pt_phys) as *mut u8;
+            unsafe { write_bytes(pt_virt, 0, 4096); }
         }
 
         let pde = self.entries[pd_idx];
-        let pt_phys = (pde >> 12) << 12;
-        let pt_virt = pt_phys as *mut [u32; ENTRIES];
+        let pt_phys = pde & 0xFFFF_F000;
+        let pt = phys_to_virt(pt_phys) as *mut [u32; ENTRIES];
 
-        // Если страница уже смаплена — не трогаем (не теряем данные!).
-        let existing_pte = unsafe { (*pt_virt)[pt_idx] };
-        if existing_pte & PTEFlags::PRESENT != 0 {
+        let existing = unsafe { (*pt)[pt_idx] };
+        if existing & PTEFlags::PRESENT != 0 {
             return;
         }
 
-        let phys_frame = self.alloc_frame();
-
+        let frame = self.alloc_frame();
         unsafe {
-            (*pt_virt)[pt_idx] = (phys_frame << 12)
+            (*pt)[pt_idx] = (frame << 12)
                 | PTEFlags::PRESENT
                 | PTEFlags::WRITABLE
                 | PTEFlags::USER
                 | PTEFlags::DIRTY;
         }
-
-        PageDirectory::flush_page(virt_addr);
     }
 }
 
@@ -429,33 +439,77 @@ impl PageManager {
         frame
     }
 
-    pub fn init(&mut self, kernel_end: u32) {
-        let cr4: u32;
+    /// Higher-half aware page-manager initialisation.
+    ///
+    /// Called from higher_half_entry() after the early dual-mapping PD
+    /// has already been installed.  Builds the definitive kernel PD:
+    ///
+    ///   • identity 0–32 MiB          (VGA, devices, early code)
+    ///   • higher-half 0xC0000000+    (kernel image, stacks, heap)
+    ///   • recursive mapping at 0xFFC00000
+    pub fn init(&mut self, kernel_end_virt: u32) {
+        // Enable PSE (4 MiB pages)
         unsafe {
-            asm!("mov {}, cr4", out(reg) cr4);
-            let cr4 = cr4 | (1 << 4);
-            asm!("mov cr4, {}", in(reg) cr4);
+            let mut cr4: u32;
+            core::arch::asm!("mov {}, cr4", out(reg) cr4);
+            cr4 |= 1 << 4;
+            core::arch::asm!("mov cr4, {}", in(reg) cr4);
         }
 
+        // ---- Identity map first 32 MiB (large pages) ----
         for i in 0..8u32 {
-            let base = i * 0x400000u32; // 4 MiB large pages, identity mapped
+            let base = i * 0x400000u32;
             self.dir.map_large(
                 base,
                 base,
-                PDEFlags::new().present().writable().accessed().user().large_page(),
+                PDEFlags::new()
+                    .present()
+                    .writable()
+                    .accessed()
+                    .large_page(),
             );
         }
 
-        let pd_phys = &self.dir as *const PageDirectory as u32;
+        // ---- Higher-half map of the same physical memory ----
+        // virt = 0xC0000000 + phys  →  phys
+        for i in 0..8u32 {
+            let phys = i * 0x400000u32;
+            let virt = KERNEL_OFFSET + phys;
+            self.dir.map_large(
+                virt,
+                phys,
+                PDEFlags::new()
+                    .present()
+                    .writable()
+                    .accessed()
+                    .large_page(),
+            );
+        }
+
+        // Physical address of this PageDirectory.
+        // After the higher-half jump the Rust reference is a high virtual
+        // address, so we convert it back to physical.
+        let pd_virt = &self.dir as *const PageDirectory as u32;
+        let pd_phys = if pd_virt >= KERNEL_OFFSET {
+            pd_virt - KERNEL_OFFSET
+        } else {
+            pd_virt
+        };
+
         self.dir.setup_recursive(pd_phys);
-        self.dir.switch();
+        self.dir.switch(); // CR3 = our new PD
 
-        let start_page = (32 * 1024 * 1024) >> 12;
-        let end_page = (kernel_end + 4095) >> 12;
+        // ---- Extra 4 KiB mappings for kernel memory past 32 MiB ----
+        // kernel_end_virt is STACK_START (high virtual).
+        // Corresponding physical end = kernel_end_virt - KERNEL_OFFSET.
+        let start_phys_page = (32 * 1024 * 1024) >> 12;
+        let end_phys_page   = ((kernel_end_virt - KERNEL_OFFSET) + 4095) >> 12;
 
-        for vpage in start_page..end_page {
-            let pd_idx = (vpage >> 10) as usize;
-            let pt_idx = (vpage & 0x3FF) as usize;
+        for phys_page in start_phys_page..end_phys_page {
+            let virt_addr = (phys_page << 12) + KERNEL_OFFSET;
+            let vpage     = virt_addr >> 12;
+            let pd_idx    = (vpage >> 10) as usize;
+            let pt_idx    = (vpage & 0x3FF) as usize;
 
             let need_table = {
                 let pde = self.dir.entries[pd_idx];
@@ -464,42 +518,41 @@ impl PageManager {
 
             if need_table {
                 let pt_phys = self.alloc_frame();
-
-                let pde = &mut self.dir.entries[pd_idx];
                 let pde_flags = PDEFlags::new()
                     .present()
                     .writable()
-                    .user()
-                    .bits();
-
-                *pde = (pt_phys << 12) | pde_flags;
-
+                    .bits(); // kernel-only
+                self.dir.entries[pd_idx] = (pt_phys << 12) | pde_flags;
                 PageDirectory::flush_page((pd_idx as u32) << 22);
 
                 let pt_ptr = PageDirectory::get_page_table_ptr(pd_idx);
                 unsafe {
-                    write_bytes(pt_ptr as *mut u8, 0, 4096);
+                    core::ptr::write_bytes(pt_ptr as *mut u8, 0, 4096);
                 }
             }
 
             let pt_ptr = PageDirectory::get_page_table_ptr(pd_idx);
             unsafe {
-                (*pt_ptr)[pt_idx] = (vpage << 12) | PTEFlags::PRESENT | PTEFlags::WRITABLE | PTEFlags::USER | PTEFlags::ACCESSED;
+                (*pt_ptr)[pt_idx] = (phys_page << 12)
+                    | PTEFlags::PRESENT
+                    | PTEFlags::WRITABLE
+                    | PTEFlags::ACCESSED;
             }
-            PageDirectory::flush_page((vpage << 12) as u32);
+            PageDirectory::flush_page(virt_addr);
         }
 
-        self.next_free_page = end_page;
+        self.next_free_page = end_phys_page + 0x100;
 
+        // Ensure PG is set (should already be from early bootstrap)
         self.dir.switch();
-
         unsafe {
-            let cr0: u32;
-            asm!("mov {}, cr0", out(reg) cr0);
-            let cr0 = cr0 | (1 << 31);
-            asm!("mov cr0, {}", in(reg) cr0);
+            let mut cr0: u32;
+            core::arch::asm!("mov {}, cr0", out(reg) cr0);
+            cr0 |= 1 << 31;
+            core::arch::asm!("mov cr0, {}", in(reg) cr0);
         }
     }
+
 
     pub fn alloc_user_memory(&mut self, size: u32) -> u32 {
         if size == 0 {
@@ -575,7 +628,12 @@ impl PageManager {
     }
 
     pub fn dir_phys(&self) -> u32 {
-        &self.dir.entries as *const [u32; ENTRIES] as u32
+        let virt = &self.dir.entries as *const [u32; ENTRIES] as u32;
+        if virt >= KERNEL_OFFSET {
+            virt - KERNEL_OFFSET
+        } else {
+            virt
+        }
     }
 }
 
@@ -628,90 +686,73 @@ pub fn setup_kernel_page_dir(pd: &mut PageManager, end_page: u32) {
 
     pd.dir.switch();
 }
-
 pub static mut KERNEL_PD_PHYS: u32 = 0;
-pub static mut KERNEL_END_PAGE: u32 = 0;
+pub static mut KERNEL_END_PAGE: u32 = 0; // physical page number
 
+/// Copy kernel address-space mappings into a newly created task page directory.
+///
+/// Copies:
+///   1. Identity large pages 0–32 MiB          (PDE 0..7)
+///   2. Higher-half large pages 0xC0000000+    (PDE 768..775)
+///   3. Any extra 4 KiB kernel PTEs that live in the higher-half
+///   4. Recursive mapping pointing at the *task's* own PD
 pub fn copy_kernel_mappings(task_dir: &mut PageDirectory, task_pd_phys: u32) {
     unsafe {
-        // 1. Копируем identity mapping первых 32 МБ (large pages) — обязательно!
-        for i in 0..8u32 {
-            let base = i * 0x400000u32; // 4 MiB large pages, identity mapped
-            task_dir.map_large(
-                base,
-                base,
-                PDEFlags::new().present().writable().accessed().user().large_page(),
-            );
-        }
-
-        let end_page = KERNEL_END_PAGE;
         let kernel_pd_phys = KERNEL_PD_PHYS;
-
         if kernel_pd_phys == 0 {
-            println!("[copy_kernel_mappings] ERROR: KERNEL_PD_PHYS not set!");
             return;
         }
+        // Читаем kernel PD через higher-half, не через identity
+        let kernel_pd = phys_to_virt(kernel_pd_phys) as *const [u32; ENTRIES];
 
-        // println!("[copy] Copying kernel mappings up to page {}", end_page);
-
-        // 2. Копируем все kernel-страницы (от 32MB и выше)
-        for pd_idx in 0..1024u32 {
-            let start_page = pd_idx * 1024;
-            if start_page >= end_page {
-                break;
+        // Higher-half large pages 0xC0000000.. (PDE 768..775)
+        for i in 0..8usize {
+            let idx = 768 + i;
+            let pde = (*kernel_pd)[idx];
+            if (pde & PDEFlags::PRESENT) != 0 {
+                task_dir.entries[idx] = pde;
             }
+        }
 
-            let global_pde = *(kernel_pd_phys as *const u32).add(pd_idx as usize);
-
-            if (global_pde & PDEFlags::PRESENT) == 0 {
+        // Extra higher-half 4K page tables (776..1022), если есть
+        for pd_idx in 776usize..1023 {
+            let pde = (*kernel_pd)[pd_idx];
+            if (pde & PDEFlags::PRESENT) == 0 {
+                continue;
+            }
+            if (pde & PDEFlags::DIR_PAGE_SIZE) != 0 {
+                task_dir.entries[pd_idx] = pde;
                 continue;
             }
 
-            let global_pt_phys = (global_pde >> 12) << 12;
-            let global_pt = global_pt_phys as *const [u32; 1024];
+            let src_pt_phys = pde & 0xFFFF_F000;
+            let new_pt_frame = PAGING.lock().alloc_frame();
+            let new_pt_phys = new_pt_frame << 12;
 
-            let need_table = {
-                let tde = task_dir.entries[pd_idx as usize];
-                tde == 0 || (tde & PDEFlags::PRESENT) == 0
-            };
-
-            if need_table {
-                let pt_phys = task_dir.alloc_frame();
-                let pde = &mut task_dir.entries[pd_idx as usize];
-                let pde_flags = PDEFlags::new()
-                    .present()
-                    .writable()
-                    .user()
-                    .bits();
-                *pde = (pt_phys << 12) | pde_flags;
-                PageDirectory::flush_page(pd_idx << 22);
-                let pt_ptr = PageDirectory::get_page_table_ptr(pd_idx as usize);
-                core::ptr::write_bytes(pt_ptr as *mut u8, 0, 4096);
+            let src = phys_to_virt(src_pt_phys) as *const u32;
+            let dst = phys_to_virt(new_pt_phys) as *mut u32;
+            core::ptr::write_bytes(dst as *mut u8, 0, 4096);
+            for i in 0..1024 {
+                *dst.add(i) = *src.add(i);
             }
 
-            let task_pt = PageDirectory::get_page_table_ptr(pd_idx as usize);
-            let max_pt = if start_page + 1024 > end_page {
-                (end_page - start_page) as usize
-            } else {
-                1024
-            };
-
-            for pt_idx in 0..max_pt {
-                let pte = (*global_pt)[pt_idx];
-                if (pte & PTEFlags::PRESENT) == 0 {
-                    continue;
-                }
-                (*task_pt)[pt_idx] = pte;
-            }
+            task_dir.entries[pd_idx] = new_pt_phys | (pde & 0xFFF);
         }
 
-        // === САМОЕ ВАЖНОЕ ===
-        task_dir.entries[RECURSIVE_INDEX] = task_pd_phys
+        // Recursive → physical PD задачи
+        task_dir.entries[1023] = task_pd_phys
             | PDEFlags::PRESENT
             | PDEFlags::WRITABLE;
 
-        // println!("[copy] Kernel mappings + recursive entry copied successfully for task PD phys = 0x{:08x}", task_pd_phys);
+        // НЕТ identity PDE[0..7]
     }
+}
+
+/// Physical → kernel virtual (higher-half).
+/// Требует, чтобы phys был в зоне higher-half large pages (сейчас 0..32 MiB).
+#[inline]
+pub fn phys_to_virt(phys: u32) -> u32 {
+    phys.wrapping_add(KERNEL_OFFSET)
 }
 
 /// Глобальный экземпляр менеджера страниц

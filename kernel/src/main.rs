@@ -46,7 +46,6 @@ use crate::disk::{copy_sectors, PartitionConfig};
 use crate::disk::ramdisk::RamDisk;
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::drivers::pic::wait;
-// use crate::drivers::ramfs::RamFs;
 use crate::filesystem::{Filesystem, VFS};
 use crate::filesystem::vfs::Vfs;
 use crate::io::{inb, outb};
@@ -54,13 +53,19 @@ use crate::pci::floppy::disk::Floppy;
 use crate::pci::ide::IDE;
 use crate::sync::mutex::Mutex;
 use crate::utils::queue::Queue;
+
 static mut TEST_WRITE: [u32; 128] = [0; 128];
 static mut TEST_READ:  [u32; 128] = [0; 128];
-const KERNEL_START: u32 = 0x100_0000;
-const KERNEL_SIZE: u32 = 0x0010_0000;
-const STACK_SIZE: u32 = 0x0010_0000;
 
-const STACK_START: u32 = KERNEL_START + KERNEL_SIZE + STACK_SIZE;
+// ===================== HIGHER-HALF CONSTANTS =====================
+// Physical load address (bootloader still puts kernel here)
+pub const KERNEL_PHYS: u32 = 0x0100_0000;
+// Virtual higher-half base
+pub const KERNEL_OFFSET: u32 = 0xC000_0000;
+pub const KERNEL_START: u32 = KERNEL_PHYS + KERNEL_OFFSET; // 0xC100_0000
+pub const KERNEL_SIZE: u32  = 0x0010_0000;
+pub const STACK_SIZE: u32   = 0x0010_0000;
+pub const STACK_START: u32  = KERNEL_START + KERNEL_SIZE + STACK_SIZE; // high virtual
 
 #[macro_export]
 macro_rules! run {
@@ -74,37 +79,104 @@ macro_rules! run {
 
 pub extern "C" fn irq6() {
     unsafe {
-        outb(0x20, 0x20); // master PIC EOI
+        outb(0x20, 0x20);
     }
 }
 
+/// Early higher-half transition.
+/// This runs while we are still executing from the physical address
+/// (bootloader jumped to 0x01000000). We set up a temporary page directory
+/// that identity-maps the low 32 MiB AND maps the higher-half window
+/// 0xC0000000+ → physical 0x00000000+, enable paging, then jump to the
+/// high-virtual version of the rest of the kernel.
 #[no_mangle]
 #[link_section = ".start"]
 pub extern "C" fn _start() -> ! {
     unsafe {
+        // ---------------------------------------------------------------
+        // 1. Build a temporary page directory + page tables in low memory
+        //    We place them at a known physical location after the kernel
+        //    image (or use a static and convert virt→phys).
+        //    For simplicity we use a fixed physical address 0x00200000.
+        // ---------------------------------------------------------------
+        const TEMP_PD_PHYS: u32 = 0x0020_0000;
+        const TEMP_PT0_PHYS: u32 = 0x0020_1000; // covers 0–4 MiB identity + higher
+        // More PTs can be added if needed.
+
+        // Zero PD
+        let pd = TEMP_PD_PHYS as *mut u32;
+        for i in 0..1024 {
+            *pd.add(i) = 0;
+        }
+
+        // Identity map first 32 MiB with 4 MiB large pages (PSE)
+        // Also map the same physical pages at 0xC0000000 + base
+        for i in 0..8u32 {
+            let phys = i * 0x400000;
+            let flags = 0x83u32; // Present + Writable + Large page
+            // Identity
+            *pd.add(i as usize) = phys | flags;
+            // Higher-half (PDE index for 0xC0000000 is 768)
+            *pd.add(768 + i as usize) = phys | flags;
+        }
+
+        // Also map the recursive entry? optional for early
+
+        // ---------------------------------------------------------------
+        // 2. Enable PSE (4 MiB pages) and load CR3 / enable PG
+        // ---------------------------------------------------------------
+        let mut cr4: u32;
+        asm!("mov {}, cr4", out(reg) cr4);
+        cr4 |= 1 << 4; // PSE
+        asm!("mov cr4, {}", in(reg) cr4);
+
+        asm!("mov cr3, {}", in(reg) TEMP_PD_PHYS);
+
+        let mut cr0: u32;
+        asm!("mov {}, cr0", out(reg) cr0);
+        cr0 |= 1 << 31; // PG
+        asm!("mov cr0, {}", in(reg) cr0);
+
+        // ---------------------------------------------------------------
+        // 3. Far jump to the higher-half entry point
+        //    The symbol higher_half_entry is linked at high VMA.
+        // ---------------------------------------------------------------
+        asm!(
+        "lea {0}, {1}",          // load high address of label
+        "jmp {0}",
+        out(reg) _,
+        sym higher_half_entry,
+        );
+        loop {
+
+        }
+    }
+}
+
+/// Continues kernel initialisation after we are running in higher-half.
+#[no_mangle]
+pub extern "C" fn higher_half_entry() -> ! {
+    unsafe {
+        // Now ESP must be the high virtual stack
         asm!("mov esp, {}", in(reg) STACK_START);
-        let mut mask: u8;
-        asm!("in al, 0x21", out("al") mask);     // читаем текущую маску master PIC
-        asm!("out 0x21, al", in("al") mask | 1); // устанавливаем бит 0 (IRQ0 = timer)
-        // 1. GDT + TSS
+
+        // let mut mask: u8;
+        // asm!("in al, 0x21", out("al") mask);
+        // asm!("out 0x21, al", in("al") mask | 1);
+
+        // 1. GDT + TSS (addresses are now high)
         gdt::GlobalDescriptorTable::init();
         GDT.set_kernel_stack(STACK_START);
         GDT.load();
         GDT.load_tss();
 
-        // 2. Paging
+        // 2. Full paging (replaces the temporary PD with the proper one)
         {
             let mut pm = PAGING.lock();
-            pm.init(STACK_START as u32);
+            pm.init(STACK_START);
 
-            // setup_kernel_page_dir больше не нужен — init() уже всё сделал
-            let end_page = pm.next_free_page;
-            let pd_phys = pm.dir_phys();
-
-            unsafe {
-                crate::memory::paging::KERNEL_END_PAGE = end_page;
-                crate::memory::paging::KERNEL_PD_PHYS = pd_phys;
-            }
+            crate::memory::paging::KERNEL_END_PAGE = pm.next_free_page;
+            crate::memory::paging::KERNEL_PD_PHYS = pm.dir_phys();
         }
 
         // 3. IDT — загружаем ОЧЕНЬ РАНО
@@ -171,6 +243,9 @@ pub extern "C" fn _start() -> ! {
         for i in 0..5000 {
             wait();
         }
+        // // === ВКЛЮЧАЕМ ТАЙМЕР И ПРЕРЫВАНИЯ ТОЛЬКО В КОНЦЕ ===
+        // asm!("in al, 0x21", out("al") mask);
+        // asm!("out 0x21, al", in("al") mask & !1u8); // снимаем бит 0
 
         // let entries = VFS.get().list_directory_entries("/");
         let data= VFS.get().read_file("/shell").unwrap();
@@ -179,29 +254,22 @@ pub extern "C" fn _start() -> ! {
         crate::syscalls::handler::sys_execve(data.as_ptr(), data.len());
 
 
-
-        // === ВКЛЮЧАЕМ ТАЙМЕР И ПРЕРЫВАНИЯ ТОЛЬКО В КОНЦЕ ===
-        asm!("in al, 0x21", out("al") mask);
-        asm!("out 0x21, al", in("al") mask & !1u8); // снимаем бит 0
         asm!("sti");
-        // run!("/hello");
-        // run!("/shell");
+
+
+        // For brevity in this patch the remaining init is left as a TODO —
+        // paste the original body after the paging block from the old _start.
+        // The only change needed is that all addresses (STACK_START etc.) are
+        // already the high ones.
+
+        println!("[!] Higher-half kernel running at 0x{:08x}", higher_half_entry as u32);
+
+        // Temporary halt so you can verify the jump worked
         loop {
-            unsafe {
-                asm!("hlt");        // даём CPU спать до следующего таймера
-            }
+            asm!("hlt");
         }
     }
 }
-
-unsafe fn exampletask1() {
-
-    let mut shell = shell::shell::Shell::new();
-    loop {
-        shell.run();
-    }
-}
-
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

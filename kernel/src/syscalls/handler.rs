@@ -218,7 +218,7 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
 
         _ => 0,
     };
-    
+
     // println!("ret: 0x{:x}", ret);
     // КЛАДЁМ результат обратно в eax (чтобы пользовательская программа его получила)
     state.eax = ret as u32;
@@ -429,11 +429,9 @@ fn sys_ls(path_ptr: *const u8, buf_ptr: *mut u8, buf_size: usize) -> usize {
 // ====================== EXECVE ======================
 pub fn sys_execve(buf_ptr: *const u8, count: usize) -> usize {
     let mut kernel_buf = alloc::vec![0u8; count];
-
     unsafe {
         core::ptr::copy_nonoverlapping(buf_ptr, kernel_buf.as_mut_ptr(), count);
     }
-
     let buf = &kernel_buf[..];
 
     let slot_i8 = unsafe { TASK_MANAGER.get_free_slot() };
@@ -443,79 +441,102 @@ pub fn sys_execve(buf_ptr: *const u8, count: usize) -> usize {
     }
     let slot = slot_i8 as usize;
 
-    const APP_TARGET: u32 = 0x40000000;
-    const APP_SIZE: u32 = 4 * 1024 * 1024;
-    // Каждая задача имеет собственный page directory — все приложения
-    // грузятся по одному виртуальному адресу (== линковому адресу ELF).
-    let target = APP_TARGET;
-    let user_stack_top = target + APP_SIZE - 0x8000;
-    let heap_start = 0x80000000 + (slot as u32 * 0x10000000);
+    // Стек пользователя — высоко в user space, растёт вниз
+    // Не зависит от base ELF
+    const USER_STACK_TOP: u32 = 0xBFFF_F000;
+    const USER_STACK_PAGES: u32 = 32; // 128 KiB
+    // Heap — отдельный регион
+    let heap_start = 0x4000_0000 + (slot as u32 * 0x1000_0000);
 
     unsafe {
         asm!("cli");
 
         let mut task = Task::new_task();
+        let kernel_pd_phys = crate::memory::paging::KERNEL_PD_PHYS;
 
-        let pd_phys = &task.page_dir as *const PageDirectory as u32;
-        let kernel_pd_phys = crate::memory::paging::KERNEL_PD_PHYS; // сохраняем kernel PD
-
+        // Kernel mappings в PD задачи
+        let pd_virt = &task.page_dir as *const PageDirectory as u32;
+        let pd_phys = if pd_virt >= crate::memory::paging::KERNEL_OFFSET {
+            pd_virt - crate::memory::paging::KERNEL_OFFSET
+        } else {
+            pd_virt
+        };
         copy_kernel_mappings(&mut task.page_dir, pd_phys);
 
-        // println!("[execve] Mapping app at {:#x} (1 MB) for task {}", target, slot);
-
-        let app_pages = (APP_SIZE >> 12) as u32;
-        for i in 0..app_pages {
-            let virt_addr = target + (i << 12);
-            task.page_dir.alloc_and_map_user_page(virt_addr);
-            if i % 64 == 0 || i == app_pages - 1 {
-                // println!("[execve] Mapped {}/{} app pages", i + 1, app_pages);
-            }
+        // User stack
+        for i in 0..USER_STACK_PAGES {
+            let page = USER_STACK_TOP - (i + 1) * PAGE_SIZE as u32;
+            task.page_dir.alloc_and_map_user_page(page);
         }
-
-        // println!("[execve] Mapping user stack + heap...");
-        for i in 0..32u32 {
-            let stack_page = user_stack_top - (i * PAGE_SIZE as u32);
-            task.page_dir.alloc_and_map_user_page(stack_page);
-        }
+        // Немного heap
         for i in 0..8u32 {
-            let heap_page = heap_start + (i * PAGE_SIZE as u32);
-            task.page_dir.alloc_and_map_user_page(heap_page);
+            task.page_dir.alloc_and_map_user_page(heap_start + i * PAGE_SIZE as u32);
         }
-        // === ВРЕМЕННО ПЕРЕКЛЮЧАЕМСЯ НА НОВУЮ ТАБЛИЦУ СТРАНИЦ ===
-        // println!("[execve] Switching to task PD for ELF loading...");
-        task.page_dir.switch();
-        match crate::elf::load_elf(buf, target, APP_SIZE) {
-            Ok(entry_point) => {
-                // Загрузка прошла успешно — возвращаемся обратно в kernel PD
-                if kernel_pd_phys != 0 {
-                    unsafe {
-                        asm!("mov cr3, {}", in(reg) kernel_pd_phys);
-                    }
-                }
 
-                task.init(entry_point, user_stack_top, heap_start);
-                // println!("[execve DEBUG] slot={} heap_start=0x{:x} heap_next after init=0x{:x}",
-                //          slot, heap_start, task.heap_next);
-                TASK_MANAGER.tasks[slot] = Some(task);
-                TASK_MANAGER.task_count += 1;
+        // Переключаемся на PD задачи и грузим ELF по его p_vaddr
+        // task.page_dir.switch();
 
-                // println!("[execve] SUCCESS: {} started! entry={:#x} task={} stack={:#x}",
-                //          path, entry_point, slot, user_stack_top);
-                asm!("sti");
-                0
-            }
+        let entry_point = match crate::elf::load_elf(buf, &mut task.page_dir) {
+            Ok(e) => e,
             Err(e) => {
-                // Если ошибка — тоже возвращаемся в kernel PD
                 println!("[execve] ELF load failed: {:?}", e);
                 if kernel_pd_phys != 0 {
-                    unsafe {
-                        asm!("mov cr3, {}", in(reg) kernel_pd_phys);
-                    }
+                    asm!("mov cr3, {}", in(reg) kernel_pd_phys);
                 }
                 asm!("sti");
-
-                usize::MAX
+                return usize::MAX;
             }
+        };
+
+        // // Назад в kernel PD
+        // if kernel_pd_phys != 0 {
+        //     asm!("mov cr3, {}", in(reg) kernel_pd_phys);
+        // }
+
+        // Кладём Task в массив и фиксируем указатели
+        TASK_MANAGER.tasks[slot] = Some(task);
+        TASK_MANAGER.task_count += 1;
+
+        if let Some(ref mut t) = TASK_MANAGER.tasks[slot] {
+            let kernel_stack_top = (t.stack.as_ptr() as usize
+                + crate::multitasking::task::STACK_SIZE) as u32;
+            t.kernel_stack = kernel_stack_top;
+
+            let state_ptr = (kernel_stack_top as usize
+                - crate::multitasking::task::HEADROOM
+                - core::mem::size_of::<CPUState>())
+                as *mut CPUState;
+            t.cpu_state_ptr = state_ptr as u32;
+
+            *state_ptr = CPUState {
+                eax: 0, ebx: 0, ecx: 0, edx: 0,
+                esi: 0, edi: 0, ebp: 0,
+                eip:    entry_point,   // e_entry из ELF, без сдвига
+                cs:     0x1B,
+                eflags: 0x202,
+                esp:    USER_STACK_TOP,
+                ss:     0x23,
+            };
+
+            let pd_virt = &t.page_dir as *const _ as u32;
+            let pd_phys = if pd_virt >= crate::memory::paging::KERNEL_OFFSET {
+                pd_virt - crate::memory::paging::KERNEL_OFFSET
+            } else {
+                pd_virt
+            };
+            t.page_dir.entries[1023] = pd_phys
+                | crate::memory::paging::PDEFlags::PRESENT
+                | crate::memory::paging::PDEFlags::WRITABLE;
+
+            t.running = true;
+            t.heap_next = heap_start;
+
+            println!("[execve] OK entry={:#x} stack={:#x} pd_phys={:#x}",
+                     entry_point, USER_STACK_TOP, pd_phys);
         }
+
+        asm!("sti");
+        0
     }
 }
+

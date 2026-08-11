@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::u32::MAX;
 use crate::filesystem::file::FileDescriptorTable;
-use crate::memory::paging::{PageDirectory, PDEFlags, copy_kernel_mappings, PhysAddr, VirtAddr};
+use crate::memory::paging::{PageDirectory, PDEFlags, copy_kernel_mappings, PhysAddr, VirtAddr, KERNEL_OFFSET};
 use crate::{gdt, print, println};
 use crate::drivers::pic::wait;
 
@@ -182,9 +182,13 @@ impl TaskManager {
         let task = self.tasks[0].as_mut().unwrap();
 
         // === НОВОЕ: инициализируем PageDirectory idle-задачи ===
-        let pd_phys = &task.page_dir as *const PageDirectory as u32;
+        let pd_virt = &task.page_dir as *const _ as u32;
+        let pd_phys = if pd_virt >= KERNEL_OFFSET {
+            pd_virt - KERNEL_OFFSET
+        } else {
+            pd_virt
+        };
         copy_kernel_mappings(&mut task.page_dir, pd_phys);
-
         let stack_top = unsafe {
             (&task.stack as *const u8).add(STACK_SIZE) as u32
         };
@@ -249,6 +253,9 @@ impl TaskManager {
 
     //CPU SCHEDULER LOGIC
     pub fn schedule(&mut self, cpu_state: *mut CPUState) -> *mut CPUState {
+        if  self.tasks[0].is_none() {
+            return cpu_state
+        }
         if self.first_switch {
             self.first_switch = false;
 
@@ -282,9 +289,34 @@ impl TaskManager {
         // println!("[SCHEDULE] switching to task {} | pd_phys={:#x} | eip={:#x}",
         //          self.current_task, &task.page_dir as *const _ as u32, task.cpu_state_ptr);
         let new_cpustate = task.cpu_state_ptr as *mut CPUState;
+        // внутри schedule, перед task.page_dir.switch()
 
         unsafe {
             gdt::TSS.esp0 = task.kernel_stack;
+            // --- ELF @ 0x400000 ---
+            // let virt = 0x0040_4000u32;
+            // let page_num = virt >> 12;
+            // let pd_idx = (page_num >> 10) as usize;      // 1
+            // let pt_idx = (page_num & 0x3FF) as usize;    // 4
+            //
+            // let pde = task.page_dir.entries[pd_idx];
+            // println!("[SCHED] PDE[{}]={:#x}", pd_idx, pde);
+            //
+            // if (pde & 1) != 0 {
+            //     let pt_phys = pde & 0xFFFF_F000;
+            //     let pt = crate::memory::paging::phys_to_virt(pt_phys) as *const [u32; 1024];
+            //     let pte = unsafe { (*pt)[pt_idx] };
+            //     println!("[SCHED] PTE[{}] virt={:#x} = {:#x}", pt_idx, virt, pte);
+            // } else {
+            //     println!("[SCHED] PDE[{}] NOT PRESENT — ELF not mapped!", pd_idx);
+            // }
+            //
+            // // --- stack @ 0xBFFFF000 ---
+            // let stack_page = 0xBFFF_F000u32;
+            // let spn = stack_page >> 12;
+            // let spd = (spn >> 10) as usize;              // 767
+            // let spt = (spn & 0x3FF) as usize;            // 1023
+            // println!("[SCHED] PDE[{}] (stack)={:#x}", spd, task.page_dir.entries[spd]);
             task.page_dir.switch();            // ← главное исправление
         }
 

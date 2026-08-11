@@ -13,33 +13,44 @@ pub const TIMER_INT: u8 = 32;
 pub extern "C" fn timer() {
     unsafe {
         asm!(
-            "cli",
-            "call jiffies_inc",
-            // Save registers (must match CPUState layout)
-            "push ebp",
-            "push edi",
-            "push esi",
-            "push edx",
-            "push ecx",
-            "push ebx",
-            "push eax",
-            // Pass current stack pointer to handler
-            "push esp",
-            "call timer_handler",
-            "add esp, 4",        // cleanup pushed argument
-            // Switch to new task's kernel stack
-            "mov esp, eax",
-            // Restore registers
-            "pop eax",
-            "pop ebx",
-            "pop ecx",
-            "pop edx",
-            "pop esi",
-            "pop edi",
-            "pop ebp",
-            "sti",
-            "iretd",
-            options(noreturn)
+        "cli",
+        "call jiffies_inc",
+
+        "push ebp",
+        "push edi",
+        "push esi",
+        "push edx",
+        "push ecx",
+        "push ebx",
+        "push eax",
+
+        "push esp",
+        "call timer_handler",
+        "add esp, 4",
+
+        "mov esp, eax",
+
+        "pop eax",
+        "pop ebx",
+        "pop ecx",
+        "pop edx",
+        "pop esi",
+        "pop edi",
+        "pop ebp",
+
+        // На стеке: EIP, CS, EFLAGS, [ESP, SS]
+        // Если CS.RPL == 3 — грузим DS/ES user data
+        "mov ax, [esp + 4]",   // CS
+        "and ax, 3",
+        "cmp ax, 3",
+        "jne 2f",
+        "mov ax, 0x23",        // user data (как SS)
+        "mov ds, ax",
+        "mov es, ax",
+        "2:",
+
+        "iretd",
+        options(noreturn)
         );
     }
 }

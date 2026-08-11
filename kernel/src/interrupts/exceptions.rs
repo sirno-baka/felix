@@ -197,11 +197,21 @@ pub extern "C" fn page_fault() {
 
 #[no_mangle]
 pub extern "C" fn page_fault_handler(esp: u32) -> u32 {
-    let state = unsafe { &*((esp as usize ) as *const CPUState) };
-    println!("PAGE FAULT!");
-    let eip = state.eip;
-    let cs = state.cs;
-    let eflags = state.eflags;
-    println!("EIP: {:#x} | CS: {:#x} | EFLAGS: {:#b}", eip, cs, eflags);
+    // После push eax..ebp и push esp:
+    // [eax][ebx][ecx][edx][esi][edi][ebp][error_code][eip][cs][eflags]...
+    let base = esp as *const u32;
+    unsafe {
+        let error_code = *base.add(7);
+        let eip        = *base.add(8);
+        let cs         = *base.add(9);
+        let eflags     = *base.add(10);
+
+        let cr2: u32;
+        core::arch::asm!("mov {}, cr2", out(reg) cr2);
+
+        println!("PAGE FAULT!");
+        println!("  CR2 (fault addr) = {:#x}", cr2);
+        println!("  EIP={:#x} CS={:#x} EFLAGS={:#b} err={:#x}", eip, cs, eflags, error_code);
+    }
     esp
 }
