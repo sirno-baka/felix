@@ -123,7 +123,12 @@ impl GlobalDescriptorTable {
         };
 
         unsafe {
-            asm!("lgdt [{0:e}]", in(reg) &descriptor);
+            // Кладём дескриптор на стек и загружаем по адресу
+            asm!(
+            "lgdt [{0}]",
+            in(reg) &descriptor as *const _ as u32,
+            options(nostack, preserves_flags)
+            );
         }
     }
 

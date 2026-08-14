@@ -4,16 +4,17 @@ use crate::multitasking::task::CPUState;
 use crate::println;
 
 #[no_mangle]
-pub extern "C" fn exception_handler(int: u32, eip: u32, cs: u32, eflags: u32) {
+pub extern "C" fn exception_handler(int: u32, esp: u32,  eip: u32, cs: u32, eflags: u32) {
     let  name = match int {
         0x00 => { "div_error" },
         0x06 => { "invalid_opcode" },
         0x0d => { "general_protection_fault" },
+        0x08 => { "double_fault" },
         0xff => { "generic_handler_handler" },
         _ => {""}
     };
     println!("\n=== EXCEPTION {} ===", name);
-    println!("EIP: {:#x}, CS: {:#x}, EFLAGS: {:#b}", eip, cs, eflags);
+    println!("ESP = 0x{:08x} EIP: {:#x}, CS: {:#x}, EFLAGS: {:#b}", esp, eip, cs, eflags);
     println!("System halted");
     loop {
         unsafe { asm!("hlt"); }
@@ -46,7 +47,7 @@ pub extern "C" fn div_error() {
 #[no_mangle]
 pub extern "C" fn div_error_handler(esp: u32) -> u32 {
     let state = unsafe { &*((esp as usize + 8) as *const CPUState) };
-    exception_handler(0x00, state.eip, state.cs, state.eflags);
+    exception_handler(0x00, esp,  state.eip, state.cs, state.eflags);
     esp
 }
 
@@ -76,7 +77,7 @@ pub extern "C" fn invalid_opcode() {
 #[no_mangle]
 pub extern "C" fn invalid_opcode_handler(esp: u32) -> u32 {
     let state = unsafe { &*((esp as usize + 8) as *const CPUState) };
-    exception_handler(0x06, state.eip, state.cs, state.eflags);
+    exception_handler(0x06, esp, state.eip, state.cs, state.eflags);
     esp
 }
 // ==============================================
@@ -106,7 +107,7 @@ pub extern "C" fn general_protection_fault() {
 #[no_mangle]
 pub extern "C" fn general_protection_fault_handler(esp: u32) -> u32 {
     let state = unsafe { &*((esp as usize + 4) as *const CPUState) };
-    exception_handler(0x0d, state.eip, state.cs, state.eflags);
+    exception_handler(0x0d, esp, state.eip, state.cs, state.eflags);
     esp
 }
 
@@ -137,7 +138,7 @@ pub extern "C" fn double_fault() {
 #[no_mangle]
 pub extern "C" fn double_fault_handler(esp: u32) -> u32 {
     let state = unsafe { &*((esp as usize + 8) as *const CPUState) };
-    exception_handler(0x08, state.eip, state.cs, state.eflags);
+    exception_handler(0x08, esp, state.eip, state.cs, state.eflags);
     esp
 }
 
@@ -167,7 +168,7 @@ pub extern "C" fn generic_handler() {
 #[no_mangle]
 pub extern "C" fn generic_handler_handler(esp: u32) -> u32 {
     let state = unsafe { &*((esp as usize + 8) as *const CPUState) };
-    exception_handler(0xff, state.eip, state.cs, state.eflags);
+    exception_handler(0xff, esp, state.eip, state.cs, state.eflags);
     esp
 }
 

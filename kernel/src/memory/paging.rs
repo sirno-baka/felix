@@ -229,8 +229,11 @@ impl PageDirectory {
     pub fn map_existing(&mut self, virtual_page: u32, physical_page: u32, flags: PTEFlags) {
         let pd_index = (virtual_page >> 10) as usize;
         let pt_index = (virtual_page & 0x3FF) as usize;
+
         let pde = self.entries[pd_index];
         assert!(pde != 0 && (pde & PDEFlags::PRESENT) != 0, "Page table not present");
+
+        // Можно оставить recursive, но после правильного flush выше он уже работает
         let pt_ptr = Self::get_page_table_ptr(pd_index);
         unsafe {
             (*pt_ptr)[pt_index] = (physical_page << 12) | flags.bits();
@@ -433,7 +436,7 @@ impl PageManager {
     pub fn free_phys_frame(&mut self, _frame: u32) {
     }
 
-    fn alloc_frame(&mut self) -> u32 {
+    pub(crate) fn alloc_frame(&mut self) -> u32 {
         let frame = self.next_free_page;
         self.next_free_page += 1;
         frame

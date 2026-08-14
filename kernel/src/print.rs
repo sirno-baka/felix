@@ -3,6 +3,7 @@
 
 use core::arch::asm;
 use core::fmt;
+use core::fmt::Write;
 use interrupt_sync::InterruptSpinMutex;
 use crate::sync::mutex::Mutex;
 
@@ -186,6 +187,9 @@ impl Printer {
 impl fmt::Write for Printer {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.prints(s);
+        // for byte in s.bytes() {
+        //     e9_write_byte(byte);
+        // }
         Ok(())
     }
 }
@@ -210,4 +214,55 @@ pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
     let mut p = super::PRINTER.lock();
     p.write_fmt(args).unwrap();
+}
+
+/// Пишет один байт в debug-port 0xE9 (QEMU/Bochs)
+#[inline]
+fn e9_write_byte(byte: u8) {
+    unsafe {
+        core::arch::asm!(
+        "out dx, al",
+        in("dx") 0xe9u16,
+        in("al") byte,
+        options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Writer, который реализует `core::fmt::Write`
+struct E9Writer;
+
+impl Write for E9Writer {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for byte in s.bytes() {
+            e9_write_byte(byte);
+        }
+        Ok(())
+    }
+}
+
+/// Низкоуровневая функция, которую вызывает макрос
+#[doc(hidden)]
+pub fn _printd(args: fmt::Arguments) {
+    let mut writer = E9Writer;
+    let _ = writer.write_fmt(args);
+}
+
+/// Макрос `print!`
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        $crate::print::_printd(format_args!($($arg)*))
+    };
+}
+
+/// Макрос `println!`
+#[macro_export]
+macro_rules! debugln {
+    () => {
+        $crate::debug!("\n")
+    };
+    ($($arg:tt)*) => {
+        $crate::debug!("{}\n", format_args!($($arg)*))
+    };
 }

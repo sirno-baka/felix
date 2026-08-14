@@ -53,6 +53,7 @@ use crate::pci::floppy::disk::Floppy;
 use crate::pci::ide::IDE;
 use crate::sync::mutex::Mutex;
 use crate::utils::queue::Queue;
+use crate::wrappers::cli;
 
 static mut TEST_WRITE: [u32; 128] = [0; 128];
 static mut TEST_READ:  [u32; 128] = [0; 128];
@@ -64,8 +65,8 @@ pub const KERNEL_PHYS: u32 = 0x0100_0000;
 pub const KERNEL_OFFSET: u32 = 0xC000_0000;
 pub const KERNEL_START: u32 = KERNEL_PHYS + KERNEL_OFFSET; // 0xC100_0000
 pub const KERNEL_SIZE: u32  = 0x0010_0000;
-pub const STACK_SIZE: u32   = 0x0010_0000;
-pub const STACK_START: u32  = KERNEL_START + KERNEL_SIZE + STACK_SIZE; // high virtual
+pub const STACK_SIZE: u32   = 0x0040_0000;  // 4 МБ стека
+pub const STACK_START: u32  = KERNEL_START + KERNEL_SIZE + STACK_SIZE; // ≈ 0xC160_0000
 
 #[macro_export]
 macro_rules! run {
@@ -159,7 +160,6 @@ pub extern "C" fn higher_half_entry() -> ! {
     unsafe {
         // Now ESP must be the high virtual stack
         asm!("mov esp, {}", in(reg) STACK_START);
-
         // let mut mask: u8;
         // asm!("in al, 0x21", out("al") mask);
         // asm!("out 0x21, al", in("al") mask | 1);
@@ -199,7 +199,21 @@ pub extern "C" fn higher_half_entry() -> ! {
             irq6 as u32,
         );
         IDT.load();                     // ← ПЕРЕМЕСТИТЬ СЮДА
+        // После полной инициализации paging
 
+        crate::drivers::framebuffer::init();
+        cli!();
+        if let Some(ref fb) = *crate::drivers::framebuffer::FRAMEBUFFER.lock() {
+            // Пример: заливаем экран тёмно-синим
+            fb.fill(0xff00ff);
+
+            // // Рисуем зелёный прямоугольник
+            fb.fill_rect(100, 100, 200, 150, 0x00FF00);
+            fb.fill_rect(300, 200, 30, 50, 0x11aa00);
+            //
+            // // Красный пиксель
+            // fb.put_pixel(400, 300, 0xFF0000);
+        }
         // 4. PIC
         PICS.init();
 
@@ -229,15 +243,7 @@ pub extern "C" fn higher_half_entry() -> ! {
 
         println!("[VFS] Virtual filesystem initialized");
         print_info();
-        fn calculate_checksum(data: Vec<u8>) -> u32 {
-            println!("Size: {}", data.len());
-            let mut sum = 0u32;
-            for i in data  {
-                // print!("{:02x}", i);
-                sum = sum.wrapping_add(unsafe { i } as u32);
-            }
-            sum
-        }
+
         // 7. Task Manager (после IDT!)
         TASK_MANAGER.init();
         for i in 0..5000 {
@@ -249,8 +255,6 @@ pub extern "C" fn higher_half_entry() -> ! {
 
         // let entries = VFS.get().list_directory_entries("/");
         let data= VFS.get().read_file("/shell").unwrap();
-        let sum = calculate_checksum(data.clone());
-        println!("[!] Shell checksum: 0x{:08x}", sum);
         crate::syscalls::handler::sys_execve(data.as_ptr(), data.len());
 
 

@@ -199,7 +199,7 @@ impl Disk {
             self.lba += batch as u32;
             remaining -= batch;
 
-            if (total_sectors - remaining) % 64 == 0 {
+            if (total_sectors - remaining) % 256 == 0 {
                 print!(".");
             }
         }

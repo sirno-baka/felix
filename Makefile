@@ -173,8 +173,7 @@ run-floppy: all floppy-image
 	@echo "Running Felix..."
 	@killall qemu-system-i386 || true
 
-	@qemu-system-i386 -drive file=build/floppy.img,index=0,format=raw,if=floppy -drive file=disk.img,index=0,media=disk,format=raw,if=ide -no-reboot -no-shutdown -m 64M -serial stdio  -s -S &
-	@sleep 1
+	@qemu-system-i386 -drive file=build/floppy.img,index=0,format=raw,if=floppy -drive file=disk.img,index=0,media=disk,format=raw,if=ide -no-reboot -vga std  -no-shutdown -m 64M -debugcon file:debug.log  -s -S &
 
 
 .PHONY: run

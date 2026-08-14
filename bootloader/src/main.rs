@@ -8,6 +8,7 @@ mod disk;
 mod gdt;
 mod splash;
 mod tss;
+mod vesa;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
@@ -57,7 +58,15 @@ pub extern "C" fn _start() -> ! {
     println!("[!] Switching to 16bit unreal mode...");
     unreal_mode();
     println!("[!] Checking memory...");
-
+    // ===================== VESA =====================
+    println!("[!] Setting VESA graphics mode...");
+    unsafe {
+        if vesa::init_vesa() {
+            println!("[!] VESA OK");
+        } else {
+            println!("[!] VESA failed, staying in text mode");
+        }
+    }
 
     unsafe {
         DISK.init(KERNEL_LBA as u32, KERNEL_BUFFER);
@@ -93,6 +102,10 @@ pub extern "C" fn _start() -> ! {
 
 
 
+    unsafe {
+        GDT.load();          // ← обязательно!
+    }
+    // ================================================
     //switch to protected mode
     println!("[!] Switching to 32bit protected mode and jumping to kernel...");
     protected_mode();
@@ -128,36 +141,51 @@ pub extern "C" fn fail() -> ! {
 //switch to 32bit protected mode and jump to kernel
 fn protected_mode() {
     unsafe {
-        //enable protected mode in cr0 register
-        asm!("mov eax, cr0", "or al, 1", "mov cr0, eax");
-        // println!("Protected mode enabled");
-        //push kernel address
+        // === 1. Снова загружаем GDT (критично после VESA) ===
+        GDT.load();
+
+        // === 2. Включаем Protected Mode ===
         asm!(
-            "push {0:e}",
-            in(reg) KERNEL_TARGET,
+        "mov eax, cr0",
+        "or eax, 1",
+        "mov cr0, eax",
+        options(nostack, preserves_flags)
         );
 
-        //jump to protected mode
-        asm!("ljmp $0x8, $2f", "2:", options(att_syntax));
-        // println!("Protected mode entrer");
-        //protected mode start
+        // === 3. Far jump с явным 32-битным смещением ===
+        // Используем абсолютный адрес метки через lea + ljmp
         asm!(
-            ".code32",
+        // Получаем адрес метки в eax
+        "lea eax, [2f]",
+        "push 0x08",          // CS = 0x08
+        "push eax",           // offset
+        "retf",               // far return = ljmp
+        "2:",
+        options(nostack)
+        );
 
-            //setup segment registers
-            "mov {0:e}, 0x10",
-            "mov ds, {0:e}",
-            "mov es, {0:e}",
-            "mov fs, {0:e}",
-            "mov gs, {0:e}",
-            "mov ss, {0:e}",
+        // === 4. Теперь мы точно в 32-битном коде с правильным CS ===
+        asm!(
+        ".code32",
+        "mov ax, 0x10",
+        "mov ds, ax",
+        "mov es, ax",
+        "mov fs, ax",
+        "mov gs, ax",
+        "mov ss, ax",
 
-            //jump to kernel
-            "pop {1:e}",
-            "call {1:e}",
+        // Ставим нормальный стек (на всякий случай)
+        "mov esp, 0x90000",
 
-            out(reg) _,
-            in(reg) KERNEL_TARGET,
+        // Прыгаем в ядро
+        "mov eax, 0x01000000",
+        "call eax",
+
+        // Если вернулось — зависаем
+        "3:",
+        "hlt",
+        "jmp 3b",
+        options(nostack)
         );
     }
 }
