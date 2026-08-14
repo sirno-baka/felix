@@ -60,13 +60,13 @@ pub extern "C" fn _start() -> ! {
     println!("[!] Checking memory...");
     // ===================== VESA =====================
     println!("[!] Setting VESA graphics mode...");
-    unsafe {
-        if vesa::init_vesa() {
-            println!("[!] VESA OK");
-        } else {
-            println!("[!] VESA failed, staying in text mode");
-        }
-    }
+    // unsafe {
+    //     if vesa::init_vesa() {
+    //         println!("[!] VESA OK");
+    //     } else {
+    //         println!("[!] VESA failed, staying in text mode");
+    //     }
+    // }
 
     unsafe {
         DISK.init(KERNEL_LBA as u32, KERNEL_BUFFER);
