@@ -4,7 +4,7 @@
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use crate::drivers::net::{map_mmio, RX_BUF_SIZE, RX_RING_SIZE, TX_BUF_SIZE, TX_RING_SIZE};
-use crate::memory::paging::{PAGING, PAGE_SIZE, PhysAddr};
+use crate::memory::paging::{PAGING, PAGE_SIZE, PhysAddr, KERNEL_OFFSET};
 use crate::pci::{self, device::PciDevice};
 use crate::println;
 use crate::sync::mutex::Mutex;
@@ -133,9 +133,6 @@ impl I8255x {
         );
 
         dev.enable_bus_mastering();
-        // если у тебя есть метод чтения конфига
-        let cmd = dev.read_u16(0x04);   // PCI Command register
-        println!("PCI Command = {:#x} (bit2=BusMaster need 1)", cmd);
 
         let bar = dev.get_bar(0).ok_or("No BAR0")?;
         let (mmio_phys, bar_size) = match bar {
@@ -143,10 +140,8 @@ impl I8255x {
             _ => return Err("BAR0 is not Memory"),
         };
 
-        println!("i8255x: BAR0 phys={:#x} size={:#x}", mmio_phys, bar_size);
 
         let mmio = map_mmio(mmio_phys, bar_size)?;
-        println!("i8255x: MMIO mapped at virt {:#x}", mmio);
 
         // ---- Выделяем страницы под кольца ----
         let tx_pages = ((core::mem::size_of::<TxDesc>() * TX_RING_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -172,11 +167,9 @@ impl I8255x {
             }
             rx_phys = rx_frame << 12;          // ← важно!
         }
-        println!("TX ring phys = {:#x}", tx_phys);
-        println!("RX ring phys = {:#x}", rx_phys);
         // Благодаря identity-mapping низкой памяти можем использовать phys как virt
-        let tx_ring = tx_phys as *mut TxDesc;
-        let rx_ring = rx_phys as *mut RxDesc;
+        let tx_ring = (tx_phys + KERNEL_OFFSET) as *mut TxDesc;
+        let rx_ring = (rx_phys + KERNEL_OFFSET) as *mut RxDesc;
 
         let mut nic = I8255x {
             mmio,
@@ -203,8 +196,7 @@ impl I8255x {
             let st = read_volatile((nic.mmio + SCB_STATUS) as *const u16);
             write_volatile((nic.mmio + SCB_STATUS) as *mut u16, st & 0xFF00);
         }
-        nic.dump_scb();
-        nic.dump_rfds();
+
         nic.initialized.store(true, Ordering::SeqCst);
 
         println!(
@@ -363,16 +355,7 @@ impl I8255x {
                 write_volatile(&mut desc.size, RX_BUF_SIZE as u16);
             }
         }
-        println!("size_of::<RxDesc> = {}", core::mem::size_of::<RxDesc>());
-        println!("size_of::<TxDesc> = {}", core::mem::size_of::<TxDesc>());
 
-        unsafe {
-            for i in 0..4 {
-                let desc = &*self.rx_ring.add(i);
-                let link = read_volatile(&desc.link);
-                println!("RFD[{}] link = {:#x}", i, link);
-            }
-        }
         Ok(())
     }
 
@@ -413,11 +396,6 @@ impl I8255x {
             core::hint::spin_loop();
         }
 
-        unsafe {
-            let st = read_volatile(&(*self.tx_ring).status);
-            println!("Configure done, status = {:04x}", st);   // должно быть ~0xA000 (C + OK)
-        }
-
         // ---------- 2. Individual Address Setup (MAC) ----------
         unsafe {
             let cmd = &mut *self.tx_ring;
@@ -442,11 +420,6 @@ impl I8255x {
                 }
             }
             core::hint::spin_loop();
-        }
-
-        unsafe {
-            let st = read_volatile(&(*self.tx_ring).status);
-            println!("IA Setup done, status = {:04x}", st);     // тоже ~0xA000
         }
 
         Err("Configure/IA-Setup timeout")
