@@ -3,10 +3,17 @@
 
 use crate::drivers::pic::PICS;
 use crate::multitasking::task::{CPUState, TASK_MANAGER};
+use crate::time::{jiffies, SYSTEM_FRACTION};
 use core::arch::asm;
 use crate::println;
 
 pub const TIMER_INT: u8 = 32;
+
+// Как часто поллить сеть (в тиках таймера)
+// При SYSTEM_FRACTION ≈ 1.0 (1 мс) → каждые 10 мс
+const NET_POLL_EVERY: usize = 10;
+
+static mut NET_POLL_COUNTER: usize = 0;
 
 /// Naked interrupt handler for timer (IRQ0)
 #[naked]
@@ -39,12 +46,11 @@ pub extern "C" fn timer() {
         "pop ebp",
 
         // На стеке: EIP, CS, EFLAGS, [ESP, SS]
-        // Если CS.RPL == 3 — грузим DS/ES user data
         "mov ax, [esp + 4]",   // CS
         "and ax, 3",
         "cmp ax, 3",
         "jne 2f",
-        "mov ax, 0x23",        // user data (как SS)
+        "mov ax, 0x23",
         "mov ds, ax",
         "mov es, ax",
         "2:",
@@ -55,14 +61,37 @@ pub extern "C" fn timer() {
     }
 }
 
-/// Called from assembly. Returns new stack pointer (new task's CPUState)
 #[no_mangle]
 pub extern "C" fn timer_handler(esp: u32) -> u32 {
     unsafe {
+        // === 1. Сетевой полл (неблокирующий) ===
+        NET_POLL_COUNTER += 1;
+        if NET_POLL_COUNTER >= NET_POLL_EVERY {
+            NET_POLL_COUNTER = 0;
+            poll_network();
+        }
+
+        // === 2. Планировщик ===
         let new_esp = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
-        // println!("TH");
+
+        // === 3. EOI ===
         PICS.end_interrupt(TIMER_INT);
 
         new_esp
     }
+}
+
+/// Безопасный полл из IRQ-контекста
+unsafe fn poll_network() {
+    // Считаем текущее время в миллисекундах
+    let timestamp_ms = (jiffies() as f64 * SYSTEM_FRACTION) as i64;
+
+    // Пытаемся взять стек без блокировки
+    if let Some(mut guard) = crate::net::stack::NET_STACK.try_lock() {
+        if let Some(ref mut stack) = *guard {
+            stack.poll(timestamp_ms);
+        }
+    }
+    // Если лок занят (syscall как раз работает с сетью) — просто пропускаем этот тик.
+    // Это нормально и безопасно.
 }

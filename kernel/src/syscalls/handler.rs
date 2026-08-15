@@ -10,6 +10,7 @@ use core::ffi::CStr;
 use crate::filesystem::file::{FileDescriptor, FileMode};
 use crate::filesystem::VFS;
 use crate::memory::paging::{PageDirectory, PDEFlags, PTEFlags, PAGING, PhysAddr, VirtAddr, copy_kernel_mappings, PAGE_SIZE};
+use crate::net::{SockAddrIn, SocketState, AF_INET, SOCKET_TABLE, SOCK_DGRAM, SOCK_STREAM};
 
 pub const SYSCALL_INT: u8 = 0x80;
 
@@ -214,6 +215,15 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                 0
             }
         }
+        // === Sockets ===
+        crate::syscalls::SYS_SOCKET   => sys_socket(current_slot, state.ebx as u16, state.ecx as u16, state.edx as u8),
+        crate::syscalls::SYS_BIND     => sys_bind(current_slot, state.ebx as usize, state.ecx as *const u8, state.edx as usize),
+        crate::syscalls::SYS_LISTEN   => sys_listen(current_slot, state.ebx as usize, state.ecx as usize),
+        crate::syscalls::SYS_ACCEPT4  => sys_accept4(current_slot, state.ebx as usize, state.ecx as *mut u8, state.edx as *mut u32, state.esi as u32),
+        crate::syscalls::SYS_CONNECT  => sys_connect(current_slot, state.ebx as usize, state.ecx as *const u8, state.edx as usize),
+        crate::syscalls::SYS_SENDTO   => sys_sendto(current_slot, state.ebx as usize, state.ecx as *const u8, state.edx as usize),
+        crate::syscalls::SYS_RECVFROM => sys_recvfrom(current_slot, state.ebx as usize, state.ecx as *mut u8, state.edx as usize),
+        crate::syscalls::SYS_SHUTDOWN => sys_shutdown(current_slot, state.ebx as usize, state.ecx as u32),
 
 
         _ => 0,
@@ -239,7 +249,7 @@ fn sys_open(current_slot: usize, path_ptr: *const u8, _flags: usize) -> usize {
         unsafe {
             if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
                 if let Some(fd) = current.fd_table.alloc_fd() {
-                    let desc = FileDescriptor::new(inode, FileMode::ReadWrite);
+                    let desc = FileDescriptor::new_file(inode, FileMode::ReadWrite);
                     current.fd_table.insert(fd, desc);
                     return fd;
                 }
@@ -257,18 +267,26 @@ fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) -> u
 
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
-            if let Some(desc) = current.fd_table.get_mut(fd) {
-                if desc.mode == FileMode::WriteOnly { return 0; }
+            match current.fd_table.get_mut(fd) {
+                Some(FileDescriptor::File { inode, offset, mode }) => {
+                    if *mode == FileMode::WriteOnly { return 0; }
 
-                let mut temp = alloc::vec![0u8; count];
-                let bytes = VFS.get().read_at(desc.inode, desc.offset, &mut temp);
+                    let mut temp = alloc::vec![0u8; count];
+                    let bytes = VFS.get().read_at(*inode, *offset, &mut temp);
 
-                if bytes > 0 {
-                    core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr, bytes);
-                    desc.offset += bytes as u64;
+                    if bytes > 0 {
+                        core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr, bytes);
+                        *offset += bytes as u64;
+                    }
+                    return bytes;
                 }
-                return bytes;
-            }
+                Some(FileDescriptor::Socket { socket_id }) => {
+                    // позже: сюда придёт socket read/write
+                    // пока можно возвращать 0 или ошибку
+                    return 0;
+                }
+                None => 0,
+            };
         }
     }
     0
@@ -347,12 +365,18 @@ fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usize) -
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
             if let Some(desc) = current.fd_table.get_mut(fd) {
-                if desc.mode == FileMode::ReadOnly {
-                    return 0;
+                match desc {
+                    FileDescriptor::File { inode, offset, mode } => {
+                        if *mode == FileMode::ReadOnly { return 0; }
+
+                        let written = VFS.get().write_at(*inode, *offset, buf);
+                        *offset += written as u64;
+                        return written;
+                    }
+                    FileDescriptor::Socket { socket_id } => {
+                        return 0
+                    }
                 }
-                let written = VFS.get().write_at(desc.inode, desc.offset, buf);
-                desc.offset += written as u64;
-                return written;
             }
         }
     }
@@ -362,7 +386,14 @@ fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usize) -
 fn sys_close(current_slot: usize, fd: usize) -> usize {
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
-            if current.fd_table.close(fd) { return 0; }
+            if let Some(desc) = current.fd_table.get(fd) {
+                if let FileDescriptor::Socket { socket_id } = *desc {
+                    SOCKET_TABLE.lock().free(socket_id);
+                }
+            }
+            if current.fd_table.close(fd) {
+                return 0;
+            }
         }
     }
     usize::MAX
@@ -539,4 +570,311 @@ pub fn sys_execve(buf_ptr: *const u8, count: usize) -> usize {
         0
     }
 }
+
+use crate::net::stack::{NET_STACK, poll_stack};
+use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
+use smoltcp::socket::{tcp, udp};
+
+fn sys_socket(current_slot: usize, domain: u16, ty: u16, protocol: u8) -> usize {
+    let mut stack_guard = NET_STACK.lock();
+    let stack = match stack_guard.as_mut() {
+        Some(s) => s,
+        None => return usize::MAX,
+    };
+
+    let (socket_id, _handle) = match stack.create_socket(domain, ty, protocol) {
+        Some(v) => v,
+        None => return usize::MAX,
+    };
+
+    // регистрируем в нашей таблице (для состояния bind/listen и т.д.)
+    {
+        let mut table = SOCKET_TABLE.lock();
+        // можно хранить дополнительную мета-информацию
+        let _ = table.alloc(domain, ty, protocol, current_slot);
+    }
+
+    // выделяем fd в задаче
+    unsafe {
+        if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
+            if let Some(fd) = current.fd_table.alloc_fd() {
+                let desc = FileDescriptor::new_socket(socket_id);
+                if current.fd_table.insert(fd, desc) {
+                    return fd;
+                }
+            }
+        }
+    }
+
+    // rollback
+    stack.remove_handle(socket_id);
+    usize::MAX
+}
+
+fn sys_bind(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: usize) -> usize {
+    if addrlen < core::mem::size_of::<SockAddrIn>() {
+        return usize::MAX;
+    }
+    let addr = unsafe { *(addr_ptr as *const SockAddrIn) };
+
+    let socket_id = unsafe {
+        match TASK_MANAGER.tasks[current_slot]
+            .as_ref()
+            .and_then(|t| t.fd_table.get(fd))
+        {
+            Some(FileDescriptor::Socket { socket_id }) => *socket_id,
+            _ => return usize::MAX,
+        }
+    };
+
+    let mut stack_guard = NET_STACK.lock();
+    let stack = match stack_guard.as_mut() {
+        Some(s) => s,
+        None => return usize::MAX,
+    };
+
+    let (handle, is_tcp) = match stack.get_handle(socket_id) {
+        Some(h) => h,
+        None => return usize::MAX,
+    };
+
+    let endpoint = IpEndpoint {
+        addr: IpAddress::Ipv4(Ipv4Address(addr.sin_addr.s_addr.to_be_bytes())),
+        port: u16::from_be(addr.sin_port),
+    };
+
+    let result = if is_tcp {
+        let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+        socket.listen(endpoint).map_err(|_| ()).map(|_| ())
+    } else {
+        let socket = stack.sockets.get_mut::<udp::Socket>(handle);
+        socket.bind(endpoint).map_err(|_| ()).map(|_| ())
+    };
+
+    // обновляем наше состояние
+    if result.is_ok() {
+        let mut table = SOCKET_TABLE.lock();
+        if let Some(sock) = table.get_mut(socket_id) {
+            sock.local_addr = Some(addr);
+            sock.state = SocketState::Bound;
+        }
+    }
+
+    if result.is_ok() { 0 } else { usize::MAX }
+}
+
+fn sys_listen(current_slot: usize, fd: usize, backlog: usize) -> usize {
+    // Для smoltcp TCP listen уже делается в bind (socket.listen()).
+    // Здесь просто меняем состояние.
+    let socket_id = unsafe {
+        match TASK_MANAGER.tasks[current_slot]
+            .as_ref()
+            .and_then(|t| t.fd_table.get(fd))
+        {
+            Some(FileDescriptor::Socket { socket_id }) => *socket_id,
+            _ => return usize::MAX,
+        }
+    };
+
+    let mut table = SOCKET_TABLE.lock();
+    if let Some(sock) = table.get_mut(socket_id) {
+        if sock.state != SocketState::Bound {
+            return usize::MAX;
+        }
+        sock.backlog = backlog.min(128);
+        sock.state = SocketState::Listening;
+        return 0;
+    }
+    usize::MAX
+}
+
+fn sys_accept4(
+    current_slot: usize,
+    fd: usize,
+    _addr: *mut u8,
+    _addrlen: *mut u32,
+    _flags: u32,
+) -> usize {
+    // Пока заглушка — возвращаем ошибку
+    // Позже: берём из accept_queue, создаём новый сокет + новый fd
+    usize::MAX
+}
+
+fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: usize) -> usize {
+    if addrlen < core::mem::size_of::<SockAddrIn>() {
+        return usize::MAX;
+    }
+    let addr = unsafe { *(addr_ptr as *const SockAddrIn) };
+
+    let socket_id = unsafe {
+        match TASK_MANAGER.tasks[current_slot]
+            .as_ref()
+            .and_then(|t| t.fd_table.get(fd))
+        {
+            Some(FileDescriptor::Socket { socket_id }) => *socket_id,
+            _ => return usize::MAX,
+        }
+    };
+
+    let mut stack_guard = NET_STACK.lock();
+    let stack = match stack_guard.as_mut() {
+        Some(s) => s,
+        None => return usize::MAX,
+    };
+
+    let (handle, is_tcp) = match stack.get_handle(socket_id) {
+        Some(h) => h,
+        None => return usize::MAX,
+    };
+
+    let endpoint = IpEndpoint {
+        addr: IpAddress::Ipv4(Ipv4Address(addr.sin_addr.s_addr.to_be_bytes())),
+        port: u16::from_be(addr.sin_port),
+    };
+
+    let result = if is_tcp {
+        let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+        // local endpoint можно оставить unspecified
+        socket.connect(stack.iface.context(), endpoint, 0).map_err(|_| ())
+    } else {
+        // UDP connect (опционально)
+        let socket = stack.sockets.get_mut::<udp::Socket>(handle);
+        socket.bind(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), 0))
+            .map_err(|_| ())
+            .and_then(|_| {
+                // smoltcp UDP не имеет connect, просто запоминаем peer
+                Ok(())
+            })
+    };
+
+    if result.is_ok() {
+        let mut table = SOCKET_TABLE.lock();
+        if let Some(sock) = table.get_mut(socket_id) {
+            sock.peer_addr = Some(addr);
+            sock.state = SocketState::Connected;
+        }
+        0
+    } else {
+        usize::MAX
+    }
+}
+fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) -> usize {
+    let socket_id = unsafe {
+        match TASK_MANAGER.tasks[current_slot]
+            .as_ref()
+            .and_then(|t| t.fd_table.get(fd))
+        {
+            Some(FileDescriptor::Socket { socket_id }) => *socket_id,
+            _ => return 0,
+        }
+    };
+
+    let mut stack_guard = NET_STACK.lock();
+    let stack = match stack_guard.as_mut() {
+        Some(s) => s,
+        None => return 0,
+    };
+
+    // poll перед отправкой
+    stack.poll(0); // timestamp можно улучшить
+
+    let (handle, is_tcp) = match stack.get_handle(socket_id) {
+        Some(h) => h,
+        None => return 0,
+    };
+
+    let data = unsafe { core::slice::from_raw_parts(buf, len) };
+
+    let sent = if is_tcp {
+        let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+        socket.send_slice(data).unwrap_or(0)
+    } else {
+        let socket = stack.sockets.get_mut::<udp::Socket>(handle);
+        // для UDP нужен endpoint. Пока берём из peer_addr
+        let table = SOCKET_TABLE.lock();
+        if let Some(sock) = table.get(socket_id) {
+            if let Some(peer) = sock.peer_addr {
+                let endpoint = IpEndpoint {
+                    addr: IpAddress::Ipv4(Ipv4Address(peer.sin_addr.s_addr.to_be_bytes())),
+                    port: u16::from_be(peer.sin_port),
+                };
+                match socket.send_slice(data, endpoint) {
+                    Ok(()) => len,
+                    Err(_) => 0,
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    };
+
+    // poll после
+    stack.poll(0);
+    sent
+}
+
+fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) -> usize {
+    let socket_id = unsafe {
+        match TASK_MANAGER.tasks[current_slot]
+            .as_ref()
+            .and_then(|t| t.fd_table.get(fd))
+        {
+            Some(FileDescriptor::Socket { socket_id }) => *socket_id,
+            _ => return 0,
+        }
+    };
+
+    let mut stack_guard = NET_STACK.lock();
+    let stack = match stack_guard.as_mut() {
+        Some(s) => s,
+        None => return 0,
+    };
+
+    stack.poll(0);
+
+    let (handle, is_tcp) = match stack.get_handle(socket_id) {
+        Some(h) => h,
+        None => return 0,
+    };
+
+    let mut temp = alloc::vec![0u8; len];
+
+    let received = if is_tcp {
+        let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+        socket.recv_slice(&mut temp).unwrap_or(0)
+    } else {
+        let socket = stack.sockets.get_mut::<udp::Socket>(handle);
+        match socket.recv_slice(&mut temp) {
+            Ok((size, _endpoint)) => size,
+            Err(_) => 0,
+        }
+    };
+
+    if received > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(temp.as_ptr(), buf, received);
+        }
+    }
+
+    received
+}
+
+fn sys_shutdown(current_slot: usize, fd: usize, _how: u32) -> usize {
+    unsafe {
+        if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
+            if let Some(FileDescriptor::Socket { socket_id }) = current.fd_table.get(fd) {
+                let mut table = SOCKET_TABLE.lock();
+                if let Some(sock) = table.get_mut(*socket_id) {
+                    sock.state = SocketState::Closed;
+                    return 0;
+                }
+            }
+        }
+    }
+    usize::MAX
+}
+
+
 

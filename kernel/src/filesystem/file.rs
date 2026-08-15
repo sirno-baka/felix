@@ -7,20 +7,33 @@ pub enum FileMode {
     ReadWrite,
 }
 
-#[derive(Clone, Debug, Copy)]
-pub struct FileDescriptor {
-    pub inode: u32,
-    pub offset: u64,
-    pub mode: FileMode,
+#[derive(Clone, Copy, Debug)]
+pub enum FileDescriptor {
+    File {
+        inode: u32,
+        offset: u64,
+        mode: FileMode,
+    },
+    Socket {
+        socket_id: usize,
+    },
 }
 
 impl FileDescriptor {
-    pub fn new(inode: u32, mode: FileMode) -> Self {
-        Self {
+    pub fn new_file(inode: u32, mode: FileMode) -> Self {
+        Self::File {
             inode,
             offset: 0,
             mode,
         }
+    }
+
+    pub fn new_socket(socket_id: usize) -> Self {
+        Self::Socket { socket_id }
+    }
+
+    pub fn is_socket(&self) -> bool {
+        matches!(self, Self::Socket { .. })
     }
 }
 
@@ -34,7 +47,7 @@ impl FileDescriptorTable {
         Self { fds: [None; 64] }
     }
 
-    /// Находит свободный дескриптор
+    /// Находит свободный дескриптор (как и раньше — с +5)
     pub fn alloc_fd(&mut self) -> Option<usize> {
         if let Some(fd) = self.fds.iter().position(|slot| slot.is_none()) {
             return Some(fd + 5);

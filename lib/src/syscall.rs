@@ -132,3 +132,118 @@ pub unsafe fn ls(path: *const u8, buf: *mut u8, buf_size: usize) -> usize {
     );
     ret
 }
+
+
+pub const SYS_SOCKET:      u32 = 359;
+pub const SYS_BIND:        u32 = 361;
+pub const SYS_CONNECT:     u32 = 362;
+pub const SYS_LISTEN:      u32 = 363;
+pub const SYS_ACCEPT4:     u32 = 364;
+pub const SYS_SENDTO:      u32 = 369;
+pub const SYS_RECVFROM:    u32 = 371;
+pub const SYS_SHUTDOWN:    u32 = 373;
+
+pub unsafe fn socket(domain: u32, ty: u32, protocol: u32) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_SOCKET => ret,
+    in("ebx") domain,
+    in("ecx") ty,
+    in("edx") protocol,
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn bind(sockfd: u32, addr: *const u8, addrlen: u32) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_BIND => ret,
+    in("ebx") sockfd,
+    in("ecx") addr,
+    in("edx") addrlen,
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn listen(sockfd: u32, backlog: u32) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_LISTEN => ret,
+    in("ebx") sockfd,
+    in("ecx") backlog,
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn accept4(sockfd: u32, addr: *mut u8, addrlen: *mut u32, _flags: u32) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_ACCEPT4 => ret,
+    in("ebx") sockfd,
+    in("ecx") addr,
+    in("edx") addrlen,
+    // flags пока не передаём (в kernel stub он всё равно игнорируется)
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn connect(sockfd: u32, addr: *const u8, addrlen: u32) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_CONNECT => ret,
+    in("ebx") sockfd,
+    in("ecx") addr,
+    in("edx") addrlen,
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn sendto(sockfd: u32, buf: *const u8, len: usize, flags: u32, addr: *const u8, addrlen: u32) -> usize {
+    // Для 6 аргументов на i386 обычно используют стек или socketcall.
+    // Пока упрощённая версия (flags + addr игнорируем).
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_SENDTO => ret,
+    in("ebx") sockfd,
+    in("ecx") buf,
+    in("edx") len,
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn recvfrom(sockfd: u32, buf: *mut u8, len: usize, flags: u32, addr: *mut u8, addrlen: *mut u32) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_RECVFROM => ret,
+    in("ebx") sockfd,
+    in("ecx") buf,
+    in("edx") len,
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn shutdown(sockfd: u32, how: u32) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_SHUTDOWN => ret,
+    in("ebx") sockfd,
+    in("ecx") how,
+    options(nostack, preserves_flags)
+    );
+    ret
+}

@@ -26,6 +26,7 @@ mod pci;
 mod time;
 mod io;
 mod disk;
+mod net;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -275,7 +276,11 @@ pub extern "C" fn higher_half_entry() -> ! {
 
         // 2. Драйвер
         crate::drivers::net::i8255x::I8255x::init().expect("NIC init failed");
+        // после I8255x::init()
+        crate::net::stack::init();
 
+        // дальше можешь оставить тестовый poll-цикл или убрать его,
+        // потому что теперь poll будет вызываться из таймера/syscalls
         // 3. Стек
         init_network_stack();
         // For brevity in this patch the remaining init is left as a TODO —

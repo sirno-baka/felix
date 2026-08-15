@@ -91,6 +91,35 @@ impl<T: ?Sized> Mutex<T> {
     }
 }
 
+impl<T: ?Sized> Mutex<T> {
+    /// Неблокирующая попытка взять лок (безопасно из IRQ)
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
+        let eflags: u32;
+        unsafe {
+            asm!("pushfd; pop {}", out(reg) eflags);
+        }
+        let was_enabled = (eflags & (1 << 9)) != 0;
+
+        unsafe { asm!("cli") };
+
+        if let Some(guard) = self.inner.try_lock() {
+            if was_enabled {
+                unsafe { asm!("sti") };
+            }
+            Some(MutexGuard {
+                guard,
+                parent: self,
+            })
+        } else {
+            // не получилось — восстанавливаем IF и уходим
+            if was_enabled {
+                unsafe { asm!("sti") };
+            }
+            None
+        }
+    }
+}
+
 pub struct MutexGuard<'a, T: ?Sized> {
     guard: interrupt_sync::SpinMutexGuard<'a, T>,
     parent: &'a Mutex<T>,
