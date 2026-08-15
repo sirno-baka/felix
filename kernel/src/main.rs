@@ -28,11 +28,18 @@ mod io;
 mod disk;
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::panic::PanicInfo;
+use core::ptr::{read_volatile, write_volatile};
+use core::str::FromStr;
+use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::socket::udp;
+use smoltcp::time::Instant;
+use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 use drivers::pic::PICS;
 use gdt::{GDT, GlobalDescriptorTable};
 use interrupts::idt::IDT;
@@ -45,6 +52,7 @@ use crate::disk::interface::BlockDevice;
 use crate::disk::{copy_sectors, PartitionConfig};
 use crate::disk::ramdisk::RamDisk;
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
+use crate::drivers::net::i8255x::SCB_STATUS;
 use crate::drivers::pic::wait;
 use crate::filesystem::{Filesystem, VFS};
 use crate::filesystem::vfs::Vfs;
@@ -246,35 +254,30 @@ pub extern "C" fn higher_half_entry() -> ! {
 
         println!("[VFS] Virtual filesystem initialized");
         print_info();
-        // В main.rs после инициализации
-        pci::print_devices();
 
-        // Найти Ethernet
-        if let Some(eth) = pci::find_device(0x8086, 0x1229) {  // типичный 8255x
-            crate::println!("Found Intel Ethernet!");
-            eth.enable_bus_mastering();
-
-            if let Some(bar) = eth.get_bar(0) {
-                crate::println!("BAR0 = {:#x}, size = {}", bar.address().unwrap_or(0), bar.size());
-            }
-        }
-        // 7. Task Manager (после IDT!)
-        TASK_MANAGER.init();
-        for i in 0..5000 {
-            wait();
-        }
+        // // 7. Task Manager (после IDT!)
+        // TASK_MANAGER.init();
+        // for i in 0..5000 {
+        //     wait();
+        // }
         // // === ВКЛЮЧАЕМ ТАЙМЕР И ПРЕРЫВАНИЯ ТОЛЬКО В КОНЦЕ ===
         // asm!("in al, 0x21", out("al") mask);
         // asm!("out 0x21, al", in("al") mask & !1u8); // снимаем бит 0
 
         // let entries = VFS.get().list_directory_entries("/");
-        let data= VFS.get().read_file("/shell").unwrap();
-        crate::syscalls::handler::sys_execve(data.as_ptr(), data.len());
+        // let data= VFS.get().read_file("/shell").unwrap();
+        // crate::syscalls::handler::sys_execve(data.as_ptr(), data.len());
 
 
         asm!("sti");
 
+        pci::print_devices();
 
+        // 2. Драйвер
+        crate::drivers::net::i8255x::I8255x::init().expect("NIC init failed");
+
+        // 3. Стек
+        init_network_stack();
         // For brevity in this patch the remaining init is left as a TODO —
         // paste the original body after the paging block from the old _start.
         // The only change needed is that all addresses (STACK_START etc.) are
@@ -285,6 +288,130 @@ pub extern "C" fn higher_half_entry() -> ! {
         // Temporary halt so you can verify the jump worked
         loop {
             asm!("hlt");
+        }
+    }
+}
+fn init_network_stack() {
+    use smoltcp::iface::{Config, Interface, SocketSet};
+    use smoltcp::socket::udp;
+    use smoltcp::time::Instant;
+    use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+
+    let mut nic = {
+        let mut guard = crate::drivers::net::i8255x::NET.lock();
+        guard.take().expect("NIC not initialized")
+    };
+
+    // --- Интерфейс ---
+    let config = Config::new(EthernetAddress(nic.mac()).into());
+    let mut iface = Interface::new(config, &mut nic, Instant::from_millis(0));
+
+    // IP для QEMU user networking
+    // Гость: 10.0.2.15/24, шлюз: 10.0.2.2
+    iface.update_ip_addrs(|addrs| {
+        addrs
+            .push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24))
+            .unwrap();
+    });
+
+    iface
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2))
+        .unwrap();
+
+    // --- Сокеты ---
+    let mut sockets = SocketSet::new(vec![]);
+
+    // UDP-сокет (слушаем)
+    let udp_rx_buffer = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY; 8],
+        vec![0u8; 4096],
+    );
+    let udp_tx_buffer = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY; 8],
+        vec![0u8; 4096],
+    );
+    let mut udp_socket = udp::Socket::new(udp_rx_buffer, udp_tx_buffer);
+
+    udp_socket
+        .bind(IpEndpoint::new(IpAddress::v4(10, 0, 2, 15), 1234))
+        .expect("bind failed");
+    let udp_handle = sockets.add(udp_socket);
+
+    println!("smoltcp: listening UDP on 10.0.2.15:1234");
+    // минимальный ethernet broadcast (можно даже мусор)
+    let dummy = [0xffu8; 64];
+    match nic.send(&dummy) {
+        Ok(()) => println!("TX submitted"),
+        Err(e) => println!("TX error: {}", e),
+    }
+
+    // немного подождать
+    for _ in 0..100000 { core::hint::spin_loop(); }
+
+    nic.dump_scb();   // смотри, появился ли bit CX (0x80)
+    // --- Главный цикл ---
+    let mut timestamp_ms: i64 = 0;
+    println!("smoltcp: listening UDP on 10.0.2.15:1234");
+
+    // даём стеку «устаканиться»
+    for _ in 0..50 {
+        let ts = Instant::from_millis(timestamp_ms);
+        iface.poll(ts, &mut nic, &mut sockets);
+        timestamp_ms += 10;
+    }
+    let mut i = 0;
+    loop {
+        // TODO: замени на настоящий таймер (pit / rdtsc)
+        timestamp_ms += 10; // грубо 10 мс на итерацию
+        let timestamp = Instant::from_millis(timestamp_ms);
+
+        // Обработка сетевого стека
+        iface.poll(timestamp, &mut nic, &mut sockets);
+
+        // --- Обработка UDP ---
+        {
+            let socket = sockets.get_mut::<udp::Socket>(udp_handle);
+            i = i + 1;
+            // if i % 10000 == 0 {
+            //     unsafe {
+            //         // ACK все статусные биты
+            //         let st = read_volatile((nic.mmio + SCB_STATUS) as *const u16);
+            //         write_volatile((nic.mmio + SCB_STATUS) as *mut u16, st & 0xFF00);
+            //     }
+            //     nic.dump_scb();
+            //     nic.dump_rfds();
+            // }
+
+            if socket.can_recv() {
+                match socket.recv() {
+                    Ok((data, endpoint)) => {
+                        // Копируем данные, чтобы снять borrow
+                        let payload = data.to_vec();
+                        let endpoint = endpoint; // IpEndpoint — Copy
+
+                        println!(
+                            "UDP from {}:{}  len={}  data={:02x?}",
+                            endpoint.endpoint.addr,
+                            endpoint.endpoint.port,
+                            payload.len(),
+                            &String::from_utf8_lossy(&payload)
+                        );
+                        let reply = String::from_str("Ксюшечка жепа").unwrap();
+                        if socket.can_send() {
+                            let _ = socket.send_slice(&reply.into_bytes(), endpoint);
+                        }
+                    }
+                    Err(e) => {
+                        println!("UDP recv error: {:?}", e);
+                    }
+                }
+            }
+        }
+
+        // Небольшая пауза (можно заменить на hlt + таймер)
+        for _ in 0..1000 {
+            core::hint::spin_loop();
         }
     }
 }

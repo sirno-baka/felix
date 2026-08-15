@@ -2,8 +2,8 @@ pub mod ide;
 
 pub mod floppy;
 mod config;
-mod bar;
-mod device;
+pub(crate) mod bar;
+pub(crate) mod device;
 
 pub mod class;
 

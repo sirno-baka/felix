@@ -427,6 +427,60 @@ impl PageManager {
         }
     }
 
+    pub fn map_physical_range(
+        &mut self,
+        phys_start: u32,
+        size: u32,
+        virt_start: u32,
+        flags: PTEFlags,
+    ) -> Result<(), &'static str> {
+        let pages = ((size as usize) + PAGE_SIZE - 1) / PAGE_SIZE;
+
+        for i in 0..pages {
+            let virt = virt_start + (i as u32) * PAGE_SIZE as u32;
+            let phys = phys_start + (i as u32) * PAGE_SIZE as u32;
+
+            let vpage = virt >> 12;
+            let ppage = phys >> 12;
+
+            let pd_idx = (vpage >> 10) as usize;
+            let pt_idx = (vpage & 0x3FF) as usize;
+
+            // Создаём Page Table, если нужно
+            let need_table = {
+                let pde = self.dir.entries[pd_idx];
+                pde == 0 || (pde & PDEFlags::PRESENT) == 0
+            };
+
+            if need_table {
+                let pt_frame = self.alloc_frame(); // возвращает номер фрейма
+                let pt_phys = pt_frame << 12;
+
+                let pde_flags = PDEFlags::new()
+                    .present()
+                    .writable()
+                    .bits(); // kernel-only
+
+                self.dir.entries[pd_idx] = pt_phys | pde_flags;
+                PageDirectory::flush_page((pd_idx as u32) << 22);
+
+                let pt_ptr = PageDirectory::get_page_table_ptr(pd_idx);
+                unsafe {
+                    write_bytes(pt_ptr as *mut u8, 0, 4096);
+                }
+            }
+
+            // Маппим страницу
+            let pt_ptr = PageDirectory::get_page_table_ptr(pd_idx);
+            unsafe {
+                (*pt_ptr)[pt_idx] = (ppage << 12) | flags.bits();
+            }
+            PageDirectory::flush_page(virt);
+        }
+
+        Ok(())
+    }
+
     pub fn alloc_phys_frame(&mut self) -> u32 {
         let frame = self.next_free_page;
         self.next_free_page += 1;

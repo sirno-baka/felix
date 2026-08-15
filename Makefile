@@ -172,8 +172,14 @@ clean:
 run-floppy: all floppy-image
 	@echo "Running Felix..."
 	@killall qemu-system-i386 || true
-
-	@qemu-system-i386 -drive file=build/floppy.img,index=0,format=raw,if=floppy -drive file=disk.img,index=0,media=disk,format=raw,if=ide -no-reboot -vga std  -no-shutdown -m 64M -debugcon file:debug.log  -s -S &
+	@qemu-system-i386 \
+       -drive file=build/floppy.img,index=0,format=raw,if=floppy \
+       -drive file=disk.img,index=0,media=disk,format=raw,if=ide \
+       -netdev user,id=net0,hostfwd=udp::1234-:1234 \
+       -device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
+       -no-reboot -vga std -no-shutdown -m 64M \
+       -debugcon file:debug.log -s -S &
+	@#qemu-system-i386 -drive file=build/floppy.img,index=0,format=raw,if=floppy -drive file=disk.img,index=0,media=disk,format=raw,if=ide -device i82551,mac=52:54:00:12:34:56 -no-reboot -vga std  -no-shutdown -m 64M -debugcon file:debug.log  -s -S &
 
 
 .PHONY: run
