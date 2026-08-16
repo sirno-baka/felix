@@ -71,6 +71,8 @@ pub struct Task {
     pub zombie: bool,
     /// Exit status (valid when zombie == true)
     pub exit_code: i32,
+    /// Pending signals bitmask (bit N-1 = signal N). See `crate::signal`.
+    pub pending_signals: u32,
 }
 
 
@@ -112,6 +114,7 @@ impl Task {
             parent: -1,
             zombie: false,
             exit_code: 0,
+            pending_signals: 0,
         }
     }
 
@@ -128,6 +131,7 @@ impl Task {
             parent: -1,
             zombie: false,
             exit_code: 0,
+            pending_signals: 0,
         }
     }
     // ====================== Task::init ======================

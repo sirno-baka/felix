@@ -75,9 +75,12 @@ pub extern "C" fn timer_handler(esp: u32) -> u32 {
         }
 
         // === 2. Планировщик ===
-        let new_esp = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
+        let mut new_esp = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
 
-        // === 3. EOI ===
+        // === 3. Pending signals on the task about to run ===
+        new_esp = crate::signal::deliver_pending(new_esp);
+
+        // === 4. EOI ===
         PICS.end_interrupt(TIMER_INT);
 
         new_esp

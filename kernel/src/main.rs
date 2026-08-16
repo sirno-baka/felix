@@ -27,6 +27,7 @@ mod time;
 mod io;
 mod disk;
 mod net;
+mod signal;
 
 use alloc::boxed::Box;
 use alloc::string::String;

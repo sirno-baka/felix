@@ -235,10 +235,9 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
     // КЛАДЁМ результат обратно в eax (чтобы пользовательская программа его получила)
     state.eax = ret as u32;
 
-    // Для int 0x80 EOI на PIC НЕ нужен!
-    // PICS.end_interrupt(SYSCALL_INT);  ← УДАЛИТЬ
-    // Возвращаем ESP — стек НЕ ломается
-    esp
+    // Deliver any signals that arrived during the syscall (e.g. SIGINT while in read/wait).
+    // May switch away from this task if the default action is terminate.
+    crate::signal::deliver_pending(esp)
 }
 
 // ====================== FILE DESCRIPTORS ======================
@@ -484,9 +483,16 @@ fn sys_exit(current_slot: usize, esp: u32) -> u32 {
 fn sys_wait(current_slot: usize, pid: i32) -> usize {
     let parent = current_slot as i8;
 
+    // Child that we are waiting for becomes the terminal foreground process
+    // so Ctrl+C (SIGINT) is delivered to it, not to the shell.
+    if pid >= 0 {
+        crate::signal::set_foreground(pid as i8);
+    }
+
     loop {
         let found = unsafe { TASK_MANAGER.find_zombie_child(parent, pid) };
         if let Some((child_slot, _exit_code)) = found {
+            crate::signal::clear_foreground();
             unsafe {
                 TASK_MANAGER.reap(child_slot);
             }
@@ -496,6 +502,7 @@ fn sys_wait(current_slot: usize, pid: i32) -> usize {
         // No zombie yet — sleep until the next interrupt (timer / keyboard),
         // same pattern as blocking stdin. Scheduler can run other tasks
         // while we are in hlt; when we are scheduled again we re-check.
+        // SIGINT on the child will turn it into a zombie via deliver_pending.
         unsafe {
             asm!("sti");
             asm!("hlt");
@@ -615,6 +622,7 @@ pub fn sys_execve(parent_slot: usize, buf_ptr: *const u8, count: usize) -> usize
             t.parent = parent_slot as i8;
             t.zombie = false;
             t.exit_code = 0;
+            t.pending_signals = 0;
 
             println!("[execve] OK pid={} entry={:#x} stack={:#x} pd_phys={:#x} parent={}",
                      slot, entry_point, USER_STACK_TOP, pd_phys, parent_slot);

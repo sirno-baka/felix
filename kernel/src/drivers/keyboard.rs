@@ -4,11 +4,12 @@
 use crate::drivers::pic::PICS;
 use core::arch::asm;
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
+use crate::signal::{self, SIGINT};
 use crate::println;
 
 // Warning! Mutable static here
 // TODO: заменить на spin::Mutex или lock-free структуру
-pub static mut KEYBOARD: Keyboard = Keyboard { shift: false };
+pub static mut KEYBOARD: Keyboard = Keyboard { shift: false, ctrl: false };
 
 pub const KEYBOARD_INT: u8 = 33;
 const KEYBOARD_PORT: u16 = 0x60;
@@ -44,6 +45,7 @@ const SHIFTED: [u8; 122] = [
 // ===================================================================
 pub struct Keyboard {
     shift: bool,
+    ctrl: bool,
 }
 
 // ===================================================================
@@ -109,18 +111,39 @@ pub extern "C" fn keyboard_handler() {
         sc
     };
 
-    // Обработка Shift (только press/release)
+    // Modifier keys (press / release)
     unsafe {
         match scancode {
+            // Left/Right Shift
             0x2a | 0x36 => { KEYBOARD.shift = true; }
             0xaa | 0xb6 => { KEYBOARD.shift = false; }
+            // Left Ctrl (Right Ctrl is E0 1D — ignored for now)
+            0x1d => { KEYBOARD.ctrl = true; }
+            0x9d => { KEYBOARD.ctrl = false; }
             _ => {}
         }
     }
 
+    // Ctrl+C → SIGINT to foreground process (do not enqueue as text)
+    // Scancode 0x2E = 'c'/'C'
+    if scancode == 0x2e && unsafe { KEYBOARD.ctrl } {
+        if signal::signal_foreground(SIGINT) {
+            PICS.end_interrupt(KEYBOARD_INT);
+            return;
+        }
+        // No foreground task (shell at prompt) → deliver ETX so line editor can handle ^C
+        match &mut *KEYBOARD_BUFFER.lock() {
+            Some(buffer) => buffer.push(0x03),
+            None => {}
+        }
+        PICS.end_interrupt(KEYBOARD_INT);
+        return;
+    }
+
     let key_byte = scancode_to_char(scancode, unsafe { KEYBOARD.shift });
 
-    if key_byte != 0 {
+    // Suppress ordinary characters while Ctrl is held (except handled above)
+    if key_byte != 0 && !unsafe { KEYBOARD.ctrl } {
         match &mut *KEYBOARD_BUFFER.lock() {
             Some(buffer) => buffer.push(key_byte),
             None => {}
