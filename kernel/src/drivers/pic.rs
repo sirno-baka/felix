@@ -122,9 +122,42 @@ impl Pics {
         self.slave.write_data(MODE);
         wait();
 
-        //restore mask
-        self.master.write_data(mask1);
-        self.slave.write_data(mask2);
+            // Do NOT restore BIOS masks — they usually leave IRQ0 (timer) open.
+        // Start with everything masked; caller unmasks what it needs when ready.
+        let _ = (mask1, mask2);
+        self.master.write_data(0xFF);
+        self.slave.write_data(0xFF);
+    }
+
+    /// Mask a hardware IRQ line (0..=15). Bit set = masked (disabled).
+    pub fn mask_irq(&self, irq: u8) {
+        if irq < 8 {
+            let m = self.master.read_data() | (1 << irq);
+            self.master.write_data(m);
+        } else if irq < 16 {
+            let m = self.slave.read_data() | (1 << (irq - 8));
+            self.slave.write_data(m);
+        }
+    }
+
+    /// Unmask a hardware IRQ line (0..=15). Bit clear = enabled.
+    pub fn unmask_irq(&self, irq: u8) {
+        if irq < 8 {
+            let m = self.master.read_data() & !(1 << irq);
+            self.master.write_data(m);
+        } else if irq < 16 {
+            let m = self.slave.read_data() & !(1 << (irq - 8));
+            self.slave.write_data(m);
+            // Slave IRQs also need cascade (IRQ2) unmasked on master
+            let m2 = self.master.read_data() & !(1 << 2);
+            self.master.write_data(m2);
+        }
+    }
+
+    /// Replace the full master+slave mask bytes.
+    pub fn set_masks(&self, master: u8, slave: u8) {
+        self.master.write_data(master);
+        self.slave.write_data(slave);
     }
 
     //check if one of the pics is handling an interrupt

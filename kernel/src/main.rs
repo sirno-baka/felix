@@ -262,39 +262,44 @@ pub extern "C" fn higher_half_entry() -> ! {
         crate::net::stack::init();
         // // 7. Task Manager (после IDT!)
         TASK_MANAGER.init();
-        // for i in 0..5000 {
-        //     wait();
-        // }
-        // // === ВКЛЮЧАЕМ ТАЙМЕР И ПРЕРЫВАНИЯ ТОЛЬКО В КОНЦЕ ===
-        // asm!("in al, 0x21", out("al") mask);
-        // asm!("out 0x21, al", in("al") mask & !1u8); // снимаем бит 0
-        asm!("sti");
-        // let entries = VFS.get().list_directory_entries("/");
-        // Start userspace shell (parent_slot = 0 = idle)
+
+        // ---------------------------------------------------------------
+        // Launch shell WHILE TIMER IS STILL MASKED and IF=0.
+        // First IRQ0 does first_switch → abandons this boot context forever.
+        // If that fires mid-execve, the system hangs intermittently.
+        // ---------------------------------------------------------------
+        // Keep cli for the entire critical section (PIC already masks all IRQs).
+        asm!("cli");
+
         let data = VFS.get().read_file("/shell").unwrap();
         let shell_argv = [b"/shell\0".to_vec()];
-        crate::syscalls::handler::sys_execve(0, data.as_ptr(), data.len(), -1, -1, -1, &shell_argv);
+        let shell_pid = crate::syscalls::handler::sys_execve(
+            0,
+            data.as_ptr(),
+            data.len(),
+            -1,
+            -1,
+            -1,
+            &shell_argv,
+        );
+        if shell_pid == usize::MAX {
+            println!("[!] Failed to exec /shell");
+            loop { asm!("hlt"); }
+        }
+        println!("[!] Shell spawned as pid={}", shell_pid);
 
-
-        // pci::print_devices();
-
-        // 2. Драйвер
-        // после I8255x::init()
-
-
-        // дальше можешь оставить тестовый poll-цикл или убрать его,
-        // потому что теперь poll будет вызываться из таймера/syscalls
-        // 3. Стек
-
-
-        // For brevity in this patch the remaining init is left as a TODO —
-        // paste the original body after the paging block from the old _start.
-        // The only change needed is that all addresses (STACK_START etc.) are
-        // already the high ones.
+        // Now safe to enable scheduling + keyboard:
+        //   IRQ0 = timer, IRQ1 = keyboard
+        PICS.unmask_irq(0);
+        PICS.unmask_irq(1);
 
         println!("[!] Higher-half kernel running at 0x{:08x}", higher_half_entry as u32);
+        println!("[!] Enabling interrupts — entering idle");
 
-        // Temporary halt so you can verify the jump worked
+        // Enable interrupts. The next timer tick will first_switch into the
+        // idle task; subsequent ticks round-robin to the shell.
+        asm!("sti");
+
         loop {
             asm!("hlt");
         }
