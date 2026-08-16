@@ -7,8 +7,9 @@ use crate::memory::allocator::ALLOCATOR;
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::asm;
 use core::ffi::CStr;
-use crate::filesystem::file::{FileDescriptor, FileMode};
+use crate::filesystem::file::{FileDescriptor, FileDescriptorTable, FileMode, PipeEnd};
 use crate::filesystem::VFS;
+use crate::pipe;
 use crate::memory::paging::{PageDirectory, PDEFlags, PTEFlags, PAGING, PhysAddr, VirtAddr, copy_kernel_mappings, PAGE_SIZE};
 use crate::net::{SockAddrIn, SocketState, AF_INET, SOCKET_TABLE, SOCK_DGRAM, SOCK_STREAM};
 
@@ -74,8 +75,21 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         crate::syscalls::SYS_MKDIR  => sys_mkdir(state.ebx as *const u8),
         crate::syscalls::SYS_RMDIR  => sys_rmdir(state.ebx as *const u8),
         crate::syscalls::SYS_UNLINK => sys_unlink(state.ebx as *const u8),
-        crate::syscalls::SYS_EXECVE => sys_execve(current_slot, state.ebx as *const u8, state.ecx as usize),
+        crate::syscalls::SYS_EXECVE => {
+            // edx = *const [i32; 3] { stdin, stdout, stderr }, or null → all -1
+            let (sin, sout, serr) = read_exec_fdmap(state.edx as *const i32);
+            sys_execve(
+                current_slot,
+                state.ebx as *const u8,
+                state.ecx as usize,
+                sin,
+                sout,
+                serr,
+            )
+        },
         crate::syscalls::SYS_WAIT   => sys_wait(current_slot, state.ebx as i32),
+        crate::syscalls::SYS_PIPE   => sys_pipe(current_slot, state.ebx as *mut u32),
+        crate::syscalls::SYS_DUP2   => sys_dup2(current_slot, state.ebx as usize, state.ecx as usize),
         crate::syscalls::SYS_LS => sys_ls(state.ebx as *const u8, state.ecx as *mut u8, state.edx as usize),
         // === Memory ===
         crate::syscalls::SYS_MALLOC => {
@@ -242,17 +256,63 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
 
 // ====================== FILE DESCRIPTORS ======================
 
-fn sys_open(current_slot: usize, path_ptr: *const u8, _flags: usize) -> usize {
-    let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
+// open flags (subset of Linux)
+const O_RDONLY: usize = 0;
+const O_WRONLY: usize = 1;
+const O_RDWR:   usize = 2;
+const O_CREAT:  usize = 0x40;
+const O_TRUNC:  usize = 0x200;
+const O_APPEND: usize = 0x400;
 
-    if let Some(inode) = VFS.get().resolve_path(path) {
-        unsafe {
-            if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
-                if let Some(fd) = current.fd_table.alloc_fd() {
-                    let desc = FileDescriptor::new_file(inode, FileMode::ReadWrite);
-                    current.fd_table.insert(fd, desc);
-                    return fd;
+fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize {
+    let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
+    if path.is_empty() {
+        return usize::MAX;
+    }
+
+    let acc = flags & 3;
+    let mode = match acc {
+        O_WRONLY => FileMode::WriteOnly,
+        O_RDWR => FileMode::ReadWrite,
+        _ => FileMode::ReadOnly,
+    };
+
+    let mut inode = VFS.get().resolve_path(path);
+
+    if inode.is_none() {
+        if flags & O_CREAT != 0 {
+            // create empty file
+            if !VFS.get().create_file(path, &[]) {
+                return usize::MAX;
+            }
+            inode = VFS.get().resolve_path(path);
+        }
+    } else if flags & O_TRUNC != 0 && (acc == O_WRONLY || acc == O_RDWR) {
+        // truncate: rewrite as empty
+        let _ = VFS.get().create_file(path, &[]);
+        inode = VFS.get().resolve_path(path);
+    }
+
+    let Some(inode) = inode else {
+        return usize::MAX;
+    };
+
+    let mut offset = 0u64;
+    if flags & O_APPEND != 0 {
+        // size via read_at probe is awkward; leave 0 and use write path size — for now
+        // try list won't work; keep 0 (write_at extends)
+        offset = 0;
+    }
+
+    unsafe {
+        if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
+            if let Some(fd) = current.fd_table.alloc_fd() {
+                let mut desc = FileDescriptor::new_file(inode, mode);
+                if let FileDescriptor::File { offset: ref mut off, .. } = desc {
+                    *off = offset;
                 }
+                current.fd_table.insert(fd, desc);
+                return fd;
             }
         }
     }
@@ -260,33 +320,39 @@ fn sys_open(current_slot: usize, path_ptr: *const u8, _flags: usize) -> usize {
 }
 
 fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) -> usize {
-    // fd 0 = stdin — читаем из буфера клавиатуры (блокирующий ввод)
-    if fd == 0 {
-        return sys_read_stdin(buf_ptr, count);
-    }
-
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
-            match current.fd_table.get_mut(fd) {
+            // Fallback: bare fd 0 with empty table still means console
+            let desc = current.fd_table.get(fd).copied().or_else(|| {
+                if fd == 0 { Some(FileDescriptor::ConsoleIn) } else { None }
+            });
+
+            match desc {
+                Some(FileDescriptor::ConsoleIn) => {
+                    return sys_read_stdin(buf_ptr, count);
+                }
                 Some(FileDescriptor::File { inode, offset, mode }) => {
-                    if *mode == FileMode::WriteOnly { return 0; }
-
+                    if mode == FileMode::WriteOnly { return 0; }
                     let mut temp = alloc::vec![0u8; count];
-                    let bytes = VFS.get().read_at(*inode, *offset, &mut temp);
-
+                    let bytes = VFS.get().read_at(inode, offset, &mut temp);
                     if bytes > 0 {
                         core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr, bytes);
-                        *offset += bytes as u64;
+                        if let Some(FileDescriptor::File { offset: ref mut off, .. }) =
+                            current.fd_table.get_mut(fd)
+                        {
+                            *off += bytes as u64;
+                        }
                     }
                     return bytes;
                 }
-                Some(FileDescriptor::Socket { socket_id }) => {
-                    // позже: сюда придёт socket read/write
-                    // пока можно возвращать 0 или ошибку
-                    return 0;
+                Some(FileDescriptor::Pipe { pipe_id, end }) => {
+                    if end != PipeEnd::Read { return 0; }
+                    return pipe::pipe_read(pipe_id, buf_ptr, count);
                 }
-                None => 0,
-            };
+                Some(FileDescriptor::Socket { .. }) => return 0,
+                Some(FileDescriptor::ConsoleOut) => return 0,
+                None => return 0,
+            }
         }
     }
     0
@@ -350,32 +416,45 @@ fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usize) -
 
 
 
-    // ====================== STDOUT / STDERR ======================
-    if fd == 0 || fd == 1 {
-        match core::str::from_utf8(buf) {
-            Ok(v) => print!("{}", v),
-            Err(_) => {
-                println!("{:02x?}", &buf);
-            }
-        }
-        return count;
-    }
-
-    // Для обычных файлов
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
-            if let Some(desc) = current.fd_table.get_mut(fd) {
-                match desc {
-                    FileDescriptor::File { inode, offset, mode } => {
-                        if *mode == FileMode::ReadOnly { return 0; }
+            let desc = current.fd_table.get(fd).copied().or_else(|| {
+                if fd == 1 || fd == 2 { Some(FileDescriptor::ConsoleOut) } else { None }
+            });
 
-                        let written = VFS.get().write_at(*inode, *offset, buf);
-                        *offset += written as u64;
-                        return written;
+            match desc {
+                Some(FileDescriptor::ConsoleOut) | Some(FileDescriptor::ConsoleIn) => {
+                    match core::str::from_utf8(buf) {
+                        Ok(v) => print!("{}", v),
+                        Err(_) => println!("{:02x?}", &buf),
                     }
-                    FileDescriptor::Socket { socket_id } => {
-                        return 0
+                    return count;
+                }
+                Some(FileDescriptor::File { inode, offset, mode }) => {
+                    if mode == FileMode::ReadOnly { return 0; }
+                    let written = VFS.get().write_at(inode, offset, buf);
+                    if let Some(FileDescriptor::File { offset: ref mut off, .. }) =
+                        current.fd_table.get_mut(fd)
+                    {
+                        *off += written as u64;
                     }
+                    return written;
+                }
+                Some(FileDescriptor::Pipe { pipe_id, end }) => {
+                    if end != PipeEnd::Write { return 0; }
+                    return pipe::pipe_write(pipe_id, buf_ptr, count);
+                }
+                Some(FileDescriptor::Socket { .. }) => return 0,
+                None => {
+                    // legacy: fd 1 without table entry
+                    if fd == 1 || fd == 2 {
+                        match core::str::from_utf8(buf) {
+                            Ok(v) => print!("{}", v),
+                            Err(_) => {}
+                        }
+                        return count;
+                    }
+                    return 0;
                 }
             }
         }
@@ -383,16 +462,87 @@ fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usize) -
     0
 }
 
+fn close_descriptor(desc: FileDescriptor) {
+    match desc {
+        FileDescriptor::Socket { socket_id } => {
+            SOCKET_TABLE.lock().free(socket_id);
+        }
+        FileDescriptor::Pipe { pipe_id, end } => {
+            match end {
+                PipeEnd::Read => pipe::pipe_close_reader(pipe_id),
+                PipeEnd::Write => pipe::pipe_close_writer(pipe_id),
+            }
+        }
+        _ => {}
+    }
+}
+
 fn sys_close(current_slot: usize, fd: usize) -> usize {
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
-            if let Some(desc) = current.fd_table.get(fd) {
-                if let FileDescriptor::Socket { socket_id } = *desc {
-                    SOCKET_TABLE.lock().free(socket_id);
+            if let Some(desc) = current.fd_table.close(fd) {
+                close_descriptor(desc);
+                return 0;
+            }
+        }
+    }
+    usize::MAX
+}
+
+fn sys_pipe(current_slot: usize, pipefd: *mut u32) -> usize {
+    let pipe_id = match pipe::pipe_create() {
+        Some(id) => id,
+        None => return usize::MAX,
+    };
+    unsafe {
+        if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
+            let r = match current.fd_table.alloc_fd() {
+                Some(f) => f,
+                None => {
+                    pipe::pipe_close_reader(pipe_id);
+                    pipe::pipe_close_writer(pipe_id);
+                    return usize::MAX;
+                }
+            };
+            current.fd_table.insert(r, FileDescriptor::new_pipe(pipe_id, PipeEnd::Read));
+            let w = match current.fd_table.alloc_fd() {
+                Some(f) => f,
+                None => {
+                    let _ = current.fd_table.close(r);
+                    pipe::pipe_close_reader(pipe_id);
+                    pipe::pipe_close_writer(pipe_id);
+                    return usize::MAX;
+                }
+            };
+            current.fd_table.insert(w, FileDescriptor::new_pipe(pipe_id, PipeEnd::Write));
+            *pipefd = r as u32;
+            *pipefd.add(1) = w as u32;
+            return 0;
+        }
+    }
+    usize::MAX
+}
+
+fn sys_dup2(current_slot: usize, oldfd: usize, newfd: usize) -> usize {
+    unsafe {
+        if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
+            if current.fd_table.get(oldfd).is_none() {
+                return usize::MAX;
+            }
+            // bump pipe refcounts on duplicate
+            if let Some(FileDescriptor::Pipe { pipe_id, end }) = current.fd_table.get(oldfd).copied() {
+                match end {
+                    PipeEnd::Read => pipe::pipe_add_reader(pipe_id),
+                    PipeEnd::Write => pipe::pipe_add_writer(pipe_id),
                 }
             }
-            if current.fd_table.close(fd) {
-                return 0;
+            if oldfd != newfd {
+                if let Some(old) = current.fd_table.close(newfd) {
+                    close_descriptor(old);
+                }
+            }
+            if current.fd_table.dup2(oldfd, newfd) {
+                return newfd;
             }
         }
     }
@@ -465,13 +615,16 @@ fn sys_exit(current_slot: usize, esp: u32) -> u32 {
     unsafe {
         if current_slot != 0 {
             if let Some(ref mut t) = TASK_MANAGER.tasks[current_slot] {
+                // Close all fds so pipe writers release EOF to readers
+                let fds: alloc::vec::Vec<_> = t.fd_table.take_all().collect();
+                for desc in fds {
+                    close_descriptor(desc);
+                }
                 t.running = false;
                 t.zombie = true;
-                // exit code currently always 0; can take from ebx later
                 t.exit_code = 0;
             }
         }
-        // Force a context switch away from the zombie
         TASK_MANAGER.schedule(esp as *mut CPUState) as u32
     }
 }
@@ -511,10 +664,62 @@ fn sys_wait(current_slot: usize, pid: i32) -> usize {
     }
 }
 
+/// Read optional fdmap from userspace: three i32 (stdin, stdout, stderr).
+/// Null pointer → defaults (-1, -1, -1) = console.
+fn read_exec_fdmap(ptr: *const i32) -> (i32, i32, i32) {
+    if ptr.is_null() {
+        return (-1, -1, -1);
+    }
+    unsafe {
+        let stdin = *ptr;
+        let stdout = *ptr.add(1);
+        let stderr = *ptr.add(2);
+        (stdin, stdout, stderr)
+    }
+}
+
+/// Copy parent fd into child slot, bumping pipe refcounts when needed.
+fn install_child_fd(
+    parent_slot: usize,
+    child_table: &mut FileDescriptorTable,
+    child_fd: usize,
+    parent_fd: i32,
+    default: FileDescriptor,
+) {
+    if parent_fd < 0 {
+        child_table.set(child_fd, default);
+        return;
+    }
+    unsafe {
+        if let Some(ref parent) = TASK_MANAGER.tasks[parent_slot] {
+            if let Some(desc) = parent.fd_table.get(parent_fd as usize).copied() {
+                if let FileDescriptor::Pipe { pipe_id, end } = desc {
+                    match end {
+                        PipeEnd::Read => pipe::pipe_add_reader(pipe_id),
+                        PipeEnd::Write => pipe::pipe_add_writer(pipe_id),
+                    }
+                }
+                child_table.set(child_fd, desc);
+                return;
+            }
+        }
+    }
+    child_table.set(child_fd, default);
+}
+
 // ====================== EXECVE ======================
 /// Spawn a new task from an ELF image in memory.
 /// Returns the new task's slot (pid) on success, or usize::MAX on failure.
-pub fn sys_execve(parent_slot: usize, buf_ptr: *const u8, count: usize) -> usize {
+/// `stdin_fd`/`stdout_fd`/`stderr_fd`: parent fd to install as child's 0/1/2,
+/// or `-1` for default ConsoleIn / ConsoleOut.
+pub fn sys_execve(
+    parent_slot: usize,
+    buf_ptr: *const u8,
+    count: usize,
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
+) -> usize {
     let mut kernel_buf = alloc::vec![0u8; count];
     unsafe {
         core::ptr::copy_nonoverlapping(buf_ptr, kernel_buf.as_mut_ptr(), count);
@@ -623,6 +828,12 @@ pub fn sys_execve(parent_slot: usize, buf_ptr: *const u8, count: usize) -> usize
             t.zombie = false;
             t.exit_code = 0;
             t.pending_signals = 0;
+
+            // stdio + optional remap from parent fds
+            t.fd_table = FileDescriptorTable::with_stdio();
+            install_child_fd(parent_slot, &mut t.fd_table, 0, stdin_fd, FileDescriptor::ConsoleIn);
+            install_child_fd(parent_slot, &mut t.fd_table, 1, stdout_fd, FileDescriptor::ConsoleOut);
+            install_child_fd(parent_slot, &mut t.fd_table, 2, stderr_fd, FileDescriptor::ConsoleOut);
 
             println!("[execve] OK pid={} entry={:#x} stack={:#x} pd_phys={:#x} parent={}",
                      slot, entry_point, USER_STACK_TOP, pd_phys, parent_slot);

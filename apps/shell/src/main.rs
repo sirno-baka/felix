@@ -6,12 +6,10 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use libfelix::prelude::*;
-use libfelix::syscall::{self, write, read, open, close, mkdir, rmdir, unlink, execve, wait};
+use libfelix::syscall::{self, write, read, open, close, mkdir, rmdir, unlink, execve, wait, pipe, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND};
 
-/// Shell state: current working directory + PATH.
 struct Shell {
     cwd: String,
-    /// Colon-separated search path for executables (like bash $PATH).
     path: String,
 }
 
@@ -19,7 +17,6 @@ impl Shell {
     fn new() -> Self {
         Self {
             cwd: String::from("/"),
-            // Root is on the PATH so `hello` works without `./`
             path: String::from("/"),
         }
     }
@@ -31,8 +28,6 @@ impl Shell {
         s
     }
 
-    /// Resolve a user path against cwd.
-    /// Absolute paths are cleaned as-is; relative are joined with cwd.
     fn resolve(&self, path: &str) -> String {
         let joined = if path.starts_with('/') {
             path.to_string()
@@ -49,9 +44,6 @@ impl Shell {
         normalize_path(&joined)
     }
 
-    /// Try to find an executable for `name`.
-    /// - if name contains '/', resolve relative to cwd (./hello, /bin/foo)
-    /// - else search each directory in PATH
     fn find_executable(&self, name: &str) -> Option<String> {
         if name.contains('/') {
             let full = self.resolve(name);
@@ -60,7 +52,6 @@ impl Shell {
             }
             return None;
         }
-
         for dir in self.path.split(':') {
             if dir.is_empty() {
                 continue;
@@ -83,7 +74,6 @@ impl Shell {
     }
 }
 
-/// Collapse `.` / `..` and duplicate slashes. Always returns an absolute path.
 fn normalize_path(path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     for part in path.split('/') {
@@ -107,13 +97,145 @@ fn file_exists(path: &str) -> bool {
     File::open(path).is_ok()
 }
 
-/// True if `path` looks like a directory (open fails as file, but ls works).
 fn is_directory(path: &str) -> bool {
     let mut p = String::from(path);
     p.push('\0');
     let mut buf = [0u8; 64];
     let n = unsafe { syscall::ls(p.as_ptr() as *const u8, buf.as_mut_ptr(), buf.len()) };
     n > 0 || path == "/"
+}
+
+// ====================== Parsing ======================
+
+#[derive(Clone, Copy, PartialEq)]
+enum RedirKind {
+    In,      // <
+    Out,     // >
+    Append,  // >>
+}
+
+struct Redir {
+    kind: RedirKind,
+    path: String,
+}
+
+struct SimpleCmd {
+    args: Vec<String>,
+    redirs: Vec<Redir>,
+}
+
+/// Split a line into pipeline stages: `a | b | c`
+fn split_pipeline(line: &str) -> Vec<String> {
+    let mut stages = Vec::new();
+    let mut cur = String::new();
+    for ch in line.chars() {
+        if ch == '|' {
+            let t = cur.trim().to_string();
+            if !t.is_empty() {
+                stages.push(t);
+            }
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    let t = cur.trim().to_string();
+    if !t.is_empty() {
+        stages.push(t);
+    }
+    stages
+}
+
+/// Parse one stage into argv + redirections.
+fn parse_simple(stage: &str) -> SimpleCmd {
+    let mut args = Vec::new();
+    let mut redirs = Vec::new();
+    let tokens: Vec<&str> = stage.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = tokens[i];
+        if t == "<" || t == ">" || t == ">>" {
+            let kind = match t {
+                "<" => RedirKind::In,
+                ">>" => RedirKind::Append,
+                _ => RedirKind::Out,
+            };
+            i += 1;
+            if i < tokens.len() {
+                redirs.push(Redir {
+                    kind,
+                    path: tokens[i].to_string(),
+                });
+            }
+        } else if t.starts_with(">>") && t.len() > 2 {
+            redirs.push(Redir {
+                kind: RedirKind::Append,
+                path: t[2..].to_string(),
+            });
+        } else if t.starts_with('>') && t.len() > 1 {
+            redirs.push(Redir {
+                kind: RedirKind::Out,
+                path: t[1..].to_string(),
+            });
+        } else if t.starts_with('<') && t.len() > 1 {
+            redirs.push(Redir {
+                kind: RedirKind::In,
+                path: t[1..].to_string(),
+            });
+        } else {
+            args.push(t.to_string());
+        }
+        i += 1;
+    }
+    SimpleCmd { args, redirs }
+}
+
+/// Open redirection files for a command. Returns (stdin_fd, stdout_fd) as i32 (-1 = default).
+/// Caller must close any >= 0 fds after spawn.
+fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
+    let mut stdin_fd: i32 = -1;
+    let mut stdout_fd: i32 = -1;
+
+    for r in redirs {
+        let full = shell.resolve(&r.path);
+        let mut path = full.clone();
+        path.push('\0');
+        match r.kind {
+            RedirKind::In => {
+                let fd = unsafe { open(path.as_ptr() as *const u8, O_RDONLY) };
+                if fd == usize::MAX {
+                    return Err(alloc::format!("{}: No such file", r.path));
+                }
+                if stdin_fd >= 0 {
+                    unsafe { close(stdin_fd as u32); }
+                }
+                stdin_fd = fd as i32;
+            }
+            RedirKind::Out => {
+                let flags = O_WRONLY | O_CREAT | O_TRUNC;
+                let fd = unsafe { open(path.as_ptr() as *const u8, flags) };
+                if fd == usize::MAX {
+                    return Err(alloc::format!("{}: cannot create", r.path));
+                }
+                if stdout_fd >= 0 {
+                    unsafe { close(stdout_fd as u32); }
+                }
+                stdout_fd = fd as i32;
+            }
+            RedirKind::Append => {
+                let flags = O_WRONLY | O_CREAT | O_APPEND;
+                let fd = unsafe { open(path.as_ptr() as *const u8, flags) };
+                if fd == usize::MAX {
+                    return Err(alloc::format!("{}: cannot open", r.path));
+                }
+                if stdout_fd >= 0 {
+                    unsafe { close(stdout_fd as u32); }
+                }
+                stdout_fd = fd as i32;
+            }
+        }
+    }
+    Ok((stdin_fd, stdout_fd))
 }
 
 #[no_mangle]
@@ -151,7 +273,6 @@ fn read_line() -> String {
                 print!("\n");
                 break;
             }
-            // Ctrl+C at the prompt: cancel the current line
             0x03 => {
                 print!("^C\n");
                 buf.clear();
@@ -175,28 +296,64 @@ fn read_line() -> String {
 }
 
 fn interpret(shell: &mut Shell, line: String) {
-    let args: Vec<String> = line
-        .trim()
-        .split_whitespace()
-        .map(|s| s.to_string())
-        .collect();
-
-    if args.is_empty() {
+    let stages = split_pipeline(line.trim());
+    if stages.is_empty() {
         return;
     }
 
-    let cmd = args[0].as_str();
-
-    match cmd {
-        "help" => print_help(),
-        "exit" | "quit" => unsafe { syscall::exit() },
-
-        "pwd" => {
-            println!("{}", shell.cwd);
+    // Single stage — may be builtin
+    if stages.len() == 1 {
+        let cmd = parse_simple(&stages[0]);
+        if cmd.args.is_empty() {
+            return;
         }
+        if try_builtin(shell, &cmd) {
+            return;
+        }
+        if let Some(pid) = run_external(shell, &cmd, -1, -1) {
+            unsafe {
+                let _ = wait(pid);
+            }
+        }
+        return;
+    }
 
+    // Pipeline: only externals supported for now
+    run_pipeline(shell, &stages);
+}
+
+fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd) -> bool {
+    let name = cmd.args[0].as_str();
+    match name {
+        "help" | "exit" | "quit" | "pwd" | "cd" | "ls" | "cat" | "mkdir" | "rmdir" | "rm"
+        | "path" | "ps" => {}
+        _ => return false,
+    }
+
+    // Builtins with output redirection: capture via temporary approach
+    // For cat/ls we write to redirected fd if present.
+    let out_fd = match open_redirs(shell, &cmd.redirs) {
+        Ok((_in, out)) => out,
+        Err(e) => {
+            println!("{}", e);
+            return true;
+        }
+    };
+    // input redirect for builtins (cat reads files by name, ignore < for now unless no args)
+
+    match name {
+        "help" => {
+            let msg = help_text();
+            write_out(out_fd, msg.as_bytes());
+        }
+        "exit" | "quit" => unsafe { syscall::exit() },
+        "pwd" => {
+            let mut s = shell.cwd.clone();
+            s.push('\n');
+            write_out(out_fd, s.as_bytes());
+        }
         "cd" => {
-            let target = args.get(1).map(|s| s.as_str()).unwrap_or("/");
+            let target = cmd.args.get(1).map(|s| s.as_str()).unwrap_or("/");
             let new_cwd = shell.resolve(target);
             if is_directory(&new_cwd) {
                 shell.cwd = new_cwd;
@@ -204,27 +361,24 @@ fn interpret(shell: &mut Shell, line: String) {
                 println!("cd: {}: No such directory", target);
             }
         }
-
         "ls" => {
-            let path = args
+            let path = cmd
+                .args
                 .get(1)
                 .map(|s| shell.resolve(s))
                 .unwrap_or_else(|| shell.cwd.clone());
-            ls(&path);
+            ls_to(&path, out_fd);
         }
-
         "cat" => {
-            if let Some(file) = args.get(1) {
-                cat(&shell.resolve(file));
+            if let Some(file) = cmd.args.get(1) {
+                cat_to(&shell.resolve(file), out_fd);
             } else {
                 println!("Usage: cat <file>");
             }
         }
-
         "mkdir" => {
-            if let Some(dir) = args.get(1) {
-                let full = shell.resolve(dir);
-                let mut path = full;
+            if let Some(dir) = cmd.args.get(1) {
+                let mut path = shell.resolve(dir);
                 path.push('\0');
                 unsafe {
                     mkdir(path.as_ptr() as *const u8);
@@ -233,9 +387,8 @@ fn interpret(shell: &mut Shell, line: String) {
                 println!("Usage: mkdir <name>");
             }
         }
-
         "rmdir" => {
-            if let Some(dir) = args.get(1) {
+            if let Some(dir) = cmd.args.get(1) {
                 let mut path = shell.resolve(dir);
                 path.push('\0');
                 unsafe {
@@ -245,9 +398,8 @@ fn interpret(shell: &mut Shell, line: String) {
                 println!("Usage: rmdir <name>");
             }
         }
-
         "rm" => {
-            if let Some(file) = args.get(1) {
+            if let Some(file) = cmd.args.get(1) {
                 let mut path = shell.resolve(file);
                 path.push('\0');
                 unsafe {
@@ -257,76 +409,217 @@ fn interpret(shell: &mut Shell, line: String) {
                 println!("Usage: rm <file>");
             }
         }
-
         "path" => {
-            if let Some(new_path) = args.get(1) {
+            if let Some(new_path) = cmd.args.get(1) {
                 shell.path = new_path.clone();
                 println!("PATH={}", shell.path);
             } else {
-                println!("{}", shell.path);
+                let mut s = shell.path.clone();
+                s.push('\n');
+                write_out(out_fd, s.as_bytes());
             }
         }
-
         "ps" => println!("ps: not implemented yet"),
+        _ => {}
+    }
 
-        // External command: resolve via PATH or explicit path, then exec + wait
-        _ => {
-            match shell.find_executable(cmd) {
-                Some(full_path) => exec_program(&full_path),
-                None => println!("{}: command not found", cmd),
-            }
+    if out_fd >= 0 {
+        unsafe {
+            close(out_fd as u32);
+        }
+    }
+    true
+}
+
+fn write_out(fd: i32, data: &[u8]) {
+    if fd < 0 {
+        unsafe {
+            write(1, data.as_ptr(), data.len());
+        }
+    } else {
+        unsafe {
+            write(fd as u32, data.as_ptr(), data.len());
         }
     }
 }
 
-fn exec_program(path: &str) {
+fn run_external(shell: &Shell, cmd: &SimpleCmd, forced_in: i32, forced_out: i32) -> Option<i32> {
+    let name = cmd.args[0].as_str();
+    let full = match shell.find_executable(name) {
+        Some(p) => p,
+        None => {
+            println!("{}: command not found", name);
+            return None;
+        }
+    };
+
+    let (mut sin, mut sout) = match open_redirs(shell, &cmd.redirs) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("{}", e);
+            return None;
+        }
+    };
+    if forced_in >= 0 {
+        if sin >= 0 {
+            unsafe {
+                close(sin as u32);
+            }
+        }
+        sin = forced_in;
+    }
+    if forced_out >= 0 {
+        if sout >= 0 {
+            unsafe {
+                close(sout as u32);
+            }
+        }
+        sout = forced_out;
+    }
+
+    let pid = spawn_elf(&full, sin, sout, -1);
+    // Parent closes its copies of redirect fds (child has its own refs)
+    if sin >= 0 && forced_in < 0 {
+        unsafe {
+            close(sin as u32);
+        }
+    }
+    if sout >= 0 && forced_out < 0 {
+        unsafe {
+            close(sout as u32);
+        }
+    }
+    pid
+}
+
+fn spawn_elf(path: &str, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) -> Option<i32> {
     match File::open(path) {
         Ok(mut f) => match f.read_to_end() {
             Ok(data) => {
-                // ELF magic check — avoid execve-ing random text files
                 if data.len() < 4 || &data[0..4] != b"\x7fELF" {
-                    println!("{}: not an executable f4b: {:?}", path, &data[0..4]);
-                    return;
+                    println!("{}: not an executable", path);
+                    return None;
                 }
                 unsafe {
-                    let pid = execve(data.as_ptr(), data.len());
+                    let pid = execve(
+                        data.as_ptr(),
+                        data.len(),
+                        stdin_fd,
+                        stdout_fd,
+                        stderr_fd,
+                    );
                     if pid == usize::MAX {
                         println!("execve failed: {}", path);
+                        None
                     } else {
-                        let _ = wait(pid as i32);
+                        Some(pid as i32)
                     }
                 }
             }
-            Err(e) => println!("read error: {:?}", e),
+            Err(e) => {
+                println!("read error: {:?}", e);
+                None
+            }
         },
-        Err(IoError::NotFound) => println!("{}: No such file", path),
-        Err(e) => println!("open error: {:?}", e),
+        Err(_) => {
+            println!("{}: No such file", path);
+            None
+        }
     }
 }
 
-fn print_help() {
-    println!(
-        r#"Builtins:
-  ls [path]        - list directory (relative to cwd)
-  cat <file>       - display file content
-  cd [dir]         - change directory
-  pwd              - print working directory
-  path [dirs]      - show or set PATH (colon-separated)
-  mkdir <name>     - create directory
-  rmdir <name>     - remove directory
-  rm <file>        - remove file
-  help             - this help
-  exit             - exit shell
+fn run_pipeline(shell: &Shell, stages: &[String]) {
+    let n = stages.len();
+    if n == 0 {
+        return;
+    }
 
-External programs:
-  ./hello          - run binary in current directory
-  /hello           - absolute path
-  hello            - search PATH (default: /)
-"#
-    );
+    // Create n-1 pipes
+    let mut pipes: Vec<(u32, u32)> = Vec::new();
+    for _ in 0..n - 1 {
+        let mut fds = [0u32; 2];
+        let r = unsafe { pipe(fds.as_mut_ptr()) };
+        if r != 0 {
+            println!("pipe failed");
+            return;
+        }
+        pipes.push((fds[0], fds[1]));
+    }
+
+    let mut pids: Vec<i32> = Vec::new();
+
+    for (i, stage) in stages.iter().enumerate() {
+        let cmd = parse_simple(stage);
+        if cmd.args.is_empty() {
+            continue;
+        }
+
+        let in_fd: i32 = if i == 0 {
+            -1 // may be overridden by <
+        } else {
+            pipes[i - 1].0 as i32
+        };
+        let out_fd: i32 = if i == n - 1 {
+            -1 // may be overridden by >
+        } else {
+            pipes[i].1 as i32
+        };
+
+        // open_redirs inside run_external may override; for middle stages force pipe ends
+        let pid = if i == 0 && i == n - 1 {
+            run_external(shell, &cmd, -1, -1)
+        } else if i == 0 {
+            run_external(shell, &cmd, -1, out_fd)
+        } else if i == n - 1 {
+            run_external(shell, &cmd, in_fd, -1)
+        } else {
+            run_external(shell, &cmd, in_fd, out_fd)
+        };
+
+        if let Some(p) = pid {
+            pids.push(p);
+        }
+    }
+
+    // Parent must close all pipe ends so children get EOF
+    for (r, w) in pipes {
+        unsafe {
+            close(r);
+            close(w);
+        }
+    }
+
+    // Wait for all children (foreground = last for Ctrl+C)
+    for (i, pid) in pids.iter().enumerate() {
+        unsafe {
+            let _ = wait(*pid);
+        }
+        let _ = i;
+    }
 }
 
-fn ls(path: &str) {
+fn help_text() -> String {
+    String::from(
+        "Builtins:\n\
+  ls [path]        - list directory\n\
+  cat <file>       - display file content\n\
+  cd [dir]         - change directory\n\
+  pwd              - print working directory\n\
+  path [dirs]      - show or set PATH\n\
+  mkdir / rmdir / rm\n\
+  help / exit\n\n\
+Redirection:\n\
+  cmd > file       - stdout to file (truncate)\n\
+  cmd >> file      - stdout append\n\
+  cmd < file       - stdin from file\n\n\
+Pipes:\n\
+  cmd1 | cmd2      - pipeline\n\n\
+External:\n\
+  ./hello  /hello  hello (PATH)\n",
+    )
+}
+
+fn ls_to(path: &str, out_fd: i32) {
     let mut path_buf = String::from(path);
     if path_buf.is_empty() {
         path_buf.push('/');
@@ -343,16 +636,18 @@ fn ls(path: &str) {
     let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
     for entry in text.lines() {
         if !entry.is_empty() {
-            println!("{}", entry);
+            let mut line = String::from(entry);
+            line.push('\n');
+            write_out(out_fd, line.as_bytes());
         }
     }
 }
 
-fn cat(filename: &str) {
+fn cat_to(filename: &str, out_fd: i32) {
     let mut path = String::from(filename);
     path.push('\0');
 
-    let fd = unsafe { open(path.as_ptr() as *const u8, 0) };
+    let fd = unsafe { open(path.as_ptr() as *const u8, O_RDONLY) };
     if fd == usize::MAX {
         println!("File not found: {}", filename);
         return;
@@ -364,9 +659,7 @@ fn cat(filename: &str) {
         if n == 0 {
             break;
         }
-        unsafe {
-            write(1, buf.as_ptr(), n);
-        }
+        write_out(out_fd, &buf[..n]);
     }
 
     unsafe {

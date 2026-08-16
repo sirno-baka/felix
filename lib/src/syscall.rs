@@ -12,6 +12,16 @@ pub const SYS_RMDIR:  u32 = 8;
 pub const SYS_UNLINK: u32 = 10;
 pub const SYS_EXECVE: u32 = 11;
 pub const SYS_WAIT:   u32 = 114;
+pub const SYS_PIPE:   u32 = 42;
+pub const SYS_DUP2:   u32 = 63;
+
+// open flags
+pub const O_RDONLY: u32 = 0;
+pub const O_WRONLY: u32 = 1;
+pub const O_RDWR:   u32 = 2;
+pub const O_CREAT:  u32 = 0x40;
+pub const O_TRUNC:  u32 = 0x200;
+pub const O_APPEND: u32 = 0x400;
 
 pub const SYS_MALLOC: u32 = 200;
 pub const SYS_FREE:   u32 = 201;
@@ -108,14 +118,49 @@ pub unsafe fn unlink(path: *const u8) -> usize {
 }
 
 /// Spawn a new task from an in-memory ELF image.
+/// `stdin_fd`/`stdout_fd`/`stderr_fd`: parent fds to map as child's 0/1/2, or -1 for console.
 /// Returns the new task's pid (slot), or usize::MAX on failure.
-pub unsafe fn execve(buf: *const u8, buf_size: usize) -> usize {
+///
+/// ABI: ebx=buf, ecx=len, edx=*const [i32; 3] (stdin, stdout, stderr).
+/// esi/edi are not used — LLVM reserves them on this target.
+pub unsafe fn execve(
+    buf: *const u8,
+    buf_size: usize,
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
+) -> usize {
+    let fdmap: [i32; 3] = [stdin_fd, stdout_fd, stderr_fd];
     let ret: usize;
     asm!(
     "int 0x80",
     inlateout("eax") SYS_EXECVE => ret,
     in("ebx") buf,
     in("ecx") buf_size,
+    in("edx") fdmap.as_ptr(),
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn pipe(pipefd: *mut u32) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_PIPE => ret,
+    in("ebx") pipefd,
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn dup2(oldfd: u32, newfd: u32) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_DUP2 => ret,
+    in("ebx") oldfd,
+    in("ecx") newfd,
     options(nostack, preserves_flags)
     );
     ret

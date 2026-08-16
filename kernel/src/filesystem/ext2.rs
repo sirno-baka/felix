@@ -1497,10 +1497,60 @@ impl crate::filesystem::Filesystem for Ext2 {
         bytes_read
     }
 
-    fn write_at(&mut self, _inode: u32, _offset: u64, _buf: &[u8]) -> usize {
-        // Пока заглушка. Полноценная запись требует аллокации блоков.
-        println!("[EXT2] write_at пока не реализована");
-        0
+    fn write_at(&mut self, inode_num: u32, offset: u64, buf: &[u8]) -> usize {
+        if buf.is_empty() {
+            return 0;
+        }
+        let mut inode = self.read_inode(inode_num);
+        if (inode.i_mode & 0xF000) != 0x8000 {
+            return 0;
+        }
+
+        let block_size = self.block_size as u64;
+        let mut written = 0usize;
+        let mut cur = offset;
+
+        while written < buf.len() {
+            let block_index = (cur / block_size) as usize;
+            if block_index >= 12 {
+                // only direct blocks for now
+                break;
+            }
+
+            // allocate if missing
+            if inode.i_block[block_index] == 0 {
+                match self.alloc_block() {
+                    Some(b) => {
+                        inode.i_block[block_index] = b;
+                        // zero the new block
+                        let zeros = [0u8; 4096];
+                        unsafe { self.write_blocks(b, zeros.as_ptr(), 1); }
+                    }
+                    None => break,
+                }
+            }
+
+            let block_num = inode.i_block[block_index];
+            let block_off = (cur % block_size) as usize;
+            let can = core::cmp::min(buf.len() - written, self.block_size as usize - block_off);
+
+            // read-modify-write
+            let mut block_buf = alloc::vec![0u8; self.block_size as usize];
+            unsafe { self.read_blocks(block_num, block_buf.as_mut_ptr(), 1); }
+            block_buf[block_off..block_off + can]
+                .copy_from_slice(&buf[written..written + can]);
+            unsafe { self.write_blocks(block_num, block_buf.as_ptr(), 1); }
+
+            written += can;
+            cur += can as u64;
+        }
+
+        let new_size = core::cmp::max(inode.i_size as u64, offset + written as u64) as u32;
+        inode.i_size = new_size;
+        let used_blocks = ((new_size as u32 + self.block_size - 1) / self.block_size).min(12);
+        inode.i_blocks = used_blocks * (self.block_size / 512);
+        self.write_inode(inode_num, &inode);
+        written
     }
 }
 

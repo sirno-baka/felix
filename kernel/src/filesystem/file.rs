@@ -7,8 +7,18 @@ pub enum FileMode {
     ReadWrite,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipeEnd {
+    Read,
+    Write,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum FileDescriptor {
+    /// Keyboard input (legacy / default stdin)
+    ConsoleIn,
+    /// VGA/serial text output (default stdout/stderr)
+    ConsoleOut,
     File {
         inode: u32,
         offset: u64,
@@ -16,6 +26,10 @@ pub enum FileDescriptor {
     },
     Socket {
         socket_id: usize,
+    },
+    Pipe {
+        pipe_id: usize,
+        end: PipeEnd,
     },
 }
 
@@ -30,6 +44,10 @@ impl FileDescriptor {
 
     pub fn new_socket(socket_id: usize) -> Self {
         Self::Socket { socket_id }
+    }
+
+    pub fn new_pipe(pipe_id: usize, end: PipeEnd) -> Self {
+        Self::Pipe { pipe_id, end }
     }
 
     pub fn is_socket(&self) -> bool {
@@ -47,10 +65,26 @@ impl FileDescriptorTable {
         Self { fds: [None; 64] }
     }
 
-    /// Находит свободный дескриптор (как и раньше — с +5)
+    /// Default stdio: 0=ConsoleIn, 1=ConsoleOut, 2=ConsoleOut
+    pub fn with_stdio() -> Self {
+        let mut t = Self::new();
+        t.fds[0] = Some(FileDescriptor::ConsoleIn);
+        t.fds[1] = Some(FileDescriptor::ConsoleOut);
+        t.fds[2] = Some(FileDescriptor::ConsoleOut);
+        t
+    }
+
+    /// First free slot starting from 0.
     pub fn alloc_fd(&mut self) -> Option<usize> {
-        if let Some(fd) = self.fds.iter().position(|slot| slot.is_none()) {
-            return Some(fd + 5);
+        self.fds.iter().position(|slot| slot.is_none())
+    }
+
+    /// Allocate fd >= min (useful to avoid clobbering 0/1/2 accidentally).
+    pub fn alloc_fd_from(&mut self, min: usize) -> Option<usize> {
+        for i in min..self.fds.len() {
+            if self.fds[i].is_none() {
+                return Some(i);
+            }
         }
         None
     }
@@ -72,12 +106,39 @@ impl FileDescriptorTable {
         }
     }
 
-    pub fn close(&mut self, fd: usize) -> bool {
-        if fd < self.fds.len() {
-            self.fds[fd] = None;
-            true
-        } else {
-            false
+    /// Install descriptor at `fd`, replacing any existing entry. Returns the old one.
+    pub fn set(&mut self, fd: usize, desc: FileDescriptor) -> Option<FileDescriptor> {
+        if fd >= self.fds.len() {
+            return None;
         }
+        self.fds[fd].replace(desc)
+    }
+
+    pub fn close(&mut self, fd: usize) -> Option<FileDescriptor> {
+        if fd < self.fds.len() {
+            self.fds[fd].take()
+        } else {
+            None
+        }
+    }
+
+    pub fn take_all(&mut self) -> impl Iterator<Item = FileDescriptor> + '_ {
+        self.fds.iter_mut().filter_map(|s| s.take())
+    }
+
+    /// Duplicate descriptor `old` into slot `new` (like dup2).
+    pub fn dup2(&mut self, old: usize, new: usize) -> bool {
+        if old >= self.fds.len() || new >= self.fds.len() {
+            return false;
+        }
+        let desc = match self.fds[old] {
+            Some(d) => d,
+            None => return false,
+        };
+        if old == new {
+            return true;
+        }
+        self.fds[new] = Some(desc);
+        true
     }
 }

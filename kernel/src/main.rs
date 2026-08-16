@@ -28,6 +28,7 @@ mod io;
 mod disk;
 mod net;
 mod signal;
+mod pipe;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -84,7 +85,7 @@ macro_rules! run {
         unsafe {
             let path = concat!($app, "\0");
             // parent_slot 0 = idle; this macro is kernel-side only
-            let _ = crate::syscalls::handler::sys_execve(0, path.as_ptr() as *const u8, 0);
+            let _ = crate::syscalls::handler::sys_execve(0, path.as_ptr() as *const u8, 0, -1, -1, -1);
         }
     };
 }
@@ -271,7 +272,7 @@ pub extern "C" fn higher_half_entry() -> ! {
         // let entries = VFS.get().list_directory_entries("/");
         // Start userspace shell (parent_slot = 0 = idle)
         let data = VFS.get().read_file("/shell").unwrap();
-        crate::syscalls::handler::sys_execve(0, data.as_ptr(), data.len());
+        crate::syscalls::handler::sys_execve(0, data.as_ptr(), data.len(), -1, -1, -1);
 
 
         // pci::print_devices();
