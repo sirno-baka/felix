@@ -11,6 +11,7 @@ pub const SYS_MKDIR:  u32 = 7;
 pub const SYS_RMDIR:  u32 = 8;
 pub const SYS_UNLINK: u32 = 10;
 pub const SYS_EXECVE: u32 = 11;
+pub const SYS_WAIT:   u32 = 114;
 
 pub const SYS_MALLOC: u32 = 200;
 pub const SYS_FREE:   u32 = 201;
@@ -106,6 +107,8 @@ pub unsafe fn unlink(path: *const u8) -> usize {
     ret
 }
 
+/// Spawn a new task from an in-memory ELF image.
+/// Returns the new task's pid (slot), or usize::MAX on failure.
 pub unsafe fn execve(buf: *const u8, buf_size: usize) -> usize {
     let ret: usize;
     asm!(
@@ -113,6 +116,19 @@ pub unsafe fn execve(buf: *const u8, buf_size: usize) -> usize {
     inlateout("eax") SYS_EXECVE => ret,
     in("ebx") buf,
     in("ecx") buf_size,
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+/// Block until the child with the given pid exits (or any child if pid == -1).
+/// Returns the reaped child's pid, or usize::MAX on error.
+pub unsafe fn wait(pid: i32) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_WAIT => ret,
+    in("ebx") pid,
     options(nostack, preserves_flags)
     );
     ret

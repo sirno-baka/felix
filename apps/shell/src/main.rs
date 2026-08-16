@@ -6,7 +6,7 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use libfelix::prelude::*;
-use libfelix::syscall::{self, write, read, open, close, mkdir, rmdir, unlink, execve};
+use libfelix::syscall::{self, write, read, open, close, mkdir, rmdir, unlink, execve, wait};
 
 const PROMPT: &str = "felix> ";
 
@@ -96,7 +96,13 @@ fn interpret(line: String) {
                         Ok(data) => {
                             println!("read {} bytes", data.len());
                             unsafe {
-                                execve(data.as_ptr(), data.len());
+                                let pid = execve(data.as_ptr(), data.len());
+                                if pid == usize::MAX {
+                                    println!("execve failed");
+                                } else {
+                                    // Block until the child exits, then show prompt again
+                                    let _ = wait(pid as i32);
+                                }
                             }
                         }
                         Err(e) => println!("read error: {:?}", e),

@@ -11,6 +11,9 @@ pub const SYS_RMDIR: u32 = 8;   // rmdir
 pub const SYS_UNLINK: u32 = 10;  // delete/unlink(filename)
 
 pub const SYS_EXECVE: u32 = 11;
+/// wait(pid) — block until child with given pid exits (-1 = any child).
+/// Returns pid of the reaped child, or usize::MAX on error.
+pub const SYS_WAIT: u32 = 114;
 
 pub const SYS_MALLOC: u32 = 200;
 pub const SYS_FREE: u32 = 201;

@@ -58,24 +58,24 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
     // Фиксируем текущий таск ОДИН раз (чтобы таймер не успел переключить)
     let current_slot = unsafe { TASK_MANAGER.get_current_slot() } as usize;
 
-    let ret = match syscall_num {
-        // === Process control ===
-        crate::syscalls::SYS_EXIT => {
-            unsafe { TASK_MANAGER.remove_current_task(); }
-            0
-        }
+    // exit must switch to another task — never return to the dead one
+    if syscall_num == crate::syscalls::SYS_EXIT {
+        return sys_exit(current_slot, esp);
+    }
 
+    let ret = match syscall_num {
         // === File descriptors ===
         crate::syscalls::SYS_OPEN  => sys_open(current_slot, state.ebx as *const u8, state.ecx as usize),
         crate::syscalls::SYS_READ  => sys_read(current_slot, state.ebx as usize, state.ecx as *mut u8, state.edx as usize),
         crate::syscalls::SYS_WRITE => sys_write(current_slot, state.ebx as usize, state.ecx as *const u8, state.edx as usize),
         crate::syscalls::SYS_CLOSE => sys_close(current_slot, state.ebx as usize),
 
-        // === Filesystem operations ===
+        // === Filesystem / process ===
         crate::syscalls::SYS_MKDIR  => sys_mkdir(state.ebx as *const u8),
         crate::syscalls::SYS_RMDIR  => sys_rmdir(state.ebx as *const u8),
         crate::syscalls::SYS_UNLINK => sys_unlink(state.ebx as *const u8),
-        crate::syscalls::SYS_EXECVE => sys_execve(state.ebx as *const u8, state.ecx as usize),
+        crate::syscalls::SYS_EXECVE => sys_execve(current_slot, state.ebx as *const u8, state.ecx as usize),
+        crate::syscalls::SYS_WAIT   => sys_wait(current_slot, state.ebx as i32),
         crate::syscalls::SYS_LS => sys_ls(state.ebx as *const u8, state.ecx as *mut u8, state.edx as usize),
         // === Memory ===
         crate::syscalls::SYS_MALLOC => {
@@ -458,15 +458,63 @@ fn sys_ls(path_ptr: *const u8, buf_ptr: *mut u8, buf_size: usize) -> usize {
     pos
 }
 
+// ====================== EXIT ======================
+/// Mark current task as zombie and switch to another task.
+/// Returns the new task's CPU-state pointer so the syscall iretd
+/// resumes a different task (never the dead one).
+fn sys_exit(current_slot: usize, esp: u32) -> u32 {
+    unsafe {
+        if current_slot != 0 {
+            if let Some(ref mut t) = TASK_MANAGER.tasks[current_slot] {
+                t.running = false;
+                t.zombie = true;
+                // exit code currently always 0; can take from ebx later
+                t.exit_code = 0;
+            }
+        }
+        // Force a context switch away from the zombie
+        TASK_MANAGER.schedule(esp as *mut CPUState) as u32
+    }
+}
+
+// ====================== WAIT ======================
+/// Block until a child matching `pid` becomes a zombie, then reap it.
+/// `pid == -1` waits for any child.
+/// Returns the reaped child's slot (pid), or usize::MAX if no such child can ever appear.
+fn sys_wait(current_slot: usize, pid: i32) -> usize {
+    let parent = current_slot as i8;
+
+    loop {
+        let found = unsafe { TASK_MANAGER.find_zombie_child(parent, pid) };
+        if let Some((child_slot, _exit_code)) = found {
+            unsafe {
+                TASK_MANAGER.reap(child_slot);
+            }
+            return child_slot;
+        }
+
+        // No zombie yet — sleep until the next interrupt (timer / keyboard),
+        // same pattern as blocking stdin. Scheduler can run other tasks
+        // while we are in hlt; when we are scheduled again we re-check.
+        unsafe {
+            asm!("sti");
+            asm!("hlt");
+            asm!("cli");
+        }
+    }
+}
+
 // ====================== EXECVE ======================
-pub fn sys_execve(buf_ptr: *const u8, count: usize) -> usize {
+/// Spawn a new task from an ELF image in memory.
+/// Returns the new task's slot (pid) on success, or usize::MAX on failure.
+pub fn sys_execve(parent_slot: usize, buf_ptr: *const u8, count: usize) -> usize {
     let mut kernel_buf = alloc::vec![0u8; count];
     unsafe {
         core::ptr::copy_nonoverlapping(buf_ptr, kernel_buf.as_mut_ptr(), count);
     }
     let buf = &kernel_buf[..];
     if count == 0 {
-        return 0;
+        return usize::MAX;
     }
     let slot_i8 = unsafe { TASK_MANAGER.get_free_slot() };
     if slot_i8 < 0 {
@@ -564,13 +612,16 @@ pub fn sys_execve(buf_ptr: *const u8, count: usize) -> usize {
 
             t.running = true;
             t.heap_next = heap_start;
+            t.parent = parent_slot as i8;
+            t.zombie = false;
+            t.exit_code = 0;
 
-            println!("[execve] OK entry={:#x} stack={:#x} pd_phys={:#x}",
-                     entry_point, USER_STACK_TOP, pd_phys);
+            println!("[execve] OK pid={} entry={:#x} stack={:#x} pd_phys={:#x} parent={}",
+                     slot, entry_point, USER_STACK_TOP, pd_phys, parent_slot);
         }
 
         asm!("sti");
-        0
+        slot // return pid to caller
     }
 }
 

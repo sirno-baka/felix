@@ -65,6 +65,12 @@ pub struct Task {
     pub fd_table: FileDescriptorTable,
     pub heap_next: u32,
     pub page_refcounts: PageRefcounts,
+    /// Parent task slot (-1 = none / kernel)
+    pub parent: i8,
+    /// Task has exited and waits to be reaped by wait()
+    pub zombie: bool,
+    /// Exit status (valid when zombie == true)
+    pub exit_code: i32,
 }
 
 
@@ -103,6 +109,9 @@ impl Task {
             kernel_stack: 0,
             heap_next: 0,
             page_refcounts: PageRefcounts::new(),
+            parent: -1,
+            zombie: false,
+            exit_code: 0,
         }
     }
 
@@ -116,6 +125,9 @@ impl Task {
             kernel_stack: 0,
             heap_next: 0,
             page_refcounts: PageRefcounts::new(),
+            parent: -1,
+            zombie: false,
+            exit_code: 0,
         }
     }
     // ====================== Task::init ======================
@@ -351,6 +363,38 @@ impl TaskManager {
 
     pub fn get_current_slot(&self) -> i8 {
         self.current_task
+    }
+
+    /// Find a zombie child of `parent` matching `want_pid` (-1 = any).
+    /// Returns (slot, exit_code) without removing the task.
+    pub fn find_zombie_child(&self, parent: i8, want_pid: i32) -> Option<(usize, i32)> {
+        for i in 0..MAX_TASKS as usize {
+            if let Some(ref t) = self.tasks[i] {
+                if t.zombie && t.parent == parent {
+                    if want_pid < 0 || want_pid == i as i32 {
+                        return Some((i, t.exit_code));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Reap (free) a zombie task slot. Returns true on success.
+    pub fn reap(&mut self, id: usize) -> bool {
+        if id == 0 {
+            return false;
+        }
+        if let Some(ref t) = self.tasks[id] {
+            if !t.zombie {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        self.tasks[id] = None;
+        self.task_count -= 1;
+        true
     }
 
     pub fn list_tasks(&self) {

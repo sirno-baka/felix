@@ -82,7 +82,8 @@ macro_rules! run {
     ($app:expr) => {
         unsafe {
             let path = concat!($app, "\0");
-            crate::syscalls::handler::sys_execve(path.as_ptr() as *const u8);
+            // parent_slot 0 = idle; this macro is kernel-side only
+            let _ = crate::syscalls::handler::sys_execve(0, path.as_ptr() as *const u8, 0);
         }
     };
 }
@@ -267,8 +268,9 @@ pub extern "C" fn higher_half_entry() -> ! {
         // asm!("out 0x21, al", in("al") mask & !1u8); // снимаем бит 0
         asm!("sti");
         // let entries = VFS.get().list_directory_entries("/");
-        let data= VFS.get().read_file("/hello").unwrap();
-        crate::syscalls::handler::sys_execve(data.as_ptr(), data.len());
+        // Start userspace shell (parent_slot = 0 = idle)
+        let data = VFS.get().read_file("/shell").unwrap();
+        crate::syscalls::handler::sys_execve(0, data.as_ptr(), data.len());
 
 
         // pci::print_devices();
