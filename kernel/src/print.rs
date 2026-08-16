@@ -45,6 +45,28 @@ impl Printer {
             return;
         }
 
+        // Backspace: move left, erase character, stay there
+        if c == '\x08' {
+            if self.x > 0 {
+                self.x -= 1;
+                let target = (VGA_START + ((self.y * WIDTH + self.x) * 2) as u32) as *mut u8;
+                unsafe {
+                    *target = b' ';
+                    let color = self.background << 4 | self.foreground;
+                    *target.byte_add(1) = color;
+                }
+                self.set_cursor_position();
+            }
+            return;
+        }
+
+        // Carriage return
+        if c == '\r' {
+            self.x = 0;
+            self.set_cursor_position();
+            return;
+        }
+
         //calculate target from coords
         let target = (VGA_START + ((self.y * WIDTH + self.x) * 2) as u32) as *mut u8;
 
@@ -89,11 +111,8 @@ impl Printer {
     }
 
     pub fn delete(&mut self) {
-        self.x -= 1;
-        self.printc('\0');
-        self.x -= 1;
-
-        self.set_cursor_position();
+        // Re-use the same logic as printc('\x08')
+        self.printc('\x08');
     }
 
     //get cursor position directly talking to vga hardware

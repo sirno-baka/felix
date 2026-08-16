@@ -281,7 +281,8 @@ fn read_line() -> String {
             0x08 | 0x7f => {
                 if !buf.is_empty() {
                     buf.pop();
-                    print!("\x08 \x08");
+                    // Kernel console now handles BS: moves cursor left + erases glyph
+                    print!("\x08");
                 }
             }
             c if c.is_ascii_graphic() || c == b' ' => {
@@ -477,7 +478,7 @@ fn run_external(shell: &Shell, cmd: &SimpleCmd, forced_in: i32, forced_out: i32)
         sout = forced_out;
     }
 
-    let pid = spawn_elf(&full, sin, sout, -1);
+    let pid = spawn_elf(&full, sin, sout, -1, &cmd.args);
     // Parent closes its copies of redirect fds (child has its own refs)
     if sin >= 0 && forced_in < 0 {
         unsafe {
@@ -492,7 +493,13 @@ fn run_external(shell: &Shell, cmd: &SimpleCmd, forced_in: i32, forced_out: i32)
     pid
 }
 
-fn spawn_elf(path: &str, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) -> Option<i32> {
+fn spawn_elf(
+    path: &str,
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
+    args: &[String],
+) -> Option<i32> {
     match File::open(path) {
         Ok(mut f) => match f.read_to_end() {
             Ok(data) => {
@@ -500,6 +507,24 @@ fn spawn_elf(path: &str, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) -> Optio
                     println!("{}: not an executable", path);
                     return None;
                 }
+                // Build C-string argv (argv[0] = path or args[0])
+                let mut c_strings: Vec<String> = Vec::new();
+                if args.is_empty() {
+                    c_strings.push({
+                        let mut s = String::from(path);
+                        s.push('\0');
+                        s
+                    });
+                } else {
+                    for a in args {
+                        let mut s = a.clone();
+                        s.push('\0');
+                        c_strings.push(s);
+                    }
+                }
+                let ptrs: Vec<*const u8> =
+                    c_strings.iter().map(|s| s.as_ptr()).collect();
+
                 unsafe {
                     let pid = execve(
                         data.as_ptr(),
@@ -507,6 +532,7 @@ fn spawn_elf(path: &str, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) -> Optio
                         stdin_fd,
                         stdout_fd,
                         stderr_fd,
+                        &ptrs,
                     );
                     if pid == usize::MAX {
                         println!("execve failed: {}", path);

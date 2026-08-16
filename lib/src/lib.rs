@@ -20,6 +20,7 @@ pub mod prelude {
     pub use crate::print;
     pub use crate::println;
     pub use crate::fs::{File, IoError, IoResult};
+    pub use crate::rt::{arg, argc, args};
     pub use alloc::string::String;
     pub use alloc::vec::Vec;
     pub use alloc::boxed::Box;

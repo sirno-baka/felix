@@ -117,27 +117,44 @@ pub unsafe fn unlink(path: *const u8) -> usize {
     ret
 }
 
+/// Parameters for `execve` (passed via edx).
+#[repr(C)]
+pub struct ExecParams {
+    pub stdin: i32,
+    pub stdout: i32,
+    pub stderr: i32,
+    pub argc: u32,
+    /// Array of `argc` pointers to C strings in the caller's address space.
+    pub argv: *const *const u8,
+}
+
 /// Spawn a new task from an in-memory ELF image.
-/// `stdin_fd`/`stdout_fd`/`stderr_fd`: parent fds to map as child's 0/1/2, or -1 for console.
+/// `argv` is a slice of C-string pointers (like Unix argv), including argv[0].
 /// Returns the new task's pid (slot), or usize::MAX on failure.
 ///
-/// ABI: ebx=buf, ecx=len, edx=*const [i32; 3] (stdin, stdout, stderr).
-/// esi/edi are not used — LLVM reserves them on this target.
+/// ABI: ebx=buf, ecx=len, edx=*const ExecParams.
 pub unsafe fn execve(
     buf: *const u8,
     buf_size: usize,
     stdin_fd: i32,
     stdout_fd: i32,
     stderr_fd: i32,
+    argv: &[*const u8],
 ) -> usize {
-    let fdmap: [i32; 3] = [stdin_fd, stdout_fd, stderr_fd];
+    let params = ExecParams {
+        stdin: stdin_fd,
+        stdout: stdout_fd,
+        stderr: stderr_fd,
+        argc: argv.len() as u32,
+        argv: argv.as_ptr(),
+    };
     let ret: usize;
     asm!(
     "int 0x80",
     inlateout("eax") SYS_EXECVE => ret,
     in("ebx") buf,
     in("ecx") buf_size,
-    in("edx") fdmap.as_ptr(),
+    in("edx") &params as *const ExecParams,
     options(nostack, preserves_flags)
     );
     ret

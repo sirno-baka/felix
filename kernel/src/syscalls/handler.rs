@@ -76,15 +76,15 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         crate::syscalls::SYS_RMDIR  => sys_rmdir(state.ebx as *const u8),
         crate::syscalls::SYS_UNLINK => sys_unlink(state.ebx as *const u8),
         crate::syscalls::SYS_EXECVE => {
-            // edx = *const [i32; 3] { stdin, stdout, stderr }, or null → all -1
-            let (sin, sout, serr) = read_exec_fdmap(state.edx as *const i32);
+            let params = read_exec_params(state.edx as *const ExecParamsUser);
             sys_execve(
                 current_slot,
                 state.ebx as *const u8,
                 state.ecx as usize,
-                sin,
-                sout,
-                serr,
+                params.stdin,
+                params.stdout,
+                params.stderr,
+                &params.argv,
             )
         },
         crate::syscalls::SYS_WAIT   => sys_wait(current_slot, state.ebx as i32),
@@ -664,18 +664,136 @@ fn sys_wait(current_slot: usize, pid: i32) -> usize {
     }
 }
 
-/// Read optional fdmap from userspace: three i32 (stdin, stdout, stderr).
-/// Null pointer → defaults (-1, -1, -1) = console.
-fn read_exec_fdmap(ptr: *const i32) -> (i32, i32, i32) {
+/// Userspace layout of `libfelix::syscall::ExecParams`.
+#[repr(C)]
+struct ExecParamsUser {
+    stdin: i32,
+    stdout: i32,
+    stderr: i32,
+    argc: u32,
+    argv: *const *const u8,
+}
+
+struct ExecParamsKernel {
+    stdin: i32,
+    stdout: i32,
+    stderr: i32,
+    /// Owned C-string copies of argv.
+    argv: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+}
+
+fn read_exec_params(ptr: *const ExecParamsUser) -> ExecParamsKernel {
     if ptr.is_null() {
-        return (-1, -1, -1);
+        return ExecParamsKernel {
+            stdin: -1,
+            stdout: -1,
+            stderr: -1,
+            argv: alloc::vec::Vec::new(),
+        };
     }
     unsafe {
-        let stdin = *ptr;
-        let stdout = *ptr.add(1);
-        let stderr = *ptr.add(2);
-        (stdin, stdout, stderr)
+        let p = &*ptr;
+        let mut argv = alloc::vec::Vec::new();
+        let n = p.argc.min(64) as usize; // hard cap
+        if !p.argv.is_null() {
+            for i in 0..n {
+                let sp = *p.argv.add(i);
+                if sp.is_null() {
+                    break;
+                }
+                // Copy C string (max 256 bytes each)
+                let mut buf = alloc::vec::Vec::new();
+                for j in 0..256 {
+                    let b = *sp.add(j);
+                    buf.push(b);
+                    if b == 0 {
+                        break;
+                    }
+                }
+                if buf.last() != Some(&0) {
+                    buf.push(0);
+                }
+                argv.push(buf);
+            }
+        }
+        ExecParamsKernel {
+            stdin: p.stdin,
+            stdout: p.stdout,
+            stderr: p.stderr,
+            argv,
+        }
     }
+}
+
+/// Write bytes to a user virtual address via the task's page tables.
+fn copy_to_user_virt(page_dir: &crate::memory::paging::PageDirectory, mut vaddr: u32, data: &[u8]) {
+    use crate::memory::paging::phys_to_virt;
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let page = vaddr & !0xFFF;
+        let page_off = (vaddr & 0xFFF) as usize;
+        let chunk = core::cmp::min(data.len() - offset, 0x1000 - page_off);
+        let pd_idx = (page >> 22) as usize;
+        let pt_idx = ((page >> 12) & 0x3FF) as usize;
+        let pde = page_dir.entries[pd_idx];
+        let pt_phys = pde & 0xFFFF_F000;
+        let pte = unsafe { *((phys_to_virt(pt_phys) as *const u32).add(pt_idx)) };
+        let frame_phys = pte & 0xFFFF_F000;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr().add(offset),
+                (phys_to_virt(frame_phys) as *mut u8).add(page_off),
+                chunk,
+            );
+        }
+        offset += chunk;
+        vaddr += chunk as u32;
+    }
+}
+
+fn write_u32_user(page_dir: &crate::memory::paging::PageDirectory, vaddr: u32, val: u32) {
+    let bytes = val.to_le_bytes();
+    copy_to_user_virt(page_dir, vaddr, &bytes);
+}
+
+/// Build Linux-style initial user stack with argc/argv/empty envp.
+/// Returns the final ESP value (points at argc).
+fn setup_user_argv(
+    page_dir: &crate::memory::paging::PageDirectory,
+    stack_top: u32,
+    argv: &[alloc::vec::Vec<u8>],
+) -> u32 {
+    let mut sp = stack_top;
+    let argc = argv.len();
+    let mut arg_addrs: alloc::vec::Vec<u32> = alloc::vec::Vec::with_capacity(argc);
+
+    // Place strings just below stack_top (highest addresses first).
+    for s in argv.iter().rev() {
+        let len = s.len();
+        sp -= len as u32;
+        copy_to_user_virt(page_dir, sp, s);
+        arg_addrs.push(sp);
+    }
+    arg_addrs.reverse();
+
+    // 16-byte align for ABI friendliness
+    sp &= !0xF;
+
+    // NULL envp terminator
+    sp -= 4;
+    write_u32_user(page_dir, sp, 0);
+    // NULL argv terminator
+    sp -= 4;
+    write_u32_user(page_dir, sp, 0);
+    // argv pointers (reverse order so argv[0] ends up at lowest address after pushes)
+    for &addr in arg_addrs.iter().rev() {
+        sp -= 4;
+        write_u32_user(page_dir, sp, addr);
+    }
+    // argc
+    sp -= 4;
+    write_u32_user(page_dir, sp, argc as u32);
+    sp
 }
 
 /// Copy parent fd into child slot, bumping pipe refcounts when needed.
@@ -719,6 +837,7 @@ pub fn sys_execve(
     stdin_fd: i32,
     stdout_fd: i32,
     stderr_fd: i32,
+    argv: &[alloc::vec::Vec<u8>],
 ) -> usize {
     let mut kernel_buf = alloc::vec![0u8; count];
     unsafe {
@@ -802,13 +921,16 @@ pub fn sys_execve(
                 as *mut CPUState;
             t.cpu_state_ptr = state_ptr as u32;
 
+            // argv on user stack (defaults to empty argc=0)
+            let user_esp = setup_user_argv(&t.page_dir, USER_STACK_TOP, argv);
+
             *state_ptr = CPUState {
                 eax: 0, ebx: 0, ecx: 0, edx: 0,
                 esi: 0, edi: 0, ebp: 0,
-                eip:    entry_point,   // e_entry из ELF, без сдвига
+                eip:    entry_point,
                 cs:     0x1B,
                 eflags: 0x202,
-                esp:    USER_STACK_TOP,
+                esp:    user_esp,
                 ss:     0x23,
             };
 

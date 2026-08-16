@@ -45,6 +45,10 @@ impl SockAddrIn {
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
+    println!("=== hello (argc={}) ===", argc());
+    for (i, a) in args().enumerate() {
+        println!("  argv[{}] = {}", i, a);
+    }
     println!("=== UDP Echo Server ===");
 
     // 1. Создаём UDP-сокет
