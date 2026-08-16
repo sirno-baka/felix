@@ -5,7 +5,7 @@ use core::arch::asm;
 use core::u32::MAX;
 use crate::filesystem::file::FileDescriptorTable;
 use crate::memory::paging::{PageDirectory, PDEFlags, copy_kernel_mappings, PhysAddr, VirtAddr, KERNEL_OFFSET};
-use crate::{gdt, print, println};
+use crate::{gdt, init_network_stack, print, println};
 use crate::drivers::pic::wait;
 
 pub const STACK_SIZE: usize = 32 * 1024;

@@ -46,13 +46,16 @@ pub extern "C" fn timer() {
         "pop ebp",
 
         // На стеке: EIP, CS, EFLAGS, [ESP, SS]
-        "mov ax, [esp + 4]",   // CS
-        "and ax, 3",
-        "cmp ax, 3",
+        // ВАЖНО: не трогать EAX — там return value syscall
+        // (если IRQ0 пришёл между sti и iretd в syscall path).
+        // Раньше mov ax, 0x23 превращал ret=0 в ret=35.
+        "mov cx, [esp + 4]",   // CS
+        "and cx, 3",
+        "cmp cx, 3",
         "jne 2f",
-        "mov ax, 0x23",
-        "mov ds, ax",
-        "mov es, ax",
+        "mov cx, 0x23",
+        "mov ds, cx",
+        "mov es, cx",
         "2:",
 
         "iretd",

@@ -255,11 +255,7 @@ pub extern "C" fn higher_half_entry() -> ! {
 
         println!("[VFS] Virtual filesystem initialized");
         print_info();
-        pci::print_devices();
-
-        // 2. Драйвер
         crate::drivers::net::i8255x::I8255x::init().expect("NIC init failed");
-        // после I8255x::init()
         crate::net::stack::init();
         // // 7. Task Manager (после IDT!)
         TASK_MANAGER.init();
@@ -269,27 +265,23 @@ pub extern "C" fn higher_half_entry() -> ! {
         // // === ВКЛЮЧАЕМ ТАЙМЕР И ПРЕРЫВАНИЯ ТОЛЬКО В КОНЦЕ ===
         // asm!("in al, 0x21", out("al") mask);
         // asm!("out 0x21, al", in("al") mask & !1u8); // снимаем бит 0
-
-        // let entries = VFS.get().list_directory_entries("/");
-
-
-
-
-        let data= VFS.get().read_file("/shell").unwrap();
-        crate::syscalls::handler::sys_execve(data.as_ptr(), data.len());
         asm!("sti");
+        // let entries = VFS.get().list_directory_entries("/");
+        let data= VFS.get().read_file("/hello").unwrap();
+        crate::syscalls::handler::sys_execve(data.as_ptr(), data.len());
+
 
         // pci::print_devices();
 
         // 2. Драйвер
-        crate::drivers::net::i8255x::I8255x::init().expect("NIC init failed");
         // после I8255x::init()
-        crate::net::stack::init();
+
 
         // дальше можешь оставить тестовый poll-цикл или убрать его,
         // потому что теперь poll будет вызываться из таймера/syscalls
         // 3. Стек
-        // init_network_stack();
+
+
         // For brevity in this patch the remaining init is left as a TODO —
         // paste the original body after the paging block from the old _start.
         // The only change needed is that all addresses (STACK_START etc.) are

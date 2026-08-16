@@ -5,6 +5,7 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use libfelix::{print, println};
+use libfelix::fs::{File, IoError};
 use libfelix::syscall::{self, write, read, open, close, mkdir, rmdir, unlink, execve};
 
 const PROMPT: &str = "felix> ";
@@ -89,10 +90,24 @@ fn interpret(line: String) {
         "run" => {
             if let Some(app) = args.get(1) {
                 let mut path = app.clone();
-                path.push('\0');
-                unsafe {
-                    execve(path.as_ptr() as *const u8);
+
+                match File::open(path.as_str()) {
+                    Ok(mut f) => {
+                        match f.read_to_end() {
+                            Ok(data) => {
+                                println!("read {} bytes", data.len());
+                                unsafe {
+                                    execve(data.as_ptr(), data.len());
+                                }
+                            }
+                            Err(e) => println!("read error: {:?}", e),
+                        }
+                    }
+                    Err(IoError::NotFound) => println!("file not found"),
+                    Err(e) => println!("open error: {:?}", e),
                 }
+
+
             } else {
                 println!("Usage: run <application>");
             }
@@ -164,6 +179,7 @@ fn ls(path: &str) {
         }
     }
 }
+
 
 fn cat(filename: &str) {
     let mut path = String::from(filename);

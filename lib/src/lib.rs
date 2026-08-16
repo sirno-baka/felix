@@ -6,3 +6,4 @@ pub mod mutex;
 pub mod print;
 pub mod sys_alloc;
 pub mod syscall;
+pub mod fs;

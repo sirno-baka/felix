@@ -103,6 +103,7 @@ floppy-image:
 	dd if=/dev/zero of=build/ext2.img bs=1 count=$$EXT2_SIZE_BYTES status=none; \
 	mkfs.ext2 -I 128 -O ^64bit,^metadata_csum,^dir_index,^ext_attr,^resize_inode build/ext2.img; \
 	$(E2CP) -p build/shell build/ext2.img:/shell; \
+	$(E2CP) -p build/hello build/ext2.img:/hello; \
 	echo "  → shell copied to ext2"; \
 	dd if=build/ext2.img of=build/floppy.img bs=512 seek=$$EXT2_START_SECTOR conv=notrunc status=none; \
 
@@ -176,7 +177,8 @@ run-floppy: all floppy-image
        -drive file=build/floppy.img,index=0,format=raw,if=floppy \
        -drive file=disk.img,index=0,media=disk,format=raw,if=ide \
        -netdev user,id=net0,hostfwd=udp::1234-:1234 \
-       -device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
+         -device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
+         -object filter-dump,id=f1,netdev=net0,file=guest.pcap \
        -no-reboot -vga std -no-shutdown -m 64M \
        -debugcon file:debug.log -s -S &
 	@#qemu-system-i386 -drive file=build/floppy.img,index=0,format=raw,if=floppy -drive file=disk.img,index=0,media=disk,format=raw,if=ide -device i82551,mac=52:54:00:12:34:56 -no-reboot -vga std  -no-shutdown -m 64M -debugcon file:debug.log  -s -S &

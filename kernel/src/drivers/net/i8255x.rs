@@ -140,8 +140,10 @@ impl I8255x {
             _ => return Err("BAR0 is not Memory"),
         };
 
+        println!("i8255x: BAR0 phys={:#x} size={:#x}", mmio_phys, bar_size);
 
         let mmio = map_mmio(mmio_phys, bar_size)?;
+        println!("i8255x: MMIO mapped at virt {:#x}", mmio);
 
         // ---- Выделяем страницы под кольца ----
         let tx_pages = ((core::mem::size_of::<TxDesc>() * TX_RING_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -168,6 +170,7 @@ impl I8255x {
             rx_phys = rx_frame << 12;          // ← важно!
         }
         // Благодаря identity-mapping низкой памяти можем использовать phys как virt
+        use crate::memory::paging::KERNEL_OFFSET;
         let tx_ring = (tx_phys + KERNEL_OFFSET) as *mut TxDesc;
         let rx_ring = (rx_phys + KERNEL_OFFSET) as *mut RxDesc;
 
@@ -304,17 +307,8 @@ impl I8255x {
     }
 
     fn read_eeprom_mac(&mut self) -> Result<(), &'static str> {
-        for i in 0..3u8 {
-            let word = self.eeprom_read(i);
-            self.mac[i as usize * 2]     = (word & 0xFF) as u8;
-            self.mac[i as usize * 2 + 1] = (word >> 8) as u8;
-        }
-
-        // sanity check
-        if self.mac == [0xff; 6] || self.mac == [0x00; 6] {
-            return Err("EEPROM MAC invalid");
-        }
-
+        // Временно для QEMU — тот MAC, который указан в -device
+        self.mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
         Ok(())
     }
 
@@ -516,31 +510,59 @@ impl I8255x {
             return None;
         }
 
-        // Временно ищем любой готовый RFD
-        for i in 0..RX_RING_SIZE {
+        // Идём по кольцу последовательно (не сканируем все RFD каждый раз)
+        let start = self.rx_idx.load(Ordering::Relaxed);
+        for offset in 0..RX_RING_SIZE {
+            let i = (start + offset) % RX_RING_SIZE;
             unsafe {
-
                 let desc = &mut *self.rx_ring.add(i);
                 let status = read_volatile(&desc.status);
-                if status & CMD_C != 0 {
-                    let count = (read_volatile(&desc.count) & 0x3FFF) as usize;
-                    if count > 0 && count <= buf.len() {
-                        core::ptr::copy_nonoverlapping(desc.data.as_ptr(), buf.as_mut_ptr(), count);
 
-                        // возвращаем дескриптор
-                        write_volatile(&mut desc.status, 0);
-                        write_volatile(&mut desc.count, 0);
-                        write_volatile(&mut desc.command, 0);
-
-                        // если был RNR — поднимаем RU
-                        let scb = read_volatile((self.mmio + SCB_STATUS) as *const u16);
-                        if (scb & STAT_RNR) != 0 {
-                            let _ = self.start_ru();
-                        }
-
-                        return Some(count);
-                    }
+                // Нужен Complete; OK желателен (без OK — часто мусор/ошибка)
+                if status & CMD_C == 0 {
+                    continue;
                 }
+
+                let count = (read_volatile(&desc.count) & 0x3FFF) as usize;
+
+                // Минимальный Ethernet-frame = 14 (заголовок).
+                // Мельче — мусор; его нельзя отдавать в smoltcp.
+                let valid = count >= 14
+                    && count <= buf.len()
+                    && count <= RX_BUF_SIZE
+                    && (status & CMD_OK) != 0;
+
+                if valid {
+                    core::ptr::copy_nonoverlapping(
+                        desc.data.as_ptr(),
+                        buf.as_mut_ptr(),
+                        count,
+                    );
+                }
+
+                // === Важно: правильно вернуть RFD в кольцо ===
+                // Раньше ставили command=0 и сбрасывали EL у последнего
+                // дескриптора → RU ломался и при RNR/рестарте
+                // отдавал старые/пустые кадры (n=35 нулей).
+                write_volatile(&mut desc.status, 0);
+                write_volatile(&mut desc.count, 0);
+                write_volatile(&mut desc.size, RX_BUF_SIZE as u16);
+                write_volatile(
+                    &mut desc.command,
+                    if i + 1 == RX_RING_SIZE { CMD_EL } else { 0 },
+                );
+
+                self.rx_idx.store((i + 1) % RX_RING_SIZE, Ordering::Release);
+
+                let scb = read_volatile((self.mmio + SCB_STATUS) as *const u16);
+                if (scb & STAT_RNR) != 0 {
+                    let _ = self.start_ru();
+                }
+
+                if valid {
+                    return Some(count);
+                }
+                // невалидный кадр — RFD уже освобождён, ищем дальше
             }
         }
         None

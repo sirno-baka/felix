@@ -106,12 +106,13 @@ pub unsafe fn unlink(path: *const u8) -> usize {
     ret
 }
 
-pub unsafe fn execve(path: *const u8) -> usize {
+pub unsafe fn execve(buf: *const u8, buf_size: usize) -> usize {
     let ret: usize;
     asm!(
     "int 0x80",
     inlateout("eax") SYS_EXECVE => ret,
-    in("ebx") path,
+    in("ebx") buf,
+    in("ecx") buf_size,
     options(nostack, preserves_flags)
     );
     ret
@@ -143,6 +144,13 @@ pub const SYS_SENDTO:      u32 = 369;
 pub const SYS_RECVFROM:    u32 = 371;
 pub const SYS_SHUTDOWN:    u32 = 373;
 
+
+pub const AF_INET:     u32 = 2;
+pub const SOCK_STREAM: u32 = 1;
+pub const SOCK_DGRAM:  u32 = 2;
+pub const IPPROTO_IP:  u32 = 0;
+pub const IPPROTO_TCP: u32 = 6;
+pub const IPPROTO_UDP: u32 = 17;
 pub unsafe fn socket(domain: u32, ty: u32, protocol: u32) -> usize {
     let ret: usize;
     asm!(
@@ -208,13 +216,11 @@ pub unsafe fn connect(sockfd: u32, addr: *const u8, addrlen: u32) -> usize {
     ret
 }
 
-pub unsafe fn sendto(sockfd: u32, buf: *const u8, len: usize, flags: u32, addr: *const u8, addrlen: u32) -> usize {
-    // Для 6 аргументов на i386 обычно используют стек или socketcall.
-    // Пока упрощённая версия (flags + addr игнорируем).
+pub unsafe fn recvfrom(sockfd: u32, buf: *mut u8, len: usize) -> usize {
     let ret: usize;
     asm!(
     "int 0x80",
-    inlateout("eax") SYS_SENDTO => ret,
+    inlateout("eax") SYS_RECVFROM => ret,
     in("ebx") sockfd,
     in("ecx") buf,
     in("edx") len,
@@ -223,11 +229,11 @@ pub unsafe fn sendto(sockfd: u32, buf: *const u8, len: usize, flags: u32, addr: 
     ret
 }
 
-pub unsafe fn recvfrom(sockfd: u32, buf: *mut u8, len: usize, flags: u32, addr: *mut u8, addrlen: *mut u32) -> usize {
-    let ret: usize;
+pub unsafe fn sendto(sockfd: u32, buf: *const u8, len: usize) -> usize {
+    let mut ret: usize;
     asm!(
     "int 0x80",
-    inlateout("eax") SYS_RECVFROM => ret,
+    inlateout("eax") SYS_SENDTO => ret,
     in("ebx") sockfd,
     in("ecx") buf,
     in("edx") len,

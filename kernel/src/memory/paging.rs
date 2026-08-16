@@ -377,10 +377,10 @@ impl PageDirectory {
         let pd_idx = (vpage >> 10) as usize;
         let pt_idx = (vpage & 0x3FF) as usize;
 
-        let need_table = {
-            let pde = self.entries[pd_idx];
-            pde == 0 || (pde & PDEFlags::PRESENT) == 0
-        };
+        let pde = self.entries[pd_idx];
+        let need_table = pde == 0
+            || (pde & PDEFlags::PRESENT) == 0
+            || (pde & PDEFlags::DIR_PAGE_SIZE) != 0; // ← важно: large page = пересоздать
 
         if need_table {
             let pt_frame = self.alloc_frame();
@@ -391,15 +391,20 @@ impl PageDirectory {
                 | PDEFlags::USER;
 
             let pt_virt = phys_to_virt(pt_phys) as *mut u8;
-            unsafe { write_bytes(pt_virt, 0, 4096); }
+            unsafe { core::ptr::write_bytes(pt_virt, 0, 4096); }
+        } else {
+            // PDE есть, но вдруг без USER — допиши
+            self.entries[pd_idx] |= PDEFlags::USER;
         }
 
         let pde = self.entries[pd_idx];
         let pt_phys = pde & 0xFFFF_F000;
-        let pt = phys_to_virt(pt_phys) as *mut [u32; ENTRIES];
+        let pt = phys_to_virt(pt_phys) as *mut [u32; 1024];
 
         let existing = unsafe { (*pt)[pt_idx] };
         if existing & PTEFlags::PRESENT != 0 {
+            // уже есть — убедись что USER стоит
+            unsafe { (*pt)[pt_idx] |= PTEFlags::USER; }
             return;
         }
 
@@ -746,62 +751,49 @@ pub fn setup_kernel_page_dir(pd: &mut PageManager, end_page: u32) {
 pub static mut KERNEL_PD_PHYS: u32 = 0;
 pub static mut KERNEL_END_PAGE: u32 = 0; // physical page number
 
-/// Copy kernel address-space mappings into a newly created task page directory.
+/// Share kernel address-space mappings into a newly created task page directory.
 ///
-/// Copies:
+/// Kernel half must be SHARED (same page-table frames), not deep-copied.
+/// Otherwise NIC/heap/MMIO mappings that live only in the kernel PD are
+/// missing or stale when a user task's CR3 is active during a syscall.
+///
+/// Shared:
 ///   1. Identity large pages 0–32 MiB          (PDE 0..7)
-///   2. Higher-half large pages 0xC0000000+    (PDE 768..775)
-///   3. Any extra 4 KiB kernel PTEs that live in the higher-half
-///   4. Recursive mapping pointing at the *task's* own PD
+///   2. Entire higher-half kernel (PDE 768..1022) including MMIO
+/// Own:
+///   3. Recursive mapping → this task's PD phys
 pub fn copy_kernel_mappings(task_dir: &mut PageDirectory, task_pd_phys: u32) {
     unsafe {
         let kernel_pd_phys = KERNEL_PD_PHYS;
         if kernel_pd_phys == 0 {
             return;
         }
-        // Читаем kernel PD через higher-half, не через identity
+
         let kernel_pd = phys_to_virt(kernel_pd_phys) as *const [u32; ENTRIES];
 
-        // Higher-half large pages 0xC0000000.. (PDE 768..775)
+        // 1. Identity 0–32 MiB (PDE 0..7) — VGA / early DMA
+        //    NOTE: user ELF @ 0x400000 will overwrite PDE[1] later with 4K+USER.
         for i in 0..8usize {
-            let idx = 768 + i;
-            let pde = (*kernel_pd)[idx];
+            let pde = (*kernel_pd)[i];
             if (pde & PDEFlags::PRESENT) != 0 {
-                task_dir.entries[idx] = pde;
+                task_dir.entries[i] = pde;
             }
         }
 
-        // Extra higher-half 4K page tables (776..1022), если есть
-        for pd_idx in 776usize..1023 {
+        // 2. Kernel higher-half + MMIO: SHARE the same page tables.
+        //    Do NOT deep-copy — deep copy was the source of page faults
+        //    (CR2 like 0xc520ae28) when poll/recv ran under a user CR3.
+        for pd_idx in 768usize..1023 {
             let pde = (*kernel_pd)[pd_idx];
-            if (pde & PDEFlags::PRESENT) == 0 {
-                continue;
-            }
-            if (pde & PDEFlags::DIR_PAGE_SIZE) != 0 {
+            if (pde & PDEFlags::PRESENT) != 0 {
                 task_dir.entries[pd_idx] = pde;
-                continue;
             }
-
-            let src_pt_phys = pde & 0xFFFF_F000;
-            let new_pt_frame = PAGING.lock().alloc_frame();
-            let new_pt_phys = new_pt_frame << 12;
-
-            let src = phys_to_virt(src_pt_phys) as *const u32;
-            let dst = phys_to_virt(new_pt_phys) as *mut u32;
-            core::ptr::write_bytes(dst as *mut u8, 0, 4096);
-            for i in 0..1024 {
-                *dst.add(i) = *src.add(i);
-            }
-
-            task_dir.entries[pd_idx] = new_pt_phys | (pde & 0xFFF);
         }
 
-        // Recursive → physical PD задачи
+        // 3. Recursive mapping → this task's own PD
         task_dir.entries[1023] = task_pd_phys
             | PDEFlags::PRESENT
             | PDEFlags::WRITABLE;
-
-        // НЕТ identity PDE[0..7]
     }
 }
 

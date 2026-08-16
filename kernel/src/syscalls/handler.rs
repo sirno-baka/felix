@@ -41,7 +41,9 @@ pub extern "C" fn syscall() {
         "pop esi",
         "pop edi",
         "pop ebp",
-        "sti",
+        // НЕ делать sti перед iretd:
+        // user eflags (0x202) уже с IF=1, iretd сам включит прерывания.
+        // sti здесь давал окно для IRQ0, который затирал EAX.
         "iretd",
         options(noreturn)
         );
@@ -235,7 +237,6 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
 
     // Для int 0x80 EOI на PIC НЕ нужен!
     // PICS.end_interrupt(SYSCALL_INT);  ← УДАЛИТЬ
-
     // Возвращаем ESP — стек НЕ ломается
     esp
 }
@@ -464,7 +465,9 @@ pub fn sys_execve(buf_ptr: *const u8, count: usize) -> usize {
         core::ptr::copy_nonoverlapping(buf_ptr, kernel_buf.as_mut_ptr(), count);
     }
     let buf = &kernel_buf[..];
-
+    if count == 0 {
+        return 0;
+    }
     let slot_i8 = unsafe { TASK_MANAGER.get_free_slot() };
     if slot_i8 < 0 {
         println!("[execve] No free task slot!");
@@ -572,11 +575,14 @@ pub fn sys_execve(buf_ptr: *const u8, count: usize) -> usize {
 }
 
 use crate::net::stack::{NET_STACK, poll_stack};
-use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
+use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 use smoltcp::socket::{tcp, udp};
 
 fn sys_socket(current_slot: usize, domain: u16, ty: u16, protocol: u8) -> usize {
-    let mut stack_guard = NET_STACK.lock();
+    let mut stack_guard = match NET_STACK.try_lock() {
+        Some(g) => g,
+        None => return usize::MAX,
+    };
     let stack = match stack_guard.as_mut() {
         Some(s) => s,
         None => return usize::MAX,
@@ -587,14 +593,15 @@ fn sys_socket(current_slot: usize, domain: u16, ty: u16, protocol: u8) -> usize 
         None => return usize::MAX,
     };
 
-    // регистрируем в нашей таблице (для состояния bind/listen и т.д.)
+    // один и тот же id в NET_STACK и SOCKET_TABLE
     {
         let mut table = SOCKET_TABLE.lock();
-        // можно хранить дополнительную мета-информацию
-        let _ = table.alloc(domain, ty, protocol, current_slot);
+        if !table.insert_with_id(socket_id, domain, ty, protocol, current_slot) {
+            stack.remove_handle(socket_id);
+            return usize::MAX;
+        }
     }
 
-    // выделяем fd в задаче
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
             if let Some(fd) = current.fd_table.alloc_fd() {
@@ -607,11 +614,16 @@ fn sys_socket(current_slot: usize, domain: u16, ty: u16, protocol: u8) -> usize 
     }
 
     // rollback
+    {
+        let mut table = SOCKET_TABLE.lock();
+        table.free(socket_id);
+    }
     stack.remove_handle(socket_id);
     usize::MAX
 }
 
 fn sys_bind(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: usize) -> usize {
+    println!("current_slot: {}, fd: {} addr_ptr: {:x} addrlen: {}", current_slot, fd, addr_ptr as usize, addrlen);
     if addrlen < core::mem::size_of::<SockAddrIn>() {
         return usize::MAX;
     }
@@ -638,17 +650,36 @@ fn sys_bind(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: usize)
         None => return usize::MAX,
     };
 
-    let endpoint = IpEndpoint {
-        addr: IpAddress::Ipv4(Ipv4Address(addr.sin_addr.s_addr.to_be_bytes())),
-        port: u16::from_be(addr.sin_port),
+    let port = u16::from_be(addr.sin_port);
+
+    // smoltcp: 0.0.0.0 / UNSPECIFIED → addr: None (слушать на всех адресах).
+    // Если передать IpEndpoint{0.0.0.0, port}, стек биндится
+    // только на нулевой адрес и отвечает ICMP port unreachable
+    // на пакеты к 10.0.2.15 — как в твоём pcap.
+    let listen = if addr.sin_addr.s_addr == 0 {
+        IpListenEndpoint { addr: None, port }
+    } else {
+        IpListenEndpoint {
+            addr: Some(IpAddress::Ipv4(Ipv4Address(addr.sin_addr.s_addr.to_be_bytes()))),
+            port,
+        }
     };
 
     let result = if is_tcp {
         let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-        socket.listen(endpoint).map_err(|_| ()).map(|_| ())
+        socket.listen(listen).map_err(|_| ()).map(|_| ())
     } else {
         let socket = stack.sockets.get_mut::<udp::Socket>(handle);
-        socket.bind(endpoint).map_err(|_| ()).map(|_| ())
+        match socket.bind(listen) {
+            Ok(()) => {
+                println!("udp bind ok port={}", port);
+                Ok(())
+            }
+            Err(e) => {
+                println!("udp bind err: {:?} port={}", e, port);
+                Err(())
+            }
+        }
     };
 
     // обновляем наше состояние
@@ -769,14 +800,16 @@ fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) -> usi
         }
     };
 
-    let mut stack_guard = NET_STACK.lock();
+    let mut stack_guard = match NET_STACK.try_lock() {
+        Some(g) => g,
+        None => return 0,
+    };
     let stack = match stack_guard.as_mut() {
         Some(s) => s,
         None => return 0,
     };
 
-    // poll перед отправкой
-    stack.poll(0); // timestamp можно улучшить
+    stack.poll(crate::time::jiffies() as i64);
 
     let (handle, is_tcp) = match stack.get_handle(socket_id) {
         Some(h) => h,
@@ -785,34 +818,31 @@ fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) -> usi
 
     let data = unsafe { core::slice::from_raw_parts(buf, len) };
 
-    let sent = if is_tcp {
-        let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-        socket.send_slice(data).unwrap_or(0)
-    } else {
-        let socket = stack.sockets.get_mut::<udp::Socket>(handle);
-        // для UDP нужен endpoint. Пока берём из peer_addr
+    if is_tcp {
+        return stack.sockets.get_mut::<tcp::Socket>(handle)
+            .send_slice(data).unwrap_or(0);
+    }
+
+    let peer = {
         let table = SOCKET_TABLE.lock();
-        if let Some(sock) = table.get(socket_id) {
-            if let Some(peer) = sock.peer_addr {
-                let endpoint = IpEndpoint {
-                    addr: IpAddress::Ipv4(Ipv4Address(peer.sin_addr.s_addr.to_be_bytes())),
-                    port: u16::from_be(peer.sin_port),
-                };
-                match socket.send_slice(data, endpoint) {
-                    Ok(()) => len,
-                    Err(_) => 0,
-                }
-            } else {
-                0
-            }
-        } else {
-            0
-        }
+        table.get(socket_id).and_then(|s| s.peer_addr)
     };
 
-    // poll после
-    stack.poll(0);
-    sent
+    let Some(peer) = peer else { return 0 };
+
+    let endpoint = IpEndpoint {
+        addr: IpAddress::Ipv4(Ipv4Address(peer.sin_addr.s_addr.to_be_bytes())),
+        port: u16::from_be(peer.sin_port),
+    };
+
+    let socket = stack.sockets.get_mut::<udp::Socket>(handle);
+    match socket.send_slice(data, endpoint) {
+        Ok(()) => {
+            stack.poll(crate::time::jiffies() as i64);
+            len
+        }
+        Err(_) => 0,
+    }
 }
 
 fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) -> usize {
@@ -826,38 +856,55 @@ fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) -> usi
         }
     };
 
-    let mut stack_guard = NET_STACK.lock();
+    let mut stack_guard = match NET_STACK.try_lock() {
+        Some(g) => g,
+        None => return 0,
+    };
     let stack = match stack_guard.as_mut() {
         Some(s) => s,
         None => return 0,
     };
 
-    stack.poll(0);
+    let ts = crate::time::jiffies() as i64; // лучше реальное время
+    stack.poll(ts);
 
     let (handle, is_tcp) = match stack.get_handle(socket_id) {
         Some(h) => h,
         None => return 0,
     };
 
-    let mut temp = alloc::vec![0u8; len];
+    let mut temp = alloc::vec![0u8; len.min(1500)];
 
     let received = if is_tcp {
-        let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-        socket.recv_slice(&mut temp).unwrap_or(0)
+        stack.sockets.get_mut::<tcp::Socket>(handle)
+            .recv_slice(&mut temp).unwrap_or(0)
     } else {
         let socket = stack.sockets.get_mut::<udp::Socket>(handle);
         match socket.recv_slice(&mut temp) {
-            Ok((size, _endpoint)) => size,
+            Ok((size, ep)) => {
+                // peer для последующего sendto (ep: IpEndpoint)
+                let mut table = SOCKET_TABLE.lock();
+                if let Some(sock) = table.get_mut(socket_id) {
+                    let ip = match ep.endpoint.addr {
+                        IpAddress::Ipv4(a) => u32::from_be_bytes(a.0),
+                        _ => 0,
+                    };
+                    sock.peer_addr = Some(SockAddrIn {
+                        sin_family: AF_INET,
+                        sin_port: ep.endpoint.port.to_be(),
+                        sin_addr: crate::net::InAddr { s_addr: ip },
+                        sin_zero: [0; 8],
+                    });
+                }
+                size
+            }
             Err(_) => 0,
         }
     };
 
     if received > 0 {
-        unsafe {
-            core::ptr::copy_nonoverlapping(temp.as_ptr(), buf, received);
-        }
+        unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf, received); }
     }
-
     received
 }
 

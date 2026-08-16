@@ -1,176 +1,225 @@
-# Felix OS - Project Information
+# Felix OS
 
-## Overview
+Experimental **32-bit x86 operating system** written from scratch in Rust (`#![no_std]`).
 
-**Felix OS** is an experimental operating system for the Intel IA-32 architecture (x86), written completely from scratch in Rust without external dependencies. This project is part of a bachelor thesis in computer engineering by Gianmatteo Palmieri.
+Originally a bachelor thesis project by [Gianmatteo Palmieri](https://gian.im); currently extended with higher-half kernel, per-task paging, Ext2/VFS, and a userspace networking stack (smoltcp + Intel 8255x).
 
-## Project Structure (Cargo Workspace)
+> Target: IA-32 (i386), BIOS boot, QEMU / real hardware.
 
-- `boot/` - 16-bit bootloader (target: `x86_16-felix.json`)
-- `bootloader/` - 32-bit bootloader (target: `x86_16-felix.json`)
-- `kernel/` - 32-bit kernel (target: `x86_32-felix.json`)
-- `apps/hello/` - Hello world app
-- `apps/shell/` - Shell application
-- `lib/` - Standard library (`libfelix`)
-- `interrupt-sync/` - Interrupt synchronization utilities (`SpinMutex`)
+---
+
+## Status
+
+| Area | State |
+|------|--------|
+| Boot (BIOS → PM) | ✅ |
+| Higher-half kernel + paging | ✅ |
+| Multitasking (round-robin) | ✅ |
+| Syscalls (`int 0x80`, Linux i386 numbers) | ✅ |
+| Ext2 + VFS + per-task FD table | ✅ |
+| ELF loader (`execve`) | ✅ |
+| Userspace apps (`shell`, `hello`) | ✅ |
+| Networking (UDP sockets) | ✅ working echo |
+| TCP sockets | 🔷 stubs / partial |
+| SMP / 64-bit | ❌ |
+
+---
+
+## Architecture
+
+```
++---------------------------+  ring 3
+|  shell / hello / apps     |  libfelix (syscalls, File, print)
++---------------------------+
+            | int 0x80
++---------------------------+  ring 0
+|  syscalls  |  VFS / Ext2  |
+|  scheduler |  net stack   |
+|  paging    |  drivers     |
++---------------------------+
+|  boot → protected mode    |
++---------------------------+
+```
+
+- **Higher-half kernel** at `0xC0000000+`
+- **Per-task page directories**: user mappings private, kernel half shared
+- **Identity map** 0–32 MiB (DMA, early boot) + MMIO for NIC
+- **TSS** for ring3 → ring0 stack switch on interrupts/syscalls
+
+---
 
 ## Features
 
-### Bootloader
+### Boot
 
-- BIOS compatible (also works on UEFI with CSM enabled)
-- Global Descriptor Table loading
-- Unreal Mode switching (to use 32-bit addresses in 16-bit Real Mode)
-- A20 line enablement
-- Kernel copying from disk to protected memory
-- 32-bit Protected Mode switching
-- Kernel jumping
+- 16-bit BIOS stage (`boot/`) + 32-bit loader (`bootloader/`)
+- A20, GDT, unreal mode, protected mode jump into kernel
 
-### Kernel Architecture
+### Kernel core
 
-The kernel is located in `kernel/` and implements a complete 32-bit protected mode OS with the following components:
+- **GDT / TSS** — kernel/user code+data segments, `esp0` for syscalls
+- **Paging** — 4 KiB pages, recursive PD at `0xFFC00000`, 4 MiB large pages for low memory
+- **Frame allocator** + kernel heap (`0xC1400000`…`0xC2000000`)
+- **IDT** — exceptions, IRQ0 (timer/schedule), IRQ1 (keyboard), `int 0x80`
+- **Scheduler** — up to 8 tasks, round-robin on timer tick, idle task with `hlt`
 
-#### System Initialization (`main.rs`)
+### Filesystem
 
-- Entry point `_start()` with custom stack setup (stack at 0x0020_0000)
-- GDT + TSS initialization
-- Paging initialization (recursive page directory mapping at 0xFFC00000)
-- IDT loading with exceptions, timer, keyboard, and syscall (0x80) interrupts
-- PIC initialization
-- PCI/IDE disk initialization
-- Ext2 filesystem mounting and VFS initialization
-- Task manager initialization and first task execution (`/shell`)
+- Ext2 on IDE disk (PCI ATA)
+- VFS layer, path resolve, mkdir/rmdir/unlink
+- Per-task **file descriptor table** (`File` / `Socket` variants)
 
-#### GDT & TSS (`gdt.rs`, `tss.rs`)
+### Syscalls (Linux i386 numbers)
 
-- 7-entry GDT: null, kernel code (0x08), kernel data (0x10), user code (0x18), user data (0x20), TSS (0x28), null
-- Task State Segment (TSS) with stack pointer for ring 0 transitions (esp0/ss0)
-- Flat 4 GiB memory model for kernel and user segments
+| # | Name | Notes |
+|---|------|--------|
+| 1 | `exit` | |
+| 3 / 4 | `read` / `write` | fd 0 = keyboard (blocking), 1 = console |
+| 5 / 6 | `open` / `close` | |
+| 7 / 8 / 10 | `mkdir` / `rmdir` / `unlink` | |
+| 11 | `execve` | load ELF into new task |
+| 200–202 | `malloc` / `free` / `realloc` | per-task user heap |
+| 302 | `ls` | directory listing into buffer |
+| 359 | `socket` | AF_INET, SOCK_DGRAM / STREAM |
+| 361 | `bind` | INADDR_ANY → smoltcp `IpListenEndpoint { addr: None }` |
+| 369 / 371 | `sendto` / `recvfrom` | UDP echo works |
+| 373 | `shutdown` | |
 
-#### Paging & Memory Management (`memory/paging.rs`)
+### Networking
 
-- 32-bit x86 paging with 4 KiB pages
-- Recursive page directory mapping at index 1023 (0xFFFFF000) for PT/PD access
-- Large page (4 MiB) identity mapping for first 32 MB
-- Page directory per task for isolated virtual memory
-- Frame allocator (`PageManager`) with global `SpinMutex<PageManager>` from `interrupt-sync`
-- User heap allocation starting at 0x20000000
-- `copy_kernel_mappings()` to copy kernel page tables to new tasks with explicit task PD physical address
-- Page reference counting (`PageRefcounts`) for tracking page allocations and unmapping
+- **Driver**: Intel 82557/82559 (`i8255x`) — Rx/Tx rings, DMA, MMIO
+- **Stack**: [smoltcp](https://github.com/smoltcp-rs/smoltcp) 0.11 (IPv4, UDP, TCP, ICMP, Ethernet)
+- Poll from timer IRQ (non-blocking `try_lock`) and from socket syscalls
+- Userspace UDP bind / recvfrom / sendto verified with QEMU user net + host `nc -u`
 
-#### Multitasking & Scheduling (`multitasking/task.rs`)
+### Userspace (`libfelix`)
 
-- Task manager with max 8 tasks (`MAX_TASKS = 8`)
-- Task structure: 32 KiB stack, page directory, CPU state, file descriptor table, heap pointer, page reference counts
-- `CPUState` struct: eax, ebx, ecx, edx, esi, edi, ebp, eip, cs, eflags, esp, ss
-- Round-robin CPU scheduler triggered by timer interrupt
-- Idle task with `hlt` instruction
-- Task creation via `add_task()`, removal via `remove_task()`
+- Syscall wrappers (`int 0x80`, `inlateout("eax")`)
+- `print!` / `println!` → `write(1, …)`
+- `File` API: `open`, `read`, `read_to_end`, `write_all`, `read_to_string`
+- Socket constants and wrappers matching kernel numbers
 
-#### Interrupts & Exceptions (`interrupts/`)
+### Apps
 
-- IDT with exception handlers and custom interrupts
-- Timer interrupt (IRQ0) for CPU scheduling
-- Keyboard interrupt (IRQ1) for input handling
-- Exception handlers for CPU faults
+- **`shell`** — `ls`, `cat`, `run`, `ps`, `mkdir`, `rmdir`, `rm`, `write`, …
+- **`hello`** — UDP echo server example (`0.0.0.0:1234`)
 
-#### Drivers (`drivers/`, `pci/ide/`)
+---
 
-- PIC driver (`drivers/pic.rs`) - Programmable Interrupt Controller
-- Keyboard driver (`drivers/keyboard.rs`) - PS/2 keyboard input
-- Keyboard buffer (`drivers/keyboard_buffer.rs`) - Queue-based keyboard input buffer with blocking read support
-- PCI/IDE disk driver (`pci/ide/`) - ATA/ATAPI disk access with channel and device support
-- Ext2 filesystem support (`filesystem/ext2.rs`)
+## Project layout
 
-#### System Calls (`syscalls/handler.rs`)
+```
+felix/
+├── boot/              # 16-bit first stage
+├── bootloader/        # 32-bit loader
+├── kernel/            # higher-half kernel
+│   ├── src/
+│   │   ├── memory/     # paging, allocator
+│   │   ├── multitasking/
+│   │   ├── syscalls/
+│   │   ├── filesystem/ # VFS + Ext2
+│   │   ├── drivers/    # PIC, keyboard, i8255x
+│   │   ├── net/        # smoltcp integration
+│   │   ├── pci/ ide/
+│   │   └── …
+│   └── Cargo.toml
+├── lib/               # libfelix (userspace)
+├── apps/
+│   ├── shell/
+│   └── hello/         # UDP echo demo
+├── interrupt-sync/    # SpinMutex safe under IRQ
+├── x86_16-felix.json / x86_32-felix.json
+└── Makefile
+```
 
-Interrupt 0x80 with the following syscalls:
+---
 
-- `SYS_EXIT` - terminate current task
-- `SYS_OPEN` - open file by path
-- `SYS_READ` - read from file descriptor (fd 0 supports blocking read from keyboard buffer)
-- `SYS_WRITE` - write to file descriptor (fd 0/1 go to VGA console)
-- `SYS_CLOSE` - close file descriptor
-- `SYS_MKDIR` - create directory
-- `SYS_RMDIR` - remove directory
-- `SYS_UNLINK` - delete file
-- `SYS_EXECVE` - load and execute ELF binary
-- `SYS_MALLOC` - allocate memory (per-task heap with page reference counting)
-- `SYS_REALLOC` - reallocate memory
-- `SYS_FREE` - free allocated memory
-- `SYS_LS` - list directory entries
+## Build
 
-#### ELF Loading (`elf.rs`)
+**Dependencies**
 
-- Load `ET_EXEC`, `EM_386` ELF binaries
-- Parse program headers (`PT_LOAD`)
-- Map segments to target virtual address
-- Handle `.bss` zero-initialization
-- Calculate correct entry point with ELF base offset
+- Rust nightly (see `rust-toolchain.toml`)
+- `mtools`, `dosfstools`, `fdisk` / `sfdisk`, `e2fsprogs`, `e2tools`, `binutils` (`objcopy`)
+- QEMU (`qemu-system-i386`)
 
-#### Filesystem & VFS (`filesystem/`)
+```bash
+# Linux (Debian/Ubuntu)
+sudo apt install build-essential qemu-system-x86 \
+  mtools dosfstools fdisk e2fsprogs e2tools binutils
 
-- Virtual filesystem (`Vfs`) with root inode
-- Ext2 filesystem driver
-- File descriptor table per task
-- File modes: ReadOnly, WriteOnly, ReadWrite
+make          # build + disk image → build/disk.img
+make run      # QEMU without NIC
+make clean
+```
 
-### Shell Commands
+**Network-enabled run** (UDP hostfwd + pcap dump):
 
-- `help` - shows available commands
-- `ls [path]` - lists directory entries with file types and sizes
-- `cat <filename>` - displays content of a file
-- `run <file>` - loads file as task and adds it to the task list
-- `ps` - lists running tasks
-- `mkdir <name>` - creates a directory
-- `rmdir <name>` - removes a directory
-- `rm <file>` - deletes a file
-- `write <file> <data>` - writes data to a file
-- `alloc` - tests memory allocation
+```bash
+make run-floppy   # or equivalent QEMU line with:
+#   -netdev user,id=net0,hostfwd=udp::1234-:1234 \
+#   -device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
+#   -object filter-dump,id=f1,netdev=net0,file=guest.pcap
+```
 
-### libfelix (Standard Library)
+From the host:
 
-Located in `lib/`, provides:
+```bash
+echo "hello" | nc -u -w1 127.0.0.1 1234
+# or against guest IP in user-net: 10.0.2.15
+```
 
-- `mutex` - `SpinMutex` implementation for interrupt synchronization
-- `print!` macro able to print formatted text to screen
-- `sys_alloc` - system allocation utilities
-- `syscall` - syscall wrappers
+**Debug**
 
-## Build System
+```bash
+make debug          # QEMU -s -S (gdbstub :1234)
+gdb -x my_gdb.sh    # or target remote :1234
+```
 
-- Uses `Makefile` for building and creating disk images
-- Requires: `rustup`, `mtools`, `dosfstools`, `fdisk`, `e2fsprogs`, `e2tools`, `binutils`
-- Builds disk image as `build/disk.img` (64 MiB with ext2 rootfs)
-- Can be built using Docker or natively on MacOS/Linux
+---
 
-## Running
+## Roadmap
 
-- QEMU: `make run` or `qemu-system-i386 -drive file=build/disk.img,index=0,media=disk,format=raw,if=ide -no-reboot -no-shutdown -m 64M -serial stdio`
-- Debug mode: `make debug` (starts QEMU with gdb server on port 1234, waits for connection)
-- Can be booted on real x86 hardware by copying `build/disk.img` to a USB drive
+### Near term
 
-## Target Specifications
+1. **Blocking / async sockets** — sleep on empty `recvfrom` instead of busy-poll; wake from NIC IRQ / timer poll  
+2. **TCP end-to-end** — finish `connect` / `listen` / `accept`, simple TCP echo app  
+3. **Proper errno** — return negative Linux-style errors instead of `0` / `usize::MAX`  
+4. **NIC RX ring hardening** — stricter RFD recycle, drop non-OK frames, less promisc if possible  
+5. **Userspace polish** — richer `libfelix` (`TcpStream`/`UdpSocket` style API, DNS later)
 
-- `x86_16-felix.json` - 16-bit real mode target for bootloader
-  - Arch: x86, CPU: i386
-  - No dynamic linking, no redzone
-  - Panic strategy: abort
+### Medium term
 
-- `x86_32-felix.json` - 32-bit protected mode target for kernel and apps
-  - Arch: x86, CPU: i386
-  - No dynamic linking, no redzone, soft-float, no SSE/MMX
-  - Panic strategy: abort
-  - Relocation model: static
+6. **Pipe / more FDs** — pipes between tasks, dup, better stdin/stdout redirection in shell  
+7. **Better memory** — demand paging, growable user stack/heap, free-list frame allocator  
+8. **Signals / kill** — minimal signal delivery for `Ctrl+C` and task control  
+9. **Disk robustness** — writeback cache, sync, more Ext2 operations (rename, larger files)  
+10. **Build ergonomics** — single `make run-net` target, less `cargo clean` in default build
 
-## Rust Features Used
+### Longer term
 
-- `#![no_std]` and `#![no_main]` for kernel and bootloader
-- `#![feature(naked_functions)]` - for syscall interrupt handler
-- `#![feature(pointer_byte_offsets)]` - for pointer arithmetic
-- `#![feature(unsize)]` and `#![feature(coerce_unsized)]` - for trait object coercion
-- `#![feature(inline_const)]` - for constant expressions
+11. **SMP** — APIC, per-CPU runqueues (hard on current design)  
+12. **User networking tools** — tiny `ping`, `nc`-like app in-tree  
+13. **Security basics** — stricter USER bits, no kernel identity in user PD where avoidable  
+14. **Optional**: UEFI boot path, or 64-bit port (large rewrite)
 
-</content>
-<parameter=filePath>
-/home/sirno/RustroverProjects/felix/README.md
+---
+
+## Design notes (networking)
+
+- Kernel address space is **shared** across all task page directories (same PT frames for PDE 768…1022). Deep-copying kernel PTs caused page faults under user CR3 during `poll`/`recv`.  
+- UDP `bind(0.0.0.0)` must use smoltcp `IpListenEndpoint { addr: None, port }` — binding to `Some(0.0.0.0)` only matches the zero address and yields ICMP port unreachable.  
+- Timer IRQ must not clobber `eax` when reloading `ds`/`es` (use `cx`); syscall path should not `sti` immediately before `iretd` (IF comes back from user eflags).
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+## Credits
+
+- Original author: **Gianmatteo Palmieri**  
+- Stack: **smoltcp**  
+- Inspired by classic hobby OSdev (Linux i386 ABI, Intel 8255x docs, Ext2)

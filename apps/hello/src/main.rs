@@ -2,46 +2,108 @@
 #![no_main]
 extern crate alloc;
 
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
 use core::panic::PanicInfo;
-use core::str::FromStr;
-use libfelix::syscall::write;
+use core::mem::size_of;
+use libfelix::{print, println};
+use libfelix::syscall::{
+    socket, bind, recvfrom, sendto, close, exit,
+    AF_INET, SOCK_DGRAM, IPPROTO_UDP,
+};
 
+/// Минимальные сетевые типы (как в Linux)
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct InAddr {
+    s_addr: u32, // network byte order
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockAddrIn {
+    sin_family: u16,
+    sin_port:   u16, // network byte order
+    sin_addr:   InAddr,
+    sin_zero:   [u8; 8],
+}
+
+impl SockAddrIn {
+    fn new(ip: [u8; 4], port: u16) -> Self {
+        Self {
+            sin_family: AF_INET as u16,
+            sin_port:   port.to_be(),
+            sin_addr:   InAddr {
+                s_addr: u32::from_be_bytes(ip),
+            },
+            sin_zero: [0; 8],
+        }
+    }
+
+    fn any(port: u16) -> Self {
+        Self::new([0, 0, 0, 0], port)
+    }
+}
 
 #[no_mangle]
 #[link_section = ".start"]
 pub extern "C" fn _start() {
-    // Статическая строка (для сравнения)
-    let static_hello: &[u8] = b"HELLO";
-    let mut v = Vec::with_capacity(32);
-    for c in static_hello.iter(){
-        v.push(*c)
-    }
+    println!("=== UDP Echo Server ===");
 
-    unsafe {
-        write(0, v.as_ptr(), v.len());
+    // 1. Создаём UDP-сокет
+    let sock = unsafe { socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP) };
+    if sock == usize::MAX {
+        println!("socket() failed");
+        unsafe { exit() };
     }
+    println!("socket fd = {}", sock);
 
-    let mut s = String::with_capacity(32);
-    for c in static_hello.iter(){
-        s.push((*c) as char)
+    // 2. bind на 0.0.0.0:1234
+    let addr = SockAddrIn::any(1234);
+    let ret = unsafe {
+        bind(
+            sock as u32,
+            &addr as *const _ as *const u8,
+            size_of::<SockAddrIn>() as u32,
+        )
+    };
+    if ret == usize::MAX {
+        println!("bind() failed");
+        unsafe { close(sock as u32); exit() };
     }
-    unsafe {
-        write(0, s.as_ptr(), s.len());
-    }
+    println!("bound to {} ", addr.sin_port);
 
-    let mut v = Vec::with_capacity(32);
-    for c in static_hello.iter(){
-        v.push(*c)
-    }
+    // 3. Главный цикл: recv → echo → send
+    let mut buf = [0u8; 10];
 
-    unsafe {
-        write(0, v.as_ptr(), v.len());
-    }
+    loop {
+        let n = unsafe {
+            recvfrom(
+                sock as u32,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
 
-    loop {}
+        if n == 0 {
+            // пока нет данных — крутимся (позже сделаем блокирующий recv)
+            continue;
+        }
+
+        println!("recv {} {:?} bytes", n, buf);
+
+        // echo обратно (пока sendto без peer-адреса — упрощённая версия)
+        let sent = unsafe {
+            sendto(
+                sock as u32,
+                buf.as_ptr(),
+                n,
+
+            )
+        };
+        println!("sent {} bytes", sent);
+    }
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! { loop {} }
+fn panic(_info: &PanicInfo) -> ! {
+    loop {}
+}

@@ -48,8 +48,8 @@ impl Socket {
 }
 
 pub struct SocketTable {
-    sockets: Vec<Option<Socket>>,
-    next_id: usize,
+    pub(crate) sockets: Vec<Option<Socket>>,
+    pub(crate) next_id: usize,
 }
 
 impl SocketTable {
@@ -72,6 +72,34 @@ impl SocketTable {
 
         self.sockets.push(Some(Socket::new(id, domain, ty, protocol, owner)));
         Some(id)
+    }
+
+    /// Зарегистрировать сокет с уже выделенным id (из NET_STACK),
+    /// чтобы id в fd и в SOCKET_TABLE совпадали.
+    pub fn insert_with_id(
+        &mut self,
+        id: usize,
+        domain: u16,
+        ty: u16,
+        protocol: u8,
+        owner: usize,
+    ) -> bool {
+        if id == 0 {
+            return false;
+        }
+        // расширяем Vec до нужного размера без Clone
+        while self.sockets.len() < id {
+            self.sockets.push(None);
+        }
+        let idx = id - 1;
+        if self.sockets[idx].is_some() {
+            return false; // слот занят
+        }
+        self.sockets[idx] = Some(Socket::new(id, domain, ty, protocol, owner));
+        if id >= self.next_id {
+            self.next_id = id + 1;
+        }
+        true
     }
 
     pub fn get(&self, id: usize) -> Option<&Socket> {
