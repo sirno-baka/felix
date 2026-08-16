@@ -1,4 +1,4 @@
-//PRINTER
+// Printer → stdout (fd 1)
 use core::fmt;
 use crate::syscall::write;
 
@@ -12,8 +12,9 @@ pub struct Printer {}
 
 impl Printer {
     pub fn prints(&mut self, s: &str) {
+        // fd 1 = stdout (kernel maps both 0 and 1 to VGA console)
         unsafe {
-            write(0, s.as_ptr(), s.len());
+            write(1, s.as_ptr(), s.len());
         }
     }
 }
@@ -32,13 +33,17 @@ macro_rules! print {
 
 #[macro_export]
 macro_rules! println {
-    () => { $crate::print::print!("\n"); };
-    ($($arg:tt)*) => {{ $crate::print!("{}\n", format_args!($($arg)*)); }};
+    () => {
+        $crate::print::print!("\n")
+    };
+    ($($arg:tt)*) => {{
+        $crate::print!("{}\n", format_args!($($arg)*))
+    }};
 }
 
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
     unsafe {
-        let _ = PRINTER.write_fmt(args);   // ← главное изменение
+        let _ = PRINTER.write_fmt(args);
     }
 }

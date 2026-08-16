@@ -1,12 +1,12 @@
 #![no_std]
 #![no_main]
+
 extern crate alloc;
 
-use core::panic::PanicInfo;
 use core::mem::size_of;
-use libfelix::{print, println};
+use libfelix::prelude::*;
 use libfelix::syscall::{
-    socket, bind, recvfrom, sendto, close, exit,
+    socket, bind, recvfrom, sendto, close,
     AF_INET, SOCK_DGRAM, IPPROTO_UDP,
 };
 
@@ -44,15 +44,14 @@ impl SockAddrIn {
 }
 
 #[no_mangle]
-#[link_section = ".start"]
-pub extern "C" fn _start() {
+pub extern "C" fn main() -> i32 {
     println!("=== UDP Echo Server ===");
 
     // 1. Создаём UDP-сокет
     let sock = unsafe { socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP) };
     if sock == usize::MAX {
         println!("socket() failed");
-        unsafe { exit() };
+        return 1;
     }
     println!("socket fd = {}", sock);
 
@@ -67,12 +66,13 @@ pub extern "C" fn _start() {
     };
     if ret == usize::MAX {
         println!("bind() failed");
-        unsafe { close(sock as u32); exit() };
+        unsafe { close(sock as u32) };
+        return 1;
     }
-    println!("bound to {} ", addr.sin_port);
+    println!("bound to port {}", u16::from_be(addr.sin_port));
 
     // 3. Главный цикл: recv → echo → send
-    let mut buf = [0u8; 10];
+    let mut buf = [0u8; 1000];
 
     loop {
         let n = unsafe {
@@ -88,7 +88,7 @@ pub extern "C" fn _start() {
             continue;
         }
 
-        println!("recv {} {:?} bytes", n, buf);
+        println!("recv {} {:?} bytes", n, &buf[..n]);
 
         // echo обратно (пока sendto без peer-адреса — упрощённая версия)
         let sent = unsafe {
@@ -96,14 +96,8 @@ pub extern "C" fn _start() {
                 sock as u32,
                 buf.as_ptr(),
                 n,
-
             )
         };
         println!("sent {} bytes", sent);
     }
-}
-
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
 }

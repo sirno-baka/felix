@@ -1,18 +1,17 @@
 #![no_std]
 #![no_main]
+
 extern crate alloc;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use libfelix::{print, println};
-use libfelix::fs::{File, IoError};
+use libfelix::prelude::*;
 use libfelix::syscall::{self, write, read, open, close, mkdir, rmdir, unlink, execve};
 
 const PROMPT: &str = "felix> ";
 
 #[no_mangle]
-#[link_section = ".start"]
-pub extern "C" fn _start() {
+pub extern "C" fn main() -> i32 {
     println!("\n=== Felix User Shell ===");
     println!("Type 'help' for commands\n");
 
@@ -44,10 +43,11 @@ fn read_line() -> String {
                 print!("\n");
                 break;
             }
-            0x08 | 0x7f => { // backspace
+            0x08 | 0x7f => {
+                // backspace
                 if !buf.is_empty() {
                     buf.pop();
-                    print!("\x08\x08");
+                    print!("\x08 \x08");
                 }
             }
             c if c.is_ascii_graphic() || c == b' ' => {
@@ -89,25 +89,21 @@ fn interpret(line: String) {
         }
         "run" => {
             if let Some(app) = args.get(1) {
-                let mut path = app.clone();
+                let path = app.clone();
 
                 match File::open(path.as_str()) {
-                    Ok(mut f) => {
-                        match f.read_to_end() {
-                            Ok(data) => {
-                                println!("read {} bytes", data.len());
-                                unsafe {
-                                    execve(data.as_ptr(), data.len());
-                                }
+                    Ok(mut f) => match f.read_to_end() {
+                        Ok(data) => {
+                            println!("read {} bytes", data.len());
+                            unsafe {
+                                execve(data.as_ptr(), data.len());
                             }
-                            Err(e) => println!("read error: {:?}", e),
                         }
-                    }
+                        Err(e) => println!("read error: {:?}", e),
+                    },
                     Err(IoError::NotFound) => println!("file not found"),
                     Err(e) => println!("open error: {:?}", e),
                 }
-
-
             } else {
                 println!("Usage: run <application>");
             }
@@ -116,7 +112,9 @@ fn interpret(line: String) {
             if let Some(dir) = args.get(1) {
                 let mut path = dir.clone();
                 path.push('\0');
-                unsafe { mkdir(path.as_ptr() as *const u8); }
+                unsafe {
+                    mkdir(path.as_ptr() as *const u8);
+                }
             } else {
                 println!("Usage: mkdir <name>");
             }
@@ -125,7 +123,9 @@ fn interpret(line: String) {
             if let Some(dir) = args.get(1) {
                 let mut path = dir.clone();
                 path.push('\0');
-                unsafe { rmdir(path.as_ptr() as *const u8); }
+                unsafe {
+                    rmdir(path.as_ptr() as *const u8);
+                }
             } else {
                 println!("Usage: rmdir <name>");
             }
@@ -134,7 +134,9 @@ fn interpret(line: String) {
             if let Some(file) = args.get(1) {
                 let mut path = file.clone();
                 path.push('\0');
-                unsafe { unlink(path.as_ptr() as *const u8); }
+                unsafe {
+                    unlink(path.as_ptr() as *const u8);
+                }
             } else {
                 println!("Usage: rm <file>");
             }
@@ -180,7 +182,6 @@ fn ls(path: &str) {
     }
 }
 
-
 fn cat(filename: &str) {
     let mut path = String::from(filename);
     path.push('\0');
@@ -191,21 +192,18 @@ fn cat(filename: &str) {
         return;
     }
 
-    println!("fd: {:?}", fd);
     let mut buf = [0u8; 512];
     loop {
         let n = unsafe { read(fd as u32, buf.as_mut_ptr(), buf.len()) };
-        println!("n: {:?}", n);
         if n == 0 {
             break;
         }
-        unsafe { write(1, buf.as_ptr(), n); }
+        unsafe {
+            write(1, buf.as_ptr(), n);
+        }
     }
 
-    unsafe { close(fd as u32); }
-}
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
+    unsafe {
+        close(fd as u32);
+    }
 }
