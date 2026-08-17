@@ -88,7 +88,6 @@ pub unsafe fn init_vesa() -> bool {
     in("di") vbe_info as u16,
     options(nostack)
     );
-    return try_hardcoded_modes(mode_info);
     if ret != 0x004F {
         // Даже если VBE Info не получен — пробуем жёсткие режимы
         return try_hardcoded_modes(mode_info);
@@ -170,10 +169,18 @@ pub unsafe fn init_vesa() -> bool {
         //     continue;
         // }
 
-        let score = (width as u32 * height as u32)
-            + if bpp >= 32 { 5_000_000 } else { 0 }
-            + if bpp == 24 { 2_000_000 } else { 0 }
-            + if bpp == 16 { 500_000 } else { 0 };
+        // Prefer 800×600 (target resolution), then higher bpp.
+        let mut score = width as u32 * height as u32;
+        if width == 800 && height == 600 {
+            score = score.saturating_add(50_000_000);
+        }
+        if bpp >= 32 {
+            score = score.saturating_add(5_000_000);
+        } else if bpp == 24 {
+            score = score.saturating_add(2_000_000);
+        } else if bpp == 16 {
+            score = score.saturating_add(500_000);
+        }
 
         if score > best_score {
             best_score = score;
@@ -192,9 +199,9 @@ pub unsafe fn init_vesa() -> bool {
     }
 
     // Если ничего не нашли — пробуем жёсткие режимы
-    // if best_mode == 0 || best.address == 0 {
-    //     return try_hardcoded_modes(mode_info);
-    // }
+    if best_mode == 0 || best.address == 0 {
+        return try_hardcoded_modes(mode_info);
+    }
 
     // --- Устанавливаем найденный режим ---
     if !set_mode(best_mode, mode_info, &mut best) {
@@ -209,16 +216,15 @@ pub unsafe fn init_vesa() -> bool {
 /// Пробует известные рабочие режимы (особенно для QEMU)
 unsafe fn try_hardcoded_modes(mode_info: *mut ModeInfoBlock) -> bool {
     // Порядок от более предпочтительных к менее
+    // Prefer 800x600; fall back to other common VBE modes.
     let candidates: [u16; 7] = [
+        0x115, // 800x600x24/32
         0x114, // 800x600x16
+        0x118, // 1024x768x24/32
         0x117, // 1024x768x16
-
-        0x115, // 800x600x24
-
-        0x118, // 1024x768x24/32  (самый частый в QEMU)
-        0x11A, // 1280x1024x16
-        0x11B, // 1280x1024x24
         0x112, // 640x480x24
+        0x11B, // 1280x1024x24
+        0x11A, // 1280x1024x16
     ];
 
     for &mode in &candidates {

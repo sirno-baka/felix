@@ -58,16 +58,8 @@ pub extern "C" fn _start() -> ! {
     println!("[!] Switching to 16bit unreal mode...");
     unreal_mode();
     println!("[!] Checking memory...");
-    // ===================== VESA =====================
-    println!("[!] Setting VESA graphics mode...");
-    // unsafe {
-    //     if vesa::init_vesa() {
-    //         println!("[!] VESA OK");
-    //     } else {
-    //         println!("[!] VESA failed, staying in text mode");
-    //     }
-    // }
 
+    // Load kernel + ramfs while still in VGA text mode so messages are visible.
     unsafe {
         DISK.init(KERNEL_LBA as u32, KERNEL_BUFFER);
         DISK.reset();
@@ -98,6 +90,17 @@ pub extern "C" fn _start() -> ! {
     // В _start() после загрузки:
     let checksum = calculate_checksum(RAMFS_TARGET, (RAMFS_SIZE as usize) * 512);
     println!("[!] RamFS checksum: 0x{:08x}", checksum);
+
+    // ===================== VESA =====================
+    // Switch graphics mode AFTER all text boot messages.
+    // Framebuffer info is written to 0x5000 for the kernel.
+    println!("[!] Setting VESA graphics mode...");
+    unsafe {
+        if vesa::init_vesa() {
+            // Text mode is gone — further println! may be invisible on screen
+            // (still go to serial/E9 if enabled).
+        }
+    }
     println!("[!] Loading Global Descriptor Table...");
 
 

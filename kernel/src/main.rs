@@ -62,6 +62,7 @@ use crate::filesystem::vfs::Vfs;
 use crate::io::{inb, outb};
 use crate::pci::floppy::disk::Floppy;
 use crate::pci::ide::IDE;
+use crate::pci::print_devices;
 use crate::sync::mutex::Mutex;
 use crate::utils::queue::Queue;
 use crate::wrappers::{cli, sti};
@@ -215,20 +216,10 @@ pub extern "C" fn higher_half_entry() -> ! {
         IDT.load();                     // ← ПЕРЕМЕСТИТЬ СЮДА
         // После полной инициализации paging
 
-        // crate::drivers::framebuffer::init();
-        // cli!();
-        // if let Some(ref fb) = *crate::drivers::framebuffer::FRAMEBUFFER.lock() {
-        //     // Пример: заливаем экран тёмно-синим
-        //     fb.fill(0xff00ff);
-        //
-        //     // // Рисуем зелёный прямоугольник
-        //     fb.fill_rect(100, 100, 200, 150, 0x00FF00);
-        //     fb.fill_rect(300, 200, 30, 50, 0x11aa00);
-        //     //
-        //     // // Красный пиксель
-        //     // fb.put_pixel(400, 300, 0xFF0000);
-        // }
-        // sti!();
+        // VESA framebuffer (mode set by bootloader, info at 0x5000).
+        // After graphics mode VGA text is gone — software console + mini-WM.
+        crate::drivers::framebuffer::init();
+        crate::drivers::wm::init();
         // 4. PIC
         PICS.init();
 
@@ -258,8 +249,9 @@ pub extern "C" fn higher_half_entry() -> ! {
 
         println!("[VFS] Virtual filesystem initialized");
         print_info();
-        crate::drivers::net::i8255x::I8255x::init().expect("NIC init failed");
-        crate::net::stack::init();
+        print_devices();
+        // crate::drivers::net::i8255x::I8255x::init().expect("NIC init failed");
+        // crate::net::stack::init();
         // // 7. Task Manager (после IDT!)
         TASK_MANAGER.init();
 
