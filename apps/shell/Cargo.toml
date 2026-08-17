@@ -4,4 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-libfelix = { path = "../../lib" }   # или libfelix, если ты назвал его так
+libfelix = { path = "../../lib" }
+kolibri-embedded-gui = "0.1.0"

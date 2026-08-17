@@ -2,13 +2,54 @@
 //!
 //! Apps create a [`Window`], draw into its local BGRX buffer, then call
 //! [`Window::flip`] to present. Raw syscalls stay in `crate::syscall`.
+//!
+//! [`Window`] implements [`embedded_graphics::draw_target::DrawTarget`] with
+//! [`Rgb888`], so it works with **embedded-graphics** and **kolibri-embedded-gui**:
+//!
+//! ```ignore
+//! use embedded_graphics::prelude::*;
+//! use kolibri_embedded_gui::ui::Ui;
+//!
+//! let mut win = Window::create(40, 40, 400, 300, "ui").unwrap();
+//! // Kolibri / eg drawing into the client area:
+//! // let mut ui = Ui::new_fullscreen(&mut win, my_rgb888_style());
+//! win.flip();
+//! ```
 
 use alloc::vec;
 use alloc::vec::Vec;
 
+use embedded_graphics::{mono_font, pixelcolor::Rgb888, prelude::*, Pixel};
+use kolibri_embedded_gui::style::{Spacing, Style};
+use embedded_graphics::primitives::Rectangle;
 use crate::syscall::{self};
 
 pub use crate::syscall::WindowInfo;
+
+
+pub fn medsize_rgb888_style() -> Style<Rgb888> {
+    Style {
+        background_color: Rgb888::new(0x7, 0x10, 0x6), // pretty dark gray
+        item_background_color: Rgb888::new(0x2, 0x4, 0x2), // darker gray
+        highlight_item_background_color: Rgb888::new(0x1, 0x2, 0x1),
+        border_color: Rgb888::WHITE,
+        highlight_border_color: Rgb888::WHITE,
+        primary_color: Rgb888::CSS_DARK_CYAN,
+        secondary_color: Rgb888::YELLOW,
+        icon_color: Rgb888::WHITE,
+        text_color: Rgb888::WHITE,
+        default_widget_height: 16,
+        border_width: 0,
+        highlight_border_width: 1,
+        default_font: mono_font::iso_8859_10::FONT_9X15,
+        spacing: Spacing {
+            item_spacing: Size::new(8, 4),
+            button_padding: Size::new(5, 5),
+            default_padding: Size::new(1, 1),
+            window_border_padding: Size::new(3, 3),
+        },
+    }
+}
 
 /// Screen resolution reported by the kernel WM.
 pub fn screen_size() -> (u32, u32) {
@@ -251,5 +292,138 @@ impl Window {
 impl Drop for Window {
     fn drop(&mut self) {
         let _ = self.close_internal();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// embedded-graphics + kolibri-embedded-gui compatibility
+// ---------------------------------------------------------------------------
+
+impl OriginDimensions for Window {
+    fn size(&self) -> Size {
+        Size::new(self.info.client_w, self.info.client_h)
+    }
+}
+
+impl DrawTarget for Window {
+    type Color = Rgb888;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        let cw = self.info.client_w as i32;
+        let ch = self.info.client_h as i32;
+        let pitch = self.pitch();
+        let buf_len = self.buffer.len();
+
+        for Pixel(coord, color) in pixels.into_iter() {
+            if coord.x < 0 || coord.y < 0 || coord.x >= cw || coord.y >= ch {
+                continue;
+            }
+            let off = (coord.y as usize) * pitch + (coord.x as usize) * 4;
+            if off + 3 >= buf_len {
+                continue;
+            }
+            // BGRX
+            self.buffer[off] = color.b();
+            self.buffer[off + 1] = color.g();
+            self.buffer[off + 2] = color.r();
+            self.buffer[off + 3] = 0;
+        }
+        Ok(())
+    }
+
+    fn fill_contiguous<I>(&mut self, area: &Rectangle, colors: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Self::Color>,
+    {
+        let cw = self.info.client_w;
+        let ch = self.info.client_h;
+        if area.size.width == 0 || area.size.height == 0 {
+            return Ok(());
+        }
+
+        let x0 = area.top_left.x.max(0) as u32;
+        let y0 = area.top_left.y.max(0) as u32;
+        let x1 = (area.top_left.x + area.size.width as i32).max(0) as u32;
+        let y1 = (area.top_left.y + area.size.height as i32).max(0) as u32;
+        let x0 = x0.min(cw);
+        let y0 = y0.min(ch);
+        let x1 = x1.min(cw);
+        let y1 = y1.min(ch);
+        if x0 >= x1 || y0 >= y1 {
+            return Ok(());
+        }
+
+        let pitch = self.pitch();
+        let mut colors = colors.into_iter();
+
+        // Skip colors that fall outside the left/top clip of the source area.
+        let skip_x = if area.top_left.x < 0 {
+            (-area.top_left.x) as u32
+        } else {
+            0
+        };
+        let skip_y = if area.top_left.y < 0 {
+            (-area.top_left.y) as u32
+        } else {
+            0
+        };
+        let full_w = area.size.width;
+
+        for _ in 0..skip_y {
+            for _ in 0..full_w {
+                let _ = colors.next();
+            }
+        }
+
+        for y in y0..y1 {
+            for _ in 0..skip_x {
+                let _ = colors.next();
+            }
+            let base = (y as usize) * pitch;
+            for x in x0..x1 {
+                let Some(color) = colors.next() else {
+                    return Ok(());
+                };
+                let off = base + (x as usize) * 4;
+                if off + 3 >= self.buffer.len() {
+                    break;
+                }
+                self.buffer[off] = color.b();
+                self.buffer[off + 1] = color.g();
+                self.buffer[off + 2] = color.r();
+                self.buffer[off + 3] = 0;
+            }
+            // Drain remaining pixels of this source row past the right edge.
+            let drawn = x1 - x0;
+            let remaining = full_w.saturating_sub(skip_x + drawn);
+            for _ in 0..remaining {
+                let _ = colors.next();
+            }
+        }
+        Ok(())
+    }
+
+    fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
+        if area.size.width == 0 || area.size.height == 0 {
+            return Ok(());
+        }
+        let x = area.top_left.x.max(0) as u32;
+        let y = area.top_left.y.max(0) as u32;
+        // Clamp size against negative origin.
+        let x_end = (area.top_left.x + area.size.width as i32).max(0) as u32;
+        let y_end = (area.top_left.y + area.size.height as i32).max(0) as u32;
+        let w = x_end.saturating_sub(x);
+        let h = y_end.saturating_sub(y);
+        self.fill_rect(x, y, w, h, rgb(color.r(), color.g(), color.b()));
+        Ok(())
+    }
+
+    fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
+        self.fill(rgb(color.r(), color.g(), color.b()));
+        Ok(())
     }
 }

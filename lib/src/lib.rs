@@ -11,6 +11,10 @@ pub mod syscall;
 pub mod fs;
 pub mod wm;
 
+/// Re-export so apps can use embedded-graphics / kolibri against our Window
+/// without an extra direct dependency (optional — apps may still depend on them).
+pub use embedded_graphics;
+
 /// Userspace runtime: provides `_start` → `main` and the panic handler.
 /// Applications should define `#[no_mangle] pub extern "C" fn main() -> i32`
 /// and must NOT define their own `_start` or `#[panic_handler]`.
