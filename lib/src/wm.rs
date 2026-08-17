@@ -1,54 +1,32 @@
 //! High-level window manager API for userspace.
 //!
 //! Apps create a [`Window`], draw into its local BGRX buffer, then call
-//! [`Window::flip`] to present. Raw syscalls stay in `crate::syscall`.
+//! [`Window::flip`] to present.
 //!
 //! [`Window`] implements [`embedded_graphics::draw_target::DrawTarget`] with
-//! [`Rgb888`], so it works with **embedded-graphics** and **kolibri-embedded-gui**:
-//!
-//! ```ignore
-//! use embedded_graphics::prelude::*;
-//! use kolibri_embedded_gui::ui::Ui;
-//!
-//! let mut win = Window::create(40, 40, 400, 300, "ui").unwrap();
-//! // Kolibri / eg drawing into the client area:
-//! // let mut ui = Ui::new_fullscreen(&mut win, my_rgb888_style());
-//! win.flip();
-//! ```
+//! [`Rgb888`]. For widgets see [`crate::ui`].
 
 use alloc::vec;
 use alloc::vec::Vec;
 
-use embedded_graphics::{mono_font, pixelcolor::Rgb888, prelude::*, Pixel};
-use kolibri_embedded_gui::style::{Spacing, Style};
+use embedded_graphics::{pixelcolor::Rgb888, prelude::*, Pixel};
 use embedded_graphics::primitives::Rectangle;
+
 use crate::syscall::{self};
 
-pub use crate::syscall::WindowInfo;
+pub use crate::syscall::{
+    WindowInfo, MouseState, WmEvent, EV_NONE, EV_MOUSE_MOVE, EV_MOUSE_DOWN, EV_MOUSE_UP,
+    EV_KEY_DOWN, EV_KEY_UP, EV_CLOSE, EV_FOCUS_IN, EV_FOCUS_OUT,
+};
 
+/// Must match kernel `drivers::wm::TITLE_H`.
+pub const TITLE_H: i32 = 18;
 
-pub fn medsize_rgb888_style() -> Style<Rgb888> {
-    Style {
-        background_color: Rgb888::new(0x7, 0x10, 0x6), // pretty dark gray
-        item_background_color: Rgb888::new(0x2, 0x4, 0x2), // darker gray
-        highlight_item_background_color: Rgb888::new(0x1, 0x2, 0x1),
-        border_color: Rgb888::WHITE,
-        highlight_border_color: Rgb888::WHITE,
-        primary_color: Rgb888::CSS_DARK_CYAN,
-        secondary_color: Rgb888::YELLOW,
-        icon_color: Rgb888::WHITE,
-        text_color: Rgb888::WHITE,
-        default_widget_height: 16,
-        border_width: 0,
-        highlight_border_width: 1,
-        default_font: mono_font::iso_8859_10::FONT_9X15,
-        spacing: Spacing {
-            item_spacing: Size::new(8, 4),
-            button_padding: Size::new(5, 5),
-            default_padding: Size::new(1, 1),
-            window_border_padding: Size::new(3, 3),
-        },
-    }
+/// Current mouse position and buttons (screen coordinates).
+pub fn mouse() -> MouseState {
+    let mut s = MouseState::default();
+    let _ = unsafe { syscall::mouse_state(&mut s) };
+    s
 }
 
 /// Screen resolution reported by the kernel WM.
@@ -144,8 +122,20 @@ impl Window {
         self.id
     }
 
-    #[inline]
+    /// Geometry from the kernel (always live — position changes after title-bar drag).
     pub fn info(&self) -> WindowInfo {
+        let mut info = self.info;
+        let ok = unsafe { syscall::wm_info(self.id, &mut info) };
+        if ok == 0 {
+            info
+        } else {
+            self.info
+        }
+    }
+
+    /// Cached info without a syscall (client size / pitch). Position may be stale.
+    #[inline]
+    pub fn info_cached(&self) -> WindowInfo {
         self.info
     }
 
@@ -175,7 +165,7 @@ impl Window {
         &mut self.buffer
     }
 
-    /// Refresh cached [`WindowInfo`] from the kernel.
+    /// Refresh the local cache from the kernel (call after external moves if you use `info_cached`).
     pub fn refresh_info(&mut self) -> bool {
         let mut info = self.info;
         let ok = unsafe { syscall::wm_info(self.id, &mut info) };
@@ -209,6 +199,15 @@ impl Window {
         unsafe {
             syscall::wm_flip(self.id, self.buffer.as_ptr(), self.buffer.len()) == 0
         }
+    }
+
+    /// Non-blocking poll of window events (mouse/key/focus).
+    /// Returns how many events were written into `out`.
+    pub fn poll_events(&self, out: &mut [WmEvent]) -> usize {
+        if out.is_empty() {
+            return 0;
+        }
+        unsafe { syscall::wm_poll(self.id, out.as_mut_ptr(), out.len()) }
     }
 
     /// Destroy the window. Consumes `self`.

@@ -10,9 +10,9 @@ pub mod sys_alloc;
 pub mod syscall;
 pub mod fs;
 pub mod wm;
+pub mod ui;
 
-/// Re-export so apps can use embedded-graphics / kolibri against our Window
-/// without an extra direct dependency (optional — apps may still depend on them).
+/// Re-export so apps can use embedded-graphics against our Window.
 pub use embedded_graphics;
 
 /// Userspace runtime: provides `_start` → `main` and the panic handler.
@@ -26,7 +26,12 @@ pub mod prelude {
     pub use crate::println;
     pub use crate::fs::{File, IoError, IoResult};
     pub use crate::rt::{arg, argc, args};
-    pub use crate::wm::{self, Window, WindowInfo, rgb, screen_size};
+    pub use crate::wm::{self, Window, WindowInfo, MouseState, WmEvent, rgb, screen_size, mouse};
+    pub use crate::wm::{
+        EV_MOUSE_MOVE, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_KEY_DOWN, EV_KEY_UP,
+        EV_CLOSE, EV_FOCUS_IN, EV_FOCUS_OUT,
+    };
+    pub use crate::ui::{self, Button, Label, TextInput, Ui, UiEvent, MouseTracker, WidgetId};
     pub use alloc::string::String;
     pub use alloc::vec::Vec;
     pub use alloc::boxed::Box;

@@ -230,6 +230,8 @@ pub const SYS_WM_INFO:    u32 = 403;
 pub const SYS_WM_FLIP:    u32 = 404;
 pub const SYS_WM_FOCUS:   u32 = 405;
 pub const SYS_WM_SCREEN:  u32 = 406;
+pub const SYS_MOUSE_STATE: u32 = 407;
+pub const SYS_WM_POLL: u32 = 408;
 
 #[repr(C)]
 pub struct WmCreateArgs {
@@ -333,6 +335,63 @@ pub unsafe fn wm_screen_size(out: *mut u32) -> usize {
         "int 0x80",
         inlateout("eax") SYS_WM_SCREEN => ret,
         in("ebx") out,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+/// Mouse snapshot (screen coordinates).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MouseState {
+    pub x: i32,
+    pub y: i32,
+    /// bit0=left, bit1=right, bit2=middle
+    pub buttons: u8,
+    pub _pad: [u8; 3],
+}
+
+pub unsafe fn mouse_state(out: *mut MouseState) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_MOUSE_STATE => ret,
+        in("ebx") out,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+/// Window event — must match kernel `drivers::wm::WmEvent`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WmEvent {
+    pub kind: u32,
+    pub a: i32,
+    pub b: i32,
+    pub c: i32,
+    pub d: i32,
+}
+
+pub const EV_NONE: u32 = 0;
+pub const EV_MOUSE_MOVE: u32 = 1;
+pub const EV_MOUSE_DOWN: u32 = 2;
+pub const EV_MOUSE_UP: u32 = 3;
+pub const EV_KEY_DOWN: u32 = 4;
+pub const EV_KEY_UP: u32 = 5;
+pub const EV_CLOSE: u32 = 6;
+pub const EV_FOCUS_IN: u32 = 7;
+pub const EV_FOCUS_OUT: u32 = 8;
+
+/// Non-blocking: copy up to `max` events for window `id` into `out`.
+pub unsafe fn wm_poll(id: u32, out: *mut WmEvent, max: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_WM_POLL => ret,
+        in("ebx") id,
+        in("ecx") out,
+        in("edx") max,
         options(nostack, preserves_flags)
     );
     ret

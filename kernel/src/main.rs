@@ -210,6 +210,10 @@ pub extern "C" fn higher_half_entry() -> ! {
             drivers::keyboard::keyboard as u32,
         );
         IDT.add(
+            drivers::mouse::MOUSE_INT as usize,
+            drivers::mouse::mouse_irq as u32,
+        );
+        IDT.add(
             6,
             irq6 as u32,
         );
@@ -223,8 +227,9 @@ pub extern "C" fn higher_half_entry() -> ! {
         // 4. PIC
         PICS.init();
 
-        // 5. Keyboard buffer
+        // 5. Keyboard buffer + PS/2 mouse (after PIC, still IF=0)
         *KEYBOARD_BUFFER.lock() = Some(Queue::new());
+        crate::drivers::mouse::init();
 
         // IDE init
         IDE.lock().initialize().expect("Cannot read from disks");
@@ -280,10 +285,11 @@ pub extern "C" fn higher_half_entry() -> ! {
         }
         println!("[!] Shell spawned as pid={}", shell_pid);
 
-        // Now safe to enable scheduling + keyboard:
-        //   IRQ0 = timer, IRQ1 = keyboard
+        // Now safe to enable scheduling + keyboard + mouse:
+        //   IRQ0 = timer, IRQ1 = keyboard, IRQ12 = mouse
         PICS.unmask_irq(0);
         PICS.unmask_irq(1);
+        PICS.unmask_irq(12);
 
         println!("[!] Higher-half kernel running at 0x{:08x}", higher_half_entry as u32);
         println!("[!] Enabling interrupts — entering idle");

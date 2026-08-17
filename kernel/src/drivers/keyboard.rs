@@ -140,13 +140,30 @@ pub extern "C" fn keyboard_handler() {
         return;
     }
 
-    let key_byte = scancode_to_char(scancode, unsafe { KEYBOARD.shift });
+    let released = scancode & 0x80 != 0;
+    let code = scancode & 0x7F;
+    let key_byte = if released {
+        0
+    } else {
+        scancode_to_char(code, unsafe { KEYBOARD.shift })
+    };
 
     // Suppress ordinary characters while Ctrl is held (except handled above)
     if key_byte != 0 && !unsafe { KEYBOARD.ctrl } {
         match &mut *KEYBOARD_BUFFER.lock() {
             Some(buffer) => buffer.push(key_byte),
             None => {}
+        }
+    }
+
+    // Window events (focused window)
+    let mods = (if unsafe { KEYBOARD.shift } { 1 } else { 0 })
+        | (if unsafe { KEYBOARD.ctrl } { 2 } else { 0 });
+    // Skip pure modifier scancodes for KeyDown/Up noise reduction? still useful.
+    match scancode {
+        0x2a | 0x36 | 0xaa | 0xb6 | 0x1d | 0x9d => {}
+        _ => {
+            crate::drivers::wm::push_key(!released, code, key_byte, mods);
         }
     }
 

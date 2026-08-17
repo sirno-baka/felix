@@ -5,4 +5,3 @@ edition = "2021"
 
 [dependencies]
 embedded-graphics = { version = "0.8.2", default-features = false }
-kolibri-embedded-gui = "0.1.0"

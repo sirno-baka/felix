@@ -1,5 +1,6 @@
 pub mod disk;
 pub mod keyboard;
+pub mod mouse;
 pub mod pic;
 pub mod framebuffer;
 pub mod wm;

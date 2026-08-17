@@ -249,6 +249,12 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         crate::syscalls::SYS_WM_FLIP    => sys_wm_flip(state.ebx, state.ecx as *const u8, state.edx as usize),
         crate::syscalls::SYS_WM_FOCUS   => sys_wm_focus(state.ebx),
         crate::syscalls::SYS_WM_SCREEN  => sys_wm_screen(state.ebx as *mut u32),
+        crate::syscalls::SYS_MOUSE_STATE => sys_mouse_state(state.ebx as *mut crate::drivers::mouse::MouseState),
+        crate::syscalls::SYS_WM_POLL => sys_wm_poll(
+            state.ebx,
+            state.ecx as *mut crate::drivers::wm::WmEvent,
+            state.edx as usize,
+        ),
 
         _ => 0,
     };
@@ -1405,6 +1411,20 @@ fn sys_wm_screen(out: *mut u32) -> usize {
         *out.add(1) = h;
     }
     0
+}
+
+fn sys_mouse_state(out: *mut crate::drivers::mouse::MouseState) -> usize {
+    if out.is_null() {
+        return usize::MAX;
+    }
+    unsafe {
+        *out = crate::drivers::mouse::state();
+    }
+    0
+}
+
+fn sys_wm_poll(id: u32, out: *mut crate::drivers::wm::WmEvent, max: usize) -> usize {
+    crate::drivers::wm::poll_events(id, out, max.min(32))
 }
 
 

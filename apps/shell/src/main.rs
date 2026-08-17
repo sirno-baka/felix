@@ -4,17 +4,12 @@
 extern crate alloc;
 
 use alloc::format;
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use kolibri_embedded_gui::button::Button;
-use kolibri_embedded_gui::label::Label;
+use core::cell::RefCell;
 use libfelix::embedded_graphics::*;
-use libfelix::embedded_graphics::mono_font::ascii::{FONT_10X20, FONT_6X10};
-use libfelix::embedded_graphics::mono_font::MonoTextStyle;
-use libfelix::embedded_graphics::pixelcolor::Rgb888;
 use libfelix::embedded_graphics::prelude::{DrawTarget, Point, Primitive, RgbColor, Size};
-use libfelix::embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
-use libfelix::embedded_graphics::text::Text;
 use libfelix::prelude::*;
 use libfelix::syscall::{self, write, read, open, close, mkdir, rmdir, unlink, execve, wait, pipe, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND};
 
@@ -247,25 +242,26 @@ fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
     }
     Ok((stdin_fd, stdout_fd))
 }
-use kolibri_embedded_gui::ui::Ui;
-use libfelix::wm::medsize_rgb888_style;
+
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
-    // Shell window via high-level WM API (userspace owns the client buffer).
-    let mut win = Window::create(40, 40, 320, 240, "demo").unwrap();
-    let mut ui = Ui::new_fullscreen(&mut win, medsize_rgb888_style());
-    ui.clear_background();
-    ui.add(Label::new("Basic Example").with_font(FONT_10X20));
+    let mut win = Window::create(40, 40, 320, 200, "ui").unwrap();
+    let mut ui = Ui::new();
+    let btn = ui.add_button(Button::new(20, 20, 120, 28, "click"));
+    let lbl = ui.add_label(Label::new(20, 60, "count: 0"));
+    let input = ui.add_text_input(TextInput::new(20, 100, 200, 24));
 
-    ui.add(Label::new("Basic Counter (7LOC)"));
+    let mut count = 0u32;
+    ui.on_click(btn, move |ui| {
+        count += 1;
+        ui.set_label(lbl, &format!("count: {count}"));
+    });
 
-    ui.add_horizontal(Button::new("-"));
-    ui.add_horizontal(Label::new(format!("Clicked times").as_ref()));
-    ui.add_horizontal(Button::new("+"));
-
-    win.flip();
-
+    loop {
+        ui.process(&mut win);
+    }
+    
     println!("\n=== Felix User Shell ===");
     println!("Type 'help' for commands\n");
 

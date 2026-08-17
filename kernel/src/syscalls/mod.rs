@@ -57,3 +57,7 @@ pub const SYS_WM_FLIP:    u32 = 404;
 pub const SYS_WM_FOCUS:   u32 = 405;
 /// screen_size(*mut u32 /*w,h*/) → 0
 pub const SYS_WM_SCREEN:  u32 = 406;
+/// mouse_state(*mut MouseState) → 0 / usize::MAX
+pub const SYS_MOUSE_STATE: u32 = 407;
+/// wm_poll(id, *mut WmEvent, max) → number of events copied
+pub const SYS_WM_POLL: u32 = 408;
