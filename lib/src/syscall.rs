@@ -222,6 +222,122 @@ pub const SYS_SENDTO:      u32 = 369;
 pub const SYS_RECVFROM:    u32 = 371;
 pub const SYS_SHUTDOWN:    u32 = 373;
 
+// Window manager — must match kernel/src/syscalls/mod.rs
+pub const SYS_WM_CREATE:  u32 = 400;
+pub const SYS_WM_DESTROY: u32 = 401;
+pub const SYS_WM_MOVE:    u32 = 402;
+pub const SYS_WM_INFO:    u32 = 403;
+pub const SYS_WM_FLIP:    u32 = 404;
+pub const SYS_WM_FOCUS:   u32 = 405;
+pub const SYS_WM_SCREEN:  u32 = 406;
+
+#[repr(C)]
+pub struct WmCreateArgs {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    pub title: *const u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct WindowInfo {
+    pub id: u32,
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    pub client_w: u32,
+    pub client_h: u32,
+    pub pitch: u32,
+    pub focused: u32,
+}
+
+pub unsafe fn wm_create(x: i32, y: i32, w: u32, h: u32, title: *const u8) -> usize {
+    let args = WmCreateArgs { x, y, w, h, title };
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_WM_CREATE => ret,
+        in("ebx") &args as *const WmCreateArgs,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn wm_destroy(id: u32) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_WM_DESTROY => ret,
+        in("ebx") id,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn wm_move(id: u32, x: i32, y: i32) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_WM_MOVE => ret,
+        in("ebx") id,
+        in("ecx") x,
+        in("edx") y,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn wm_info(id: u32, out: *mut WindowInfo) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_WM_INFO => ret,
+        in("ebx") id,
+        in("ecx") out,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+/// Copy `pixels` (BGRx 32bpp, pitch from WindowInfo) into the window surface and compose.
+pub unsafe fn wm_flip(id: u32, pixels: *const u8, len: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_WM_FLIP => ret,
+        in("ebx") id,
+        in("ecx") pixels,
+        in("edx") len,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn wm_focus(id: u32) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_WM_FOCUS => ret,
+        in("ebx") id,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn wm_screen_size(out: *mut u32) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_WM_SCREEN => ret,
+        in("ebx") out,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
 
 pub const AF_INET:     u32 = 2;
 pub const SOCK_STREAM: u32 = 1;

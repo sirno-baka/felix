@@ -40,12 +40,6 @@ impl Printer {
             asm!("out dx, al", in("dx") 0xe9 as u16, in("al") c as u8);
         }
 
-        // Prefer software FB console when graphics mode is active
-        if crate::drivers::fb_console::is_active() {
-            crate::drivers::fb_console::write_char(c);
-            return;
-        }
-
         if c == '\n' {
             self.new_line();
             return;
@@ -238,18 +232,13 @@ macro_rules! println {
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
 
-    // When the FB software console is active, do NOT touch the VGA Printer
-    // (cursor CRTC ports are meaningless in VESA mode and prints() would
-    // still talk to them). Write straight to fb_console (+ E9 inside).
-    if crate::drivers::fb_console::is_active() {
-        struct FbWriter;
-        impl Write for FbWriter {
-            fn write_str(&mut self, s: &str) -> fmt::Result {
-                crate::drivers::fb_console::write_str(s);
-                Ok(())
-            }
-        }
-        let _ = FbWriter.write_fmt(args);
+    // After VESA / WM: no VGA text, no kernel FB console — logs go to E9 only.
+    // Userspace apps create windows and draw themselves.
+    if crate::drivers::wm::is_ready()
+        || crate::drivers::framebuffer::FRAMEBUFFER.lock().is_some()
+    {
+        let mut writer = E9Writer;
+        let _ = writer.write_fmt(args);
         return;
     }
 

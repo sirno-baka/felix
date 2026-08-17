@@ -41,3 +41,19 @@ pub const SYS_SENDMSG:     u32 = 370;
 pub const SYS_RECVFROM:    u32 = 371;
 pub const SYS_RECVMSG:     u32 = 372;
 pub const SYS_SHUTDOWN:    u32 = 373;
+
+// Window manager (kernel compositor)
+/// create(x, y, w, h, title_ptr) → window_id or usize::MAX
+pub const SYS_WM_CREATE:  u32 = 400;
+/// destroy(id) → 0 / usize::MAX
+pub const SYS_WM_DESTROY: u32 = 401;
+/// move(id, x, y) → 0 / usize::MAX
+pub const SYS_WM_MOVE:    u32 = 402;
+/// info(id, *mut WindowInfo) → 0 / usize::MAX
+pub const SYS_WM_INFO:    u32 = 403;
+/// flip(id, user_pixels, len) → 0 / usize::MAX  (copy + compose)
+pub const SYS_WM_FLIP:    u32 = 404;
+/// focus(id) → 0 / usize::MAX
+pub const SYS_WM_FOCUS:   u32 = 405;
+/// screen_size(*mut u32 /*w,h*/) → 0
+pub const SYS_WM_SCREEN:  u32 = 406;

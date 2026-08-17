@@ -241,6 +241,14 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         crate::syscalls::SYS_RECVFROM => sys_recvfrom(current_slot, state.ebx as usize, state.ecx as *mut u8, state.edx as usize),
         crate::syscalls::SYS_SHUTDOWN => sys_shutdown(current_slot, state.ebx as usize, state.ecx as u32),
 
+        // === Window manager ===
+        crate::syscalls::SYS_WM_CREATE  => sys_wm_create(current_slot, state.ebx as *const WmCreateArgs),
+        crate::syscalls::SYS_WM_DESTROY => sys_wm_destroy(state.ebx),
+        crate::syscalls::SYS_WM_MOVE    => sys_wm_move(state.ebx, state.ecx as i32, state.edx as i32),
+        crate::syscalls::SYS_WM_INFO    => sys_wm_info(state.ebx, state.ecx as *mut crate::drivers::wm::WindowInfo),
+        crate::syscalls::SYS_WM_FLIP    => sys_wm_flip(state.ebx, state.ecx as *const u8, state.edx as usize),
+        crate::syscalls::SYS_WM_FOCUS   => sys_wm_focus(state.ebx),
+        crate::syscalls::SYS_WM_SCREEN  => sys_wm_screen(state.ebx as *mut u32),
 
         _ => 0,
     };
@@ -1313,6 +1321,90 @@ fn sys_shutdown(current_slot: usize, fd: usize, _how: u32) -> usize {
         }
     }
     usize::MAX
+}
+
+// ====================== WINDOW MANAGER ======================
+
+#[repr(C)]
+struct WmCreateArgs {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    title: *const u8,
+}
+
+fn sys_wm_create(current_slot: usize, args: *const WmCreateArgs) -> usize {
+    if args.is_null() {
+        return usize::MAX;
+    }
+    let a = unsafe { &*args };
+    let title = if a.title.is_null() {
+        ""
+    } else {
+        unsafe { CStr::from_ptr(a.title as *const i8).to_str().unwrap_or("") }
+    };
+    match crate::drivers::wm::create_window(a.x, a.y, a.w, a.h, title, current_slot as i8) {
+        Some(id) => id as usize,
+        None => usize::MAX,
+    }
+}
+
+fn sys_wm_destroy(id: u32) -> usize {
+    if crate::drivers::wm::destroy_window(id) {
+        0
+    } else {
+        usize::MAX
+    }
+}
+
+fn sys_wm_move(id: u32, x: i32, y: i32) -> usize {
+    if crate::drivers::wm::move_window(id, x, y) {
+        0
+    } else {
+        usize::MAX
+    }
+}
+
+fn sys_wm_info(id: u32, out: *mut crate::drivers::wm::WindowInfo) -> usize {
+    if out.is_null() {
+        return usize::MAX;
+    }
+    match crate::drivers::wm::window_info(id) {
+        Some(info) => {
+            unsafe { *out = info };
+            0
+        }
+        None => usize::MAX,
+    }
+}
+
+fn sys_wm_flip(id: u32, pixels: *const u8, len: usize) -> usize {
+    if crate::drivers::wm::flip(id, pixels, len) {
+        0
+    } else {
+        usize::MAX
+    }
+}
+
+fn sys_wm_focus(id: u32) -> usize {
+    if crate::drivers::wm::focus_window(id) {
+        0
+    } else {
+        usize::MAX
+    }
+}
+
+fn sys_wm_screen(out: *mut u32) -> usize {
+    if out.is_null() {
+        return usize::MAX;
+    }
+    let (w, h) = crate::drivers::wm::screen_size();
+    unsafe {
+        *out = w;
+        *out.add(1) = h;
+    }
+    0
 }
 
 

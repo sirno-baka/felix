@@ -141,7 +141,7 @@ impl Framebuffer {
 
     /// Hot path — caller must hold interrupts off (or use `put_pixel`).
     #[inline]
-    fn put_pixel_raw(&self, x: u32, y: u32, color: u32) {
+    pub fn put_pixel_raw(&self, x: u32, y: u32, color: u32) {
         if x >= self.info.width as u32 || y >= self.info.height as u32 {
             return;
         }

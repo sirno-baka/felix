@@ -240,6 +240,14 @@ fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
+    // Shell window via high-level WM API (userspace owns the client buffer).
+    let mut _win = Window::create(10, 10, 100, 100, "Shell").map(|mut w| {
+        w.fill(rgb(0x18, 0x20, 0x28));
+        w.fill_rect(0, 0, w.client_width(), 4, rgb(0x40, 0xA0, 0x60));
+        let _ = w.flip();
+        w
+    });
+
     println!("\n=== Felix User Shell ===");
     println!("Type 'help' for commands\n");
 
