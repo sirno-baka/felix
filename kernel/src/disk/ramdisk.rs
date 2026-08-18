@@ -1,74 +1,104 @@
-use alloc::vec;
-use alloc::vec::Vec;
 use crate::disk::interface::BlockDevice;
+use crate::memory::paging::{PAGING, PTEFlags, PDEFlags, PageDirectory, phys_to_virt};
 use core::ptr;
-use crate::println;
 
 pub const SECTOR_SIZE: u32 = 512;
 pub const RAMDISK_SIZE: usize = 5 * 1024 * 1024; // 5MB
-pub const RAMFS_LBA: u64 = 2114; //kernel location logical block address
-pub const RAMFS_TARGET: u32 = 0x0060_0000; //where to put kernel in memory
+pub const RAMFS_LBA: u64 = 2114;
+pub const RAMFS_TARGET: u32 = 0x0060_0000;
 
-#[derive(Clone)]
 pub struct RamDisk {
-    pub data: Vec<u8>,
+    ptr: *mut u8,
+    size: usize,
 }
-
+unsafe impl Send for RamDisk {}
+unsafe impl Sync for RamDisk {}
 impl RamDisk {
     pub fn new() -> Self {
-        let mut data = vec![0; RAMDISK_SIZE];
+        let size = RAMDISK_SIZE;
+        let pages = (size + 4095) / 4096;
+
+        // Динамический адрес сразу после кучи ядра (0xC200_0000)
+        static mut KERNEL_RAMDISK_VIRT: u32 = 0xC200_0000;
+        let virt_start = unsafe { KERNEL_RAMDISK_VIRT };
+
+        let mut paging = unsafe { PAGING.lock() };
+
+        for i in 0..pages {
+            let virt = virt_start + (i as u32) * 4096;
+            let vpage = virt >> 12;
+            let pd_idx = (vpage >> 10) as usize;
+            let pt_idx = (vpage & 0x3FF) as usize;
+
+            // Создаем Page Table, если её нет
+            let pde = paging.dir.entries[pd_idx];
+            if pde == 0 || (pde & PDEFlags::PRESENT) == 0 {
+                let pt_phys = paging.alloc_frame();
+                // БЕЗ флага USER -> защита от user-space
+                let pde_flags = PDEFlags::new().present().writable().bits();
+                paging.dir.entries[pd_idx] = (pt_phys << 12) | pde_flags;
+                PageDirectory::flush_page((pd_idx as u32) << 22);
+                let pt_ptr = PageDirectory::get_page_table_ptr(pd_idx);
+                unsafe { ptr::write_bytes(pt_ptr as *mut u8, 0, 4096); }
+            }
+
+            // Выделяем физический фрейм и маппим его
+            let phys_frame = paging.alloc_frame();
+            let pt_ptr = PageDirectory::get_page_table_ptr(pd_idx);
+            unsafe {
+                // БЕЗ флага USER -> защита от user-space
+                (*pt_ptr)[pt_idx] = (phys_frame << 12)
+                    | PTEFlags::PRESENT
+                    | PTEFlags::WRITABLE
+                    | PTEFlags::DIRTY;
+            }
+            PageDirectory::flush_page(virt);
+        }
+
+        unsafe { KERNEL_RAMDISK_VIRT += (pages as u32) * 4096; }
+        drop(paging);
+
+        let ptr = virt_start as *mut u8;
+
+        // Копируем данные из памяти загрузчика
         unsafe {
-            ptr::copy_nonoverlapping(RAMFS_TARGET as *const u8, data.as_mut_ptr(), (766 * SECTOR_SIZE) as usize);
+            ptr::copy_nonoverlapping(
+                phys_to_virt(RAMFS_TARGET) as *const u8,
+                ptr,
+                (766 * SECTOR_SIZE) as usize,
+            );
         }
-        RamDisk {
-            data: data,
-        }
+
+        RamDisk { ptr, size }
     }
 }
 
 impl BlockDevice for RamDisk {
     fn read_sectors(&self, numsects: u8, lba: u32, buf: u32) -> Result<(), u8> {
-        let start_offset = lba * SECTOR_SIZE;
-        let bytes_to_read = (numsects as u32) * SECTOR_SIZE;
+        let start_offset = (lba as usize) * (SECTOR_SIZE as usize);
+        let bytes_to_read = (numsects as usize) * (SECTOR_SIZE as usize);
 
-        if start_offset as usize + bytes_to_read as usize > self.data.len() {
+        if start_offset + bytes_to_read > self.size || buf == 0 {
             return Err(1);
         }
 
-        if buf == 0 {
-            return Err(2);
-        }
-
-        let src_ptr = unsafe { self.data.as_ptr().add(start_offset as usize) };
-        let dst_ptr = buf as *mut u8;
-
         unsafe {
-            ptr::copy_nonoverlapping(src_ptr, dst_ptr, bytes_to_read as usize);
+            ptr::copy_nonoverlapping(self.ptr.add(start_offset), buf as *mut u8, bytes_to_read);
         }
-
         Ok(())
     }
 
     fn write_sectors(&mut self, numsects: u8, lba: u32, buf: u32) -> Result<(), u8> {
-        let start_offset = lba * SECTOR_SIZE;
-        let bytes_to_write = (numsects as u32) * SECTOR_SIZE;
+        let start_offset = (lba as usize) * (SECTOR_SIZE as usize);
+        let bytes_to_write = (numsects as usize) * (SECTOR_SIZE as usize);
 
-        if start_offset as usize + bytes_to_write as usize > self.data.len() {
+        if start_offset + bytes_to_write > self.size || buf == 0 {
             return Err(1);
         }
 
-        if buf == 0 {
-            return Err(2);
-        }
-
-        let src_ptr = buf as *const u8;
-        let dst_ptr = unsafe { self.data.as_mut_ptr().add(start_offset as usize) };
-        println!("src {:x}", src_ptr as usize);
-        println!("dst {:x}", dst_ptr as usize);
         unsafe {
-            ptr::copy_nonoverlapping(src_ptr, dst_ptr, bytes_to_write as usize);
+            ptr::copy_nonoverlapping(buf as *const u8, self.ptr.add(start_offset), bytes_to_write);
         }
-
         Ok(())
     }
 

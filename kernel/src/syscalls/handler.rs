@@ -586,7 +586,7 @@ fn sys_unlink(path_ptr: *const u8) -> usize {
 /// Читает содержимое директории и записывает имена файлов
 /// (разделённые '\n') в пользовательский буфер.
 /// Возвращает количество записанных байт или 0 при ошибке.
-fn sys_ls(path_ptr: *const u8, buf_ptr: *mut u8, buf_size: usize) -> usize {
+pub fn sys_ls(path_ptr: *const u8, buf_ptr: *mut u8, buf_size: usize) -> usize {
     let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("/") };
     let path = if path.is_empty() { "/" } else { path };
 

@@ -4,14 +4,17 @@
 extern crate alloc;
 
 use alloc::format;
-use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::cell::RefCell;
-use libfelix::embedded_graphics::*;
-use libfelix::embedded_graphics::prelude::{DrawTarget, Point, Primitive, RgbColor, Size};
 use libfelix::prelude::*;
-use libfelix::syscall::{self, write, read, open, close, mkdir, rmdir, unlink, execve, wait, pipe, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND};
+use libfelix::syscall::{
+    self, write, read, open, close, mkdir, rmdir, unlink, execve, wait, pipe, O_RDONLY, O_WRONLY,
+    O_CREAT, O_TRUNC, O_APPEND,
+};
+
+// ---------------------------------------------------------------------------
+// Shell state
+// ---------------------------------------------------------------------------
 
 struct Shell {
     cwd: String,
@@ -114,9 +117,9 @@ fn is_directory(path: &str) -> bool {
 
 #[derive(Clone, Copy, PartialEq)]
 enum RedirKind {
-    In,      // <
-    Out,     // >
-    Append,  // >>
+    In,     // <
+    Out,    // >
+    Append, // >>
 }
 
 struct Redir {
@@ -129,7 +132,6 @@ struct SimpleCmd {
     redirs: Vec<Redir>,
 }
 
-/// Split a line into pipeline stages: `a | b | c`
 fn split_pipeline(line: &str) -> Vec<String> {
     let mut stages = Vec::new();
     let mut cur = String::new();
@@ -151,7 +153,6 @@ fn split_pipeline(line: &str) -> Vec<String> {
     stages
 }
 
-/// Parse one stage into argv + redirections.
 fn parse_simple(stage: &str) -> SimpleCmd {
     let mut args = Vec::new();
     let mut redirs = Vec::new();
@@ -195,8 +196,6 @@ fn parse_simple(stage: &str) -> SimpleCmd {
     SimpleCmd { args, redirs }
 }
 
-/// Open redirection files for a command. Returns (stdin_fd, stdout_fd) as i32 (-1 = default).
-/// Caller must close any >= 0 fds after spawn.
 fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
     let mut stdin_fd: i32 = -1;
     let mut stdout_fd: i32 = -1;
@@ -209,10 +208,12 @@ fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
             RedirKind::In => {
                 let fd = unsafe { open(path.as_ptr() as *const u8, O_RDONLY) };
                 if fd == usize::MAX {
-                    return Err(alloc::format!("{}: No such file", r.path));
+                    return Err(format!("{}: No such file", r.path));
                 }
                 if stdin_fd >= 0 {
-                    unsafe { close(stdin_fd as u32); }
+                    unsafe {
+                        close(stdin_fd as u32);
+                    }
                 }
                 stdin_fd = fd as i32;
             }
@@ -220,10 +221,12 @@ fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
                 let flags = O_WRONLY | O_CREAT | O_TRUNC;
                 let fd = unsafe { open(path.as_ptr() as *const u8, flags) };
                 if fd == usize::MAX {
-                    return Err(alloc::format!("{}: cannot create", r.path));
+                    return Err(format!("{}: cannot create", r.path));
                 }
                 if stdout_fd >= 0 {
-                    unsafe { close(stdout_fd as u32); }
+                    unsafe {
+                        close(stdout_fd as u32);
+                    }
                 }
                 stdout_fd = fd as i32;
             }
@@ -231,10 +234,12 @@ fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
                 let flags = O_WRONLY | O_CREAT | O_APPEND;
                 let fd = unsafe { open(path.as_ptr() as *const u8, flags) };
                 if fd == usize::MAX {
-                    return Err(alloc::format!("{}: cannot open", r.path));
+                    return Err(format!("{}: cannot open", r.path));
                 }
                 if stdout_fd >= 0 {
-                    unsafe { close(stdout_fd as u32); }
+                    unsafe {
+                        close(stdout_fd as u32);
+                    }
                 }
                 stdout_fd = fd as i32;
             }
@@ -243,137 +248,93 @@ fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
     Ok((stdin_fd, stdout_fd))
 }
 
+// ---------------------------------------------------------------------------
+// Terminal buffer (history of completed lines)
+// ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub extern "C" fn main() -> i32 {
-    let mut win = Window::create(40, 40, 320, 200, "ui").unwrap();
-    let mut ui = Ui::new();
-    let btn = ui.add_button(Button::new(20, 20, 120, 28, "click"));
-    let lbl = ui.add_label(Label::new(20, 60, "count: 0"));
-    let input = ui.add_text_input(TextInput::new(20, 100, 200, 24));
+const MAX_HISTORY: usize = 64;
+/// Total label rows. Last row is always the live prompt+input line.
+const VISIBLE_LINES: usize = 22;
+const HISTORY_ROWS: usize = VISIBLE_LINES - 1;
 
-    let mut count = 0u32;
-    ui.on_click(btn, move |ui| {
-        count += 1;
-        ui.set_label(lbl, &format!("count: {count}"));
-    });
+struct TermBuffer {
+    lines: Vec<String>,
+}
 
-    loop {
-        ui.process(&mut win);
+impl TermBuffer {
+    fn new() -> Self {
+        Self { lines: Vec::new() }
     }
-    
-    println!("\n=== Felix User Shell ===");
-    println!("Type 'help' for commands\n");
 
-    let mut shell = Shell::new();
-
-    loop {
-        print!("{}", shell.prompt());
-
-        let line = read_line();
-        if line.trim().is_empty() {
-            continue;
+    fn push(&mut self, line: &str) {
+        for part in line.split('\n') {
+            self.lines.push(String::from(part));
+            if self.lines.len() > MAX_HISTORY {
+                self.lines.remove(0);
+            }
         }
-        interpret(&mut shell, line);
+    }
+
+    fn clear(&mut self) {
+        self.lines.clear();
+    }
+
+    /// Last HISTORY_ROWS of completed output (oldest first).
+    fn visible_history(&self) -> impl Iterator<Item = &str> {
+        let start = self.lines.len().saturating_sub(HISTORY_ROWS);
+        self.lines[start..].iter().map(|s| s.as_str())
     }
 }
 
-fn read_line() -> String {
-    let mut buf = String::new();
-    let mut byte_buf = [0u8; 1];
+// ---------------------------------------------------------------------------
+// Builtins / interpreter
+// ---------------------------------------------------------------------------
 
-    loop {
-        let n = unsafe { read(0, byte_buf.as_mut_ptr(), 1) };
-        if n == 0 {
-            break;
-        }
-
-        let c = byte_buf[0];
-
-        match c {
-            b'\n' | b'\r' => {
-                print!("\n");
-                break;
-            }
-            0x03 => {
-                print!("^C\n");
-                buf.clear();
-                break;
-            }
-            0x08 | 0x7f => {
-                if !buf.is_empty() {
-                    buf.pop();
-                    // Kernel console now handles BS: moves cursor left + erases glyph
-                    print!("\x08");
-                }
-            }
-            c if c.is_ascii_graphic() || c == b' ' => {
-                buf.push(c as char);
-                print!("{}", c as char);
-            }
-            _ => {}
-        }
-    }
-
-    buf
-}
-
-fn interpret(shell: &mut Shell, line: String) {
-    let stages = split_pipeline(line.trim());
-    if stages.is_empty() {
-        return;
-    }
-
-    // Single stage — may be builtin
-    if stages.len() == 1 {
-        let cmd = parse_simple(&stages[0]);
-        if cmd.args.is_empty() {
-            return;
-        }
-        if try_builtin(shell, &cmd) {
-            return;
-        }
-        if let Some(pid) = run_external(shell, &cmd, -1, -1) {
-            unsafe {
-                let _ = wait(pid);
-            }
-        }
-        return;
-    }
-
-    // Pipeline: only externals supported for now
-    run_pipeline(shell, &stages);
-}
-
-fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd) -> bool {
+fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool {
     let name = cmd.args[0].as_str();
     match name {
         "help" | "exit" | "quit" | "pwd" | "cd" | "ls" | "cat" | "mkdir" | "rmdir" | "rm"
-        | "path" | "ps" => {}
+        | "path" | "ps" | "clear" => {}
         _ => return false,
     }
 
-    // Builtins with output redirection: capture via temporary approach
-    // For cat/ls we write to redirected fd if present.
-    let out_fd = match open_redirs(shell, &cmd.redirs) {
-        Ok((_in, out)) => out,
+    let file_fd = match open_redirs(shell, &cmd.redirs) {
+        Ok((_in, out_fd)) => out_fd,
         Err(e) => {
-            println!("{}", e);
+            out.push(&e);
             return true;
         }
     };
-    // input redirect for builtins (cat reads files by name, ignore < for now unless no args)
 
     match name {
         "help" => {
             let msg = help_text();
-            write_out(out_fd, msg.as_bytes());
+            if file_fd >= 0 {
+                unsafe {
+                    write(file_fd as u32, msg.as_bytes().as_ptr(), msg.len());
+                    close(file_fd as u32);
+                }
+            } else {
+                for line in msg.lines() {
+                    out.push(line);
+                }
+            }
         }
-        "exit" | "quit" => unsafe { syscall::exit() },
+        "exit" | "quit" => {
+            out.push("Goodbye.");
+        }
         "pwd" => {
-            let mut s = shell.cwd.clone();
-            s.push('\n');
-            write_out(out_fd, s.as_bytes());
+            let s = shell.cwd.clone();
+            if file_fd >= 0 {
+                let mut b = s.clone();
+                b.push('\n');
+                unsafe {
+                    write(file_fd as u32, b.as_bytes().as_ptr(), b.len());
+                    close(file_fd as u32);
+                }
+            } else {
+                out.push(&s);
+            }
         }
         "cd" => {
             let target = cmd.args.get(1).map(|s| s.as_str()).unwrap_or("/");
@@ -381,7 +342,12 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd) -> bool {
             if is_directory(&new_cwd) {
                 shell.cwd = new_cwd;
             } else {
-                println!("cd: {}: No such directory", target);
+                out.push(&format!("cd: {}: No such directory", target));
+            }
+            if file_fd >= 0 {
+                unsafe {
+                    close(file_fd as u32);
+                }
             }
         }
         "ls" => {
@@ -390,13 +356,23 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd) -> bool {
                 .get(1)
                 .map(|s| shell.resolve(s))
                 .unwrap_or_else(|| shell.cwd.clone());
-            ls_to(&path, out_fd);
+            ls_to(&path, file_fd, out);
+            if file_fd >= 0 {
+                unsafe {
+                    close(file_fd as u32);
+                }
+            }
         }
         "cat" => {
             if let Some(file) = cmd.args.get(1) {
-                cat_to(&shell.resolve(file), out_fd);
+                cat_to(&shell.resolve(file), file_fd, out);
             } else {
-                println!("Usage: cat <file>");
+                out.push("Usage: cat <file>");
+            }
+            if file_fd >= 0 {
+                unsafe {
+                    close(file_fd as u32);
+                }
             }
         }
         "mkdir" => {
@@ -407,7 +383,12 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd) -> bool {
                     mkdir(path.as_ptr() as *const u8);
                 }
             } else {
-                println!("Usage: mkdir <name>");
+                out.push("Usage: mkdir <name>");
+            }
+            if file_fd >= 0 {
+                unsafe {
+                    close(file_fd as u32);
+                }
             }
         }
         "rmdir" => {
@@ -418,7 +399,12 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd) -> bool {
                     rmdir(path.as_ptr() as *const u8);
                 }
             } else {
-                println!("Usage: rmdir <name>");
+                out.push("Usage: rmdir <name>");
+            }
+            if file_fd >= 0 {
+                unsafe {
+                    close(file_fd as u32);
+                }
             }
         }
         "rm" => {
@@ -429,49 +415,122 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd) -> bool {
                     unlink(path.as_ptr() as *const u8);
                 }
             } else {
-                println!("Usage: rm <file>");
+                out.push("Usage: rm <file>");
+            }
+            if file_fd >= 0 {
+                unsafe {
+                    close(file_fd as u32);
+                }
             }
         }
         "path" => {
             if let Some(new_path) = cmd.args.get(1) {
                 shell.path = new_path.clone();
-                println!("PATH={}", shell.path);
+                out.push(&format!("PATH={}", shell.path));
             } else {
-                let mut s = shell.path.clone();
-                s.push('\n');
-                write_out(out_fd, s.as_bytes());
+                out.push(&shell.path);
+            }
+            if file_fd >= 0 {
+                unsafe {
+                    close(file_fd as u32);
+                }
             }
         }
-        "ps" => println!("ps: not implemented yet"),
-        _ => {}
-    }
-
-    if out_fd >= 0 {
-        unsafe {
-            close(out_fd as u32);
+        "ps" => {
+            out.push("ps: not implemented yet");
+            if file_fd >= 0 {
+                unsafe {
+                    close(file_fd as u32);
+                }
+            }
         }
+        "clear" => {
+            out.clear();
+            if file_fd >= 0 {
+                unsafe {
+                    close(file_fd as u32);
+                }
+            }
+        }
+        _ => {}
     }
     true
 }
 
-fn write_out(fd: i32, data: &[u8]) {
-    if fd < 0 {
-        unsafe {
-            write(1, data.as_ptr(), data.len());
-        }
-    } else {
-        unsafe {
-            write(fd as u32, data.as_ptr(), data.len());
+fn ls_to(path: &str, file_fd: i32, out: &mut TermBuffer) {
+    let mut path_buf = String::from(path);
+    if path_buf.is_empty() {
+        path_buf.push('/');
+    }
+    path_buf.push('\0');
+
+    let mut buf = [0u8; 4096];
+    let n = unsafe { syscall::ls(path_buf.as_ptr() as *const u8, buf.as_mut_ptr(), buf.len()) };
+    if n == 0 {
+        out.push(&format!("ls: cannot read directory: {}", path));
+        return;
+    }
+
+    let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    for entry in text.lines() {
+        if !entry.is_empty() {
+            if file_fd >= 0 {
+                let mut line = String::from(entry);
+                line.push('\n');
+                unsafe {
+                    write(file_fd as u32, line.as_bytes().as_ptr(), line.len());
+                }
+            } else {
+                out.push(entry);
+            }
         }
     }
 }
 
-fn run_external(shell: &Shell, cmd: &SimpleCmd, forced_in: i32, forced_out: i32) -> Option<i32> {
+fn cat_to(filename: &str, file_fd: i32, out: &mut TermBuffer) {
+    let mut path = String::from(filename);
+    path.push('\0');
+
+    let fd = unsafe { open(path.as_ptr() as *const u8, O_RDONLY) };
+    if fd == usize::MAX {
+        out.push(&format!("File not found: {}", filename));
+        return;
+    }
+
+    let mut buf = [0u8; 512];
+    loop {
+        let n = unsafe { read(fd as u32, buf.as_mut_ptr(), buf.len()) };
+        if n == 0 {
+            break;
+        }
+        if file_fd >= 0 {
+            unsafe {
+                write(file_fd as u32, buf.as_ptr(), n);
+            }
+        } else if let Ok(s) = core::str::from_utf8(&buf[..n]) {
+            for line in s.split('\n') {
+                out.push(line);
+            }
+        }
+    }
+
+    unsafe {
+        close(fd as u32);
+    }
+}
+
+fn run_external(
+    shell: &Shell,
+    cmd: &SimpleCmd,
+    forced_in: i32,
+    forced_out: i32,
+    out: &mut TermBuffer,
+) -> Option<i32> {
     let name = cmd.args[0].as_str();
     let full = match shell.find_executable(name) {
         Some(p) => p,
         None => {
-            println!("{}: command not found", name);
+            out.push(&format!("{}: command not found", name));
             return None;
         }
     };
@@ -479,7 +538,7 @@ fn run_external(shell: &Shell, cmd: &SimpleCmd, forced_in: i32, forced_out: i32)
     let (mut sin, mut sout) = match open_redirs(shell, &cmd.redirs) {
         Ok(v) => v,
         Err(e) => {
-            println!("{}", e);
+            out.push(&e);
             return None;
         }
     };
@@ -500,8 +559,8 @@ fn run_external(shell: &Shell, cmd: &SimpleCmd, forced_in: i32, forced_out: i32)
         sout = forced_out;
     }
 
+    out.push(&format!("[running {} ...]", full));
     let pid = spawn_elf(&full, sin, sout, -1, &cmd.args);
-    // Parent closes its copies of redirect fds (child has its own refs)
     if sin >= 0 && forced_in < 0 {
         unsafe {
             close(sin as u32);
@@ -526,10 +585,8 @@ fn spawn_elf(
         Ok(mut f) => match f.read_to_end() {
             Ok(data) => {
                 if data.len() < 4 || &data[0..4] != b"\x7fELF" {
-                    println!("{}: not an executable", path);
                     return None;
                 }
-                // Build C-string argv (argv[0] = path or args[0])
                 let mut c_strings: Vec<String> = Vec::new();
                 if args.is_empty() {
                     c_strings.push({
@@ -544,8 +601,7 @@ fn spawn_elf(
                         c_strings.push(s);
                     }
                 }
-                let ptrs: Vec<*const u8> =
-                    c_strings.iter().map(|s| s.as_ptr()).collect();
+                let ptrs: Vec<*const u8> = c_strings.iter().map(|s| s.as_ptr()).collect();
 
                 unsafe {
                     let pid = execve(
@@ -557,38 +613,30 @@ fn spawn_elf(
                         &ptrs,
                     );
                     if pid == usize::MAX {
-                        println!("execve failed: {}", path);
                         None
                     } else {
                         Some(pid as i32)
                     }
                 }
             }
-            Err(e) => {
-                println!("read error: {:?}", e);
-                None
-            }
+            Err(_) => None,
         },
-        Err(_) => {
-            println!("{}: No such file", path);
-            None
-        }
+        Err(_) => None,
     }
 }
 
-fn run_pipeline(shell: &Shell, stages: &[String]) {
+fn run_pipeline(shell: &Shell, stages: &[String], out: &mut TermBuffer) {
     let n = stages.len();
     if n == 0 {
         return;
     }
 
-    // Create n-1 pipes
     let mut pipes: Vec<(u32, u32)> = Vec::new();
     for _ in 0..n - 1 {
         let mut fds = [0u32; 2];
         let r = unsafe { pipe(fds.as_mut_ptr()) };
         if r != 0 {
-            println!("pipe failed");
+            out.push("pipe failed");
             return;
         }
         pipes.push((fds[0], fds[1]));
@@ -603,25 +651,24 @@ fn run_pipeline(shell: &Shell, stages: &[String]) {
         }
 
         let in_fd: i32 = if i == 0 {
-            -1 // may be overridden by <
+            -1
         } else {
             pipes[i - 1].0 as i32
         };
         let out_fd: i32 = if i == n - 1 {
-            -1 // may be overridden by >
+            -1
         } else {
             pipes[i].1 as i32
         };
 
-        // open_redirs inside run_external may override; for middle stages force pipe ends
         let pid = if i == 0 && i == n - 1 {
-            run_external(shell, &cmd, -1, -1)
+            run_external(shell, &cmd, -1, -1, out)
         } else if i == 0 {
-            run_external(shell, &cmd, -1, out_fd)
+            run_external(shell, &cmd, -1, out_fd, out)
         } else if i == n - 1 {
-            run_external(shell, &cmd, in_fd, -1)
+            run_external(shell, &cmd, in_fd, -1, out)
         } else {
-            run_external(shell, &cmd, in_fd, out_fd)
+            run_external(shell, &cmd, in_fd, out_fd, out)
         };
 
         if let Some(p) = pid {
@@ -629,7 +676,6 @@ fn run_pipeline(shell: &Shell, stages: &[String]) {
         }
     }
 
-    // Parent must close all pipe ends so children get EOF
     for (r, w) in pipes {
         unsafe {
             close(r);
@@ -637,13 +683,36 @@ fn run_pipeline(shell: &Shell, stages: &[String]) {
         }
     }
 
-    // Wait for all children (foreground = last for Ctrl+C)
-    for (i, pid) in pids.iter().enumerate() {
+    for pid in pids {
         unsafe {
-            let _ = wait(*pid);
+            let _ = wait(pid);
         }
-        let _ = i;
     }
+}
+
+fn interpret(shell: &mut Shell, line: &str, out: &mut TermBuffer) {
+    let stages = split_pipeline(line.trim());
+    if stages.is_empty() {
+        return;
+    }
+
+    if stages.len() == 1 {
+        let cmd = parse_simple(&stages[0]);
+        if cmd.args.is_empty() {
+            return;
+        }
+        if try_builtin(shell, &cmd, out) {
+            return;
+        }
+        if let Some(pid) = run_external(shell, &cmd, -1, -1, out) {
+            unsafe {
+                let _ = wait(pid);
+            }
+        }
+        return;
+    }
+
+    run_pipeline(shell, &stages, out);
 }
 
 fn help_text() -> String {
@@ -655,6 +724,7 @@ fn help_text() -> String {
   pwd              - print working directory\n\
   path [dirs]      - show or set PATH\n\
   mkdir / rmdir / rm\n\
+  clear            - clear terminal\n\
   help / exit\n\n\
 Redirection:\n\
   cmd > file       - stdout to file (truncate)\n\
@@ -667,50 +737,119 @@ External:\n\
     )
 }
 
-fn ls_to(path: &str, out_fd: i32) {
-    let mut path_buf = String::from(path);
-    if path_buf.is_empty() {
-        path_buf.push('/');
-    }
-    path_buf.push('\0');
+// ---------------------------------------------------------------------------
+// Classic terminal GUI (no TextInput / no buttons)
+// ---------------------------------------------------------------------------
 
-    let mut buf = [0u8; 4096];
-    let n = unsafe { syscall::ls(path_buf.as_ptr() as *const u8, buf.as_mut_ptr(), buf.len()) };
-    if n == 0 {
-        println!("ls: cannot read directory: {}", path);
-        return;
-    }
+const SCAN_BACKSPACE: u8 = 0x0E;
+const SCAN_ENTER: u8 = 0x1C;
+const MAX_INPUT: usize = 96;
+const LINE_MAX_CHARS: usize = 68;
 
-    let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
-    for entry in text.lines() {
-        if !entry.is_empty() {
-            let mut line = String::from(entry);
-            line.push('\n');
-            write_out(out_fd, line.as_bytes());
-        }
+fn truncate_line(s: &str) -> &str {
+    if s.len() > LINE_MAX_CHARS {
+        &s[s.len() - LINE_MAX_CHARS..]
+    } else {
+        s
     }
 }
 
-fn cat_to(filename: &str, out_fd: i32) {
-    let mut path = String::from(filename);
-    path.push('\0');
+/// Redraw all labels: history rows + live prompt line at the bottom.
+fn refresh_terminal(
+    ui: &mut Ui,
+    shell: &Shell,
+    term: &TermBuffer,
+    input: &str,
+    line_ids: &[WidgetId],
+) {
+    // History fills the first HISTORY_ROWS labels (pad with empty from top).
+    let mut hist: Vec<&str> = term.visible_history().collect();
+    while hist.len() < HISTORY_ROWS {
+        hist.insert(0, "");
+    }
 
-    let fd = unsafe { open(path.as_ptr() as *const u8, O_RDONLY) };
-    if fd == usize::MAX {
-        println!("File not found: {}", filename);
+    for i in 0..HISTORY_ROWS {
+        let text = hist.get(i).copied().unwrap_or("");
+        ui.set_label(line_ids[i], truncate_line(text));
+    }
+
+    // Last label = prompt + current input (+ caret)
+    let mut live = shell.prompt();
+    live.push_str(input);
+    live.push('_');
+    ui.set_label(line_ids[HISTORY_ROWS], truncate_line(&live));
+}
+
+fn run_line(shell: &mut Shell, term: &mut TermBuffer, input: &str) {
+    let cmd = input.trim();
+    if cmd.is_empty() {
         return;
     }
+    // Echo the completed line into history
+    term.push(&format!("{}{}", shell.prompt(), cmd));
+    interpret(shell, cmd, term);
+}
 
-    let mut buf = [0u8; 512];
-    loop {
-        let n = unsafe { read(fd as u32, buf.as_mut_ptr(), buf.len()) };
-        if n == 0 {
-            break;
-        }
-        write_out(out_fd, &buf[..n]);
+#[no_mangle]
+pub extern "C" fn main() -> i32 {
+    let mut win = Window::create(30, 30, 640, 400, "Felix Shell").unwrap_or_else(|| {
+        Window::create(40, 40, 480, 320, "Felix Shell").expect("wm_create failed")
+    });
+
+    let mut ui = Ui::new();
+
+    // Only labels — one per visible row (last row is the live input line)
+    let mut line_ids: Vec<WidgetId> = Vec::new();
+    let line_y0 = 8;
+    let line_h = 16;
+    for i in 0..VISIBLE_LINES {
+        let y = line_y0 + (i as i32) * line_h;
+        line_ids.push(ui.add_label(Label::new(10, y, "")));
     }
 
-    unsafe {
-        close(fd as u32);
+    let mut shell = Shell::new();
+    let mut term = TermBuffer::new();
+    let mut input = String::new();
+
+    term.push("=== Felix User Shell ===");
+    term.push("Type commands and press Enter.  help — builtins, clear — wipe view.");
+    term.push("");
+
+    refresh_terminal(&mut ui, &shell, &term, &input, &line_ids);
+    ui.draw(&mut win);
+    let _ = win.flip();
+
+    loop {
+        let mut dirty = false;
+
+        let mut evbuf = [WmEvent::default(); 64];
+        let n = win.poll_events(&mut evbuf);
+
+        for e in &evbuf[..n] {
+            if e.kind != EV_KEY_DOWN {
+                continue;
+            }
+            let scancode = e.a as u8;
+            let ch = e.b as u8;
+
+            if scancode == SCAN_ENTER {
+                run_line(&mut shell, &mut term, &input);
+                input.clear();
+                dirty = true;
+            } else if scancode == SCAN_BACKSPACE {
+                if input.pop().is_some() {
+                    dirty = true;
+                }
+            } else if ch >= 0x20 && ch < 0x7f && input.len() < MAX_INPUT {
+                input.push(ch as char);
+                dirty = true;
+            }
+        }
+
+        if dirty {
+            refresh_terminal(&mut ui, &shell, &term, &input, &line_ids);
+            ui.draw(&mut win);
+            let _ = win.flip();
+        }
     }
 }

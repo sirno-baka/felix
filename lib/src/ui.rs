@@ -263,6 +263,8 @@ pub struct TextInput {
     dirty: bool,
     focused: bool,
     max_len: usize,
+    /// Set when Enter is pressed while focused; consumed by `take_submit`.
+    pending_submit: bool,
 }
 
 impl TextInput {
@@ -276,6 +278,7 @@ impl TextInput {
             dirty: true,
             focused: false,
             max_len: 64,
+            pending_submit: false,
         }
     }
 
@@ -293,6 +296,13 @@ impl TextInput {
             self.text = String::from(s);
             self.dirty = true;
         }
+    }
+
+    /// Returns true and clears the flag if Enter was pressed since last call.
+    pub fn take_submit(&mut self) -> bool {
+        let v = self.pending_submit;
+        self.pending_submit = false;
+        v
     }
 
     fn contains(&self, x: i32, y: i32) -> bool {
@@ -331,7 +341,7 @@ impl TextInput {
                     return true;
                 }
                 if scancode == SCAN_ENTER {
-                    // consume Enter; app can poll text
+                    self.pending_submit = true;
                     return true;
                 }
                 if ch >= 0x20 && ch < 0x7f && self.text.len() < self.max_len {
@@ -555,6 +565,15 @@ impl Ui {
     pub fn set_label(&mut self, id: WidgetId, s: &str) {
         if let Some(l) = self.label_mut(id) {
             l.set_text(s);
+        }
+    }
+
+    /// True if the given TextInput received Enter since last check (clears the flag).
+    pub fn take_submit(&mut self, id: WidgetId) -> bool {
+        if let Some(t) = self.text_input_mut(id) {
+            t.take_submit()
+        } else {
+            false
         }
     }
 
