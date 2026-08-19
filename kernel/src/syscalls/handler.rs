@@ -366,6 +366,25 @@ fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) -> u
                 Some(FileDescriptor::Socket { .. }) => return 0,
                 Some(FileDescriptor::ConsoleOut) => return 0,
                 None => return 0,
+                Some(FileDescriptor::Device { inode, offset, mode }) => {
+                    if mode == FileMode::WriteOnly { return 0; }
+
+                    let mut temp = alloc::vec![0u8; count];
+                    // VFS сам разберется, что это DevFS, и вызовет read_from_block_device или CharDevice::read
+                    let bytes = VFS.get().read_at(inode, offset, &mut temp);
+
+                    if bytes > 0 {
+                        core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr, bytes);
+
+                        // Обновляем offset в таблице дескрипторов
+                        if let Some(FileDescriptor::Device { offset: ref mut off, .. }) =
+                            current.fd_table.get_mut(fd)
+                        {
+                            *off += bytes as u64;
+                        }
+                    }
+                    return bytes;
+                }
             }
         }
     }
@@ -459,6 +478,24 @@ fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usize) -
                     return pipe::pipe_write(pipe_id, buf_ptr, count);
                 }
                 Some(FileDescriptor::Socket { .. }) => return 0,
+                Some(FileDescriptor::Device { inode, offset, mode }) => {
+                    if mode == FileMode::ReadOnly { return 0; }
+
+                    let mut temp = alloc::vec![0u8; count];
+                    core::ptr::copy_nonoverlapping(buf_ptr, temp.as_mut_ptr(), count);
+
+                    // VFS маршрутизирует в DevFS -> write_to_block_device (Read-Modify-Write)
+                    let bytes = VFS.get().write_at(inode, offset, &temp);
+
+                    if bytes > 0 {
+                        if let Some(FileDescriptor::Device { offset: ref mut off, .. }) =
+                            current.fd_table.get_mut(fd)
+                        {
+                            *off += bytes as u64;
+                        }
+                    }
+                    return bytes;
+                }
                 None => {
                     // legacy: fd 1 without table entry
                     if fd == 1 || fd == 2 {
@@ -586,7 +623,7 @@ fn sys_unlink(path_ptr: *const u8) -> usize {
 /// Читает содержимое директории и записывает имена файлов
 /// (разделённые '\n') в пользовательский буфер.
 /// Возвращает количество записанных байт или 0 при ошибке.
-pub fn sys_ls(path_ptr: *const u8, buf_ptr: *mut u8, buf_size: usize) -> usize {
+fn sys_ls(path_ptr: *const u8, buf_ptr: *mut u8, buf_size: usize) -> usize {
     let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("/") };
     let path = if path.is_empty() { "/" } else { path };
 

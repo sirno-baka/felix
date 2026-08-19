@@ -7,6 +7,7 @@ pub const RAMDISK_SIZE: usize = 5 * 1024 * 1024; // 5MB
 pub const RAMFS_LBA: u64 = 2114;
 pub const RAMFS_TARGET: u32 = 0x0060_0000;
 
+#[derive(Clone, Copy)]
 pub struct RamDisk {
     ptr: *mut u8,
     size: usize,

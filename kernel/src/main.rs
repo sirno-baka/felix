@@ -29,6 +29,7 @@ mod disk;
 mod net;
 mod signal;
 mod pipe;
+mod device;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -58,6 +59,7 @@ use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::drivers::net::i8255x::SCB_STATUS;
 use crate::drivers::pic::wait;
 use crate::filesystem::{Filesystem, VFS};
+use crate::filesystem::devfs::DevFS;
 use crate::filesystem::vfs::Vfs;
 use crate::io::{inb, outb};
 use crate::pci::floppy::disk::Floppy;
@@ -245,11 +247,14 @@ pub extern "C" fn higher_half_entry() -> ! {
         //     Err(e) => { print!("err: {:02x?}", e);}
         // };
         // Буфер достаточного размера
-        let mut rd = RamDisk::new();
+        let devfs = Box::new(DevFS::new());
+
+        let rd = RamDisk::new();
         let disk = Arc::new(spin::Mutex::new(rd));
+        devfs.register_block("ramdisk", Box::new(rd));
         let mut ext2 = Ext2::new(disk.clone(), None);
         ext2.mount(None);
-
+        VFS.get().mount("/dev", devfs);
         VFS.get().set_root(Box::new(ext2));
 
         println!("[VFS] Virtual filesystem initialized");

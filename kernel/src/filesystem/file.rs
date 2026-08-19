@@ -31,6 +31,11 @@ pub enum FileDescriptor {
         pipe_id: usize,
         end: PipeEnd,
     },
+    Device {
+        inode: u32,
+        offset: u64,
+        mode: FileMode,
+    },
 }
 
 impl FileDescriptor {

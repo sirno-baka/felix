@@ -294,7 +294,7 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
     let name = cmd.args[0].as_str();
     match name {
         "help" | "exit" | "quit" | "pwd" | "cd" | "ls" | "cat" | "mkdir" | "rmdir" | "rm"
-        | "path" | "ps" | "clear" => {}
+        | "path" | "ps" | "clear" | "echo" => {}
         _ => return false,
     }
 
@@ -320,6 +320,27 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
                 }
             }
         }
+
+        "echo" => {
+            let mut msg = String::new();
+            for (i, arg) in cmd.args.iter().enumerate().skip(1) {
+                if i > 1 {
+                    msg.push(' ');
+                }
+                msg.push_str(arg);
+            }
+
+            if file_fd >= 0 {
+                msg.push('\n');
+                unsafe {
+                    write(file_fd as u32, msg.as_bytes().as_ptr(), msg.len());
+                    close(file_fd as u32);
+                }
+            } else {
+                out.push(&msg);
+            }
+        }
+        
         "exit" | "quit" => {
             out.push("Goodbye.");
         }
