@@ -34,7 +34,7 @@ impl DevFS {
         }
     }
 
-    pub fn register_block(&self, name: &str, dev: Box<dyn BlockDevice>) -> u32 {
+    pub fn register_block(&self, name: &str, dev: Mutex<Box<dyn BlockDevice>>) -> u32 {
         let mut devices = self.devices.lock();
         let mut next_inode = self.next_inode.lock();
         let inode = *next_inode;
@@ -43,7 +43,7 @@ impl DevFS {
         devices.push(DeviceNode {
             name: name.into(),
             inode,
-            dev_type: DeviceType::Block(Mutex::new(dev)),
+            dev_type: DeviceType::Block(dev),
         });
         inode
     }
@@ -105,7 +105,7 @@ impl Filesystem for DevFS {
             // 2 = S_IFCHR (символьное), 3 = S_IFBLK (блочное)
             file_type: match d.dev_type {
                 DeviceType::Block(_) => 3,
-                DeviceType::Char(_) => 2,
+                DeviceType::Char(_) => 4,
             },
             size: 0,
         }).collect())

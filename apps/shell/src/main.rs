@@ -6,6 +6,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::cmp::{max, min};
 use libfelix::prelude::*;
 use libfelix::syscall::{
     self, write, read, open, close, mkdir, rmdir, unlink, execve, wait, pipe, O_RDONLY, O_WRONLY,
@@ -294,7 +295,7 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
     let name = cmd.args[0].as_str();
     match name {
         "help" | "exit" | "quit" | "pwd" | "cd" | "ls" | "cat" | "mkdir" | "rmdir" | "rm"
-        | "path" | "ps" | "clear" | "echo" => {}
+        | "path" | "ps" | "clear" | "echo" | "head" => {}
         _ => return false,
     }
 
@@ -340,7 +341,7 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
                 out.push(&msg);
             }
         }
-        
+
         "exit" | "quit" => {
             out.push("Goodbye.");
         }
@@ -387,6 +388,19 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
         "cat" => {
             if let Some(file) = cmd.args.get(1) {
                 cat_to(&shell.resolve(file), file_fd, out);
+            } else {
+                out.push("Usage: cat <file>");
+            }
+            if file_fd >= 0 {
+                unsafe {
+                    close(file_fd as u32);
+                }
+            }
+        }
+
+        "head" => {
+            if let Some(file) = cmd.args.get(1) {
+                head_to(&shell.resolve(file), file_fd, 20, out);
             } else {
                 out.push("Usage: cat <file>");
             }
@@ -505,6 +519,40 @@ fn ls_to(path: &str, file_fd: i32, out: &mut TermBuffer) {
                 out.push(entry);
             }
         }
+    }
+}
+
+fn head_to(filename: &str, file_fd: i32, count: u32, out: &mut TermBuffer) {
+    let mut path = String::from(filename);
+    path.push('\0');
+
+    let fd = unsafe { open(path.as_ptr() as *const u8, O_RDONLY) };
+    if fd == usize::MAX {
+        out.push(&format!("File not found: {}", filename));
+        return;
+    }
+    let mut remain = count as usize;
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = unsafe { read(fd as u32, buf.as_mut_ptr(), min(remain as usize, 4096)) };
+
+        if file_fd >= 0 {
+            unsafe {
+                write(file_fd as u32, buf.as_ptr(), n);
+            }
+        } else if let Ok(s) = core::str::from_utf8(&buf[..n]) {
+            for line in s.split('\n') {
+                out.push(line);
+            }
+        }
+        remain = remain - n;
+        if remain == 0 {
+            break;
+        }
+    }
+
+    unsafe {
+        close(fd as u32);
     }
 }
 

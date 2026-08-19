@@ -52,6 +52,7 @@ use print::PRINTER;
 use filesystem::ext2::Ext2;
 
 use multitasking::task::TASK_MANAGER;
+use crate::device::char::{NullDevice, ZeroDevice};
 use crate::disk::interface::BlockDevice;
 use crate::disk::{copy_sectors, PartitionConfig};
 use crate::disk::ramdisk::RamDisk;
@@ -251,9 +252,19 @@ pub extern "C" fn higher_half_entry() -> ! {
 
         let rd = RamDisk::new();
         let disk = Arc::new(spin::Mutex::new(rd));
-        devfs.register_block("ramdisk", Box::new(rd));
+        devfs.register_block("ramdisk", Mutex::new(Box::new(rd)));
+        devfs.register_char("null", Box::new(NullDevice));
+        devfs.register_char("zero", Box::new(ZeroDevice));
+
         let mut ext2 = Ext2::new(disk.clone(), None);
         ext2.mount(None);
+
+        let first = IDE.lock().get_device(0).unwrap();
+        let mut ext2d = Ext2::new(Arc::new(spin::Mutex::new(first.clone())), None);
+        ext2d.mount(None);
+        devfs.register_block("sda", Mutex::new(Box::new(first)));
+
+        VFS.get().mount("/mnt", Box::new(ext2d));
         VFS.get().mount("/dev", devfs);
         VFS.get().set_root(Box::new(ext2));
 

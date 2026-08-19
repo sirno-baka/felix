@@ -58,12 +58,14 @@ impl IDEController {
 	/// Actually return a reference to the device and should be clone afterward
 	/// However if the reference is never needed this function will probably
 	/// be change to return a clone of the device instead
-	pub fn get_device(&self, num: u8) -> Option<Arc<spin::Mutex<IDEDevice>>> {
+	pub fn get_device(&self, num: u8) -> Option<IDEDevice> {
 		if num > 3 || self.devices[num as usize].reserved == 0 {
 			return None;
 		}
-		Some(Arc::new(spin::Mutex::new(self.devices[num as usize].clone())))
+		Some(self.devices[num as usize].clone())
 	}
+
+
 
 	pub unsafe fn initialize(
 		&mut self,

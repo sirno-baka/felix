@@ -26,14 +26,16 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use embedded_graphics_unicodefonts::mono_9x18_atlas;
+
 use embedded_graphics::{
-    mono_font::{ascii::FONT_9X15, MonoTextStyle},
+    mono_font::{MonoTextStyle},
     pixelcolor::Rgb888,
     prelude::*,
     primitives::{PrimitiveStyle, Rectangle, RoundedRectangle},
     text::{Baseline, Text},
 };
-
+use crate::println;
 use crate::wm::{
     mouse, Window, TITLE_H, WmEvent, EV_KEY_DOWN, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_MOVE,
     EV_MOUSE_UP,
@@ -175,8 +177,8 @@ impl Button {
         let _ = rr
             .into_styled(PrimitiveStyle::with_stroke(BTN_BORDER, 1))
             .draw(win);
-
-        let style = MonoTextStyle::new(&FONT_9X15, TEXT);
+        let binding = mono_9x18_atlas();
+        let style = MonoTextStyle::new(&binding, TEXT);
         let tw = (self.label.len() as i32) * 9;
         let tx = self.x + (self.w as i32 - tw) / 2;
         let ty = self.y + (self.h as i32 - 15) / 2;
@@ -238,8 +240,9 @@ impl Label {
         let _ = Rectangle::new(Point::new(self.x, self.y), Size::new(self.clear_w, 16))
             .into_styled(PrimitiveStyle::with_fill(BG))
             .draw(win);
+        let binding = mono_9x18_atlas();
 
-        let style = MonoTextStyle::new(&FONT_9X15, self.fg);
+        let style = MonoTextStyle::new(&binding, self.fg);
         let _ = Text::with_baseline(
             self.text.as_str(),
             Point::new(self.x, self.y),
@@ -372,8 +375,8 @@ impl TextInput {
         let _ = rect
             .into_styled(PrimitiveStyle::with_stroke(border, 1))
             .draw(win);
-
-        let style = MonoTextStyle::new(&FONT_9X15, TEXT);
+        let binding = mono_9x18_atlas();
+        let style = MonoTextStyle::new(&binding, TEXT);
         let ty = self.y + (self.h as i32 - 15) / 2;
         let mut shown = self.text.as_str();
         // crude clip by pixel width

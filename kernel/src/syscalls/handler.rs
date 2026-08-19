@@ -317,14 +317,17 @@ fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize {
         // try list won't work; keep 0 (write_at extends)
         offset = 0;
     }
+    let fs_id = (inode >> 24) as u8;
+    let is_device = fs_id != 0; // fs_id > 0 значит это точка монтирования (DevFS и т.д.)
 
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
             if let Some(fd) = current.fd_table.alloc_fd() {
-                let mut desc = FileDescriptor::new_file(inode, mode);
-                if let FileDescriptor::File { offset: ref mut off, .. } = desc {
-                    *off = offset;
-                }
+                let desc = if is_device {
+                    FileDescriptor::Device { inode, offset, mode }
+                } else {
+                    FileDescriptor::File { inode, offset, mode }
+                };
                 current.fd_table.insert(fd, desc);
                 return fd;
             }
