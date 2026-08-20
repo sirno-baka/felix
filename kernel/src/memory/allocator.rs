@@ -20,8 +20,11 @@ pub struct Allocator {
 }
 
 impl Allocator {
-    const HEAP_START: usize = 0xC140_0000;
-    const HEAP_END:   usize = 0xC200_0000;  // ~12 MiB heap
+    // Boot stack: ESP=0xC1600000 grows DOWN to ~0xC1200000.
+    // Leave a 2 MiB guard between stack top and heap so a deep call or
+    // interrupt frame cannot smash the first heap objects.
+    const HEAP_START: usize = 0xC180_0000;
+    const HEAP_END:   usize = 0xC200_0000;
 
     const HEADER_SIZE: usize = core::mem::size_of::<FreeBlock>();
     const HEADER_ALIGN: usize = core::mem::align_of::<FreeBlock>();
@@ -70,14 +73,36 @@ impl Allocator {
 
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let _guard: SpinMutexGuard<()> = self.lock.lock();
+        // MUST cli for the whole critical section. Timer IRQ runs smoltcp which
+        // allocates; without cli that re-enters the free-list and either deadlocks
+        // on SpinMutex or corrupts VecDeque metadata.
+        interrupt_sync::without_interrupts(|| {
+            let _guard: SpinMutexGuard<()> = self.lock.lock();
+            self.alloc_inner(layout)
+        })
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if ptr.is_null() {
+            return;
+        }
+        interrupt_sync::without_interrupts(|| {
+            let _guard: SpinMutexGuard<()> = self.lock.lock();
+            let layout = Self::adjust_layout(layout);
+            self.add_free_block(ptr, layout.size());
+        })
+    }
+}
+
+impl Allocator {
+    unsafe fn alloc_inner(&self, layout: Layout) -> *mut u8 {
         let layout = Self::adjust_layout(layout);
         let size = layout.size();
         let align = layout.align();
 
-        // 1. Ищем в free list
+        // 1. Free list (under lock + cli — plain linked list, no CAS races)
         let mut prev: *mut FreeBlock = null_mut();
-        let mut current = self.free_list.load(Ordering::Acquire);
+        let mut current = self.free_list.load(Ordering::Relaxed);
 
         while !current.is_null() {
             let block_size = (*current).size;
@@ -85,79 +110,32 @@ unsafe impl GlobalAlloc for Allocator {
 
             if block_size >= size && (block_ptr as usize) % align == 0 {
                 let next_block = (*current).next;
-
                 if prev.is_null() {
-                    match self.free_list.compare_exchange(
-                        current,
-                        next_block,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed
-                    ) {
-                        Ok(_) => {
-                            let remaining = block_size - size;
-                            if remaining > Self::HEADER_SIZE * 2 {
-                                let remainder_ptr = block_ptr.add(size);
-                                self.add_free_block(remainder_ptr, remaining);
-                            }
-                            return block_ptr;
-                        }
-                        Err(_) => {
-                            current = self.free_list.load(Ordering::Acquire);
-                            prev = null_mut();
-                            continue;
-                        }
-                    }
+                    self.free_list.store(next_block, Ordering::Relaxed);
                 } else {
-                    if (*prev).next == current {
-                        (*prev).next = next_block;
-                        let remaining = block_size - size;
-                        if remaining > Self::HEADER_SIZE * 2 {
-                            let remainder_ptr = block_ptr.add(size);
-                            self.add_free_block(remainder_ptr, remaining);
-                        }
-                        return block_ptr;
-                    } else {
-                        current = self.free_list.load(Ordering::Acquire);
-                        prev = null_mut();
-                        continue;
-                    }
+                    (*prev).next = next_block;
                 }
+                let remaining = block_size - size;
+                if remaining > Self::HEADER_SIZE * 2 {
+                    let remainder_ptr = block_ptr.add(size);
+                    self.add_free_block(remainder_ptr, remaining);
+                }
+                return block_ptr;
             }
 
             prev = current;
             current = (*current).next;
         }
 
-        // 2. Bump allocation
-        let mut current_bump = self.bump_next.load(Ordering::Acquire);
-        loop {
-            let aligned = Self::align_up(current_bump, align);
-            let new_next = aligned + size;
-
-            if new_next > Self::HEAP_END {
-                return null_mut();
-            }
-
-            match self.bump_next.compare_exchange(
-                current_bump,
-                new_next,
-                Ordering::AcqRel,
-                Ordering::Relaxed
-            ) {
-                Ok(_) => return aligned as *mut u8,
-                Err(val) => current_bump = val,
-            }
+        // 2. Bump
+        let current_bump = self.bump_next.load(Ordering::Relaxed);
+        let aligned = Self::align_up(current_bump, align);
+        let new_next = aligned + size;
+        if new_next > Self::HEAP_END {
+            return null_mut();
         }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if ptr.is_null() {
-            return;
-        }
-        let _guard: SpinMutexGuard<()> = self.lock.lock();
-        let layout = Self::adjust_layout(layout);
-        let size = layout.size();
-        self.add_free_block(ptr, size);
+        self.bump_next.store(new_next, Ordering::Relaxed);
+        aligned as *mut u8
     }
 }
 

@@ -25,8 +25,7 @@ impl ATAPI {
 			Some(x) => x,
 			None => return Err(0x1)
 		};
-		let bind = binding.lock();
-		let mut channel = bind.borrow_mut();
+		let mut channel = binding.lock();
 		let slavebit: u32 = device.drive as u32;
 		let bus: u32 = channel.base as u32;
 		let mut buffer: [u32; 2] = [0; 2];
@@ -110,8 +109,7 @@ impl ATAPI {
 			Some(x) => x,
 			None => return Err(0x1)
 		};
-		let bind = binding.lock();
-		let mut channel = bind.borrow_mut();
+		let mut channel = binding.lock();
 		let slavebit: u32 = device.drive as u32;
 		let bus: u32 = channel.base as u32;
 		// Sector Size
@@ -195,8 +193,7 @@ impl ATAPI {
 			Some(x) => x,
 			None => return Err(0x1)
 		};
-		let bind = binding.lock();
-		let mut channel = bind.borrow_mut();
+		let mut channel = binding.lock();
 		let slavebit: u32 = device.drive as u32;
 		let bus: u32 = channel.base as u32;
 

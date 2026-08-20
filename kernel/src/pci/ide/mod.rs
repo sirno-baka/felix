@@ -3,10 +3,9 @@ use core::ffi::CStr;
 use core::mem::size_of;
 
 use crate::{println, spin};
-use crate::spin::{KMutex, Mutex};
+use crate::spin::KMutex;
 use crate::time::sleep;
 use crate::utils::arcm::Arcm;
-use core::cell::RefCell;
 
 pub mod ata;
 pub mod atapi;
@@ -28,8 +27,9 @@ pub use device::IDEDevice;
 use crate::io::{inb, outb};
 
 static IDE_IRQ_INVOKED: KMutex<u8> = KMutex::<u8>::new(0);
-pub static IDE: Mutex<IDEController> =
-	Mutex::<IDEController>::new(IDEController::new());
+/// KMutex (cli) — timer must not preempt mid-PIO or the lock is held across tasks forever.
+pub static IDE: KMutex<IDEController> =
+	KMutex::<IDEController>::new(IDEController::new());
 
 pub enum IDEType {
 	ATA   = 0x00,
@@ -94,19 +94,17 @@ impl IDEController {
 			0
 		);
 		// println!("channels");
-		let mut channels: [Arcm<RefCell<IDEChannelRegisters>>; 2] = [
-			Arcm::new(RefCell::new(primary)),
-			Arcm::new(RefCell::new(secondary))
+		let channels: [Arcm<IDEChannelRegisters>; 2] = [
+			Arcm::new(primary),
+			Arcm::new(secondary)
 		];
-		// 2- Disable IRQs
-		primary
-			.write(ATAReg::CONTROL, 2);
+		// 2- Disable IRQs (must go through Arcm — IDEChannelRegisters is Copy)
+		channels[0].lock().write(ATAReg::CONTROL, 2);
 		sleep(5);
-		secondary
-			.write(ATAReg::CONTROL, 2);
+		channels[1].lock().write(ATAReg::CONTROL, 2);
 		sleep(5);
-		channels[0].lock().borrow_mut().software_reset();
-		channels[1].lock().borrow_mut().software_reset();
+		channels[0].lock().software_reset();
+		channels[1].lock().software_reset();
 		sleep(5);
 		let mut count: usize = 0;
 		// 3- Detect ATA-ATAPI Devices
@@ -118,20 +116,18 @@ impl IDEController {
 				// (I) Select Drive
 				channels[i]
 					.lock()
-					.borrow_mut()
 					.write(ATAReg::HDDEVSEL, 0xa0 | (j << 4));
 				sleep(5);
 
 				// (II) Send ATA Identify Command
 				channels[i]
 					.lock()
-					.borrow_mut()
 					.write(ATAReg::COMMAND, ATACommand::Identify as u8);
 				sleep(5);
 
 				// (III) Polling
 				// If Status = 0, No Device
-				let status = channels[i].lock().borrow_mut().read(ATAReg::STATUS);
+				let status = channels[i].lock().read(ATAReg::STATUS);
 				if status == 0x00 || status == 0xFF {
 					continue; // нет устройства
 				}
@@ -139,7 +135,7 @@ impl IDEController {
 
 				loop {
 					let status: u8 =
-						channels[i].lock().borrow_mut().read(ATAReg::STATUS);
+						channels[i].lock().read(ATAReg::STATUS);
 					if (status & ATAStatus::ERR) != 0 {
 						err = 1;
 						break;
@@ -154,9 +150,9 @@ impl IDEController {
 				// (IV) Probe for ATAPI Devices
 				if err != 0 {
 					let cl: u8 =
-						channels[i].lock().borrow_mut().read(ATAReg::LBA1);
+						channels[i].lock().read(ATAReg::LBA1);
 					let ch: u8 =
-						channels[i].lock().borrow_mut().read(ATAReg::LBA2);
+						channels[i].lock().read(ATAReg::LBA2);
 
 					if cl == 0x14 && ch == 0xeb {
 						r#type = IDEType::ATAPI as u8;
@@ -167,7 +163,7 @@ impl IDEController {
 						continue;
 					}
 
-					channels[i].lock().borrow_mut().write(
+					channels[i].lock().write(
 						ATAReg::COMMAND,
 						ATACommand::IdentifyPacket as u8
 					);
@@ -175,7 +171,7 @@ impl IDEController {
 				}
 
 				// (V) Read Identification Space of the Device
-				channels[i].lock().borrow_mut().read_buffer(
+				channels[i].lock().read_buffer(
 					ATAReg::DATA,
 					unsafe { ide_buf.align_to_mut::<u32>().1 },
 					128

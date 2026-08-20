@@ -5,6 +5,7 @@
 #![feature(unsize)]
 #![feature(coerce_unsized)]
 #![feature(inline_const)]
+#![allow(warnings)]
 extern crate alloc;
 
 mod drivers;
@@ -80,8 +81,10 @@ pub const KERNEL_PHYS: u32 = 0x0100_0000;
 pub const KERNEL_OFFSET: u32 = 0xC000_0000;
 pub const KERNEL_START: u32 = KERNEL_PHYS + KERNEL_OFFSET; // 0xC100_0000
 pub const KERNEL_SIZE: u32  = 0x0010_0000;
-pub const STACK_SIZE: u32   = 0x0010_0000;  // 4 МБ стека
-pub const STACK_START: u32  = KERNEL_START + KERNEL_SIZE + STACK_SIZE; // ≈ 0xC160_0000
+pub const STACK_SIZE: u32   = 0x0040_0000;  // 4 МБ стека: 0xC1200000..0xC1600000
+pub const STACK_START: u32  = 0xC160_0000;
+// Heap is 0xC1600000..0xC2000000 (allocator.rs). Frames from phys 0x02000000.
+pub const HEAP_END_VIRT: u32 = 0xC200_0000;
 
 #[macro_export]
 macro_rules! run {
@@ -191,7 +194,7 @@ pub extern "C" fn higher_half_entry() -> ! {
         // 2. Full paging (replaces the temporary PD with the proper one)
         {
             let mut pm = PAGING.lock();
-            pm.init(STACK_START);
+            pm.init(HEAP_END_VIRT);
 
             crate::memory::paging::KERNEL_END_PAGE = pm.next_free_page;
             crate::memory::paging::KERNEL_PD_PHYS = pm.dir_phys();
@@ -229,12 +232,13 @@ pub extern "C" fn higher_half_entry() -> ! {
         crate::drivers::wm::init();
         // 4. PIC
         PICS.init();
-
+        // Use nesting cli so KMutex unlock cannot sti mid-boot.
+        crate::wrappers::_cli();
         // 5. Keyboard buffer + PS/2 mouse (after PIC, still IF=0)
         *KEYBOARD_BUFFER.lock() = Some(Queue::new());
         crate::drivers::mouse::init();
 
-        // IDE init
+        // IDE init (holds KMutex — must not enable IF on unlock)
         IDE.lock().initialize().expect("Cannot read from disks");
 
         // let first = IDE.lock().get_device(0).unwrap();
@@ -259,12 +263,12 @@ pub extern "C" fn higher_half_entry() -> ! {
         let mut ext2 = Ext2::new(disk.clone(), None);
         ext2.mount(None);
 
-        let first = IDE.lock().get_device(0).unwrap();
-        let mut ext2d = Ext2::new(Arc::new(spin::Mutex::new(first.clone())), None);
-        ext2d.mount(None);
-        devfs.register_block("sda", Mutex::new(Box::new(first)));
+        // let first = IDE.lock().get_device(0).unwrap();
+        // let mut ext2d = Ext2::new(Arc::new(spin::Mutex::new(first.clone())), None);
+        // ext2d.mount(None);
+        // devfs.register_block("sda", Mutex::new(Box::new(first)));
 
-        VFS.get().mount("/mnt", Box::new(ext2d));
+        // VFS.get().mount("/mnt", Box::new(ext2d));
         VFS.get().mount("/dev", devfs);
         VFS.get().set_root(Box::new(ext2));
 
@@ -281,8 +285,8 @@ pub extern "C" fn higher_half_entry() -> ! {
         // First IRQ0 does first_switch → abandons this boot context forever.
         // If that fires mid-execve, the system hangs intermittently.
         // ---------------------------------------------------------------
-        // Keep cli for the entire critical section (PIC already masks all IRQs).
-        asm!("cli");
+        // Keep nested cli for the entire critical section.
+        crate::wrappers::_cli();
 
         let data = VFS.get().read_file("/shell").unwrap();
         let shell_argv = [b"/shell\0".to_vec()];

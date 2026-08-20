@@ -4,12 +4,13 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::u32::MAX;
 use crate::filesystem::file::FileDescriptorTable;
-use crate::memory::paging::{PageDirectory, PDEFlags, copy_kernel_mappings, PhysAddr, VirtAddr, KERNEL_OFFSET};
+use crate::memory::paging::{PageDirectory, PDEFlags, copy_kernel_mappings, PhysAddr, VirtAddr, KERNEL_OFFSET, alloc_kernel_stack, alloc_task_page_dir};
 use crate::{gdt, init_network_stack, print, println};
 use crate::drivers::pic::wait;
 
-pub const STACK_SIZE: usize = 32 * 1024;
-pub const HEADROOM: usize = 16 * 1024;
+pub const STACK_SIZE: usize = 64 * 1024;
+/// Space above the saved CPUState for the hardware interrupt frame (~few dozen bytes).
+pub const HEADROOM: usize = 256;
 const MAX_TASKS: i8 = 8;
 
 /// Отслеживает сколько выделений памяти используют каждую страницу.
@@ -54,24 +55,23 @@ impl PageRefcounts {
     }
 }
 
-//each task has a 4KiB stack containg the cpu state in the bottom part of it
+// Stack and PD live in allocated frames — NOT inline.
+// An inline 32KiB stack + 4KiB PD made Task ~37KiB; sys_execve from userspace
+// put that on the current task's 32KiB kernel stack and smashed WM BSS.
 #[derive(Clone)]
 pub struct Task {
-    pub stack: [u8; STACK_SIZE],
-    pub page_dir: PageDirectory,
+    pub stack_base: u32,              // virt, STACK_SIZE bytes
+    pub page_dir: *mut PageDirectory, // virt via phys_to_virt
+    pub page_dir_phys: u32,           // goes into CR3
     pub cpu_state_ptr: u32,
     pub running: bool,
     pub kernel_stack: u32,
     pub fd_table: FileDescriptorTable,
     pub heap_next: u32,
     pub page_refcounts: PageRefcounts,
-    /// Parent task slot (-1 = none / kernel)
     pub parent: i8,
-    /// Task has exited and waits to be reaped by wait()
     pub zombie: bool,
-    /// Exit status (valid when zombie == true)
     pub exit_code: i32,
-    /// Pending signals bitmask (bit N-1 = signal N). See `crate::signal`.
     pub pending_signals: u32,
 }
 
@@ -93,18 +93,24 @@ pub struct CPUState {
 }
 
 impl Task {
-    pub fn sleep(&mut self) {
-        self.running = false;
+    pub fn pd(&self) -> &PageDirectory {
+        unsafe { &*self.page_dir }
     }
 
-    pub fn wake(&mut self) {
-        self.running = true;
+    pub fn pd_mut(&mut self) -> &mut PageDirectory {
+        unsafe { &mut *self.page_dir }
     }
 
-    pub fn new_idle() -> Self {
+    pub unsafe fn switch_address_space(&self) {
+        asm!("mov cr3, {}", in(reg) self.page_dir_phys);
+    }
+
+    pub fn new() -> Self {
+        let (page_dir, page_dir_phys) = alloc_task_page_dir();
         Task {
-            stack: [0; STACK_SIZE],
-            page_dir: PageDirectory::new(),
+            stack_base: alloc_kernel_stack(STACK_SIZE),
+            page_dir,
+            page_dir_phys,
             cpu_state_ptr: 0,
             running: false,
             fd_table: FileDescriptorTable::new(),
@@ -118,60 +124,38 @@ impl Task {
         }
     }
 
-    pub fn new_task() -> Self {
-        Task {
-            stack: [0; STACK_SIZE],
-            page_dir: PageDirectory::new(),
-            cpu_state_ptr: 0,
-            running: false,
-            fd_table: FileDescriptorTable::new(),
-            kernel_stack: 0,
-            heap_next: 0,
-            page_refcounts: PageRefcounts::new(),
-            parent: -1,
-            zombie: false,
-            exit_code: 0,
-            pending_signals: 0,
-        }
-    }
-    // ====================== Task::init ======================
+    pub fn new_idle() -> Self { Self::new() }
+    pub fn new_task() -> Self { Self::new() }
+
+    pub fn sleep(&mut self) { self.running = false; }
+    pub fn wake(&mut self) { self.running = true; }
+
     pub fn init(&mut self, entry_point: u32, user_stack_top: u32, heap_start: u32) {
         self.running = true;
 
-        let kernel_stack_top = unsafe {
-            (&self.stack as *const u8).add(STACK_SIZE) as u32
-        };
+        let kernel_stack_top = self.stack_base + STACK_SIZE as u32;
         self.kernel_stack = kernel_stack_top;
 
-        let state_ptr = (kernel_stack_top as usize - HEADROOM - core::mem::size_of::<CPUState>()) as *mut CPUState;
+        let state_ptr = (kernel_stack_top as usize
+            - HEADROOM
+            - core::mem::size_of::<CPUState>()) as *mut CPUState;
         self.cpu_state_ptr = state_ptr as u32;
 
         unsafe {
-            let state = &mut *state_ptr;
-            *state = CPUState {
+            *state_ptr = CPUState {
                 eax: 0, ebx: 0, ecx: 0, edx: 0,
                 esi: 0, edi: 0, ebp: 0,
-                eip:    entry_point,
-                cs:     0x1B,
+                eip: entry_point,
+                cs: 0x1B,
                 eflags: 0x202,
-                esp:    user_stack_top,
-                ss:     0x23,
+                esp: user_stack_top,
+                ss: 0x23,
             };
         }
 
-        // let recursive_pde = self.page_dir.entries[1023];
-        // if (recursive_pde & PDEFlags::PRESENT) == 0 {
-        //     copy_kernel_mappings(&mut self.page_dir);
-        // }
-
         self.fd_table = FileDescriptorTable::new();
         self.heap_next = heap_start;
-
-        println!("[TASK::init] Task ready | entry={:#x} | user_stack={:#x} | kernel_stack={:#x} | cpu_state={:#x} | page_dir={:#x}",
-                 entry_point, user_stack_top, self.kernel_stack, self.cpu_state_ptr,
-                 &self.page_dir as *const PageDirectory as u32);
     }
-
 }
 
 pub struct TaskManager {
@@ -196,48 +180,44 @@ impl TaskManager {
     pub fn init(&mut self) {
         self.tasks[0] = Some(Task::new_idle());
         let task = self.tasks[0].as_mut().unwrap();
+        let pd_phys = task.page_dir_phys;
+        copy_kernel_mappings(task.pd_mut(), pd_phys);
 
-        // === НОВОЕ: инициализируем PageDirectory idle-задачи ===
-        let pd_virt = &task.page_dir as *const _ as u32;
-        let pd_phys = if pd_virt >= KERNEL_OFFSET {
-            pd_virt - KERNEL_OFFSET
-        } else {
-            pd_virt
-        };
-        copy_kernel_mappings(&mut task.page_dir, pd_phys);
-        let stack_top = unsafe {
-            (&task.stack as *const u8).add(STACK_SIZE) as u32
-        };
-
-        let state_ptr = (stack_top as usize - HEADROOM - core::mem::size_of::<CPUState>()) as *mut CPUState;
+        let stack_top = task.stack_base + STACK_SIZE as u32;
+        let state_ptr = (stack_top as usize
+            - HEADROOM
+            - core::mem::size_of::<CPUState>()) as *mut CPUState;
 
         unsafe {
-            let state = &mut *state_ptr;
-            *state = CPUState {
+            *state_ptr = CPUState {
                 eax: 0, ebx: 0, ecx: 0, edx: 0,
                 esi: 0, edi: 0, ebp: 0,
                 eip: idle as u32,
-                cs:     0x08,
+                cs: 0x08,
                 eflags: 0x202,
-                esp:    stack_top,
-                ss:     0x10,
+                esp: stack_top,
+                ss: 0x10,
             };
             task.cpu_state_ptr = state_ptr as u32;
             task.kernel_stack = stack_top;
             task.running = true;
-        }
+            task.parent = -1;
 
-        unsafe {
             gdt::TSS.esp0 = task.kernel_stack;
-            gdt::TSS.ss0  = 0x10;
+            gdt::TSS.ss0 = 0x10;
         }
 
         self.task_count = 1;
         self.current_task = 0;
         self.first_switch = true;
 
-        println!("[TASK] Idle task initialized | kernel_stack={:#x} | cpu_state={:#x} | pd_phys={:#x}",
-                 task.kernel_stack, task.cpu_state_ptr, pd_phys);
+        println!(
+            "[TASK] Idle | kstack={:#x} cpu_state={:#x} pd_phys={:#x} Task={}",
+            task.kernel_stack,
+            task.cpu_state_ptr,
+            task.page_dir_phys,
+            core::mem::size_of::<Task>(),
+        );
     }
 
     //add given task to next slot
@@ -279,7 +259,7 @@ impl TaskManager {
             let new_cpustate = task.cpu_state_ptr as *mut CPUState;
             unsafe {
                 gdt::TSS.esp0 = task.kernel_stack;
-                task.page_dir.switch();        // ← правильно: &self, без копирования
+                task.switch_address_space();
             }
             return new_cpustate;
         }
@@ -333,7 +313,7 @@ impl TaskManager {
             // let spd = (spn >> 10) as usize;              // 767
             // let spt = (spn & 0x3FF) as usize;            // 1023
             // println!("[SCHED] PDE[{}] (stack)={:#x}", spd, task.page_dir.entries[spd]);
-            task.page_dir.switch();            // ← главное исправление
+            task.switch_address_space();
         }
 
         new_cpustate
@@ -407,7 +387,7 @@ impl TaskManager {
         for i in 0..MAX_TASKS {
             if let Some(ref task) = self.tasks[i as usize] {
                 if task.running {
-                    println!("ID: {} | page_dir={:#x}", i, &task.page_dir as *const PageDirectory as u32);
+                    println!("ID: {} | pd_phys={:#x}", i, task.page_dir_phys);
                 }
             }
         }

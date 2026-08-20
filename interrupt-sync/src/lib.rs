@@ -46,19 +46,35 @@ unsafe impl<R: RawMutex> RawMutex for RawInterruptMutex<R> {
 
     const INIT: Self = RawInterruptMutex { inner: R::INIT };
 
+    /// cli for the whole hold, not just the spin. Previously without_interrupts()
+    /// only wrapped lock() so sti ran before the critical section — useless.
     #[inline(always)]
     fn lock(&self) {
-        without_interrupts(|| self.inner.lock());
+        unsafe {
+            asm!("cli", options(nomem, nostack));
+        }
+        self.inner.lock();
     }
 
     #[inline(always)]
     fn try_lock(&self) -> bool {
-        without_interrupts(|| self.inner.try_lock())
+        unsafe {
+            asm!("cli", options(nomem, nostack));
+        }
+        if self.inner.try_lock() {
+            true
+        } else {
+            unsafe {
+                asm!("sti", options(nomem, nostack));
+            }
+            false
+        }
     }
 
     #[inline(always)]
     unsafe fn unlock(&self) {
         self.inner.unlock();
+        asm!("sti", options(nomem, nostack));
     }
 }
 

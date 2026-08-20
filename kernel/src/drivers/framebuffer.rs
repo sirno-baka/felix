@@ -39,6 +39,38 @@ pub const FB_INFO_PHYS: u32 = 0x0000_5000;
 /// Виртуальный адрес, куда мы замапим LFB
 pub const FB_VIRT_BASE: u32 = 0xD000_0000;
 
+pub static mut LFB_PHYS: u32 = 0;
+pub static mut LFB_SIZE: u32 = 0;
+
+/// Map LFB as 4 MiB large pages — shared via copy_kernel_mappings, no fragile 4K PT.
+pub fn map_lfb_large(dir: &mut crate::memory::paging::PageDirectory) {
+    use crate::memory::paging::PDEFlags;
+    let phys = unsafe { LFB_PHYS };
+    let size = unsafe { LFB_SIZE };
+    if phys == 0 || size == 0 {
+        return;
+    }
+    let phys_al = phys & 0xFFC0_0000;
+    let extra = phys - phys_al;
+    let n = ((extra + size + 0x3F_FFFF) / 0x40_0000).max(1);
+    for i in 0..n {
+        dir.map_large(
+            FB_VIRT_BASE + i * 0x400000,
+            phys_al + i * 0x400000,
+            PDEFlags::new().present().writable().accessed().large_page(),
+        );
+    }
+}
+
+pub fn lfb_pde() -> u32 {
+    unsafe {
+        let pd = crate::memory::paging::phys_to_virt(
+            crate::memory::paging::KERNEL_PD_PHYS,
+        ) as *const [u32; 1024];
+        (*pd)[(FB_VIRT_BASE >> 22) as usize]
+    }
+}
+
 pub struct Framebuffer {
     pub info: FramebufferInfo,
     pub virt_base: u32,
@@ -69,73 +101,25 @@ impl Framebuffer {
 
         let bytes_per_line = info.pitch as u32;
         let height_u = info.height as u32;
-
-        // Реальный размер фреймбуфера
         let size = bytes_per_line * height_u;
-
-        // Учитываем возможное смещение физического адреса + запас
         let start_offset = info.address & 0xFFF;
-        let total_size = size + start_offset + 0x10000; // +64 KiB slack
-        let pages = ((total_size + 4095) / 4096).max(1);
+        let total_size = size + start_offset + 0x10000;
         let virt_base = FB_VIRT_BASE + start_offset;
-        println!("[FB] mapping {} pages (≈ {} KB)", pages, total_size / 1024);
+        println!("[FB] mapping LFB large pages (≈ {} KB)", total_size / 1024);
         unsafe {
+            LFB_PHYS = info.address;
+            LFB_SIZE = total_size;
             let mut paging = PAGING.lock();
-
-            for i in 0..pages {
-                let phys = (info.address & !0xFFF) + i * 4096;
-                let virt = FB_VIRT_BASE + i * 4096;
-
-                let vpage = virt >> 12;
-                let ppage = phys >> 12;
-
-                let pd_index = (vpage >> 10) as usize;
-
-                // 1. Убеждаемся, что page table существует
-                //    (выделяем фрейм для PT если нужно)
-                let need_table = {
-                    let pde = paging.dir.entries[pd_index];
-                    pde == 0 || (pde & 1) == 0   // PRESENT bit
-                };
-                if need_table {
-                    let pt_frame = paging.alloc_frame();          // номер фрейма
-                    let pt_phys  = pt_frame << 12;
-
-                    // 1. Ставим PDE
-                    paging.dir.entries[pd_index] = pt_phys | 0x3; // Present + Writable
-
-                    // 2. Обязательно сбрасываем TLB именно рекурсивного адреса новой таблицы
-                    let pt_recursive = 0xFFC00000u32 + (pd_index as u32) * 4096;
-                    crate::memory::paging::PageDirectory::flush_page(pt_recursive);
-
-                    // 3. Теперь рекурсивный указатель безопасен
-                    let pt_ptr = crate::memory::paging::PageDirectory::get_page_table_ptr(pd_index);
-                    unsafe {
-                        core::ptr::write_bytes(pt_ptr as *mut u8, 0, 4096);
-                    }
-                    PageDirectory::flush_page((pd_index as u32) << 22);
-                    PageDirectory::flush_page(pt_recursive);
-                }
-
-                // 2. Теперь page table точно есть → используем map_existing
-                paging.dir.map_existing(
-                    vpage,
-                    ppage,
-                    PTEFlags::new().present().writable(),
-                );
-
-            }
-
+            map_lfb_large(&mut paging.dir);
         }
         crate::memory::paging::PageDirectory::flush_all();
-        let height = info.height;
         println!(
-            "[FB] ready {}x{} {}bpp pitch={} virt={:#x} phys={:#x}",
-            width, height, bpp, pitch, virt_base, address
+            "[FB] ready {}x{} {}bpp pitch={} virt={:#x} phys={:#x} PDE={:#x}",
+            width, height, bpp, pitch, virt_base, address, lfb_pde()
         );
         Some(Framebuffer {
             info,
-            virt_base,          // уже с учётом offset
+            virt_base,
         })
     }
 

@@ -4,14 +4,13 @@ pub use super::channel::IDEChannelRegisters;
 use super::IDEType;
 use crate::println;
 use crate::utils::arcm::Arcm;
-use core::cell::RefCell;
 use core::ffi::CStr;
 use crate::disk::interface::BlockDevice;
 
 #[derive(Clone)]
 pub struct IDEDevice {
 	pub reserved:     u8, // 0 (Empty) or 1 (This Drive really exists)
-	pub channel:      Option<Arcm<RefCell<IDEChannelRegisters>>>,
+	pub channel:      Option<Arcm<IDEChannelRegisters>>,
 	pub drive:        u8,  // 0 (Master Drive) or 1 (Slave Drive)
 	pub r#type:       u16, // 0: ATA, 1:ATAPI
 	pub signature:    u16, // Drive Signature
@@ -48,8 +47,7 @@ impl IDEDevice {
 				return 23;
 			}
 		};
-		let bind = binding.lock();
-		let channel: &mut IDEChannelRegisters = &mut bind.borrow_mut();
+		let mut channel = binding.lock();
 		match err {
 			1 => {
 				println!("- Device Fault");

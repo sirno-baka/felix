@@ -42,11 +42,13 @@ impl<T: ?Sized, const INT: bool> RawMutex<T, INT> {
 	/// Once the value as been written the mutex is successfully locked.
 	/// If `const INT` as been set to `true`, interrupt flag is clear
 	fn obtain_lock(&self) {
-		// We must cli before obtaining lock otherwise we could lock and get
-		// interrupted right after it without cli
+		// cli via nesting counter so nested KMutex / boot cli stay consistent.
 		if INT == true {
 			crate::wrappers::_cli();
 		}
+		// Spin with interrupts left as-is by caller. If INT, we already cli'd.
+		// CRITICAL: never spin forever with IF=0 while another task holds the lock
+		// and cannot run — only valid on UP with IF=0 if the lock is free soon.
 		while self
 			.lock
 			.compare_exchange_weak(
@@ -126,6 +128,7 @@ impl<'a, T: ?Sized, const INT: bool> DerefMut for MutexGuard<'a, T, INT> {
 impl<'a, T: ?Sized, const INT: bool> Drop for MutexGuard<'a, T, INT> {
 	fn drop(&mut self) {
 		self.lock.store(false, Ordering::Release);
+		// Nesting _sti: only enables IF when outermost cli is released.
 		if INT == true {
 			crate::wrappers::_sti();
 		}

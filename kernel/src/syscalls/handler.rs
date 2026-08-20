@@ -120,7 +120,7 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                         while addr < end_page {
                             let need_map = task.page_refcounts.inc(addr);
                             if need_map {
-                                task.page_dir.alloc_and_map_user_page(addr);
+                                task.pd_mut().alloc_and_map_user_page(addr);
                             }
                             addr += page_size;
                         }
@@ -160,7 +160,7 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                         while addr < end_page {
                             let need_map = task.page_refcounts.inc(addr);
                             if need_map {
-                                task.page_dir.alloc_and_map_user_page(addr);
+                                task.pd_mut().alloc_and_map_user_page(addr);
                             }
                             addr += page_size;
                         }
@@ -190,7 +190,7 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                         while addr < old_end_page {
                             let should_unmap = task.page_refcounts.dec(addr);
                             if should_unmap {
-                                task.page_dir.unmap(addr);
+                                task.pd_mut().unmap(addr);
                             }
                             addr += page_size;
                         }
@@ -222,7 +222,7 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                         while addr < end_page {
                             let should_unmap = task.page_refcounts.dec(addr);
                             if should_unmap {
-                                task.page_dir.unmap(addr);
+                                task.pd_mut().unmap(addr);
                             }
                             addr += page_size;
                         }
@@ -920,30 +920,25 @@ pub fn sys_execve(
 
         let mut task = Task::new_task();
         let kernel_pd_phys = crate::memory::paging::KERNEL_PD_PHYS;
+        let pd_phys = task.page_dir_phys;
 
         // Kernel mappings в PD задачи
-        let pd_virt = &task.page_dir as *const PageDirectory as u32;
-        let pd_phys = if pd_virt >= crate::memory::paging::KERNEL_OFFSET {
-            pd_virt - crate::memory::paging::KERNEL_OFFSET
-        } else {
-            pd_virt
-        };
-        copy_kernel_mappings(&mut task.page_dir, pd_phys);
+        copy_kernel_mappings(task.pd_mut(), pd_phys);
 
         // User stack
         for i in 0..USER_STACK_PAGES {
             let page = USER_STACK_TOP - (i + 1) * PAGE_SIZE as u32;
-            task.page_dir.alloc_and_map_user_page(page);
+            task.pd_mut().alloc_and_map_user_page(page);
         }
         // Немного heap
         for i in 0..8u32 {
-            task.page_dir.alloc_and_map_user_page(heap_start + i * PAGE_SIZE as u32);
+            task.pd_mut().alloc_and_map_user_page(heap_start + i * PAGE_SIZE as u32);
         }
 
         // Переключаемся на PD задачи и грузим ELF по его p_vaddr
         // task.page_dir.switch();
 
-        let entry_point = match crate::elf::load_elf(buf, &mut task.page_dir) {
+        let entry_point = match crate::elf::load_elf(buf, task.pd_mut()) {
             Ok(e) => e,
             Err(e) => {
                 println!("[execve] ELF load failed: {:?}", e);
@@ -965,8 +960,8 @@ pub fn sys_execve(
         TASK_MANAGER.task_count += 1;
 
         if let Some(ref mut t) = TASK_MANAGER.tasks[slot] {
-            let kernel_stack_top = (t.stack.as_ptr() as usize
-                + crate::multitasking::task::STACK_SIZE) as u32;
+            let kernel_stack_top = t.stack_base
+                + crate::multitasking::task::STACK_SIZE as u32;
             t.kernel_stack = kernel_stack_top;
 
             let state_ptr = (kernel_stack_top as usize
@@ -976,7 +971,7 @@ pub fn sys_execve(
             t.cpu_state_ptr = state_ptr as u32;
 
             // argv on user stack (defaults to empty argc=0)
-            let user_esp = setup_user_argv(&t.page_dir, USER_STACK_TOP, argv);
+            let user_esp = setup_user_argv(t.pd(), USER_STACK_TOP, argv);
 
             *state_ptr = CPUState {
                 eax: 0, ebx: 0, ecx: 0, edx: 0,
@@ -988,13 +983,8 @@ pub fn sys_execve(
                 ss:     0x23,
             };
 
-            let pd_virt = &t.page_dir as *const _ as u32;
-            let pd_phys = if pd_virt >= crate::memory::paging::KERNEL_OFFSET {
-                pd_virt - crate::memory::paging::KERNEL_OFFSET
-            } else {
-                pd_virt
-            };
-            t.page_dir.entries[1023] = pd_phys
+            let pd_phys = t.page_dir_phys;
+            t.pd_mut().entries[1023] = pd_phys
                 | crate::memory::paging::PDEFlags::PRESENT
                 | crate::memory::paging::PDEFlags::WRITABLE;
 

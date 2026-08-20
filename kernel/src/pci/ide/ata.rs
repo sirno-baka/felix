@@ -112,8 +112,7 @@ impl ATA {
 			Some(x) => x,
 			None => return Err(0x1)
 		};
-		let bind = binding.lock();
-		let mut channel = bind.borrow_mut();
+		let mut channel = binding.lock();
 		let lba_mode: u8; // 0: CHS, 1: LBA28, 2: LBA48
 		let dma: u8; // 0: No DMA, 1: DMA
 		let mut lba_io: [u8; 6] = [0; 6];

@@ -566,6 +566,32 @@ fn draw_close_button(fb: &mut Framebuffer, w: &Window) {
 
 pub static WM: Mutex<Compositor> = Mutex::new(Compositor::empty());
 
+/// Run `f` under kernel CR3 so LFB large-page PDE is present.
+#[inline]
+fn with_lfb<R>(f: impl FnOnce() -> R) -> R {
+    unsafe {
+        let kpd = crate::memory::paging::KERNEL_PD_PHYS;
+        let mut old: u32;
+        core::arch::asm!("mov {}, cr3", out(reg) old);
+        if kpd != 0 && old != kpd {
+            // ensure LFB large PDE exists on kernel PD
+            let kdir = crate::memory::paging::phys_to_virt(kpd)
+                as *mut crate::memory::paging::PageDirectory;
+            let idx = (crate::drivers::framebuffer::FB_VIRT_BASE >> 22) as usize;
+            let pde = (*kdir).entries[idx];
+            if pde & 1 == 0 || (pde & (1 << 7)) == 0 {
+                crate::drivers::framebuffer::map_lfb_large(&mut *kdir);
+            }
+            core::arch::asm!("mov cr3, {}", in(reg) kpd);
+        }
+        let r = f();
+        if kpd != 0 && old != kpd {
+            core::arch::asm!("mov cr3, {}", in(reg) old);
+        }
+        r
+    }
+}
+
 /// After FB init: clear screen, mark ready. Windows are created by apps.
 pub fn init() {
     debugln!("[wm] init");
@@ -608,69 +634,76 @@ pub fn create_window(
     if w < 40 || h < TITLE_H + 8 {
         return None;
     }
-    let mut wm = WM.lock();
-    let slot = wm.slot_free()?;
-    let client_w = w;
-    let client_h = h.saturating_sub(TITLE_H);
-    let surface = Surface::new(client_w, client_h)?;
-    let id = wm.next_id;
-    wm.next_id = wm.next_id.wrapping_add(1).max(1);
-    let z = wm.next_z;
-    wm.next_z = wm.next_z.wrapping_add(1);
-
+    // Copy title under *current* (user) CR3 — user pages vanish after with_lfb.
     let mut title_buf = [0u8; 32];
     let tbytes = title.as_bytes();
     let n = tbytes.len().min(31);
     title_buf[..n].copy_from_slice(&tbytes[..n]);
 
-    // unfocus others
-    for win in wm.windows.iter_mut().flatten() {
-        win.focused = false;
-    }
+    with_lfb(|| {
+        let mut wm = WM.lock();
+        let slot = wm.slot_free()?;
+        let client_w = w;
+        let client_h = h.saturating_sub(TITLE_H);
+        let surface = Surface::new(client_w, client_h)?;
+        println!("surface: {:p}", &surface);
+        let id = wm.next_id;
+        wm.next_id = wm.next_id.wrapping_add(1).max(1);
+        let z = wm.next_z;
+        wm.next_z = wm.next_z.wrapping_add(1);
 
-    wm.windows[slot] = Some(Window {
-        id,
-        x,
-        y,
-        w,
-        h,
-        z,
-        focused: true,
-        visible: true,
-        dirty: true,
-        title: title_buf,
-        surface,
-        owner_slot,
-        events: EventQueue::new(),
-    });
-    wm.compose_dirty();
-    Some(id as u32)
+        for win in wm.windows.iter_mut().flatten() {
+            win.focused = false;
+        }
+
+        wm.windows[slot] = Some(Window {
+            id,
+            x,
+            y,
+            w,
+            h,
+            z,
+            focused: true,
+            visible: true,
+            dirty: true,
+            title: title_buf,
+            surface,
+            owner_slot,
+            events: EventQueue::new(),
+        });
+        wm.compose_dirty();
+        Some(id as u32)
+    })
 }
 
 pub fn destroy_window(id: u32) -> bool {
-    let mut wm = WM.lock();
-    let id = id as u8;
-    for slot in wm.windows.iter_mut() {
-        if slot.as_ref().map(|w| w.id) == Some(id) {
-            *slot = None;
-            wm.compose();
-            return true;
+    with_lfb(|| {
+        let mut wm = WM.lock();
+        let id = id as u8;
+        for slot in wm.windows.iter_mut() {
+            if slot.as_ref().map(|w| w.id) == Some(id) {
+                *slot = None;
+                wm.compose();
+                return true;
+            }
         }
-    }
-    false
+        false
+    })
 }
 
 pub fn move_window(id: u32, x: i32, y: i32) -> bool {
-    let mut wm = WM.lock();
-    if let Some(w) = wm.find_mut(id as u8) {
-        w.x = x;
-        w.y = y;
-        w.events = EventQueue::new(); // очистить stale events
-        wm.compose();
-        true
-    } else {
-        false
-    }
+    with_lfb(|| {
+        let mut wm = WM.lock();
+        if let Some(w) = wm.find_mut(id as u8) {
+            w.x = x;
+            w.y = y;
+            w.events = EventQueue::new();
+            wm.compose();
+            true
+        } else {
+            false
+        }
+    })
 }
 
 pub fn window_info(id: u32) -> Option<WindowInfo> {
@@ -684,6 +717,7 @@ pub fn window_info(id: u32) -> Option<WindowInfo> {
 /// User buffer is only valid under the *current* task CR3. A timer tick
 /// mid-copy would switch page directories and page-fault (e.g. CR2=0x40e000).
 pub fn flip(id: u32, user_pixels: *const u8, len: usize) -> bool {
+    // copy_from_user must run under user CR3; compose under kernel CR3.
     let mut wm = WM.lock();
     if let Some(w) = wm.find_mut(id as u8) {
         if !user_pixels.is_null() && len > 0 {
@@ -692,7 +726,10 @@ pub fn flip(id: u32, user_pixels: *const u8, len: usize) -> bool {
             });
         }
         w.dirty = true;
-        wm.compose_dirty();
+        drop(wm);
+        with_lfb(|| {
+            WM.lock().compose_dirty();
+        });
         true
     } else {
         false
@@ -700,23 +737,25 @@ pub fn flip(id: u32, user_pixels: *const u8, len: usize) -> bool {
 }
 
 pub fn focus_window(id: u32) -> bool {
-    let mut wm = WM.lock();
-    let id = id as u8;
-    if wm.find(id).is_none() {
-        return false;
-    }
-    let new_z = wm.next_z;
-    wm.next_z = wm.next_z.wrapping_add(1);
-    for w in wm.windows.iter_mut().flatten() {
-        let is_target = w.id == id;
-        w.focused = is_target;
-        if is_target {
-            w.z = new_z;
-            w.dirty = true;
+    with_lfb(|| {
+        let mut wm = WM.lock();
+        let id = id as u8;
+        if wm.find(id).is_none() {
+            return false;
         }
-    }
-    wm.compose_dirty();
-    true
+        let new_z = wm.next_z;
+        wm.next_z = wm.next_z.wrapping_add(1);
+        for w in wm.windows.iter_mut().flatten() {
+            let is_target = w.id == id;
+            w.focused = is_target;
+            if is_target {
+                w.z = new_z;
+                w.dirty = true;
+            }
+        }
+        wm.compose_dirty();
+        true
+    })
 }
 
 pub fn screen_size() -> (u32, u32) {

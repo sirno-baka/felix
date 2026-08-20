@@ -234,8 +234,7 @@ pub fn _print(args: fmt::Arguments) {
 
     // After VESA / WM: no VGA text, no kernel FB console — logs go to E9 only.
     // Userspace apps create windows and draw themselves.
-    if crate::drivers::wm::is_ready()
-        || crate::drivers::framebuffer::FRAMEBUFFER.lock().is_some()
+
     {
         let mut writer = E9Writer;
         let _ = writer.write_fmt(args);
