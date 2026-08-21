@@ -4,7 +4,6 @@
 use crate::drivers::pic::PICS;
 use core::arch::asm;
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
-use crate::signal::{self, SIGINT};
 use crate::println;
 
 // Warning! Mutable static here
@@ -127,23 +126,14 @@ pub extern "C" fn keyboard_handler() {
     let released = scancode & 0x80 != 0;
     let code = scancode & 0x7F;
 
-    // Ctrl+C (scancode 0x2E = 'c'):
-    // 1) try kernel SIGINT to foreground (legacy blocking wait)
-    // 2) ALWAYS deliver ETX (0x03) to the focused WM window so userspace
-    //    shells can do kill() themselves without blocking the UI.
+    // Ctrl+C → ETX to focused window (shell kills its own children).
     if code == 0x2e && unsafe { KEYBOARD.ctrl } && !released {
-        let _ = signal::signal_foreground(SIGINT);
-
-        // Console buffer (text-mode / non-WM readers)
         match &mut *KEYBOARD_BUFFER.lock() {
             Some(buffer) => buffer.push(0x03),
             None => {}
         }
-
-        // WM event — this is what the async GUI shell sees
-        let mods = 2u8; // ctrl
+        let mods = 2u8;
         crate::drivers::wm::push_key(true, code, 0x03, mods);
-
         PICS.end_interrupt(KEYBOARD_INT);
         return;
     }

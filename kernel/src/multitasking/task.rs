@@ -73,6 +73,8 @@ pub struct Task {
     pub zombie: bool,
     pub exit_code: i32,
     pub pending_signals: u32,
+    /// Per-signal handlers: 0=SIG_DFL, 1=SIG_IGN, else userspace addr.
+    pub signal_handlers: [u32; 32],
 }
 
 
@@ -121,6 +123,7 @@ impl Task {
             zombie: false,
             exit_code: 0,
             pending_signals: 0,
+            signal_handlers: [0; 32],
         }
     }
 

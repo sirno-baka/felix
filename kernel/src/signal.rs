@@ -32,24 +32,6 @@ pub const fn sigbit(sig: u32) -> u32 {
 const DEFAULT_TERMINATE: u32 =
     sigbit(SIGHUP) | sigbit(SIGINT) | sigbit(SIGQUIT) | sigbit(SIGKILL) | sigbit(SIGTERM);
 
-// ====================== Foreground task ======================
-
-/// Slot of the process that receives terminal-generated signals (Ctrl+C).
-/// `-1` = none (e.g. shell is at the prompt).
-static mut FOREGROUND_TASK: i8 = -1;
-
-pub fn set_foreground(slot: i8) {
-    unsafe { FOREGROUND_TASK = slot; }
-}
-
-pub fn get_foreground() -> i8 {
-    unsafe { FOREGROUND_TASK }
-}
-
-pub fn clear_foreground() {
-    unsafe { FOREGROUND_TASK = -1; }
-}
-
 // ====================== Send ======================
 
 /// Queue `sig` for task `slot`. Returns false if slot invalid / idle / zombie.
@@ -68,16 +50,6 @@ pub fn send_signal(slot: i8, sig: u32) -> bool {
             false
         }
     }
-}
-
-/// Send `sig` to the current foreground task.
-/// Returns true if a task received it (caller should NOT put the key in stdin).
-pub fn signal_foreground(sig: u32) -> bool {
-    let fg = get_foreground();
-    if fg < 0 {
-        return false;
-    }
-    send_signal(fg, sig)
 }
 
 // ====================== Delivery ======================
@@ -103,36 +75,58 @@ pub fn deliver_pending(esp: u32) -> u32 {
                 _ => return esp_or_current(esp),
             };
 
-            // Fatal signals → terminate
-            let fatal = pending & DEFAULT_TERMINATE;
-            if fatal != 0 {
-                // Prefer a well-known signum for exit status (lowest set bit)
-                let sig = lowest_sig(fatal).unwrap_or(SIGINT);
+            // Process pending signals one by one (lowest first)
+            let mut remaining = pending;
+            while remaining != 0 {
+                let sig = lowest_sig(remaining).unwrap_or(1);
+                remaining &= !sigbit(sig);
 
+                let handler = match TASK_MANAGER.tasks[slot as usize].as_ref() {
+                    Some(t) => t.signal_handlers[(sig - 1) as usize],
+                    None => 0,
+                };
+
+                if handler == 1 {
+                    // SIG_IGN — drop
+                    if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
+                        t.pending_signals &= !sigbit(sig);
+                    }
+                    continue;
+                }
+
+                if handler != 0 {
+                    // Custom handler (cdecl): push sig, then return addr
+                    if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
+                        t.pending_signals &= !sigbit(sig);
+                        let state = &mut *(esp as *mut CPUState);
+                        let mut usp = state.esp;
+                        usp = usp.wrapping_sub(4);
+                        *(usp as *mut u32) = sig;
+                        usp = usp.wrapping_sub(4);
+                        *(usp as *mut u32) = state.eip;
+                        state.esp = usp;
+                        state.eip = handler;
+                    }
+                    return esp_or_current(esp);
+                }
+
+                // Default action
+                if (DEFAULT_TERMINATE & sigbit(sig)) != 0 {
+                    if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
+                        t.pending_signals &= !sigbit(sig);
+                        t.running = false;
+                        t.zombie = true;
+                        t.exit_code = 128 + sig as i32;
+                    }
+                    println!("[signal] task {} killed by signal {}", slot, sig);
+                    let new_esp = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
+                    return deliver_pending_after_switch(new_esp);
+                }
+
+                // Unknown default: just clear
                 if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
-                    t.pending_signals &= !fatal;
-                    t.running = false;
-                    t.zombie = true;
-                    t.exit_code = 128 + sig as i32;
+                    t.pending_signals &= !sigbit(sig);
                 }
-
-                if get_foreground() == slot {
-                    clear_foreground();
-                }
-
-                println!("[signal] task {} killed by signal {}", slot, sig);
-
-                let new_esp = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
-                // Continue loop: maybe the next task also has pending signals
-                let _ = new_esp;
-                // Use the scheduled stack for further delivery / return
-                return deliver_pending_after_switch(new_esp);
-            }
-
-            // Non-fatal pending bits: for now just clear (no handlers yet).
-            // Later: invoke userspace handler here.
-            if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
-                t.pending_signals = 0;
             }
             return esp_or_current(esp);
         }
@@ -160,9 +154,6 @@ fn deliver_pending_after_switch(esp: u32) -> u32 {
                 t.running = false;
                 t.zombie = true;
                 t.exit_code = 128 + sig as i32;
-            }
-            if get_foreground() == slot {
-                clear_foreground();
             }
             return TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
         }

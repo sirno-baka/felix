@@ -13,6 +13,8 @@ pub const SYS_UNLINK: u32 = 10;  // delete/unlink(filename)
 pub const SYS_EXECVE: u32 = 11;
 /// kill(pid, sig) — queue signal for task. 0 on success, usize::MAX on error.
 pub const SYS_KILL: u32 = 37;
+/// sigaction(sig, act, oldact) — set/get signal handler. 0 on success.
+pub const SYS_SIGACTION: u32 = 67;
 /// wait(pid, options) — block until child exits (-1 = any). options: WNOHANG=1
 /// Returns pid of the reaped child, 0 if WNOHANG and none ready, or usize::MAX on error.
 pub const SYS_WAIT: u32 = 114;

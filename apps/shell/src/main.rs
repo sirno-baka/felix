@@ -592,10 +592,9 @@ Ctrl+C interrupts a running program (userspace).\n",
 // External process supervision (cooperative: UI + stdout + wait)
 // ---------------------------------------------------------------------------
 
-/// What the UI poll reported while a child is running.
 enum UiTick {
     None,
-    Interrupt, // Ctrl+C
+    Interrupt,
 }
 
 fn spawn_elf(
@@ -702,7 +701,6 @@ impl UiBridge<'_> {
             let ch = e.b as u8;
             let sc = e.a as u8;
             let mods = e.c as u8;
-            // ETX from kernel, or Ctrl held + 'c' scancode
             if ch == 0x03 || (sc == 0x2e && (mods & 2) != 0) {
                 return UiTick::Interrupt;
             }
@@ -717,10 +715,7 @@ impl UiBridge<'_> {
     }
 }
 
-/// Run child while keeping the UI alive:
-/// - non-blocking stdout drain
-/// - WNOHANG wait
-/// - keyboard poll (Ctrl+C → kill via userspace syscall)
+/// Ctrl+C in this window → kill(child, SIGINT).
 fn supervise_child(pid: i32, capture_fd: Option<u32>, out: &mut TermBuffer, ui: &mut UiBridge<'_>) {
     if let Some(fd) = capture_fd {
         let _ = unsafe { set_nonblock(fd) };
@@ -732,7 +727,6 @@ fn supervise_child(pid: i32, capture_fd: Option<u32>, out: &mut TermBuffer, ui: 
     let mut sent_sigint = false;
 
     while !done {
-        // 1) stdout
         if let Some(fd) = capture_fd {
             let mut any = false;
             while drain_pipe_once(fd, out, &mut partial, &mut live_idx) {
@@ -743,19 +737,15 @@ fn supervise_child(pid: i32, capture_fd: Option<u32>, out: &mut TermBuffer, ui: 
             }
         }
 
-        // 2) keyboard / UI (userspace Ctrl+C)
-        if matches!(ui.poll_keys(), UiTick::Interrupt) {
-            if !sent_sigint {
-                unsafe {
-                    let _ = kill(pid, SIGINT);
-                }
-                out.push("^C");
-                ui.redraw(out);
-                sent_sigint = true;
+        if matches!(ui.poll_keys(), UiTick::Interrupt) && !sent_sigint {
+            unsafe {
+                let _ = kill(pid, SIGINT);
             }
+            out.push("^C");
+            ui.redraw(out);
+            sent_sigint = true;
         }
 
-        // 3) wait (non-blocking)
         let w = unsafe { wait_options(pid, WNOHANG) };
         if w == pid as usize || w == usize::MAX {
             done = true;
@@ -766,7 +756,6 @@ fn supervise_child(pid: i32, capture_fd: Option<u32>, out: &mut TermBuffer, ui: 
         }
     }
 
-    // Final drain after writer side closed
     if let Some(fd) = capture_fd {
         loop {
             if !drain_pipe_once(fd, out, &mut partial, &mut live_idx) {
@@ -1029,7 +1018,6 @@ pub extern "C" fn main() -> i32 {
     let mut win = Window::create(30, 30, 640, 400, "Felix Shell").unwrap_or_else(|| {
         Window::create(40, 40, 480, 320, "Felix Shell").expect("wm_create failed")
     });
-
     let mut ui = Ui::new();
     let mut line_ids: Vec<WidgetId> = Vec::new();
     let line_y0 = 8;
@@ -1064,7 +1052,6 @@ pub extern "C" fn main() -> i32 {
             let scancode = e.a as u8;
             let ch = e.b as u8;
 
-            // Ignore Ctrl+C at the prompt (no child to kill)
             if ch == 0x03 || (scancode == 0x2e && (e.c as u8 & 2) != 0) {
                 continue;
             }

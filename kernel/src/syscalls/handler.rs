@@ -89,6 +89,7 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         },
         crate::syscalls::SYS_WAIT   => sys_wait(current_slot, state.ebx as i32, state.ecx as u32),
         crate::syscalls::SYS_KILL   => sys_kill(state.ebx as i32, state.ecx as u32),
+        crate::syscalls::SYS_SIGACTION => sys_sigaction(current_slot, state.ebx as u32, state.ecx as *const SigActionUser, state.edx as *mut SigActionUser),
         crate::syscalls::SYS_PIPE   => sys_pipe(current_slot, state.ebx as *mut u32),
         crate::syscalls::SYS_DUP2   => sys_dup2(current_slot, state.ebx as usize, state.ecx as usize),
         crate::syscalls::SYS_FCNTL  => sys_fcntl(current_slot, state.ebx as usize, state.ecx as u32, state.edx as u32),
@@ -707,22 +708,44 @@ fn sys_kill(pid: i32, sig: u32) -> usize {
     }
 }
 
+#[repr(C)]
+struct SigActionUser {
+    sa_handler: u32,
+    sa_mask: u32,
+    sa_flags: u32,
+}
+
+/// sigaction(sig, act, oldact)
+fn sys_sigaction(current_slot: usize, sig: u32, act: *const SigActionUser, oldact: *mut SigActionUser) -> usize {
+    if sig == 0 || sig > 31 || sig == crate::signal::SIGKILL {
+        return usize::MAX;
+    }
+    let idx = (sig - 1) as usize;
+    unsafe {
+        if let Some(ref mut t) = TASK_MANAGER.tasks[current_slot] {
+            if !oldact.is_null() {
+                *oldact = SigActionUser {
+                    sa_handler: t.signal_handlers[idx],
+                    sa_mask: 0,
+                    sa_flags: 0,
+                };
+            }
+            if !act.is_null() {
+                t.signal_handlers[idx] = (*act).sa_handler;
+            }
+            return 0;
+        }
+    }
+    usize::MAX
+}
+
 fn sys_wait(current_slot: usize, pid: i32, options: u32) -> usize {
     let parent = current_slot as i8;
     let nohang = options & WNOHANG != 0;
 
-    // Child that we are waiting for becomes the terminal foreground process
-    // so Ctrl+C (SIGINT) is delivered to it, not to the shell.
-    if pid >= 0 && !nohang {
-        crate::signal::set_foreground(pid as i8);
-    }
-
     loop {
         let found = unsafe { TASK_MANAGER.find_zombie_child(parent, pid) };
         if let Some((child_slot, _exit_code)) = found {
-            if !nohang {
-                crate::signal::clear_foreground();
-            }
             unsafe {
                 TASK_MANAGER.reap(child_slot);
             }
@@ -736,7 +759,6 @@ fn sys_wait(current_slot: usize, pid: i32, options: u32) -> usize {
         // No zombie yet — sleep until the next interrupt (timer / keyboard),
         // same pattern as blocking stdin. Scheduler can run other tasks
         // while we are in hlt; when we are scheduled again we re-check.
-        // SIGINT on the child will turn it into a zombie via deliver_pending.
         unsafe {
             asm!("sti");
             asm!("hlt");
@@ -1166,6 +1188,7 @@ pub fn sys_execve(
             t.zombie = false;
             t.exit_code = 0;
             t.pending_signals = 0;
+            t.signal_handlers = [0; 32];
 
             // stdio + optional remap from parent fds
             t.fd_table = FileDescriptorTable::with_stdio();

@@ -12,6 +12,7 @@ pub const SYS_RMDIR:  u32 = 8;
 pub const SYS_UNLINK: u32 = 10;
 pub const SYS_EXECVE: u32 = 11;
 pub const SYS_KILL:   u32 = 37;
+pub const SYS_SIGACTION: u32 = 67;
 pub const SYS_WAIT:   u32 = 114;
 pub const SYS_PIPE:   u32 = 42;
 pub const SYS_DUP2:   u32 = 63;
@@ -32,9 +33,22 @@ pub const F_SETFL: u32 = 4;
 
 pub const WNOHANG: u32 = 1;
 
+pub const SIGHUP:  u32 = 1;
 pub const SIGINT:  u32 = 2;
+pub const SIGQUIT: u32 = 3;
 pub const SIGKILL: u32 = 9;
 pub const SIGTERM: u32 = 15;
+
+pub const SIG_DFL: u32 = 0;
+pub const SIG_IGN: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SigAction {
+    pub sa_handler: u32,
+    pub sa_mask: u32,
+    pub sa_flags: u32,
+}
 
 pub const POLLIN: i16 = 0x0001;
 pub const POLLOUT: i16 = 0x0004;
@@ -236,6 +250,20 @@ pub unsafe fn kill(pid: i32, sig: u32) -> usize {
     inlateout("eax") SYS_KILL => ret,
     in("ebx") pid,
     in("ecx") sig,
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+/// Set/get signal handler. act/oldact may be null.
+pub unsafe fn sigaction(sig: u32, act: *const SigAction, oldact: *mut SigAction) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_SIGACTION => ret,
+    in("ebx") sig,
+    in("ecx") act,
+    in("edx") oldact,
     options(nostack, preserves_flags)
     );
     ret

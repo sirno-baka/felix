@@ -101,6 +101,8 @@ fn usage() {
     println!("  hello <ip> <port>            UDP client (send line, print reply)");
 }
 
+
+
 fn run_server(port: u16) -> i32 {
     let sock = unsafe { socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP) };
     if sock == usize::MAX {
@@ -213,6 +215,12 @@ fn run_client(ip: [u8; 4], port: u16) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
+    // свой хендлер
+    extern "C" fn on_int(sig: u32) {
+        println!("got {}", sig);
+        exit();
+    }
+    on(SIGINT, on_int);
     // hello -l <port>
     if arg(1) == Some("-l") {
         let port = match arg(2).and_then(parse_u16) {

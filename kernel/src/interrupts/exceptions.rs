@@ -59,10 +59,6 @@ fn kill_current_task(esp: u32, reason: &str, exit_code: i32) -> u32 {
             t.pending_signals = 0;
         }
 
-        if crate::signal::get_foreground() == slot as i8 {
-            crate::signal::clear_foreground();
-        }
-
         println!("[exc] task {} killed: {} (exit={})", slot, reason, exit_code);
 
         TASK_MANAGER.schedule(esp as *mut CPUState) as u32
