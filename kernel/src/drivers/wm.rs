@@ -963,7 +963,6 @@ pub fn push_key(down: bool, scancode: u8, ch: u8, mods: u8) {
     };
     for w in wm.windows.iter_mut().flatten() {
         if w.focused && w.visible {
-            println!("[KERNEL] push_key");
             w.events.push(WmEvent {
                 kind: if down { EV_KEY_DOWN } else { EV_KEY_UP },
                 a: scancode as i32,

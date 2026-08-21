@@ -259,7 +259,7 @@ const VISIBLE_LINES: usize = 22;
 const HISTORY_ROWS: usize = VISIBLE_LINES - 1;
 
 struct TermBuffer {
-    lines: Vec<String>,
+    lines: Vec<String>, // accessed by drain_pipe_to_term for live partial lines
 }
 
 impl TermBuffer {
@@ -594,6 +594,7 @@ fn run_external(
     forced_in: i32,
     forced_out: i32,
     out: &mut TermBuffer,
+    mut redraw: Option<&mut dyn FnMut(&TermBuffer)>,
 ) -> Option<i32> {
     let name = cmd.args[0].as_str();
     let full = match shell.find_executable(name) {
@@ -628,19 +629,147 @@ fn run_external(
         sout = forced_out;
     }
 
-    out.push(&format!("[running {} ...]", full));
-    let pid = spawn_elf(&full, sin, sout, -1, &cmd.args);
+    // Capture child output into TermBuffer when not already redirected.
+    // - no stdout redir: pipe both stdout+stderr
+    // - stdout is file/pipe: still capture stderr so status lines show in shell
+    let mut capture_r: i32 = -1;
+    let mut capture_w: i32 = -1;
+    let mut serr: i32 = -1;
+    if sout < 0 {
+        let mut fds = [0u32; 2];
+        if unsafe { pipe(fds.as_mut_ptr()) } == 0 {
+            capture_r = fds[0] as i32;
+            capture_w = fds[1] as i32;
+            sout = capture_w;
+            serr = capture_w;
+        }
+    } else {
+        let mut fds = [0u32; 2];
+        if unsafe { pipe(fds.as_mut_ptr()) } == 0 {
+            capture_r = fds[0] as i32;
+            capture_w = fds[1] as i32;
+            serr = capture_w;
+        }
+    }
+
+    let pid = spawn_elf(&full, sin, sout, serr, &cmd.args);
+
+    // Parent no longer needs write end (child has its own ref).
+    if capture_w >= 0 {
+        unsafe {
+            close(capture_w as u32);
+        }
+    }
     if sin >= 0 && forced_in < 0 {
         unsafe {
             close(sin as u32);
         }
     }
-    if sout >= 0 && forced_out < 0 {
+    // Don't close sout if it is a pipeline forced_out (still needed by other stage),
+    // and don't close capture_w twice.
+    if sout >= 0 && forced_out < 0 && sout != capture_w {
         unsafe {
             close(sout as u32);
         }
     }
+
+    // Capture: drain pipe live (redraw after each chunk), then wait.
+    if capture_r >= 0 {
+        drain_pipe_to_term(capture_r as u32, out, redraw);
+        unsafe {
+            close(capture_r as u32);
+        }
+        if let Some(p) = pid {
+            unsafe {
+                let _ = wait(p);
+            }
+        }
+        return None;
+    }
+
     pid
+}
+
+fn drain_pipe_to_term(
+    fd: u32,
+    out: &mut TermBuffer,
+    mut redraw: Option<&mut dyn FnMut(&TermBuffer)>,
+) {
+    let mut buf = [0u8; 512];
+    let mut partial = String::new();
+    // Index of a temporary "live" incomplete line in term history, if any.
+    let mut live_idx: Option<usize> = None;
+
+    loop {
+        let n = unsafe { read(fd, buf.as_mut_ptr(), buf.len()) };
+        if n == 0 || n == usize::MAX {
+            break;
+        }
+        match core::str::from_utf8(&buf[..n]) {
+            Ok(s) => partial.push_str(s),
+            Err(_) => {
+                if let Some(i) = live_idx.take() {
+                    if i < out.lines.len() {
+                        out.lines[i] = format!("<{} bytes>", n);
+                    }
+                } else {
+                    out.push(&format!("<{} bytes>", n));
+                }
+                if let Some(ref mut r) = redraw {
+                    r(out);
+                }
+                continue;
+            }
+        }
+
+        let mut dirty = false;
+        while let Some(pos) = partial.find('\n') {
+            let line: String = partial.drain(..=pos).collect();
+            let line = line.trim_end_matches(&['\n', '\r'][..]);
+            if let Some(i) = live_idx.take() {
+                if i < out.lines.len() {
+                    out.lines[i] = String::from(line);
+                } else {
+                    out.push(line);
+                }
+            } else {
+                out.push(line);
+            }
+            dirty = true;
+        }
+
+        // Show incomplete line (e.g. print! without \\n) immediately.
+        if !partial.is_empty() {
+            if let Some(i) = live_idx {
+                if i < out.lines.len() {
+                    out.lines[i] = partial.clone();
+                }
+            } else {
+                out.push(&partial);
+                live_idx = Some(out.lines.len().saturating_sub(1));
+            }
+            dirty = true;
+        }
+
+        if dirty {
+            if let Some(ref mut r) = redraw {
+                r(out);
+            }
+        }
+    }
+
+    if !partial.is_empty() {
+        if let Some(i) = live_idx {
+            if i < out.lines.len() {
+                out.lines[i] = partial;
+            }
+        } else {
+            out.push(&partial);
+        }
+        if let Some(ref mut r) = redraw {
+            r(out);
+        }
+    }
 }
 
 fn spawn_elf(
@@ -694,7 +823,12 @@ fn spawn_elf(
     }
 }
 
-fn run_pipeline(shell: &Shell, stages: &[String], out: &mut TermBuffer) {
+fn run_pipeline(
+    shell: &Shell,
+    stages: &[String],
+    out: &mut TermBuffer,
+    mut redraw: Option<&mut dyn FnMut(&TermBuffer)>,
+) {
     let n = stages.len();
     if n == 0 {
         return;
@@ -730,14 +864,16 @@ fn run_pipeline(shell: &Shell, stages: &[String], out: &mut TermBuffer) {
             pipes[i].1 as i32
         };
 
-        let pid = if i == 0 && i == n - 1 {
-            run_external(shell, &cmd, -1, -1, out)
+        let is_last = i + 1 == n;
+        let rd = if is_last { redraw.take() } else { None };
+        let pid = if i == 0 && is_last {
+            run_external(shell, &cmd, -1, -1, out, rd)
         } else if i == 0 {
-            run_external(shell, &cmd, -1, out_fd, out)
-        } else if i == n - 1 {
-            run_external(shell, &cmd, in_fd, -1, out)
+            run_external(shell, &cmd, -1, out_fd, out, None)
+        } else if is_last {
+            run_external(shell, &cmd, in_fd, -1, out, rd)
         } else {
-            run_external(shell, &cmd, in_fd, out_fd, out)
+            run_external(shell, &cmd, in_fd, out_fd, out, None)
         };
 
         if let Some(p) = pid {
@@ -759,7 +895,12 @@ fn run_pipeline(shell: &Shell, stages: &[String], out: &mut TermBuffer) {
     }
 }
 
-fn interpret(shell: &mut Shell, line: &str, out: &mut TermBuffer) {
+fn interpret(
+    shell: &mut Shell,
+    line: &str,
+    out: &mut TermBuffer,
+    redraw: Option<&mut dyn FnMut(&TermBuffer)>,
+) {
     let stages = split_pipeline(line.trim());
     if stages.is_empty() {
         return;
@@ -773,7 +914,7 @@ fn interpret(shell: &mut Shell, line: &str, out: &mut TermBuffer) {
         if try_builtin(shell, &cmd, out) {
             return;
         }
-        if let Some(pid) = run_external(shell, &cmd, -1, -1, out) {
+        if let Some(pid) = run_external(shell, &cmd, -1, -1, out, redraw) {
             unsafe {
                 let _ = wait(pid);
             }
@@ -781,7 +922,7 @@ fn interpret(shell: &mut Shell, line: &str, out: &mut TermBuffer) {
         return;
     }
 
-    run_pipeline(shell, &stages, out);
+    run_pipeline(shell, &stages, out, redraw);
 }
 
 fn help_text() -> String {
@@ -826,12 +967,11 @@ fn truncate_line(s: &str) -> &str {
 /// Redraw all labels: history rows + live prompt line at the bottom.
 fn refresh_terminal(
     ui: &mut Ui,
-    shell: &Shell,
+    prompt: &str,
     term: &TermBuffer,
     input: &str,
     line_ids: &[WidgetId],
 ) {
-    // History fills the first HISTORY_ROWS labels (pad with empty from top).
     let mut hist: Vec<&str> = term.visible_history().collect();
     while hist.len() < HISTORY_ROWS {
         hist.insert(0, "");
@@ -842,21 +982,26 @@ fn refresh_terminal(
         ui.set_label(line_ids[i], truncate_line(text));
     }
 
-    // Last label = prompt + current input (+ caret)
-    let mut live = shell.prompt();
+    let mut live = String::from(prompt);
     live.push_str(input);
     live.push('_');
     ui.set_label(line_ids[HISTORY_ROWS], truncate_line(&live));
 }
 
-fn run_line(shell: &mut Shell, term: &mut TermBuffer, input: &str) {
+fn run_line(
+    shell: &mut Shell,
+    term: &mut TermBuffer,
+    input: &str,
+    redraw: &mut dyn FnMut(&TermBuffer),
+) {
     let cmd = input.trim();
+
+    term.push(&format!("{}{}", shell.prompt(), cmd));
+    redraw(term);
     if cmd.is_empty() {
         return;
     }
-    // Echo the completed line into history
-    term.push(&format!("{}{}", shell.prompt(), cmd));
-    interpret(shell, cmd, term);
+    interpret(shell, cmd, term, Some(redraw));
 }
 
 #[no_mangle]
@@ -884,7 +1029,8 @@ pub extern "C" fn main() -> i32 {
     term.push("Type commands and press Enter.  help — builtins, clear — wipe view.");
     term.push("");
 
-    refresh_terminal(&mut ui, &shell, &term, &input, &line_ids);
+    let prompt = shell.prompt();
+    refresh_terminal(&mut ui, &prompt, &term, &input, &line_ids);
     ui.draw(&mut win);
     let _ = win.flip();
 
@@ -902,7 +1048,13 @@ pub extern "C" fn main() -> i32 {
             let ch = e.b as u8;
 
             if scancode == SCAN_ENTER {
-                run_line(&mut shell, &mut term, &input);
+                let prompt_now = shell.prompt();
+                let mut redraw = |t: &TermBuffer| {
+                    refresh_terminal(&mut ui, &prompt_now, t, "", &line_ids);
+                    ui.draw(&mut win);
+                    let _ = win.flip();
+                };
+                run_line(&mut shell, &mut term, &input, &mut redraw);
                 input.clear();
                 dirty = true;
             } else if scancode == SCAN_BACKSPACE {
@@ -916,7 +1068,8 @@ pub extern "C" fn main() -> i32 {
         }
 
         if dirty {
-            refresh_terminal(&mut ui, &shell, &term, &input, &line_ids);
+            let prompt = shell.prompt();
+            refresh_terminal(&mut ui, &prompt, &term, &input, &line_ids);
             ui.draw(&mut win);
             let _ = win.flip();
         }

@@ -275,8 +275,8 @@ pub extern "C" fn higher_half_entry() -> ! {
         println!("[VFS] Virtual filesystem initialized");
         print_info();
         print_devices();
-        // crate::drivers::net::i8255x::I8255x::init().expect("NIC init failed");
-        // crate::net::stack::init();
+        crate::drivers::net::i8255x::I8255x::init().expect("NIC init failed");
+        crate::net::stack::init();
         // // 7. Task Manager (после IDT!)
         TASK_MANAGER.init();
 
