@@ -124,24 +124,30 @@ pub extern "C" fn keyboard_handler() {
         }
     }
 
-    // Ctrl+C → SIGINT to foreground process (do not enqueue as text)
-    // Scancode 0x2E = 'c'/'C'
-    if scancode == 0x2e && unsafe { KEYBOARD.ctrl } {
-        if signal::signal_foreground(SIGINT) {
-            PICS.end_interrupt(KEYBOARD_INT);
-            return;
-        }
-        // No foreground task (shell at prompt) → deliver ETX so line editor can handle ^C
+    let released = scancode & 0x80 != 0;
+    let code = scancode & 0x7F;
+
+    // Ctrl+C (scancode 0x2E = 'c'):
+    // 1) try kernel SIGINT to foreground (legacy blocking wait)
+    // 2) ALWAYS deliver ETX (0x03) to the focused WM window so userspace
+    //    shells can do kill() themselves without blocking the UI.
+    if code == 0x2e && unsafe { KEYBOARD.ctrl } && !released {
+        let _ = signal::signal_foreground(SIGINT);
+
+        // Console buffer (text-mode / non-WM readers)
         match &mut *KEYBOARD_BUFFER.lock() {
             Some(buffer) => buffer.push(0x03),
             None => {}
         }
+
+        // WM event — this is what the async GUI shell sees
+        let mods = 2u8; // ctrl
+        crate::drivers::wm::push_key(true, code, 0x03, mods);
+
         PICS.end_interrupt(KEYBOARD_INT);
         return;
     }
 
-    let released = scancode & 0x80 != 0;
-    let code = scancode & 0x7F;
     let key_byte = if released {
         0
     } else {
@@ -163,7 +169,9 @@ pub extern "C" fn keyboard_handler() {
     match scancode {
         0x2a | 0x36 | 0xaa | 0xb6 | 0x1d | 0x9d => {}
         _ => {
-            crate::drivers::wm::push_key(!released, code, key_byte, mods);
+            // While Ctrl held, don't inject the underlying letter into WM either
+            let ch = if unsafe { KEYBOARD.ctrl } { 0 } else { key_byte };
+            crate::drivers::wm::push_key(!released, code, ch, mods);
         }
     }
 

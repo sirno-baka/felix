@@ -102,6 +102,83 @@ fn maybe_free(id: usize) {
     }
 }
 
+/// True if a non-blocking read would not block (data available or EOF).
+pub fn pipe_readable(id: usize) -> bool {
+    unsafe {
+        if id >= MAX_PIPES || !PIPES[id].in_use {
+            return true; // treat as ready (EOF/error)
+        }
+        PIPES[id].len > 0 || PIPES[id].writers == 0
+    }
+}
+
+/// True if a non-blocking write would not block.
+pub fn pipe_writable(id: usize) -> bool {
+    unsafe {
+        if id >= MAX_PIPES || !PIPES[id].in_use {
+            return true;
+        }
+        PIPES[id].readers == 0 || PIPES[id].len < PIPE_BUF_SIZE
+    }
+}
+
+/// Non-blocking read. Returns:
+/// - `n > 0` bytes read
+/// - `0` EOF (no writers, empty)
+/// - `usize::MAX` would block (no data, writers still open)
+pub fn pipe_try_read(id: usize, buf: *mut u8, count: usize) -> usize {
+    if id >= MAX_PIPES || count == 0 {
+        return 0;
+    }
+    unsafe {
+        if !PIPES[id].in_use {
+            return 0;
+        }
+        if PIPES[id].len == 0 {
+            return if PIPES[id].writers == 0 { 0 } else { usize::MAX };
+        }
+        let mut read = 0usize;
+        while read < count && PIPES[id].len > 0 {
+            let byte = PIPES[id].buf[PIPES[id].tail];
+            PIPES[id].tail = (PIPES[id].tail + 1) % PIPE_BUF_SIZE;
+            PIPES[id].len -= 1;
+            *buf.add(read) = byte;
+            read += 1;
+        }
+        read
+    }
+}
+
+/// Non-blocking write. Returns:
+/// - `n` bytes written (may be partial)
+/// - `0` no readers
+/// - `usize::MAX` would block (buffer full, readers exist)
+pub fn pipe_try_write(id: usize, buf: *const u8, count: usize) -> usize {
+    if id >= MAX_PIPES || count == 0 {
+        return 0;
+    }
+    unsafe {
+        if !PIPES[id].in_use {
+            return 0;
+        }
+        if PIPES[id].readers == 0 {
+            return 0;
+        }
+        if PIPES[id].len == PIPE_BUF_SIZE {
+            return usize::MAX;
+        }
+        let mut written = 0usize;
+        while written < count && PIPES[id].len < PIPE_BUF_SIZE {
+            let byte = *buf.add(written);
+            PIPES[id].buf[PIPES[id].head] = byte;
+            PIPES[id].head = (PIPES[id].head + 1) % PIPE_BUF_SIZE;
+            PIPES[id].len += 1;
+            written += 1;
+        }
+        written
+    }
+}
+
 /// Blocking read from pipe. Returns 0 on EOF (no writers left and empty).
 pub fn pipe_read(id: usize, buf: *mut u8, count: usize) -> usize {
     if id >= MAX_PIPES || count == 0 {

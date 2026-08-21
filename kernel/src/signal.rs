@@ -120,7 +120,7 @@ pub fn deliver_pending(esp: u32) -> u32 {
                     clear_foreground();
                 }
 
-                // println!("[signal] task {} killed by signal {}", slot, sig);
+                println!("[signal] task {} killed by signal {}", slot, sig);
 
                 let new_esp = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
                 // Continue loop: maybe the next task also has pending signals

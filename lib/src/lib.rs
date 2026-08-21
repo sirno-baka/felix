@@ -11,6 +11,7 @@ pub mod syscall;
 pub mod fs;
 pub mod wm;
 pub mod ui;
+pub mod async_rt;
 
 /// Re-export so apps can use embedded-graphics against our Window.
 pub use embedded_graphics;
@@ -35,4 +36,5 @@ pub mod prelude {
     pub use alloc::string::String;
     pub use alloc::vec::Vec;
     pub use alloc::boxed::Box;
+    pub use crate::async_rt::{self, block_on, yield_now, Executor, wait_readable};
 }

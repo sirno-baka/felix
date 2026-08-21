@@ -6,11 +6,13 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::cmp::{max, min};
+use core::cmp::min;
+
+use libfelix::async_rt::yield_now;
 use libfelix::prelude::*;
 use libfelix::syscall::{
-    self, write, read, open, close, mkdir, rmdir, unlink, execve, wait, pipe, O_RDONLY, O_WRONLY,
-    O_CREAT, O_TRUNC, O_APPEND,
+    self, close, execve, kill, mkdir, open, pipe, read, rmdir, set_nonblock, unlink, wait,
+    wait_options, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGINT, WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
@@ -56,10 +58,7 @@ impl Shell {
     fn find_executable(&self, name: &str) -> Option<String> {
         if name.contains('/') {
             let full = self.resolve(name);
-            if file_exists(&full) {
-                return Some(full);
-            }
-            return None;
+            return file_exists(&full).then_some(full);
         }
         for dir in self.path.split(':') {
             if dir.is_empty() {
@@ -110,17 +109,19 @@ fn is_directory(path: &str) -> bool {
     let mut p = String::from(path);
     p.push('\0');
     let mut buf = [0u8; 64];
-    let n = unsafe { syscall::ls(p.as_ptr() as *const u8, buf.as_mut_ptr(), buf.len()) };
+    let n = unsafe { syscall::ls(p.as_ptr(), buf.as_mut_ptr(), buf.len()) };
     n > 0 || path == "/"
 }
 
-// ====================== Parsing ======================
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq)]
 enum RedirKind {
-    In,     // <
-    Out,    // >
-    Append, // >>
+    In,
+    Out,
+    Append,
 }
 
 struct Redir {
@@ -207,7 +208,7 @@ fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
         path.push('\0');
         match r.kind {
             RedirKind::In => {
-                let fd = unsafe { open(path.as_ptr() as *const u8, O_RDONLY) };
+                let fd = unsafe { open(path.as_ptr(), O_RDONLY) };
                 if fd == usize::MAX {
                     return Err(format!("{}: No such file", r.path));
                 }
@@ -219,8 +220,7 @@ fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
                 stdin_fd = fd as i32;
             }
             RedirKind::Out => {
-                let flags = O_WRONLY | O_CREAT | O_TRUNC;
-                let fd = unsafe { open(path.as_ptr() as *const u8, flags) };
+                let fd = unsafe { open(path.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC) };
                 if fd == usize::MAX {
                     return Err(format!("{}: cannot create", r.path));
                 }
@@ -232,8 +232,7 @@ fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
                 stdout_fd = fd as i32;
             }
             RedirKind::Append => {
-                let flags = O_WRONLY | O_CREAT | O_APPEND;
-                let fd = unsafe { open(path.as_ptr() as *const u8, flags) };
+                let fd = unsafe { open(path.as_ptr(), O_WRONLY | O_CREAT | O_APPEND) };
                 if fd == usize::MAX {
                     return Err(format!("{}: cannot open", r.path));
                 }
@@ -250,16 +249,15 @@ fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Terminal buffer (history of completed lines)
+// Terminal buffer
 // ---------------------------------------------------------------------------
 
 const MAX_HISTORY: usize = 64;
-/// Total label rows. Last row is always the live prompt+input line.
 const VISIBLE_LINES: usize = 22;
 const HISTORY_ROWS: usize = VISIBLE_LINES - 1;
 
 struct TermBuffer {
-    lines: Vec<String>, // accessed by drain_pipe_to_term for live partial lines
+    lines: Vec<String>,
 }
 
 impl TermBuffer {
@@ -280,7 +278,6 @@ impl TermBuffer {
         self.lines.clear();
     }
 
-    /// Last HISTORY_ROWS of completed output (oldest first).
     fn visible_history(&self) -> impl Iterator<Item = &str> {
         let start = self.lines.len().saturating_sub(HISTORY_ROWS);
         self.lines[start..].iter().map(|s| s.as_str())
@@ -288,7 +285,7 @@ impl TermBuffer {
 }
 
 // ---------------------------------------------------------------------------
-// Builtins / interpreter
+// Builtins
 // ---------------------------------------------------------------------------
 
 fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool {
@@ -321,7 +318,6 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
                 }
             }
         }
-
         "echo" => {
             let mut msg = String::new();
             for (i, arg) in cmd.args.iter().enumerate().skip(1) {
@@ -330,7 +326,6 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
                 }
                 msg.push_str(arg);
             }
-
             if file_fd >= 0 {
                 msg.push('\n');
                 unsafe {
@@ -341,10 +336,7 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
                 out.push(&msg);
             }
         }
-
-        "exit" | "quit" => {
-            out.push("Goodbye.");
-        }
+        "exit" | "quit" => out.push("Goodbye."),
         "pwd" => {
             let s = shell.cwd.clone();
             if file_fd >= 0 {
@@ -397,12 +389,11 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
                 }
             }
         }
-
         "head" => {
             if let Some(file) = cmd.args.get(1) {
                 head_to(&shell.resolve(file), file_fd, 20, out);
             } else {
-                out.push("Usage: cat <file>");
+                out.push("Usage: head <file>");
             }
             if file_fd >= 0 {
                 unsafe {
@@ -415,7 +406,7 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
                 let mut path = shell.resolve(dir);
                 path.push('\0');
                 unsafe {
-                    mkdir(path.as_ptr() as *const u8);
+                    mkdir(path.as_ptr());
                 }
             } else {
                 out.push("Usage: mkdir <name>");
@@ -431,7 +422,7 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
                 let mut path = shell.resolve(dir);
                 path.push('\0');
                 unsafe {
-                    rmdir(path.as_ptr() as *const u8);
+                    rmdir(path.as_ptr());
                 }
             } else {
                 out.push("Usage: rmdir <name>");
@@ -447,7 +438,7 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
                 let mut path = shell.resolve(file);
                 path.push('\0');
                 unsafe {
-                    unlink(path.as_ptr() as *const u8);
+                    unlink(path.as_ptr());
                 }
             } else {
                 out.push("Usage: rm <file>");
@@ -498,26 +489,25 @@ fn ls_to(path: &str, file_fd: i32, out: &mut TermBuffer) {
         path_buf.push('/');
     }
     path_buf.push('\0');
-
     let mut buf = [0u8; 4096];
-    let n = unsafe { syscall::ls(path_buf.as_ptr() as *const u8, buf.as_mut_ptr(), buf.len()) };
+    let n = unsafe { syscall::ls(path_buf.as_ptr(), buf.as_mut_ptr(), buf.len()) };
     if n == 0 {
         out.push(&format!("ls: cannot read directory: {}", path));
         return;
     }
-
     let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
     for entry in text.lines() {
-        if !entry.is_empty() {
-            if file_fd >= 0 {
-                let mut line = String::from(entry);
-                line.push('\n');
-                unsafe {
-                    write(file_fd as u32, line.as_bytes().as_ptr(), line.len());
-                }
-            } else {
-                out.push(entry);
+        if entry.is_empty() {
+            continue;
+        }
+        if file_fd >= 0 {
+            let mut line = String::from(entry);
+            line.push('\n');
+            unsafe {
+                write(file_fd as u32, line.as_bytes().as_ptr(), line.len());
             }
+        } else {
+            out.push(entry);
         }
     }
 }
@@ -525,17 +515,18 @@ fn ls_to(path: &str, file_fd: i32, out: &mut TermBuffer) {
 fn head_to(filename: &str, file_fd: i32, count: u32, out: &mut TermBuffer) {
     let mut path = String::from(filename);
     path.push('\0');
-
-    let fd = unsafe { open(path.as_ptr() as *const u8, O_RDONLY) };
+    let fd = unsafe { open(path.as_ptr(), O_RDONLY) };
     if fd == usize::MAX {
         out.push(&format!("File not found: {}", filename));
         return;
     }
     let mut remain = count as usize;
     let mut buf = [0u8; 4096];
-    loop {
-        let n = unsafe { read(fd as u32, buf.as_mut_ptr(), min(remain as usize, 4096)) };
-
+    while remain > 0 {
+        let n = unsafe { read(fd as u32, buf.as_mut_ptr(), min(remain, 4096)) };
+        if n == 0 {
+            break;
+        }
         if file_fd >= 0 {
             unsafe {
                 write(file_fd as u32, buf.as_ptr(), n);
@@ -545,12 +536,8 @@ fn head_to(filename: &str, file_fd: i32, count: u32, out: &mut TermBuffer) {
                 out.push(line);
             }
         }
-        remain = remain - n;
-        if remain == 0 {
-            break;
-        }
+        remain = remain.saturating_sub(n);
     }
-
     unsafe {
         close(fd as u32);
     }
@@ -559,13 +546,11 @@ fn head_to(filename: &str, file_fd: i32, count: u32, out: &mut TermBuffer) {
 fn cat_to(filename: &str, file_fd: i32, out: &mut TermBuffer) {
     let mut path = String::from(filename);
     path.push('\0');
-
-    let fd = unsafe { open(path.as_ptr() as *const u8, O_RDONLY) };
+    let fd = unsafe { open(path.as_ptr(), O_RDONLY) };
     if fd == usize::MAX {
         out.push(&format!("File not found: {}", filename));
         return;
     }
-
     let mut buf = [0u8; 512];
     loop {
         let n = unsafe { read(fd as u32, buf.as_mut_ptr(), buf.len()) };
@@ -582,10 +567,235 @@ fn cat_to(filename: &str, file_fd: i32, out: &mut TermBuffer) {
             }
         }
     }
-
     unsafe {
         close(fd as u32);
     }
+}
+
+fn help_text() -> String {
+    String::from(
+        "Builtins:\n\
+  ls [path]        - list directory\n\
+  cat <file>       - display file content\n\
+  cd [dir]         - change directory\n\
+  pwd              - print working directory\n\
+  path [dirs]      - show or set PATH\n\
+  mkdir / rmdir / rm\n\
+  clear            - clear terminal\n\
+  help / exit\n\n\
+Redirection / pipes as usual.\n\
+Ctrl+C interrupts a running program (userspace).\n",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// External process supervision (cooperative: UI + stdout + wait)
+// ---------------------------------------------------------------------------
+
+/// What the UI poll reported while a child is running.
+enum UiTick {
+    None,
+    Interrupt, // Ctrl+C
+}
+
+fn spawn_elf(
+    path: &str,
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
+    args: &[String],
+) -> Option<i32> {
+    let mut f = File::open(path).ok()?;
+    let data = f.read_to_end().ok()?;
+    if data.len() < 4 || &data[0..4] != b"\x7fELF" {
+        return None;
+    }
+    let mut c_strings: Vec<String> = Vec::new();
+    if args.is_empty() {
+        let mut s = String::from(path);
+        s.push('\0');
+        c_strings.push(s);
+    } else {
+        for a in args {
+            let mut s = a.clone();
+            s.push('\0');
+            c_strings.push(s);
+        }
+    }
+    let ptrs: Vec<*const u8> = c_strings.iter().map(|s| s.as_ptr()).collect();
+    unsafe {
+        let pid = execve(
+            data.as_ptr(),
+            data.len(),
+            stdin_fd,
+            stdout_fd,
+            stderr_fd,
+            &ptrs,
+        );
+        if pid == usize::MAX {
+            None
+        } else {
+            Some(pid as i32)
+        }
+    }
+}
+
+/// Non-blocking line-oriented pipe drain. Returns true if any data was consumed.
+fn drain_pipe_once(fd: u32, out: &mut TermBuffer, partial: &mut String, live_idx: &mut Option<usize>) -> bool {
+    let mut buf = [0u8; 512];
+    let n = unsafe { read(fd, buf.as_mut_ptr(), buf.len()) };
+    if n == 0 || n == usize::MAX {
+        return false;
+    }
+    match core::str::from_utf8(&buf[..n]) {
+        Ok(s) => partial.push_str(s),
+        Err(_) => {
+            out.push(&format!("<{} bytes>", n));
+            return true;
+        }
+    }
+
+    let mut dirty = false;
+    while let Some(pos) = partial.find('\n') {
+        let line: String = partial.drain(..=pos).collect();
+        let line = line.trim_end_matches(&['\n', '\r'][..]);
+        if let Some(i) = live_idx.take() {
+            if i < out.lines.len() {
+                out.lines[i] = String::from(line);
+            } else {
+                out.push(line);
+            }
+        } else {
+            out.push(line);
+        }
+        dirty = true;
+    }
+    if !partial.is_empty() {
+        if let Some(i) = *live_idx {
+            if i < out.lines.len() {
+                out.lines[i] = partial.clone();
+            }
+        } else {
+            out.push(partial);
+            *live_idx = Some(out.lines.len().saturating_sub(1));
+        }
+        dirty = true;
+    }
+    dirty
+}
+
+/// UI bridge: one mutable owner of the window so tick + redraw don't conflict.
+struct UiBridge<'a> {
+    win: &'a mut Window,
+    ui: &'a mut Ui,
+    line_ids: &'a [WidgetId],
+}
+
+impl UiBridge<'_> {
+    fn poll_keys(&mut self) -> UiTick {
+        let mut evbuf = [WmEvent::default(); 32];
+        let n = self.win.poll_events(&mut evbuf);
+        for e in &evbuf[..n] {
+            if e.kind != EV_KEY_DOWN {
+                continue;
+            }
+            let ch = e.b as u8;
+            let sc = e.a as u8;
+            let mods = e.c as u8;
+            // ETX from kernel, or Ctrl held + 'c' scancode
+            if ch == 0x03 || (sc == 0x2e && (mods & 2) != 0) {
+                return UiTick::Interrupt;
+            }
+        }
+        UiTick::None
+    }
+
+    fn redraw(&mut self, term: &TermBuffer) {
+        refresh_terminal(self.ui, "", term, "", self.line_ids);
+        self.ui.draw(self.win);
+        let _ = self.win.flip();
+    }
+}
+
+/// Run child while keeping the UI alive:
+/// - non-blocking stdout drain
+/// - WNOHANG wait
+/// - keyboard poll (Ctrl+C → kill via userspace syscall)
+fn supervise_child(pid: i32, capture_fd: Option<u32>, out: &mut TermBuffer, ui: &mut UiBridge<'_>) {
+    if let Some(fd) = capture_fd {
+        let _ = unsafe { set_nonblock(fd) };
+    }
+
+    let mut partial = String::new();
+    let mut live_idx: Option<usize> = None;
+    let mut done = false;
+    let mut sent_sigint = false;
+
+    while !done {
+        // 1) stdout
+        if let Some(fd) = capture_fd {
+            let mut any = false;
+            while drain_pipe_once(fd, out, &mut partial, &mut live_idx) {
+                any = true;
+            }
+            if any {
+                ui.redraw(out);
+            }
+        }
+
+        // 2) keyboard / UI (userspace Ctrl+C)
+        if matches!(ui.poll_keys(), UiTick::Interrupt) {
+            if !sent_sigint {
+                unsafe {
+                    let _ = kill(pid, SIGINT);
+                }
+                out.push("^C");
+                ui.redraw(out);
+                sent_sigint = true;
+            }
+        }
+
+        // 3) wait (non-blocking)
+        let w = unsafe { wait_options(pid, WNOHANG) };
+        if w == pid as usize || w == usize::MAX {
+            done = true;
+        }
+
+        if !done {
+            block_on_yield();
+        }
+    }
+
+    // Final drain after writer side closed
+    if let Some(fd) = capture_fd {
+        loop {
+            if !drain_pipe_once(fd, out, &mut partial, &mut live_idx) {
+                break;
+            }
+            ui.redraw(out);
+        }
+        if !partial.is_empty() {
+            if let Some(i) = live_idx {
+                if i < out.lines.len() {
+                    out.lines[i] = partial;
+                }
+            } else {
+                out.push(&partial);
+            }
+            ui.redraw(out);
+        }
+        unsafe {
+            close(fd);
+        }
+    }
+}
+
+/// Tiny yield without pulling Executor into every call site.
+fn block_on_yield() {
+    // One Pending cycle via our runtime helper.
+    libfelix::async_rt::block_on(async {
+        yield_now().await;
+    });
 }
 
 fn run_external(
@@ -594,7 +804,7 @@ fn run_external(
     forced_in: i32,
     forced_out: i32,
     out: &mut TermBuffer,
-    mut redraw: Option<&mut dyn FnMut(&TermBuffer)>,
+    ui: &mut UiBridge<'_>,
 ) -> Option<i32> {
     let name = cmd.args[0].as_str();
     let full = match shell.find_executable(name) {
@@ -629,9 +839,6 @@ fn run_external(
         sout = forced_out;
     }
 
-    // Capture child output into TermBuffer when not already redirected.
-    // - no stdout redir: pipe both stdout+stderr
-    // - stdout is file/pipe: still capture stderr so status lines show in shell
     let mut capture_r: i32 = -1;
     let mut capture_w: i32 = -1;
     let mut serr: i32 = -1;
@@ -654,7 +861,6 @@ fn run_external(
 
     let pid = spawn_elf(&full, sin, sout, serr, &cmd.args);
 
-    // Parent no longer needs write end (child has its own ref).
     if capture_w >= 0 {
         unsafe {
             close(capture_w as u32);
@@ -665,161 +871,27 @@ fn run_external(
             close(sin as u32);
         }
     }
-    // Don't close sout if it is a pipeline forced_out (still needed by other stage),
-    // and don't close capture_w twice.
     if sout >= 0 && forced_out < 0 && sout != capture_w {
         unsafe {
             close(sout as u32);
         }
     }
 
-    // Capture: drain pipe live (redraw after each chunk), then wait.
-    if capture_r >= 0 {
-        drain_pipe_to_term(capture_r as u32, out, redraw);
-        unsafe {
-            close(capture_r as u32);
-        }
-        if let Some(p) = pid {
-            unsafe {
-                let _ = wait(p);
-            }
-        }
-        return None;
-    }
-
-    pid
-}
-
-fn drain_pipe_to_term(
-    fd: u32,
-    out: &mut TermBuffer,
-    mut redraw: Option<&mut dyn FnMut(&TermBuffer)>,
-) {
-    let mut buf = [0u8; 512];
-    let mut partial = String::new();
-    // Index of a temporary "live" incomplete line in term history, if any.
-    let mut live_idx: Option<usize> = None;
-
-    loop {
-        let n = unsafe { read(fd, buf.as_mut_ptr(), buf.len()) };
-        if n == 0 || n == usize::MAX {
-            break;
-        }
-        match core::str::from_utf8(&buf[..n]) {
-            Ok(s) => partial.push_str(s),
-            Err(_) => {
-                if let Some(i) = live_idx.take() {
-                    if i < out.lines.len() {
-                        out.lines[i] = format!("<{} bytes>", n);
-                    }
-                } else {
-                    out.push(&format!("<{} bytes>", n));
-                }
-                if let Some(ref mut r) = redraw {
-                    r(out);
-                }
-                continue;
-            }
-        }
-
-        let mut dirty = false;
-        while let Some(pos) = partial.find('\n') {
-            let line: String = partial.drain(..=pos).collect();
-            let line = line.trim_end_matches(&['\n', '\r'][..]);
-            if let Some(i) = live_idx.take() {
-                if i < out.lines.len() {
-                    out.lines[i] = String::from(line);
-                } else {
-                    out.push(line);
-                }
-            } else {
-                out.push(line);
-            }
-            dirty = true;
-        }
-
-        // Show incomplete line (e.g. print! without \\n) immediately.
-        if !partial.is_empty() {
-            if let Some(i) = live_idx {
-                if i < out.lines.len() {
-                    out.lines[i] = partial.clone();
-                }
-            } else {
-                out.push(&partial);
-                live_idx = Some(out.lines.len().saturating_sub(1));
-            }
-            dirty = true;
-        }
-
-        if dirty {
-            if let Some(ref mut r) = redraw {
-                r(out);
-            }
-        }
-    }
-
-    if !partial.is_empty() {
-        if let Some(i) = live_idx {
-            if i < out.lines.len() {
-                out.lines[i] = partial;
-            }
+    if let Some(p) = pid {
+        let cap = if capture_r >= 0 {
+            Some(capture_r as u32)
         } else {
-            out.push(&partial);
-        }
-        if let Some(ref mut r) = redraw {
-            r(out);
-        }
-    }
-}
-
-fn spawn_elf(
-    path: &str,
-    stdin_fd: i32,
-    stdout_fd: i32,
-    stderr_fd: i32,
-    args: &[String],
-) -> Option<i32> {
-    match File::open(path) {
-        Ok(mut f) => match f.read_to_end() {
-            Ok(data) => {
-                if data.len() < 4 || &data[0..4] != b"\x7fELF" {
-                    return None;
-                }
-                let mut c_strings: Vec<String> = Vec::new();
-                if args.is_empty() {
-                    c_strings.push({
-                        let mut s = String::from(path);
-                        s.push('\0');
-                        s
-                    });
-                } else {
-                    for a in args {
-                        let mut s = a.clone();
-                        s.push('\0');
-                        c_strings.push(s);
-                    }
-                }
-                let ptrs: Vec<*const u8> = c_strings.iter().map(|s| s.as_ptr()).collect();
-
-                unsafe {
-                    let pid = execve(
-                        data.as_ptr(),
-                        data.len(),
-                        stdin_fd,
-                        stdout_fd,
-                        stderr_fd,
-                        &ptrs,
-                    );
-                    if pid == usize::MAX {
-                        None
-                    } else {
-                        Some(pid as i32)
-                    }
-                }
+            None
+        };
+        supervise_child(p, cap, out, ui);
+        None
+    } else {
+        if capture_r >= 0 {
+            unsafe {
+                close(capture_r as u32);
             }
-            Err(_) => None,
-        },
-        Err(_) => None,
+        }
+        None
     }
 }
 
@@ -827,7 +899,7 @@ fn run_pipeline(
     shell: &Shell,
     stages: &[String],
     out: &mut TermBuffer,
-    mut redraw: Option<&mut dyn FnMut(&TermBuffer)>,
+    ui: &mut UiBridge<'_>,
 ) {
     let n = stages.len();
     if n == 0 {
@@ -835,10 +907,9 @@ fn run_pipeline(
     }
 
     let mut pipes: Vec<(u32, u32)> = Vec::new();
-    for _ in 0..n - 1 {
+    for _ in 0..n.saturating_sub(1) {
         let mut fds = [0u32; 2];
-        let r = unsafe { pipe(fds.as_mut_ptr()) };
-        if r != 0 {
+        if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
             out.push("pipe failed");
             return;
         }
@@ -852,32 +923,29 @@ fn run_pipeline(
         if cmd.args.is_empty() {
             continue;
         }
-
         let in_fd: i32 = if i == 0 {
             -1
         } else {
             pipes[i - 1].0 as i32
         };
-        let out_fd: i32 = if i == n - 1 {
+        let out_fd: i32 = if i + 1 == n {
             -1
         } else {
             pipes[i].1 as i32
         };
-
         let is_last = i + 1 == n;
-        let rd = if is_last { redraw.take() } else { None };
-        let pid = if i == 0 && is_last {
-            run_external(shell, &cmd, -1, -1, out, rd)
-        } else if i == 0 {
-            run_external(shell, &cmd, -1, out_fd, out, None)
-        } else if is_last {
-            run_external(shell, &cmd, in_fd, -1, out, rd)
-        } else {
-            run_external(shell, &cmd, in_fd, out_fd, out, None)
-        };
 
-        if let Some(p) = pid {
-            pids.push(p);
+        // Only the last stage gets live UI supervision + capture.
+        if is_last {
+            let _ = run_external(shell, &cmd, in_fd, -1, out, ui);
+        } else {
+            // Intermediate stages: fire-and-forget wait after all spawned.
+            let name = cmd.args[0].as_str();
+            if let Some(full) = shell.find_executable(name) {
+                if let Some(p) = spawn_elf(&full, in_fd, out_fd, -1, &cmd.args) {
+                    pids.push(p);
+                }
+            }
         }
     }
 
@@ -887,7 +955,6 @@ fn run_pipeline(
             close(w);
         }
     }
-
     for pid in pids {
         unsafe {
             let _ = wait(pid);
@@ -899,13 +966,12 @@ fn interpret(
     shell: &mut Shell,
     line: &str,
     out: &mut TermBuffer,
-    redraw: Option<&mut dyn FnMut(&TermBuffer)>,
+    ui: &mut UiBridge<'_>,
 ) {
     let stages = split_pipeline(line.trim());
     if stages.is_empty() {
         return;
     }
-
     if stages.len() == 1 {
         let cmd = parse_simple(&stages[0]);
         if cmd.args.is_empty() {
@@ -914,41 +980,14 @@ fn interpret(
         if try_builtin(shell, &cmd, out) {
             return;
         }
-        if let Some(pid) = run_external(shell, &cmd, -1, -1, out, redraw) {
-            unsafe {
-                let _ = wait(pid);
-            }
-        }
+        let _ = run_external(shell, &cmd, -1, -1, out, ui);
         return;
     }
-
-    run_pipeline(shell, &stages, out, redraw);
-}
-
-fn help_text() -> String {
-    String::from(
-        "Builtins:\n\
-  ls [path]        - list directory\n\
-  cat <file>       - display file content\n\
-  cd [dir]         - change directory\n\
-  pwd              - print working directory\n\
-  path [dirs]      - show or set PATH\n\
-  mkdir / rmdir / rm\n\
-  clear            - clear terminal\n\
-  help / exit\n\n\
-Redirection:\n\
-  cmd > file       - stdout to file (truncate)\n\
-  cmd >> file      - stdout append\n\
-  cmd < file       - stdin from file\n\n\
-Pipes:\n\
-  cmd1 | cmd2      - pipeline\n\n\
-External:\n\
-  ./hello  /hello  hello (PATH)\n",
-    )
+    run_pipeline(shell, &stages, out, ui);
 }
 
 // ---------------------------------------------------------------------------
-// Classic terminal GUI (no TextInput / no buttons)
+// GUI terminal
 // ---------------------------------------------------------------------------
 
 const SCAN_BACKSPACE: u8 = 0x0E;
@@ -964,7 +1003,6 @@ fn truncate_line(s: &str) -> &str {
     }
 }
 
-/// Redraw all labels: history rows + live prompt line at the bottom.
 fn refresh_terminal(
     ui: &mut Ui,
     prompt: &str,
@@ -976,32 +1014,14 @@ fn refresh_terminal(
     while hist.len() < HISTORY_ROWS {
         hist.insert(0, "");
     }
-
     for i in 0..HISTORY_ROWS {
         let text = hist.get(i).copied().unwrap_or("");
         ui.set_label(line_ids[i], truncate_line(text));
     }
-
     let mut live = String::from(prompt);
     live.push_str(input);
     live.push('_');
     ui.set_label(line_ids[HISTORY_ROWS], truncate_line(&live));
-}
-
-fn run_line(
-    shell: &mut Shell,
-    term: &mut TermBuffer,
-    input: &str,
-    redraw: &mut dyn FnMut(&TermBuffer),
-) {
-    let cmd = input.trim();
-
-    term.push(&format!("{}{}", shell.prompt(), cmd));
-    redraw(term);
-    if cmd.is_empty() {
-        return;
-    }
-    interpret(shell, cmd, term, Some(redraw));
 }
 
 #[no_mangle]
@@ -1011,8 +1031,6 @@ pub extern "C" fn main() -> i32 {
     });
 
     let mut ui = Ui::new();
-
-    // Only labels — one per visible row (last row is the live input line)
     let mut line_ids: Vec<WidgetId> = Vec::new();
     let line_y0 = 8;
     let line_h = 16;
@@ -1026,7 +1044,7 @@ pub extern "C" fn main() -> i32 {
     let mut input = String::new();
 
     term.push("=== Felix User Shell ===");
-    term.push("Type commands and press Enter.  help — builtins, clear — wipe view.");
+    term.push("help — builtins · clear — wipe · Ctrl+C stops a running program");
     term.push("");
 
     let prompt = shell.prompt();
@@ -1036,7 +1054,6 @@ pub extern "C" fn main() -> i32 {
 
     loop {
         let mut dirty = false;
-
         let mut evbuf = [WmEvent::default(); 64];
         let n = win.poll_events(&mut evbuf);
 
@@ -1047,15 +1064,27 @@ pub extern "C" fn main() -> i32 {
             let scancode = e.a as u8;
             let ch = e.b as u8;
 
+            // Ignore Ctrl+C at the prompt (no child to kill)
+            if ch == 0x03 || (scancode == 0x2e && (e.c as u8 & 2) != 0) {
+                continue;
+            }
+
             if scancode == SCAN_ENTER {
-                let prompt_now = shell.prompt();
-                let mut redraw = |t: &TermBuffer| {
-                    refresh_terminal(&mut ui, &prompt_now, t, "", &line_ids);
-                    ui.draw(&mut win);
-                    let _ = win.flip();
-                };
-                run_line(&mut shell, &mut term, &input, &mut redraw);
+                let cmd = input.clone();
                 input.clear();
+                term.push(&format!("{}{}", shell.prompt(), cmd.trim()));
+
+                {
+                    let mut bridge = UiBridge {
+                        win: &mut win,
+                        ui: &mut ui,
+                        line_ids: &line_ids,
+                    };
+                    bridge.redraw(&term);
+                    if !cmd.trim().is_empty() {
+                        interpret(&mut shell, &cmd, &mut term, &mut bridge);
+                    }
+                }
                 dirty = true;
             } else if scancode == SCAN_BACKSPACE {
                 if input.pop().is_some() {

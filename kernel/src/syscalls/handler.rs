@@ -87,9 +87,12 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                 &params.argv,
             )
         },
-        crate::syscalls::SYS_WAIT   => sys_wait(current_slot, state.ebx as i32),
+        crate::syscalls::SYS_WAIT   => sys_wait(current_slot, state.ebx as i32, state.ecx as u32),
+        crate::syscalls::SYS_KILL   => sys_kill(state.ebx as i32, state.ecx as u32),
         crate::syscalls::SYS_PIPE   => sys_pipe(current_slot, state.ebx as *mut u32),
         crate::syscalls::SYS_DUP2   => sys_dup2(current_slot, state.ebx as usize, state.ecx as usize),
+        crate::syscalls::SYS_FCNTL  => sys_fcntl(current_slot, state.ebx as usize, state.ecx as u32, state.edx as u32),
+        crate::syscalls::SYS_POLL   => sys_poll(current_slot, state.ebx as *mut PollFd, state.ecx as usize, state.edx as i32),
         crate::syscalls::SYS_LS => sys_ls(state.ebx as *const u8, state.ecx as *mut u8, state.edx as usize),
         // === Memory ===
         crate::syscalls::SYS_MALLOC => {
@@ -364,6 +367,9 @@ fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) -> u
                 }
                 Some(FileDescriptor::Pipe { pipe_id, end }) => {
                     if end != PipeEnd::Read { return 0; }
+                    if current.fd_table.is_nonblock(fd) {
+                        return pipe::pipe_try_read(pipe_id, buf_ptr, count);
+                    }
                     return pipe::pipe_read(pipe_id, buf_ptr, count);
                 }
                 Some(FileDescriptor::Socket { .. }) => return 0,
@@ -478,6 +484,9 @@ fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usize) -
                 }
                 Some(FileDescriptor::Pipe { pipe_id, end }) => {
                     if end != PipeEnd::Write { return 0; }
+                    if current.fd_table.is_nonblock(fd) {
+                        return pipe::pipe_try_write(pipe_id, buf_ptr, count);
+                    }
                     return pipe::pipe_write(pipe_id, buf_ptr, count);
                 }
                 Some(FileDescriptor::Socket { .. }) => return 0,
@@ -687,29 +696,192 @@ fn sys_exit(current_slot: usize, esp: u32) -> u32 {
 /// Block until a child matching `pid` becomes a zombie, then reap it.
 /// `pid == -1` waits for any child.
 /// Returns the reaped child's slot (pid), or usize::MAX if no such child can ever appear.
-fn sys_wait(current_slot: usize, pid: i32) -> usize {
+pub const WNOHANG: u32 = 1;
+
+/// kill(pid, sig) — queue `sig` for task slot `pid`.
+fn sys_kill(pid: i32, sig: u32) -> usize {
+    if crate::signal::send_signal(pid as i8, sig) {
+        0
+    } else {
+        usize::MAX
+    }
+}
+
+fn sys_wait(current_slot: usize, pid: i32, options: u32) -> usize {
     let parent = current_slot as i8;
+    let nohang = options & WNOHANG != 0;
 
     // Child that we are waiting for becomes the terminal foreground process
     // so Ctrl+C (SIGINT) is delivered to it, not to the shell.
-    if pid >= 0 {
+    if pid >= 0 && !nohang {
         crate::signal::set_foreground(pid as i8);
     }
 
     loop {
         let found = unsafe { TASK_MANAGER.find_zombie_child(parent, pid) };
         if let Some((child_slot, _exit_code)) = found {
-            crate::signal::clear_foreground();
+            if !nohang {
+                crate::signal::clear_foreground();
+            }
             unsafe {
                 TASK_MANAGER.reap(child_slot);
             }
             return child_slot;
         }
 
+        if nohang {
+            return 0;
+        }
+
         // No zombie yet — sleep until the next interrupt (timer / keyboard),
         // same pattern as blocking stdin. Scheduler can run other tasks
         // while we are in hlt; when we are scheduled again we re-check.
         // SIGINT on the child will turn it into a zombie via deliver_pending.
+        unsafe {
+            asm!("sti");
+            asm!("hlt");
+            asm!("cli");
+        }
+    }
+}
+
+const F_GETFL: u32 = 3;
+const F_SETFL: u32 = 4;
+
+fn sys_fcntl(current_slot: usize, fd: usize, cmd: u32, arg: u32) -> usize {
+    unsafe {
+        if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
+            if current.fd_table.get(fd).is_none() {
+                return usize::MAX;
+            }
+            match cmd {
+                F_GETFL => return current.fd_table.get_flags(fd) as usize,
+                F_SETFL => {
+                    // Only O_NONBLOCK is meaningful for now.
+                    let flags = arg & crate::filesystem::file::O_NONBLOCK;
+                    if current.fd_table.set_flags(fd, flags) {
+                        return 0;
+                    }
+                    return usize::MAX;
+                }
+                _ => return usize::MAX,
+            }
+        }
+    }
+    usize::MAX
+}
+
+/// Linux-ish pollfd (32-bit).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+pub const POLLIN: i16 = 0x0001;
+pub const POLLOUT: i16 = 0x0004;
+pub const POLLERR: i16 = 0x0008;
+pub const POLLHUP: i16 = 0x0010;
+
+fn fd_poll_revents(current_slot: usize, fd: i32, events: i16) -> i16 {
+    if fd < 0 {
+        return 0;
+    }
+    let fd = fd as usize;
+    unsafe {
+        let Some(ref current) = TASK_MANAGER.tasks[current_slot] else {
+            return POLLERR;
+        };
+        match current.fd_table.get(fd).copied() {
+            Some(FileDescriptor::Pipe { pipe_id, end }) => {
+                let mut rev = 0i16;
+                match end {
+                    PipeEnd::Read => {
+                        if events & POLLIN != 0 && pipe::pipe_readable(pipe_id) {
+                            rev |= POLLIN;
+                        }
+                    }
+                    PipeEnd::Write => {
+                        if events & POLLOUT != 0 && pipe::pipe_writable(pipe_id) {
+                            rev |= POLLOUT;
+                        }
+                    }
+                }
+                rev
+            }
+            Some(FileDescriptor::ConsoleIn) => {
+                // Always report readable for simplicity (stdin may still block on read).
+                if events & POLLIN != 0 {
+                    POLLIN
+                } else {
+                    0
+                }
+            }
+            Some(FileDescriptor::ConsoleOut) | Some(FileDescriptor::File { .. })
+            | Some(FileDescriptor::Device { .. }) => {
+                let mut rev = 0i16;
+                if events & POLLIN != 0 {
+                    rev |= POLLIN;
+                }
+                if events & POLLOUT != 0 {
+                    rev |= POLLOUT;
+                }
+                rev
+            }
+            Some(FileDescriptor::Socket { .. }) => {
+                // UDP recv is already non-blocking-ish (returns 0).
+                let mut rev = 0i16;
+                if events & POLLIN != 0 {
+                    rev |= POLLIN;
+                }
+                if events & POLLOUT != 0 {
+                    rev |= POLLOUT;
+                }
+                rev
+            }
+            None => POLLERR,
+        }
+    }
+}
+
+fn sys_poll(current_slot: usize, fds: *mut PollFd, nfds: usize, timeout_ms: i32) -> usize {
+    if fds.is_null() || nfds == 0 {
+        return 0;
+    }
+    let nfds = nfds.min(64);
+    let start = crate::time::jiffies();
+
+    loop {
+        let mut ready = 0usize;
+        for i in 0..nfds {
+            unsafe {
+                let p = fds.add(i);
+                let fd = (*p).fd;
+                let events = (*p).events;
+                let rev = fd_poll_revents(current_slot, fd, events);
+                (*p).revents = rev;
+                if rev != 0 {
+                    ready += 1;
+                }
+            }
+        }
+        if ready > 0 {
+            return ready;
+        }
+        // timeout_ms: -1 = block forever, 0 = return immediately, >0 = ms
+        if timeout_ms == 0 {
+            return 0;
+        }
+        if timeout_ms > 0 {
+            let elapsed = crate::time::jiffies().wrapping_sub(start);
+            // jiffies ~1ms on this kernel
+            if elapsed as i32 >= timeout_ms {
+                return 0;
+            }
+        }
+        // Sleep until next timer/keyboard interrupt so other tasks can run.
         unsafe {
             asm!("sti");
             asm!("hlt");

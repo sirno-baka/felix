@@ -60,14 +60,21 @@ impl FileDescriptor {
     }
 }
 
+pub const O_NONBLOCK: u32 = 0x800;
+
 #[derive(Clone, Copy, Debug)]
 pub struct FileDescriptorTable {
     fds: [Option<FileDescriptor>; 64],
+    /// Per-fd open flags (e.g. O_NONBLOCK).
+    flags: [u32; 64],
 }
 
 impl FileDescriptorTable {
     pub const fn new() -> Self {
-        Self { fds: [None; 64] }
+        Self {
+            fds: [None; 64],
+            flags: [0; 64],
+        }
     }
 
     /// Default stdio: 0=ConsoleIn, 1=ConsoleOut, 2=ConsoleOut
@@ -77,6 +84,26 @@ impl FileDescriptorTable {
         t.fds[1] = Some(FileDescriptor::ConsoleOut);
         t.fds[2] = Some(FileDescriptor::ConsoleOut);
         t
+    }
+
+    pub fn get_flags(&self, fd: usize) -> u32 {
+        if fd < self.flags.len() {
+            self.flags[fd]
+        } else {
+            0
+        }
+    }
+
+    pub fn set_flags(&mut self, fd: usize, flags: u32) -> bool {
+        if fd >= self.flags.len() {
+            return false;
+        }
+        self.flags[fd] = flags;
+        true
+    }
+
+    pub fn is_nonblock(&self, fd: usize) -> bool {
+        self.get_flags(fd) & O_NONBLOCK != 0
     }
 
     /// First free slot starting from 0.
@@ -121,6 +148,7 @@ impl FileDescriptorTable {
 
     pub fn close(&mut self, fd: usize) -> Option<FileDescriptor> {
         if fd < self.fds.len() {
+            self.flags[fd] = 0;
             self.fds[fd].take()
         } else {
             None
@@ -144,6 +172,7 @@ impl FileDescriptorTable {
             return true;
         }
         self.fds[new] = Some(desc);
+        self.flags[new] = self.flags[old];
         true
     }
 }

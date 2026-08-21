@@ -52,7 +52,7 @@ endif
 
 .PHONY: build
 build:
-	@cargo clean -p felix-kernel -p hello -p libfelix -p felix-boot
+	@cargo clean -p felix-kernel -p hello -p shell -p async_test -p libfelix -p felix-boot
 	@echo "Building Felix..."
 	@cargo build --target=x86_16-felix.json --package=felix-boot --release
 	@cargo build --target=x86_16-felix.json --package=felix-bootloader
@@ -61,6 +61,7 @@ build:
 	@cargo build --target=x86_32-felix.json --package=felix-kernel --release
 	@cargo build --target=x86_32-felix.json --package=hello --release
 	@cargo build --target=x86_32-felix.json --package=shell --release
+	@cargo build --target=x86_32-felix.json --package=async_test --release
 
 
 .PHONY: objcopy
@@ -73,6 +74,7 @@ objcopy:
 	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_32-felix/debug/felix-kernel build/kernel.bin
 	@cp target/x86_32-felix/release/hello build/hello
 	@cp target/x86_32-felix/release/shell build/shell
+	@cp target/x86_32-felix/release/async_test build/async_test
 
 .PHONY: floppy-image
 floppy-image:
@@ -104,6 +106,7 @@ floppy-image:
 	mkfs.ext2 -I 128 -O ^64bit,^metadata_csum,^dir_index,^ext_attr,^resize_inode build/ext2.img; \
 	$(E2CP) -p build/shell build/ext2.img:/shell; \
 	$(E2CP) -p build/hello build/ext2.img:/hello; \
+	$(E2CP) -p build/async_test build/ext2.img:/test; \
 	echo "  → shell copied to ext2"; \
 	dd if=build/ext2.img of=build/floppy.img bs=512 seek=$$EXT2_START_SECTOR conv=notrunc status=none; \
 
@@ -142,6 +145,7 @@ image:
 	@cp -f build/*.bin build/apps/ 2>/dev/null || true
 	@cp -f build/shell build/apps/ 2>/dev/null || true
 	@cp -f build/hello build/apps/ 2>/dev/null || true
+	@cp -f build/async_test build/apps/ 2>/dev/null || true
 
 	@echo "=== Copying files to ext2 partition ==="
 	@for f in build/apps/*; do \

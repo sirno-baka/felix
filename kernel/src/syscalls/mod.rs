@@ -11,13 +11,19 @@ pub const SYS_RMDIR: u32 = 8;   // rmdir
 pub const SYS_UNLINK: u32 = 10;  // delete/unlink(filename)
 
 pub const SYS_EXECVE: u32 = 11;
-/// wait(pid) — block until child with given pid exits (-1 = any child).
-/// Returns pid of the reaped child, or usize::MAX on error.
+/// kill(pid, sig) — queue signal for task. 0 on success, usize::MAX on error.
+pub const SYS_KILL: u32 = 37;
+/// wait(pid, options) — block until child exits (-1 = any). options: WNOHANG=1
+/// Returns pid of the reaped child, 0 if WNOHANG and none ready, or usize::MAX on error.
 pub const SYS_WAIT: u32 = 114;
 /// pipe(pipefd: *mut u32) — writes [read_fd, write_fd], returns 0 or usize::MAX
 pub const SYS_PIPE: u32 = 42;
 /// dup2(oldfd, newfd) → newfd or usize::MAX
 pub const SYS_DUP2: u32 = 63;
+/// fcntl(fd, cmd, arg) — F_GETFL=3, F_SETFL=4
+pub const SYS_FCNTL: u32 = 55;
+/// poll(fds, nfds, timeout_ms) — timeout -1 = block, 0 = nonblock
+pub const SYS_POLL: u32 = 168;
 
 pub const SYS_MALLOC: u32 = 200;
 pub const SYS_FREE: u32 = 201;

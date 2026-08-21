@@ -11,9 +11,12 @@ pub const SYS_MKDIR:  u32 = 7;
 pub const SYS_RMDIR:  u32 = 8;
 pub const SYS_UNLINK: u32 = 10;
 pub const SYS_EXECVE: u32 = 11;
+pub const SYS_KILL:   u32 = 37;
 pub const SYS_WAIT:   u32 = 114;
 pub const SYS_PIPE:   u32 = 42;
 pub const SYS_DUP2:   u32 = 63;
+pub const SYS_FCNTL:  u32 = 55;
+pub const SYS_POLL:   u32 = 168;
 
 // open flags
 pub const O_RDONLY: u32 = 0;
@@ -22,6 +25,29 @@ pub const O_RDWR:   u32 = 2;
 pub const O_CREAT:  u32 = 0x40;
 pub const O_TRUNC:  u32 = 0x200;
 pub const O_APPEND: u32 = 0x400;
+pub const O_NONBLOCK: u32 = 0x800;
+
+pub const F_GETFL: u32 = 3;
+pub const F_SETFL: u32 = 4;
+
+pub const WNOHANG: u32 = 1;
+
+pub const SIGINT:  u32 = 2;
+pub const SIGKILL: u32 = 9;
+pub const SIGTERM: u32 = 15;
+
+pub const POLLIN: i16 = 0x0001;
+pub const POLLOUT: i16 = 0x0004;
+pub const POLLERR: i16 = 0x0008;
+pub const POLLHUP: i16 = 0x0010;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
 
 pub const SYS_MALLOC: u32 = 200;
 pub const SYS_FREE:   u32 = 201;
@@ -186,14 +212,69 @@ pub unsafe fn dup2(oldfd: u32, newfd: u32) -> usize {
 /// Block until the child with the given pid exits (or any child if pid == -1).
 /// Returns the reaped child's pid, or usize::MAX on error.
 pub unsafe fn wait(pid: i32) -> usize {
+    wait_options(pid, 0)
+}
+
+/// `options`: WNOHANG — return 0 if no child is ready.
+pub unsafe fn wait_options(pid: i32, options: u32) -> usize {
     let ret: usize;
     asm!(
     "int 0x80",
     inlateout("eax") SYS_WAIT => ret,
     in("ebx") pid,
+    in("ecx") options,
     options(nostack, preserves_flags)
     );
     ret
+}
+
+/// Queue `sig` for task `pid`. Returns 0 on success.
+pub unsafe fn kill(pid: i32, sig: u32) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_KILL => ret,
+    in("ebx") pid,
+    in("ecx") sig,
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn fcntl(fd: u32, cmd: u32, arg: u32) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_FCNTL => ret,
+    in("ebx") fd,
+    in("ecx") cmd,
+    in("edx") arg,
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+/// Returns number of ready fds. timeout_ms: -1 block, 0 nonblock, >0 ms.
+pub unsafe fn poll(fds: *mut PollFd, nfds: usize, timeout_ms: i32) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_POLL => ret,
+    in("ebx") fds,
+    in("ecx") nfds,
+    in("edx") timeout_ms,
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+/// Set O_NONBLOCK on fd.
+pub unsafe fn set_nonblock(fd: u32) -> bool {
+    let cur = fcntl(fd, F_GETFL, 0);
+    if cur == usize::MAX {
+        return false;
+    }
+    fcntl(fd, F_SETFL, (cur as u32) | O_NONBLOCK) == 0
 }
 
 /// Читает содержимое директории.
