@@ -1,5 +1,5 @@
 //! Minimal read-only ext2 for the 16-bit bootloader.
-//! Assumes: block size 1024, inode size 128, no extents (classic direct blocks).
+//! Assumes: block size 1024, inode size 128, classic block maps (no extents).
 //! Partition LBA is absolute on the disk (BIOS drive 0x80).
 
 use core::mem::size_of;
@@ -10,7 +10,7 @@ const SECTOR: u32 = 512;
 const SUPER_MAGIC: u16 = 0xEF53;
 const ROOT_INODE: u32 = 2;
 
-/// Low buffer in conventional memory for one FS block (max 4 KiB).
+/// Staging buffer in conventional memory (one FS block, up to 4 KiB).
 const BLOCK_BUF: u16 = 0x9000;
 
 #[repr(C, packed)]
@@ -31,7 +31,6 @@ struct Superblock {
     _mnt_count: u16,
     _max_mnt: u16,
     magic: u16,
-    // ... rest ignored
 }
 
 #[repr(C, packed)]
@@ -39,7 +38,6 @@ struct GroupDesc {
     block_bitmap: u32,
     inode_bitmap: u32,
     inode_table: u32,
-    // ...
 }
 
 #[repr(C, packed)]
@@ -57,7 +55,6 @@ struct Inode {
     flags: u32,
     _osd1: u32,
     block: [u32; 15],
-    // ...
 }
 
 #[repr(C, packed)]
@@ -66,7 +63,6 @@ struct DirEntry {
     rec_len: u16,
     name_len: u8,
     file_type: u8,
-    // name follows
 }
 
 pub struct Ext2 {
@@ -78,12 +74,11 @@ pub struct Ext2 {
 }
 
 impl Ext2 {
-    /// Mount partition starting at `part_lba` (absolute disk LBA).
     pub fn mount(part_lba: u32) -> Option<Self> {
         // Superblock at byte 1024 of the FS = part_lba + 2 sectors
         unsafe {
             DISK.init(part_lba + 2, BLOCK_BUF);
-            DISK.read_sectors(2, BLOCK_BUF as u32); // 1024 bytes into buffer
+            DISK.read_sectors(2, BLOCK_BUF as u32);
         }
 
         let sb = unsafe { &*(BLOCK_BUF as *const Superblock) };
@@ -93,21 +88,17 @@ impl Ext2 {
             return None;
         }
 
-        let log_bs = sb.log_block_size;
-        let block_size = 1024u32 << log_bs;
+        let block_size = 1024u32 << sb.log_block_size;
         if block_size != 1024 && block_size != 2048 && block_size != 4096 {
             println!("[ext2] unsupported bs {}", block_size);
             return None;
         }
 
-        // inode size: for rev0 = 128; we force -I 128 in mkfs
-        let inode_size = 128u32;
-
         Some(Ext2 {
             part_lba,
             block_size,
             inodes_per_group: sb.inodes_per_group,
-            inode_size,
+            inode_size: 128,
             first_data_block: sb.first_data_block,
         })
     }
@@ -136,15 +127,7 @@ impl Ext2 {
         let idx = ino - 1;
         let group = idx / self.inodes_per_group;
         let index = idx % self.inodes_per_group;
-
-        // group descriptor: block after superblock
-        // for 1k: first_data_block=1 (super in block1), GDT in block2
-        // for 4k: first_data_block=0, super in block0, GDT in block1
-        let gdt_block = if self.block_size == 1024 {
-            self.first_data_block + 1
-        } else {
-            self.first_data_block + 1
-        };
+        let gdt_block = self.first_data_block + 1;
 
         self.read_block_to_buf(gdt_block);
         let gd = unsafe {
@@ -163,10 +146,8 @@ impl Ext2 {
         unsafe { *((BLOCK_BUF as u32 + off) as *const Inode) }
     }
 
-    /// Look up `name` in directory inode `dir_ino`. Returns child inode or 0.
     fn lookup(&self, dir_ino: u32, name: &[u8]) -> u32 {
         let inode = self.read_inode(dir_ino);
-        // Walk direct blocks only (enough for small dirs)
         for bi in 0..12 {
             let b = inode.block[bi];
             if b == 0 {
@@ -199,11 +180,9 @@ impl Ext2 {
         0
     }
 
-    /// Resolve absolute path like "/boot/kernel.bin" (leading slash required).
     pub fn resolve(&self, path: &[u8]) -> Option<u32> {
         let mut ino = ROOT_INODE;
         let mut i = 0usize;
-        // skip leading '/'
         if !path.is_empty() && path[0] == b'/' {
             i = 1;
         }
@@ -226,16 +205,16 @@ impl Ext2 {
         Some(ino)
     }
 
-    /// Load file inode into physical memory at `dest`. Returns file size.
     pub fn load_file(&self, ino: u32, dest: u32) -> Option<u32> {
         let inode = self.read_inode(ino);
         let size = inode.size;
         if size == 0 {
             return Some(0);
         }
-        // Direct blocks only: 12 * block_size (12 KiB / 24 / 48)
+
         let mut left = size;
         let mut dst = dest;
+
         for bi in 0..12 {
             if left == 0 {
                 break;
@@ -249,33 +228,40 @@ impl Ext2 {
             left -= chunk;
             dst += self.block_size;
         }
-        // Single indirect
+
+        // Single indirect: snapshot pointers first (staging buf is reused by read_block)
         if left > 0 && inode.block[12] != 0 {
             self.read_block_to_buf(inode.block[12]);
-            let ptrs = (self.block_size / 4) as usize;
-            for pi in 0..ptrs {
+            let nptrs = (self.block_size / 4) as usize;
+            // max 1024 ptrs for 4k blocks; stack array capped
+            let mut ptrs = [0u32; 256];
+            let take = core::cmp::min(nptrs, 256);
+            for pi in 0..take {
+                ptrs[pi] =
+                    unsafe { *((BLOCK_BUF as u32 + (pi as u32) * 4) as *const u32) };
+            }
+            for pi in 0..take {
                 if left == 0 {
                     break;
                 }
-                let pb = unsafe { *((BLOCK_BUF as u32 + (pi as u32) * 4) as *const u32) };
+                let pb = ptrs[pi];
                 if pb == 0 {
                     break;
                 }
-                // Need a second buffer for data — reuse high copy via DISK target
                 self.read_block(pb, dst);
                 let chunk = core::cmp::min(left, self.block_size);
                 left -= chunk;
                 dst += self.block_size;
             }
         }
+
         if left > 0 {
-            println!("[ext2] file too big / no double-indirect");
+            println!("[ext2] file too big");
             return None;
         }
         Some(size)
     }
 
-    /// Open path and load to dest.
     pub fn load_path(&self, path: &[u8], dest: u32) -> Option<u32> {
         let ino = self.resolve(path)?;
         self.load_file(ino, dest)
