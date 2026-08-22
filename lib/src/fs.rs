@@ -33,7 +33,8 @@ impl File {
     pub fn open(path: &str) -> IoResult<Self> {
         let cpath = path_to_cstr(path);
         let fd = unsafe { syscall::open(cpath.as_ptr(), 0) };
-        if fd == usize::MAX {
+        // Linux-style: negative = -errno; also accept legacy usize::MAX
+        if fd == usize::MAX || (fd as i32) < 0 {
             Err(IoError::NotFound)
         } else {
             Ok(Self { fd: fd as u32 })

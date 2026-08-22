@@ -60,7 +60,9 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
     let current_slot = unsafe { TASK_MANAGER.get_current_slot() } as usize;
 
     // exit must switch to another task — never return to the dead one
-    if syscall_num == crate::syscalls::SYS_EXIT {
+    if syscall_num == crate::syscalls::SYS_EXIT
+        || syscall_num == crate::syscalls::SYS_EXIT_GROUP
+    {
         return sys_exit(current_slot, esp);
     }
 
@@ -70,6 +72,23 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         crate::syscalls::SYS_READ  => sys_read(current_slot, state.ebx as usize, state.ecx as *mut u8, state.edx as usize),
         crate::syscalls::SYS_WRITE => sys_write(current_slot, state.ebx as usize, state.ecx as *const u8, state.edx as usize),
         crate::syscalls::SYS_CLOSE => sys_close(current_slot, state.ebx as usize),
+        crate::syscalls::SYS_LSEEK => sys_lseek(current_slot, state.ebx as usize, state.ecx as i32, state.edx as u32),
+        crate::syscalls::SYS_BRK => sys_brk(current_slot, state.ebx),
+        crate::syscalls::SYS_MMAP => sys_mmap_old(current_slot, state.ebx as *const MmapArgStruct),
+        crate::syscalls::SYS_MMAP2 => sys_mmap2(
+            current_slot,
+            state.ebx,
+            state.ecx as usize,
+            state.edx,
+            state.esi,
+            state.edi as i32,
+            state.ebp,
+        ),
+        crate::syscalls::SYS_MUNMAP => sys_munmap(current_slot, state.ebx, state.ecx as usize),
+        crate::syscalls::SYS_IOCTL => sys_ioctl(current_slot, state.ebx as usize, state.ecx, state.edx),
+        crate::syscalls::SYS_FSTAT64 => sys_fstat64(current_slot, state.ebx as usize, state.ecx as *mut Stat64),
+        crate::syscalls::SYS_STAT64 => sys_stat64(state.ebx as *const u8, state.ecx as *mut Stat64),
+        crate::syscalls::SYS_GETDENTS64 => sys_getdents64(current_slot, state.ebx as usize, state.ecx as *mut u8, state.edx as usize),
 
         // === Filesystem / process ===
         crate::syscalls::SYS_MKDIR  => sys_mkdir(state.ebx as *const u8),
@@ -281,11 +300,135 @@ const O_RDWR:   usize = 2;
 const O_CREAT:  usize = 0x40;
 const O_TRUNC:  usize = 0x200;
 const O_APPEND: usize = 0x400;
+const O_DIRECTORY: usize = 0x10000;
+
+const SEEK_SET: u32 = 0;
+const SEEK_CUR: u32 = 1;
+const SEEK_END: u32 = 2;
+
+// Linux errno (returned as -errno in eax)
+const EPERM: usize = (-1isize) as usize;
+const ENOENT: usize = (-2isize) as usize;
+const EBADF: usize = (-9isize) as usize;
+const ENOMEM: usize = (-12isize) as usize;
+const EFAULT: usize = (-14isize) as usize;
+const EINVAL: usize = (-22isize) as usize;
+const ENOTTY: usize = (-25isize) as usize;
+const ENOTDIR: usize = (-20isize) as usize;
+
+const S_IFREG: u32 = 0o100000;
+const S_IFDIR: u32 = 0o040000;
+const S_IFCHR: u32 = 0o020000;
+
+/// Linux i386 `struct stat64` (glibc layout).
+#[repr(C, packed)]
+struct Stat64 {
+    st_dev: u64,
+    __pad0: [u8; 4],
+    __st_ino: u32,
+    st_mode: u32,
+    st_nlink: u32,
+    st_uid: u32,
+    st_gid: u32,
+    st_rdev: u64,
+    __pad3: [u8; 4],
+    st_size: i64,
+    st_blksize: u32,
+    st_blocks: u64,
+    st_atime: u32,
+    st_atime_nsec: u32,
+    st_mtime: u32,
+    st_mtime_nsec: u32,
+    st_ctime: u32,
+    st_ctime_nsec: u32,
+    st_ino: u64,
+}
+
+fn probe_inode_size(inode: u32) -> u64 {
+    let mut size = 0u64;
+    let mut buf = [0u8; 1024];
+    loop {
+        let n = VFS.get().read_at(inode, size, &mut buf);
+        if n == 0 {
+            break;
+        }
+        size += n as u64;
+        if n < buf.len() {
+            break;
+        }
+        // safety cap ~16 MiB
+        if size > 16 * 1024 * 1024 {
+            break;
+        }
+    }
+    size
+}
+
+fn path_is_dir(path: &str) -> bool {
+    VFS.get().list_directory_entries(path).is_some()
+}
+
+fn fill_stat64(st: &mut Stat64, inode: u32, mode: u32, size: u64) {
+    *st = Stat64 {
+        st_dev: 1,
+        __pad0: [0; 4],
+        __st_ino: inode,
+        st_mode: mode | 0o644,
+        st_nlink: 1,
+        st_uid: 0,
+        st_gid: 0,
+        st_rdev: 0,
+        __pad3: [0; 4],
+        st_size: size as i64,
+        st_blksize: 4096,
+        st_blocks: (size + 511) / 512,
+        st_atime: 0,
+        st_atime_nsec: 0,
+        st_mtime: 0,
+        st_mtime_nsec: 0,
+        st_ctime: 0,
+        st_ctime_nsec: 0,
+        st_ino: inode as u64,
+    };
+}
 
 fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize {
     let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
     if path.is_empty() {
-        return usize::MAX;
+        return ENOENT;
+    }
+
+    // Directory open (explicit or path is a dir)
+    if path_is_dir(path) {
+        if flags & O_WRONLY != 0 || flags & O_RDWR != 0 {
+            return EINVAL;
+        }
+        let pb = path.as_bytes();
+        if pb.len() >= 96 {
+            return ENAMETOOLONG_OR_EINVAL();
+        }
+        let mut path_buf = [0u8; 96];
+        path_buf[..pb.len()].copy_from_slice(pb);
+        unsafe {
+            if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
+                if let Some(fd) = current.fd_table.alloc_fd() {
+                    current.fd_table.insert(
+                        fd,
+                        FileDescriptor::Dir {
+                            path: path_buf,
+                            path_len: pb.len() as u8,
+                            cookie: 0,
+                        },
+                    );
+                    return fd;
+                }
+            }
+        }
+        return EMFILE_OR_ENOMEM();
+    }
+
+    if flags & O_DIRECTORY != 0 {
+        return ENOTDIR;
     }
 
     let acc = flags & 3;
@@ -299,30 +442,27 @@ fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize {
 
     if inode.is_none() {
         if flags & O_CREAT != 0 {
-            // create empty file
             if !VFS.get().create_file(path, &[]) {
-                return usize::MAX;
+                return ENOENT;
             }
             inode = VFS.get().resolve_path(path);
         }
     } else if flags & O_TRUNC != 0 && (acc == O_WRONLY || acc == O_RDWR) {
-        // truncate: rewrite as empty
         let _ = VFS.get().create_file(path, &[]);
         inode = VFS.get().resolve_path(path);
     }
 
     let Some(inode) = inode else {
-        return usize::MAX;
+        return ENOENT;
     };
 
-    let mut offset = 0u64;
-    if flags & O_APPEND != 0 {
-        // size via read_at probe is awkward; leave 0 and use write path size — for now
-        // try list won't work; keep 0 (write_at extends)
-        offset = 0;
-    }
+    let offset = if flags & O_APPEND != 0 {
+        probe_inode_size(inode)
+    } else {
+        0
+    };
     let fs_id = (inode >> 24) as u8;
-    let is_device = fs_id != 0; // fs_id > 0 значит это точка монтирования (DevFS и т.д.)
+    let is_device = fs_id != 0;
 
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
@@ -337,7 +477,372 @@ fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize {
             }
         }
     }
-    usize::MAX
+    ENOMEM
+}
+
+fn ENAMETOOLONG_OR_EINVAL() -> usize {
+    EINVAL
+}
+fn EMFILE_OR_ENOMEM() -> usize {
+    ENOMEM
+}
+
+fn sys_lseek(current_slot: usize, fd: usize, offset: i32, whence: u32) -> usize {
+    unsafe {
+        if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
+            match current.fd_table.get_mut(fd) {
+                Some(FileDescriptor::File { inode, offset: ref mut off, .. })
+                | Some(FileDescriptor::Device { inode, offset: ref mut off, .. }) => {
+                    let size = probe_inode_size(*inode);
+                    let base = match whence {
+                        SEEK_SET => 0i64,
+                        SEEK_CUR => *off as i64,
+                        SEEK_END => size as i64,
+                        _ => return EINVAL,
+                    };
+                    let new = base + offset as i64;
+                    if new < 0 {
+                        return EINVAL;
+                    }
+                    *off = new as u64;
+                    return *off as usize;
+                }
+                Some(FileDescriptor::Dir { cookie, .. }) => {
+                    if whence != SEEK_SET || offset != 0 {
+                        return EINVAL;
+                    }
+                    *cookie = 0;
+                    return 0;
+                }
+                _ => return EBADF,
+            }
+        }
+    }
+    EBADF
+}
+
+fn sys_brk(current_slot: usize, addr: u32) -> usize {
+    unsafe {
+        if current_slot == 0 || current_slot >= 8 {
+            return 0;
+        }
+        let Some(ref mut task) = TASK_MANAGER.tasks[current_slot] else {
+            return 0;
+        };
+        // Region: 0x4000_0000 + slot * 0x1000_0000
+        let heap_base = 0x4000_0000u32.wrapping_add((current_slot as u32).wrapping_mul(0x1000_0000));
+        if task.heap_next < heap_base {
+            task.heap_next = heap_base;
+        }
+        // brk(0) → current break
+        if addr == 0 {
+            return task.heap_next as usize;
+        }
+        if addr < heap_base {
+            return task.heap_next as usize;
+        }
+        // Cap growth: 32 MiB per process
+        if addr.saturating_sub(heap_base) > 32 * 1024 * 1024 {
+            return task.heap_next as usize;
+        }
+        let page_size = PAGE_SIZE as u32;
+        if addr > task.heap_next {
+            let start_page = task.heap_next & !(page_size - 1);
+            let end_page = (addr + page_size - 1) & !(page_size - 1);
+            let mut p = start_page;
+            while p < end_page {
+                let need = task.page_refcounts.inc(p);
+                if need {
+                    task.pd_mut().alloc_and_map_user_page(p);
+                }
+                p += page_size;
+            }
+        }
+        task.heap_next = addr;
+        task.heap_next as usize
+    }
+}
+
+const MAP_SHARED: u32 = 0x01;
+const MAP_PRIVATE: u32 = 0x02;
+const MAP_FIXED: u32 = 0x10;
+const MAP_ANONYMOUS: u32 = 0x20;
+
+/// Linux i386 old mmap arg block (syscall 90).
+#[repr(C)]
+struct MmapArgStruct {
+    addr: u32,
+    len: u32,
+    prot: u32,
+    flags: u32,
+    fd: i32,
+    offset: u32, // byte offset
+}
+
+fn sys_mmap_old(current_slot: usize, argp: *const MmapArgStruct) -> usize {
+    if argp.is_null() {
+        return EFAULT;
+    }
+    let a = unsafe { &*argp };
+    // offset is in bytes; mmap2 wants page offset
+    let pgoff = a.offset >> 12;
+    sys_mmap2(
+        current_slot,
+        a.addr,
+        a.len as usize,
+        a.prot,
+        a.flags,
+        a.fd,
+        pgoff,
+    )
+}
+
+/// mmap2: offset is in pages (4 KiB).
+fn sys_mmap2(
+    current_slot: usize,
+    addr: u32,
+    len: usize,
+    _prot: u32,
+    flags: u32,
+    fd: i32,
+    pgoff: u32,
+) -> usize {
+    if len == 0 {
+        return EINVAL;
+    }
+    // Cap single mapping at 64 MiB
+    if len > 64 * 1024 * 1024 {
+        return ENOMEM;
+    }
+    let page_size = PAGE_SIZE as u32;
+    let len_u = ((len as u32) + page_size - 1) & !(page_size - 1);
+
+    let anonymous = flags & MAP_ANONYMOUS != 0 || fd < 0;
+
+    unsafe {
+        if current_slot == 0 || current_slot >= 8 {
+            return ENOMEM;
+        }
+        let Some(ref mut task) = TASK_MANAGER.tasks[current_slot] else {
+            return ENOMEM;
+        };
+
+        // Pick VA
+        let mut va = if flags & MAP_FIXED != 0 {
+            if addr == 0 {
+                return EINVAL;
+            }
+            addr & !(page_size - 1)
+        } else if addr != 0 {
+            // Hint — we honour it if non-zero and not FIXED (simple)
+            addr & !(page_size - 1)
+        } else {
+            // Auto: bump allocator from mmap_next
+            if task.mmap_next < 0x6000_0000 {
+                task.mmap_next = 0x6000_0000;
+            }
+            // Keep below user stack (~0xBFFF_F000)
+            if task.mmap_next.saturating_add(len_u) >= 0xB000_0000 {
+                return ENOMEM;
+            }
+            let v = task.mmap_next;
+            task.mmap_next = task.mmap_next.saturating_add(len_u);
+            v
+        };
+
+        // Don't map into kernel half
+        if va >= 0xC000_0000 || va.saturating_add(len_u) > 0xC000_0000 {
+            return EINVAL;
+        }
+
+        // Map pages (zero-filled)
+        let mut p = va;
+        let end = va + len_u;
+        while p < end {
+            let need = task.page_refcounts.inc(p);
+            if need {
+                task.pd_mut().alloc_and_map_user_page(p);
+            }
+            // Clear page
+            core::ptr::write_bytes(p as *mut u8, 0, PAGE_SIZE);
+            p += page_size;
+        }
+
+        // File-backed: copy file contents into mapping
+        if !anonymous {
+            let inode = match task.fd_table.get(fd as usize) {
+                Some(FileDescriptor::File { inode, .. })
+                | Some(FileDescriptor::Device { inode, .. }) => *inode,
+                _ => return EBADF,
+            };
+            let file_off = (pgoff as u64) * (PAGE_SIZE as u64);
+            let mut remaining = len;
+            let mut dst = va as *mut u8;
+            let mut off = file_off;
+            while remaining > 0 {
+                let chunk = remaining.min(4096);
+                let mut buf = alloc::vec![0u8; chunk];
+                let n = VFS.get().read_at(inode, off, &mut buf);
+                if n == 0 {
+                    break;
+                }
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, n);
+                remaining -= n;
+                off += n as u64;
+                dst = dst.add(n);
+            }
+        }
+
+        va as usize
+    }
+}
+
+fn sys_munmap(current_slot: usize, addr: u32, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let page_size = PAGE_SIZE as u32;
+    let start = addr & !(page_size - 1);
+    let end = (addr.saturating_add(len as u32) + page_size - 1) & !(page_size - 1);
+    if start >= 0xC000_0000 {
+        return EINVAL;
+    }
+    unsafe {
+        if let Some(ref mut task) = TASK_MANAGER.tasks[current_slot] {
+            let mut p = start;
+            while p < end && p < 0xC000_0000 {
+                let should = task.page_refcounts.dec(p);
+                if should {
+                    task.pd_mut().unmap(p);
+                }
+                p += page_size;
+            }
+            return 0;
+        }
+    }
+    EINVAL
+}
+
+fn sys_ioctl(_current_slot: usize, _fd: usize, _req: u32, _arg: u32) -> usize {
+    // Most tty ioctls → ENOTTY is fine for non-interactive tools
+    ENOTTY
+}
+
+fn sys_fstat64(current_slot: usize, fd: usize, st_ptr: *mut Stat64) -> usize {
+    if st_ptr.is_null() {
+        return EFAULT;
+    }
+    unsafe {
+        if let Some(ref current) = TASK_MANAGER.tasks[current_slot] {
+            let desc = current.fd_table.get(fd).copied().or_else(|| {
+                if fd == 0 {
+                    Some(FileDescriptor::ConsoleIn)
+                } else if fd == 1 || fd == 2 {
+                    Some(FileDescriptor::ConsoleOut)
+                } else {
+                    None
+                }
+            });
+            match desc {
+                Some(FileDescriptor::File { inode, .. })
+                | Some(FileDescriptor::Device { inode, .. }) => {
+                    let size = probe_inode_size(inode);
+                    fill_stat64(&mut *st_ptr, inode, S_IFREG, size);
+                    return 0;
+                }
+                Some(FileDescriptor::Dir { .. }) => {
+                    fill_stat64(&mut *st_ptr, 1, S_IFDIR, 0);
+                    return 0;
+                }
+                Some(FileDescriptor::ConsoleIn) | Some(FileDescriptor::ConsoleOut) => {
+                    fill_stat64(&mut *st_ptr, 0, S_IFCHR, 0);
+                    return 0;
+                }
+                _ => return EBADF,
+            }
+        }
+    }
+    EBADF
+}
+
+fn sys_stat64(path_ptr: *const u8, st_ptr: *mut Stat64) -> usize {
+    if st_ptr.is_null() || path_ptr.is_null() {
+        return EFAULT;
+    }
+    let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
+    if path.is_empty() {
+        return ENOENT;
+    }
+    if path_is_dir(path) {
+        unsafe {
+            fill_stat64(&mut *st_ptr, 1, S_IFDIR, 0);
+        }
+        return 0;
+    }
+    let Some(inode) = VFS.get().resolve_path(path) else {
+        return ENOENT;
+    };
+    let size = probe_inode_size(inode);
+    unsafe {
+        fill_stat64(&mut *st_ptr, inode, S_IFREG, size);
+    }
+    0
+}
+
+fn sys_getdents64(current_slot: usize, fd: usize, dirp: *mut u8, count: usize) -> usize {
+    if dirp.is_null() || count < 24 {
+        return EINVAL;
+    }
+    unsafe {
+        let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] else {
+            return EBADF;
+        };
+        let (path_str, cookie) = match current.fd_table.get(fd) {
+            Some(FileDescriptor::Dir {
+                path,
+                path_len,
+                cookie,
+            }) => {
+                let s = core::str::from_utf8(&path[..*path_len as usize]).unwrap_or("/");
+                (s, *cookie)
+            }
+            _ => return ENOTDIR,
+        };
+        let entries = match VFS.get().list_directory_entries(path_str) {
+            Some(e) => e,
+            None => return ENOTDIR,
+        };
+        let mut written = 0usize;
+        let mut idx = cookie as usize;
+        while idx < entries.len() {
+            let e = &entries[idx];
+            let name = e.name.as_bytes();
+            // reclen = 19 + name + NUL, aligned to 8
+            let base = 19 + name.len() + 1;
+            let reclen = (base + 7) & !7;
+            if written + reclen > count {
+                break;
+            }
+            let p = dirp.add(written);
+            // d_ino u64
+            core::ptr::write_unaligned(p as *mut u64, e.inode as u64);
+            // d_off i64 = next index
+            core::ptr::write_unaligned(p.add(8) as *mut i64, (idx + 1) as i64);
+            // d_reclen u16
+            core::ptr::write_unaligned(p.add(16) as *mut u16, reclen as u16);
+            // d_type u8: DT_DIR=4, DT_REG=8
+            *p.add(18) = if e.file_type == 2 { 4 } else { 8 };
+            // d_name
+            core::ptr::copy_nonoverlapping(name.as_ptr(), p.add(19), name.len());
+            *p.add(19 + name.len()) = 0;
+            written += reclen;
+            idx += 1;
+        }
+        if let Some(FileDescriptor::Dir { cookie, .. }) = current.fd_table.get_mut(fd) {
+            *cookie = idx as u32;
+        }
+        written
+    }
 }
 
 fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) -> usize {
@@ -395,6 +900,7 @@ fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) -> u
                     }
                     return bytes;
                 }
+                _ => {}
             }
         }
     }
@@ -520,6 +1026,7 @@ fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usize) -
                     }
                     return 0;
                 }
+                _ => {}
             }
         }
     }
@@ -864,6 +1371,9 @@ fn fd_poll_revents(current_slot: usize, fd: i32, events: i16) -> i16 {
                 rev
             }
             None => POLLERR,
+            _ => {
+                0
+            }
         }
     }
 }
@@ -1184,6 +1694,7 @@ pub fn sys_execve(
 
             t.running = true;
             t.heap_next = heap_start;
+            t.mmap_next = 0x6000_0000;
             t.parent = parent_slot as i8;
             t.zombie = false;
             t.exit_code = 0;

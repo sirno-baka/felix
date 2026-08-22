@@ -11,6 +11,26 @@ pub const SYS_RMDIR: u32 = 8;   // rmdir
 pub const SYS_UNLINK: u32 = 10;  // delete/unlink(filename)
 
 pub const SYS_EXECVE: u32 = 11;
+/// lseek(fd, offset, whence) — Linux i386 #19
+pub const SYS_LSEEK: u32 = 19;
+/// brk(addr) — Linux i386 #45; brk(0) returns current break
+pub const SYS_BRK: u32 = 45;
+/// old mmap(struct mmap_arg_struct*) — Linux i386 #90
+pub const SYS_MMAP: u32 = 90;
+/// munmap(addr, len) — Linux i386 #91
+pub const SYS_MUNMAP: u32 = 91;
+/// mmap2(addr,len,prot,flags,fd,pgoff) — Linux i386 #192
+pub const SYS_MMAP2: u32 = 192;
+/// ioctl(fd, request, arg) — Linux i386 #54 (stub)
+pub const SYS_IOCTL: u32 = 54;
+/// fstat64(fd, statbuf) — Linux i386 #197
+pub const SYS_FSTAT64: u32 = 197;
+/// stat64(path, statbuf) — Linux i386 #195
+pub const SYS_STAT64: u32 = 195;
+/// getdents64(fd, dirp, count) — Linux i386 #220
+pub const SYS_GETDENTS64: u32 = 220;
+/// exit_group(status) — Linux i386 #252 (= exit)
+pub const SYS_EXIT_GROUP: u32 = 252;
 /// kill(pid, sig) — queue signal for task. 0 on success, usize::MAX on error.
 pub const SYS_KILL: u32 = 37;
 /// sigaction(sig, act, oldact) — set/get signal handler. 0 on success.

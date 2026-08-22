@@ -36,6 +36,12 @@ pub enum FileDescriptor {
         offset: u64,
         mode: FileMode,
     },
+    /// Directory for getdents64. `cookie` = next entry index.
+    Dir {
+        path: [u8; 96],
+        path_len: u8,
+        cookie: u32,
+    },
 }
 
 impl FileDescriptor {

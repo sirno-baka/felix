@@ -68,6 +68,8 @@ pub struct Task {
     pub kernel_stack: u32,
     pub fd_table: FileDescriptorTable,
     pub heap_next: u32,
+    /// Next free VA for anonymous mmap (grows up).
+    pub mmap_next: u32,
     pub page_refcounts: PageRefcounts,
     pub parent: i8,
     pub zombie: bool,
@@ -118,6 +120,7 @@ impl Task {
             fd_table: FileDescriptorTable::new(),
             kernel_stack: 0,
             heap_next: 0,
+            mmap_next: 0x6000_0000,
             page_refcounts: PageRefcounts::new(),
             parent: -1,
             zombie: false,
