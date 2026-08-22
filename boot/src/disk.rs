@@ -1,54 +1,69 @@
-// Minimal CHS floppy reader (INT 13h AH=02). No DAP.
-// lba is u16 — enough for 1.44MB floppy (max ~2880). Avoids fat 64-bit div.
+//! MBR stage: load bootloader via INT 13h LBA from HDD (DL=0x80).
 
 use core::arch::asm;
 
-const SECTOR_SIZE: u16 = 512;
-const SPT: u16 = 18;
-const HEADS: u16 = 2;
+#[repr(C, packed)]
+struct Dap {
+    size: u8,
+    reserved: u8,
+    count: u16,
+    offset: u16,
+    segment: u16,
+    lba: u64,
+}
 
 pub struct DiskReader {
-    lba: u16,
-    target: u16,
+    lba: u32,
+    buffer: u16,
 }
 
 impl DiskReader {
-    pub fn new(lba: u16, target: u16) -> Self {
-        Self { lba, target }
-    }
-
-    pub fn read_sector(&self) {
-        // LBA → CHS (all 16-bit, tiny code)
-        let sector = (self.lba % SPT) + 1;
-        let temp = self.lba / SPT;
-        let head = temp % HEADS;
-        let cyl = temp / HEADS;
-
-        let cx = (cyl << 8) | sector;
-        let dx = head << 8; // DL=0
-
-        unsafe {
-            asm!(
-            "xor ax, ax",
-            "mov es, ax",
-            "mov ax, 0x0201",
-            "int 0x13",
-            "jc fail",
-            in("bx") self.target,
-            in("cx") cx,
-            in("dx") dx,
-            lateout("ax") _,
-            options(nostack),
-            );
+    pub fn new(lba: u16, buffer: u16) -> Self {
+        Self {
+            lba: lba as u32,
+            buffer,
         }
     }
 
-    pub fn read_sectors(&mut self, mut n: u16) {
-        while n != 0 {
-            self.read_sector();
-            self.target = self.target.wrapping_add(SECTOR_SIZE);
-            self.lba = self.lba.wrapping_add(1);
-            n -= 1;
+    pub fn read_sectors(&mut self, count: u16) {
+        let mut remaining = count;
+        let mut lba = self.lba;
+        let mut buf = self.buffer;
+
+        while remaining > 0 {
+            let dap = Dap {
+                size: 16,
+                reserved: 0,
+                count: 1,
+                offset: buf,
+                segment: 0,
+                lba: lba as u64,
+            };
+            let dap_ptr = &dap as *const Dap as u16;
+            let mut err: u16;
+            unsafe {
+                asm!("sti", options(nostack));
+                asm!(
+                    "mov ah, 0x42",
+                    "mov dl, 0x80",
+                    "int 0x13",
+                    "mov ax, 0",
+                    "jnc 1f",
+                    "inc ax",
+                    "1:",
+                    in("si") dap_ptr,
+                    lateout("ax") err,
+                    options(nostack),
+                );
+            }
+            if err != 0 {
+                unsafe {
+                    asm!("jmp fail", options(noreturn));
+                }
+            }
+            lba += 1;
+            buf = buf.wrapping_add(512);
+            remaining -= 1;
         }
     }
 }

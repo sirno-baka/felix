@@ -4,11 +4,6 @@ device: disk.img
 unit: sectors
 sector-size: 512
 
-# boot сектор + bootloader
-1 : start=        2048, size=        2048, type=0
-
-# kernel
-2 : start=        4096, size=       32768, type=0
-
-# ext2 партишен (сюда копируются все приложения)
-3 : start=       36864, size=       94208, type=83
+# Single Linux (ext2) partition. Bootloader lives in the MBR gap (LBA 1..63).
+# Partition starts at 1 MiB for alignment.
+1 : start=        2048, size=      129024, type=83
