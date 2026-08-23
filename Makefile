@@ -136,7 +136,7 @@ image:
 
 	@echo "=== Creating ext2 rootfs (~63 MiB, 4K blocks, 128-byte inodes) ==="
 	@dd if=/dev/zero of=build/rootfs.img bs=512 count=129024 status=none
-	@$(E2MKFS) -F -b 4096 -I 128 -O ^64bit,^metadata_csum,^dir_index,^ext_attr,^resize_inode build/rootfs.img
+	@$(E2MKFS) -I 128 -O ^64bit,^metadata_csum,^dir_index,^ext_attr,^resize_inode build/rootfs.img
 
 	@echo "=== Copying /kernel.bin and userspace to ext2 ==="
 	@$(E2CP) -p build/kernel.bin build/rootfs.img:/kernel.bin && echo "  → /kernel.bin"
@@ -152,7 +152,7 @@ image:
 	@$(SFDISK) --list build/disk.img
 
 	@echo "=== Superblock magic (expect ef53 at partition+1024+56) ==="
-	@xxd -s $$((2048 * 512 + 1024 + 56)) -l 2 build/disk.img || \
+	#@xxd -s $$((2048 * 512 + 1024 + 56)) -l 2 build/disk.img || \
 		od -A x -t x1 -j $$((2048 * 512 + 1024 + 56)) -N 2 build/disk.img
 
 	@mkdir -p pxe/assets/felix
@@ -200,7 +200,9 @@ run: all
 debug: all
 	@echo "Debugging Felix..."
 	@killall qemu-system-i386 || true
-	@qemu-system-i386 -drive file=build/disk.img,index=0,media=disk,format=raw,if=ide -no-reboot -d int,guest_errors -no-reboot -no-shutdown \
+	@qemu-system-i386 -drive file=build/disk.img,index=0,media=disk,format=raw,if=ide -no-reboot -d int,guest_errors -no-reboot -debugcon file:debug.log -no-shutdown \
+		-netdev user,id=net0 \
+		-device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
                                                                                                                                            -no-shutdown \
                                                                                                                                            -m 64M \
                                                                                                                                            -serial stdio -s -S &

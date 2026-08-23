@@ -130,8 +130,6 @@ impl ATA {
 		channel.write(ATAReg::CONTROL, 0x02);
 
 		// (I) Select one from LBA28, LBA48 or CHS
-		// Sure Drive should support LBA in this case or you
-		// are giving a wrong LBA
 		if lba >= 0x10000000 {
 			// LBA48
 			lba_mode = 2;
@@ -139,18 +137,18 @@ impl ATA {
 			lba_io[1] = ((lba & 0x0000FF00) >> 8) as u8;
 			lba_io[2] = ((lba & 0x00FF0000) >> 16) as u8;
 			lba_io[3] = ((lba & 0xFF000000) >> 24) as u8;
-			lba_io[4] = 0; // LBA28 is integer, so 32-bits are enough to access 2TB
-			lba_io[5] = 0; // LBA28 is integer, so 32-bits are enough to access 2TB
-			head = 0; // Lower 4-bits of HDDEVSEL are not used here
+			lba_io[4] = 0;
+			lba_io[5] = 0;
+			head = 0;
 		} else if device.capabilities & 0x200 != 0 {
-			// LBA48
+			// LBA28
 			lba_mode = 1;
 			lba_io[0] = ((lba & 0x00000FF) >> 0) as u8;
 			lba_io[1] = ((lba & 0x000FF00) >> 8) as u8;
 			lba_io[2] = ((lba & 0x0FF0000) >> 16) as u8;
-			lba_io[3] = 0; // These Registers are not used here
-			lba_io[4] = 0; // These Registers are not used here
-			lba_io[5] = 0; // These Registers are not used here
+			lba_io[3] = 0;
+			lba_io[4] = 0;
+			lba_io[5] = 0;
 			head = ((lba & 0xF000000) >> 24) as u8;
 		} else {
 			// CHS:
@@ -163,15 +161,20 @@ impl ATA {
 			lba_io[3] = 0;
 			lba_io[4] = 0;
 			lba_io[5] = 0;
-			// Head number is written to HDDEVSEL lower 4-bits
 			head = ((lba + 1 - sect as u32) % (16 * 63) / (63)) as u8;
 		}
 
 		// (II) See if drive supports DMA or not
 		dma = 0; // We don't support DMA
 
-		// (III) Wait if the drive is busy
-		while (channel.read(ATAReg::STATUS) & ATAStatus::BSY) != 0 {}
+		// (III) Wait if the drive is busy (with timeout — never spin forever)
+		let mut bsy_timeout = 2_000_000u32;
+		while (channel.read(ATAReg::STATUS) & ATAStatus::BSY) != 0 {
+			if bsy_timeout == 0 {
+				return Err(0xFF);
+			}
+			bsy_timeout -= 1;
+		}
 
 		// (IV) Select Drive from the controller
 		if lba_mode == 0 {
@@ -197,14 +200,6 @@ impl ATA {
 		channel.write(ATAReg::LBA2, lba_io[2]);
 
 		// (VI) Select the command and send it
-		// Routine that is followed:
-		// If ( DMA & LBA48)   DO_DMA_EXT
-		// If ( DMA & LBA28)   DO_DMA_LBA
-		// If ( DMA & LBA28)   DO_DMA_CHS
-		// If (!DMA & LBA48)   DO_PIO_EXT
-		// If (!DMA & LBA28)   DO_PIO_LBA
-		// If (!DMA & !LBA#)   DO_PIO_CHS
-
 		let cmd = match (lba_mode, dma, direction) {
 			(0, 0, 0) => ATACommand::ReadPio,
 			(1, 0, 0) => ATACommand::ReadPio,
@@ -229,34 +224,29 @@ impl ATA {
 			} else {
 				// DMA Write
 			}
-		} else {
-			if direction == 0 {
-				// PIO Read
-				for _ in 0..numsects {
-					// Polling, set error and exit if there is
-					channel.polling(1)?;
-					io::insw(bus as u16, edi as *mut _, words);
-					edi += words * 2;
-				}
-			} else {
-				// PIO Write
-				for _ in 0..numsects {
-					// Polling
-					channel.polling(0)?;
-					io::outsw(bus as u16, edi as *mut _, words);
-					edi += words * 2;
-				}
-				channel.write(
-					ATAReg::COMMAND,
-					[
-						ATACommand::CacheFlush,
-						ATACommand::CacheFlush,
-						ATACommand::CacheFlushExt
-					][lba_mode as usize] as u8
-				);
-				// Polling
-				channel.polling(0)?;
+		} else if direction == 0 {
+			// PIO Read — one poll+transfer per sector
+			for _ in 0..numsects {
+				channel.polling(1)?;
+				io::insw(bus as u16, edi as *mut _, words);
+				edi += words * 2;
 			}
+		} else {
+			// PIO Write
+			for _ in 0..numsects {
+				channel.polling(0)?;
+				io::outsw(bus as u16, edi as *mut _, words);
+				edi += words * 2;
+			}
+			channel.write(
+				ATAReg::COMMAND,
+				[
+					ATACommand::CacheFlush,
+					ATACommand::CacheFlush,
+					ATACommand::CacheFlushExt
+				][lba_mode as usize] as u8
+			);
+			channel.polling(0)?;
 		}
 		Ok(())
 	}

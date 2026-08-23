@@ -55,21 +55,16 @@ use filesystem::ext2::Ext2;
 use multitasking::task::TASK_MANAGER;
 use crate::device::char::{NullDevice, ZeroDevice};
 use crate::disk::interface::BlockDevice;
-use crate::disk::{copy_sectors, PartitionConfig};
 use crate::disk::ramdisk::RamDisk;
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::drivers::net::i8255x::SCB_STATUS;
-use crate::drivers::pic::wait;
 use crate::filesystem::{Filesystem, VFS};
 use crate::filesystem::devfs::DevFS;
-use crate::filesystem::vfs::Vfs;
-use crate::io::{inb, outb};
-use crate::pci::floppy::disk::Floppy;
-use crate::pci::ide::IDE;
+use crate::io::outb;
+use crate::pci::ide::{IDE, IDEDevice};
 use crate::pci::print_devices;
 use crate::sync::mutex::Mutex;
 use crate::utils::queue::Queue;
-use crate::wrappers::{cli, sti};
 
 static mut TEST_WRITE: [u32; 128] = [0; 128];
 static mut TEST_READ:  [u32; 128] = [0; 128];
@@ -238,23 +233,18 @@ pub extern "C" fn higher_half_entry() -> ! {
         *KEYBOARD_BUFFER.lock() = Some(Queue::new());
         crate::drivers::mouse::init();
 
-        // IDE init (holds KMutex — must not enable IF on unlock)
-        IDE.lock().initialize().expect("Cannot read from disks");
+        // Real ATA disk → ext2 (MBR type 0x83). No RamFS / ramdisk.
+        IDE.lock().initialize().expect("Cannot probe IDE");
 
-        // let first = IDE.lock().get_device(0).unwrap();
-        // let mut ext2d = Ext2::new(first.clone(), None);
-        // //Ext2::format_gb(first, 0, 64, 4096);
-        // ext2d.mount(None);
-        // let disk = Arc::new(spin::Mutex::new(floppy));
-        // let mut superblock_buf = [0u8; 1024];
-        // match disk.lock().read_sectors(2, 2113, superblock_buf.as_mut_ptr() as u32) {
-        //     Ok(_) => {println!("{:02x?}", &superblock_buf);}
-        //     Err(e) => { print!("err: {:02x?}", e);}
-        // };
-        // Буфер достаточного размера
+        let ide_disk = match first_ata_disk() {
+            Some(d) => d,
+            None => {
+                println!("[!] No ATA disk found");
+                halt();
+            }
+        };
+
         let devfs = Box::new(DevFS::new());
-
-        let ide_disk = IDE.lock().get_device(0).expect("No IDE disk");
         devfs.register_block("sda", Mutex::new(Box::new(ide_disk.clone())));
         devfs.register_char("null", Box::new(NullDevice));
         devfs.register_char("zero", Box::new(ZeroDevice));
@@ -262,11 +252,16 @@ pub extern "C" fn higher_half_entry() -> ! {
         let disk = Arc::new(spin::Mutex::new(ide_disk));
         let mut ext2 = Ext2::new_with_auto_partition(disk);
         ext2.mount(None);
+        if !ext2.mounted {
+            println!("[!] ext2 mount failed (no superblock 0xEF53)");
+        } else {
+            VFS.get().set_root(Box::new(ext2));
+            println!("[VFS] root = ext2 on ATA (/dev/sda)");
+        }
 
         VFS.get().mount("/dev", devfs);
-        VFS.get().set_root(Box::new(ext2));
 
-        println!("[VFS] Virtual filesystem initialized");
+
         print_info();
         print_devices();
         crate::drivers::net::i8255x::I8255x::init().expect("NIC init failed");
@@ -282,7 +277,13 @@ pub extern "C" fn higher_half_entry() -> ! {
         // Keep nested cli for the entire critical section.
         crate::wrappers::_cli();
 
-        let data = VFS.get().read_file("/shell").unwrap();
+        let data = match VFS.get().read_file("/shell") {
+            Some(d) => d,
+            None => {
+                println!("[!] /shell not found on ext2 root");
+                halt();
+            }
+        };
         let shell_argv = [b"/shell\0".to_vec()];
         let shell_pid = crate::syscalls::handler::sys_execve(
             0,
@@ -453,6 +454,24 @@ fn panic(info: &PanicInfo) -> ! {
     println!("System halted");
     loop {
         unsafe { core::arch::asm!("hlt"); }
+    }
+}
+
+fn first_ata_disk() -> Option<IDEDevice> {
+    let ide = IDE.lock();
+    for i in 0..4u8 {
+        if let Some(dev) = ide.get_device(i) {
+            if dev.r#type == 0 {
+                return Some(dev);
+            }
+        }
+    }
+    None
+}
+
+fn halt() -> ! {
+    loop {
+        unsafe { asm!("hlt"); }
     }
 }
 

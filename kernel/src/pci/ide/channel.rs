@@ -106,41 +106,45 @@ impl IDEChannelRegisters {
 		}
 	}
 
+	/// Wait until BSY clears, then (if advanced_check) until DRQ or error.
+	/// Timeout was 500 spins — QEMU/real HW often need far more after multi-sector READ.
 	pub fn polling(&mut self, advanced_check: u32) -> Result<(), u8> {
+		// ~400ns delay required after command before reading status
 		for _ in 0..4 {
 			self.read(ATAReg::ALTSTATUS);
 		}
 
-		let mut timeout = 500; // подбери под свой sleep
+		const TIMEOUT: u32 = 2_000_000;
+
+		let mut timeout = TIMEOUT;
 		while (self.read(ATAReg::STATUS) & ATAStatus::BSY) != 0 {
 			if timeout == 0 {
-				return Err(0xFF); // timeout
+				return Err(0xFF); // BSY timeout
 			}
-			// можно sleep(0) или просто крутить
 			timeout -= 1;
 		}
 
 		if advanced_check != 0 {
-			// Read Status Register
-			let state: u8 = self.read(ATAReg::STATUS);
+			// Wait for DRQ (data ready) or an error bit — do not check only once.
+			timeout = TIMEOUT;
+			loop {
+				let state: u8 = self.read(ATAReg::STATUS);
 
-			// (III) Check for errors
-			if (state & ATAStatus::ERR) != 0 {
-				return Err(2);
-			}
-
-			// (IV) Check if device fault
-			if (state & ATAStatus::DF) != 0 {
-				return Err(1);
-			}
-
-			// (V) Check DRQ
-			// BSY = 0; DF = 0; Err = 0; So we should check for DRQ now
-			if (state & ATAStatus::DRQ) == 0 {
-				return Err(3);
+				if (state & ATAStatus::ERR) != 0 {
+					return Err(2);
+				}
+				if (state & ATAStatus::DF) != 0 {
+					return Err(1);
+				}
+				if (state & ATAStatus::DRQ) != 0 {
+					return Ok(());
+				}
+				if timeout == 0 {
+					return Err(3); // Reads Nothing
+				}
+				timeout -= 1;
 			}
 		}
-		// No Error
 		Ok(())
 	}
 }

@@ -62,12 +62,10 @@ pub extern "C" fn _start() -> ! {
     // VESA after the kernel is in memory so boot messages stay visible.
     println!("[!] Setting VESA graphics mode...");
     unsafe {
-        let _ = vesa::init_vesa();
+        // let _ = vesa::init_vesa();
     }
 
-    unsafe {
-        GDT.load();
-    }
+    restore_unreal();
 
     println!("[!] Switching to 32bit protected mode and jumping to kernel...");
     protected_mode();
@@ -120,11 +118,20 @@ fn protected_mode() {
     }
 }
 
+/// iPXE / BIOS INT 13h reloads segments and kills the 4GB unreal-mode limits.
+/// Call this before any access above 1MB.
+pub(crate) fn restore_unreal() {
+    enable_a20_fast();
+    unreal_mode();
+}
+
 fn unreal_mode() {
     let ds: u16;
+    let es: u16;
     let ss: u16;
     unsafe {
         asm!("mov {0:x}, ds", out(reg) ds);
+        asm!("mov {0:x}, es", out(reg) es);
         asm!("mov {0:x}, ss", out(reg) ss);
     }
 
@@ -139,16 +146,25 @@ fn unreal_mode() {
         let cr0_protected = cr0 | 1;
         asm!("mov cr0, {0:e}", in(reg) cr0_protected);
 
-        asm!("mov {0:x}, 0x10", "mov ds, {0:x}", "mov ss, {0:x}", out(reg) _);
+        asm!(
+            "mov ax, 0x10",
+            "mov ds, ax",
+            "mov es, ax",
+            "mov fs, ax",
+            "mov gs, ax",
+            "mov ss, ax",
+            out("ax") _,
+        );
 
         asm!("mov cr0, {0:e}", in(reg) cr0);
 
         asm!("mov ds, {0:x}", in(reg) ds);
+        asm!("mov es, {0:x}", in(reg) es);
         asm!("mov ss, {0:x}", in(reg) ss);
     }
 }
 
-fn enable_a20() {
+fn enable_a20_fast() {
     unsafe {
         let mut val: u8;
         asm!("in al, 0x92", out("al") val);
@@ -157,7 +173,12 @@ fn enable_a20() {
             val &= !1;
             asm!("out 0x92, al", in("al") val);
         }
+    }
+}
 
+fn enable_a20() {
+    enable_a20_fast();
+    unsafe {
         let mut ax: u16;
         asm!(
             "mov ax, 0x2401",

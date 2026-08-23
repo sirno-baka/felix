@@ -1,7 +1,6 @@
 // DISK READER — INT 0x13 AH=42 (LBA DAP)
-// One DAP per request. Do not increment the buffer across sectors: that was
-// leaving inode-table bytes past the first 512B as leftover directory data,
-// so /kernel.bin (inode ~12, offset 1408) parsed as size=0.
+// iPXE/BIOS INT 13h destroys unreal-mode segment limits. High-memory copies
+// must restore them first, otherwise writing to 0x01000000 #GPs and hangs.
 
 use core::arch::asm;
 use core::mem;
@@ -44,21 +43,26 @@ impl Disk {
 
         let dap_address = &dap as *const DiskAddressPacket as u16;
 
-        // LLVM reserves ESI on this target — never list si as an asm operand.
-        // Save/restore SI via a compiler-allocated register, same as the MBR reader.
+        // LLVM reserves ESI — never list si as an asm operand.
+        // STI: iPXE HTTP SAN needs IRQs for the NIC.
         unsafe {
             asm!(
                 "push ds",
+                "push es",
                 "push ax",
                 "xor ax, ax",
                 "mov ds, ax",
+                "mov es, ax",
                 "pop ax",
                 "mov {1:x}, si",
                 "mov si, {0:x}",
+                "sti",
                 "int 0x13",
-                "jc fail",
+                "cli",
                 "cld",
+                "jc fail",
                 "mov si, {1:x}",
+                "pop es",
                 "pop ds",
                 in(reg) dap_address,
                 out(reg) _,
@@ -77,32 +81,29 @@ impl Disk {
         self.int13(sectors);
     }
 
-    /// Read `sectors` one at a time and copy each to high memory (unreal mode).
+    /// Read a whole block into the low scratch buffer, then copy to high memory.
     pub fn read_sectors(&mut self, sectors: u16, target: u32) {
-        let scratch = self.buffer;
-        let mut dest = target;
-        let mut left = sectors;
-        while left > 0 {
-            self.int13(1);
+        self.int13(sectors);
+        crate::restore_unreal();
+        copy_high(self.buffer as u32, target, sectors as u32 * 512);
+        print!(".");
+    }
+}
 
-            let mut src = scratch as u32;
-            let end = dest + 512;
-            while dest < end {
-                unsafe {
-                    let mut byte: u8;
-                    asm!("mov {0}, [{1:e}]", out(reg_byte) byte, in(reg) src);
-                    asm!("mov [{0:e}], {1}", in(reg) dest, in(reg_byte) byte);
-                }
-                src += 1;
-                dest += 1;
-            }
-
-            self.lba += 1;
-            left -= 1;
-            let read = sectors - left;
-            if read % 64 == 0 {
-                print!(".");
-            }
-        }
+fn copy_high(src: u32, dst: u32, len: u32) {
+    unsafe {
+        asm!(
+            "2:",
+            "mov eax, [{0:e}]",
+            "mov [{1:e}], eax",
+            "add {0:e}, 4",
+            "add {1:e}, 4",
+            "sub {2:e}, 4",
+            "jnz 2b",
+            inout(reg) src => _,
+            inout(reg) dst => _,
+            inout(reg) len => _,
+            out("eax") _,
+        );
     }
 }
