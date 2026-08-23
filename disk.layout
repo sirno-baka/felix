@@ -4,11 +4,8 @@ device: disk.img
 unit: sectors
 sector-size: 512
 
-# boot сектор + bootloader
-1 : start=        2048, size=        2048, type=0
+# LBA 0        : MBR (boot.bin)
+# LBA 1..2047  : stage2 bootloader (embedded in the 1 MiB gap)
+# LBA 2048+    : ext2 with /kernel.bin, /shell, ...
 
-# kernel
-2 : start=        4096, size=       32768, type=0
-
-# ext2 партишен (сюда копируются все приложения)
-3 : start=       36864, size=       94208, type=83
+1 : start=        2048, size=      129024, type=83, bootable

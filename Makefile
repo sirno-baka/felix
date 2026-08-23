@@ -122,50 +122,46 @@ floppy-image:
 
 .PHONY: image
 image:
-	@echo "=== Creating clean 64 MiB disk image ==="
+	@echo "=== Creating 64 MiB bootable disk (MBR | bootloader | ext2) ==="
 	@rm -f build/disk.img build/rootfs.img
-	@dd if=/dev/zero of=build/disk.img bs=1M count=64
+	@dd if=/dev/zero of=build/disk.img bs=1M count=64 status=none
 
-	@echo "=== Applying partition layout ==="
+	@echo "=== Partition table (ext2 at LBA 2048) ==="
 	@$(SFDISK) build/disk.img < disk.layout
-	@echo "--- Partition table after first sfdisk ---"
 	@$(SFDISK) --list build/disk.img
 
-	@echo "=== Writing boot, bootloader and kernel ==="
-	@dd if=build/boot.bin       of=build/disk.img bs=512 conv=notrunc
-	@dd if=build/bootloader.bin of=build/disk.img bs=512 seek=2048 conv=notrunc
-	@dd if=build/kernel.bin     of=build/disk.img bs=512 seek=4096 conv=notrunc
+	@echo "=== Writing MBR (LBA 0) and bootloader (LBA 1) ==="
+	@dd if=build/boot.bin of=build/disk.img bs=512 conv=notrunc status=none
+	@dd if=build/bootloader.bin of=build/disk.img bs=512 seek=1 conv=notrunc status=none
 
-	@echo "=== Creating ext2 rootfs ==="
-	@dd if=/dev/zero of=build/rootfs.img bs=512 count=94208
-	@$(E2MKFS) -I 128 -O ^64bit,^metadata_csum,^dir_index,^ext_attr,^resize_inode build/rootfs.img
+	@echo "=== Creating ext2 rootfs (~63 MiB, 4K blocks, 128-byte inodes) ==="
+	@dd if=/dev/zero of=build/rootfs.img bs=512 count=129024 status=none
+	@$(E2MKFS) -F -b 4096 -I 128 -O ^64bit,^metadata_csum,^dir_index,^ext_attr,^resize_inode build/rootfs.img
 
-	@echo "=== Preparing files for copying ==="
-	@mkdir -p build/apps
-	@cp -f build/*.bin build/apps/ 2>/dev/null || true
-	@cp -f build/shell build/apps/ 2>/dev/null || true
-	@cp -f build/hello build/apps/ 2>/dev/null || true
-	@cp -f build/async_test build/apps/ 2>/dev/null || true
+	@echo "=== Copying /kernel.bin and userspace to ext2 ==="
+	@$(E2CP) -p build/kernel.bin build/rootfs.img:/kernel.bin && echo "  → /kernel.bin"
+	@$(E2CP) -p build/shell build/rootfs.img:/shell && echo "  → /shell"
+	@$(E2CP) -p build/hello build/rootfs.img:/hello && echo "  → /hello"
+	@$(E2CP) -p build/async_test build/rootfs.img:/test && echo "  → /test"
 
-	@echo "=== Copying files to ext2 partition ==="
-	@for f in build/apps/*; do \
-		if [ -f "$$f" ]; then \
-			$(E2CP) -p "$$f" build/rootfs.img:/$$(basename "$$f"); \
-			echo "  → $$(basename "$$f")"; \
-		fi; \
-	done
+	@echo "=== Embedding ext2 at LBA 2048 ==="
+	@dd if=build/rootfs.img of=build/disk.img bs=512 seek=2048 conv=notrunc status=none
 
-	@echo "=== Inserting ext2 partition back into disk ==="
-	@dd if=build/rootfs.img of=build/disk.img bs=512 seek=36864 conv=notrunc
-
-	@echo "=== Re-applying partition table (critical fix) ==="
+	@echo "=== Restore MBR partition table (keep boot code) ==="
 	@$(SFDISK) build/disk.img < disk.layout
-
-	@echo "=== FINAL partition table check ==="
 	@$(SFDISK) --list build/disk.img
+
+	@echo "=== Superblock magic (expect ef53 at partition+1024+56) ==="
+	@xxd -s $$((2048 * 512 + 1024 + 56)) -l 2 build/disk.img || \
+		od -A x -t x1 -j $$((2048 * 512 + 1024 + 56)) -N 2 build/disk.img
+
+	@mkdir -p pxe/assets/felix
+	@cp -f build/disk.img pxe/assets/felix/disk.img 2>/dev/null || true
+	@cp -f build/disk.img pxe/assets/disk.img 2>/dev/null || true
 
 	@rm -f build/rootfs.img
-	@echo "=== Disk image ready! ==="
+	@ls -lh build/disk.img
+	@echo "=== Disk image ready (dd if=build/disk.img of=/dev/sdX) ==="
 
 .PHONY: clean
 clean:
@@ -190,10 +186,15 @@ run-floppy: all floppy-image
 
 .PHONY: run
 run: all
-	@echo "Running Felix..."
+	@echo "Running Felix from HDD image..."
 	@killall qemu-system-i386 || true
-
-	@qemu-system-i386 -drive file=build/disk.img,index=0,media=disk,format=raw,if=ide -no-reboot -no-shutdown -m 64M -serial stdio
+	@qemu-system-i386 \
+		-drive file=build/disk.img,index=0,media=disk,format=raw,if=ide \
+		-boot order=c \
+		-netdev user,id=net0 \
+		-device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
+		-no-reboot -no-shutdown -vga std -m 64M \
+		-debugcon file:debug.log -serial stdio
 
 .PHONY: debug
 debug: all

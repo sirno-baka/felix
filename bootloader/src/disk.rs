@@ -1,255 +1,108 @@
-// DISK READER for FLOPPY — real hardware friendly
-// INT 13h AH=02 (CHS), no DAP
-use core::arch::asm;
-use crate::print::PRINTER;
+// DISK READER — INT 0x13 AH=42 (LBA DAP)
+// One DAP per request. Do not increment the buffer across sectors: that was
+// leaving inode-table bytes past the first 512B as leftover directory data,
+// so /kernel.bin (inode ~12, offset 1408) parsed as size=0.
 
-pub static mut DISK: Disk = Disk { lba: 0, buffer: 0 };
-const SECTOR_SIZE: u32 = 512;
-const SPT: u16 = 18;
-const HEADS: u16 = 2;
-const MAX_RETRIES: u8 = 6;
+use core::arch::asm;
+use core::mem;
+
+pub static mut DISK: Disk = Disk {
+    lba: 0,
+    buffer: 0,
+};
+
+#[repr(C, packed)]
+struct DiskAddressPacket {
+    size: u8,
+    zero: u8,
+    sectors: u16,
+    offset: u16,
+    segment: u16,
+    lba: u64,
+}
 
 pub struct Disk {
-    lba: u32,
+    lba: u64,
     buffer: u16,
 }
 
 impl Disk {
-    pub fn init(&mut self, lba: u32, buffer: u16) {
+    pub fn init(&mut self, lba: u64, buffer: u16) {
         self.lba = lba;
         self.buffer = buffer;
-
-        
     }
 
-    fn check_ready(&self) {
-        print!("T");
-        let mut status: u16;
-        unsafe {
-            asm!(
-            "mov ah, 0x10",
-            "mov dl, 0x00",
-            "int 0x13",
-            "mov al, ah",
-            "mov ah, 0",
-            "jnc 1f",
-            "or ax, 0x100",
-            "1:",
-            lateout("ax") status,
-            lateout("dx") _,
-            options(nostack),
-            );
-        }
-        println!(" ready-status=0x{:x}", status);
-    }
+    fn int13(&self, sectors: u16) {
+        let dap = DiskAddressPacket {
+            size: mem::size_of::<DiskAddressPacket>() as u8,
+            zero: 0,
+            sectors,
+            offset: self.buffer,
+            segment: 0x0000,
+            lba: self.lba,
+        };
 
-    pub(crate) fn reset(&self) {
-        unsafe {
-            asm!(
-            "xor ax, ax",
-            "mov dl, 0x00",
-            "int 0x13",
-            lateout("ax") _,
-            lateout("dx") _,
-            options(nostack),
-            );
-        }
-        println!("reset")
-    }
+        let dap_address = &dap as *const DiskAddressPacket as u16;
 
-    pub(crate) fn delay(&self) {
-        print!(".");
+        // LLVM reserves ESI on this target — never list si as an asm operand.
+        // Save/restore SI via a compiler-allocated register, same as the MBR reader.
         unsafe {
             asm!(
-            "mov cx, 0xFFFF",
-            "2:",
-            "loop 2b",
-            "mov cx, 0xFFFF",
-            "3:",
-            "loop 3b",
-            lateout("cx") _,
-            options(nostack, nomem),
+                "push ds",
+                "push ax",
+                "xor ax, ax",
+                "mov ds, ax",
+                "pop ax",
+                "mov {1:x}, si",
+                "mov si, {0:x}",
+                "int 0x13",
+                "jc fail",
+                "cld",
+                "mov si, {1:x}",
+                "pop ds",
+                in(reg) dap_address,
+                out(reg) _,
+                in("ax") 0x4200u16,
+                in("dx") 0x0080u16,
             );
         }
     }
 
     pub fn read_sector(&self) {
-        let sector = ((self.lba % SPT as u32) + 1) as u16;
-        let temp   = (self.lba / SPT as u32) as u16;
-        let head   = temp % HEADS;
-        let cyl    = temp / HEADS;
-
-        let cx = (cyl << 8) | sector;
-        let dx = (head << 8) | 0x00; // DL = 0 (Drive 0)
-
-        for attempt in 0..MAX_RETRIES {
-            print!(".");
-            let mut err: u16;
-            unsafe {
-                // Прерывания должны быть включены для корректной работы BIOS
-                asm!("sti", options(nostack));
-                asm!(
-                "mov ax, 0x0202",       // AH=02 (read), AL=1 (sector count)
-                "int 0x13",
-                // Если CF=0 (успех), err = 0. Иначе err = 1.
-                "mov ax, 0",
-                "jnc 4f",
-                "inc ax",
-                "4:",
-                in("bx") self.buffer,
-                in("cx") cx,
-                in("dx") dx,
-                lateout("ax") err,
-                options(nostack),
-                );
-            }
-            self.delay();
-
-            if err == 0 {
-                return; // Успешно прочитано
-            }
-
-            println!("retry");
-            // При ошибке: сброс контроллера и задержка перед повтором
-            self.reset();
-            self.delay();
-        }
-
-        // Если все попытки исчерпаны
-        unsafe { asm!("jmp fail", options(noreturn)); }
-    }
-    // Вставь эту функцию где-нибудь в disk.rs или в main.rs
-
-    fn read_sectors_safe(&self, count: u16) {
-        let sector = ((self.lba % SPT as u32) + 1) as u16;
-        let temp   = (self.lba / SPT as u32) as u16;
-        let head   = temp % HEADS;
-        let cyl    = temp / HEADS;
-
-        let cx = (cyl << 8) | sector;
-        let dx = (head << 8) | 0x00;
-
-        for attempt in 0..MAX_RETRIES {
-            print!(".");
-            let mut err: u16;
-
-            // Вычисляем команду заранее
-            let cmd: u16 = 0x0200 | count;   // AH=02, AL=count (1 или 2)
-
-            unsafe {
-                asm!("sti", options(nostack));
-
-                asm!(
-                "int 0x13",
-                "mov ax, 0",
-                "jnc 1f",
-                "inc ax",
-                "1:",
-                inlateout("ax") cmd => err,   // ← вот так правильно
-                in("bx") self.buffer,
-                in("cx") cx,
-                in("dx") dx,
-                options(nostack),
-                );
-            }
-
-            self.delay();
-
-            if err == 0 {
-                return;
-            }
-
-            println!("retry {}", err);
-            self.reset();
-            self.delay();
-        }
-
-        unsafe { asm!("jmp fail", options(noreturn)); }
+        self.int13(1);
     }
 
-    pub fn read_sectors(&mut self, total_sectors: u16, target: u32) {
-        let mut remaining = total_sectors;
-        let mut dst = target;
+    /// Read `sectors` into self.buffer in a single BIOS call.
+    pub fn read_low(&self, sectors: u16) {
+        self.int13(sectors);
+    }
 
-        while remaining > 0 {
-            // Сколько секторов осталось до конца текущего трека?
-            let pos_in_track = (self.lba % SPT as u32) as u16;
-            let sectors_to_track_end = SPT - pos_in_track;
+    /// Read `sectors` one at a time and copy each to high memory (unreal mode).
+    pub fn read_sectors(&mut self, sectors: u16, target: u32) {
+        let scratch = self.buffer;
+        let mut dest = target;
+        let mut left = sectors;
+        while left > 0 {
+            self.int13(1);
 
-            // Берём минимум из: оставшихся, 2 (максимум за раз), и сколько влезет в трек
-            let batch = core::cmp::min(remaining, core::cmp::min(8, sectors_to_track_end));
-
-            // Читаем batch секторов (1 или 2)
-            self.read_sectors_safe(batch);
-
-            // Копируем прочитанное (у тебя сейчас байтовый цикл на 1024 байта)
-            let bytes_to_copy = (batch as u32) * SECTOR_SIZE;
-            let mut src = self.buffer as u32;
-
-            for _ in 0..bytes_to_copy {
+            let mut src = scratch as u32;
+            let end = dest + 512;
+            while dest < end {
                 unsafe {
-                    let mut b: u8;
-                    asm!("mov {0}, [{1:e}]", out(reg_byte) b, in(reg) src, options(nostack));
-                    asm!("mov [{0:e}], {1}", in(reg) dst, in(reg_byte) b, options(nostack));
+                    let mut byte: u8;
+                    asm!("mov {0}, [{1:e}]", out(reg_byte) byte, in(reg) src);
+                    asm!("mov [{0:e}], {1}", in(reg) dest, in(reg_byte) byte);
                 }
                 src += 1;
-                dst += 1;
+                dest += 1;
             }
 
-            self.lba += batch as u32;
-            remaining -= batch;
-
-            if (total_sectors - remaining) % 256 == 0 {
+            self.lba += 1;
+            left -= 1;
+            let read = sectors - left;
+            if read % 64 == 0 {
                 print!(".");
             }
         }
-        println!();
     }
-}
-
-// Вставь эту функцию где-нибудь в disk.rs или в main.rs
-
-unsafe fn copy_to_high_memory(src_offset: u16, dst_phys: u32) {
-    print!(".");
-    asm!(
-    "cli",                    // отключаем прерывания на время
-    "push ds",
-    "push es",
-    "push fs",
-    "push gs",
-
-    // На всякий случай перезагружаем GDT (дешево на этапе загрузки)
-
-    // Входим в protected mode
-    "mov eax, cr0",
-    "or al, 1",
-    "mov cr0, eax",
-
-    // Плоские сегменты
-    "mov ax, 0x10",
-    "mov ds, ax",
-    "mov es, ax",
-
-    // Копирование
-    "movzx esi, {src:x}",
-    "mov edi, {dst:e}",
-    "mov ecx, 512",
-    "rep movsb",
-
-    // Выходим из protected mode
-    "mov eax, cr0",
-    "and al, 0xfe",
-    "mov cr0, eax",
-
-    "pop gs",
-    "pop fs",
-    "pop es",
-    "pop ds",
-    "sti",                    // включаем прерывания обратно
-
-    src = in(reg) src_offset,
-    dst = in(reg) dst_phys,
-    out("eax") _,
-    options(nostack, preserves_flags),
-    );
 }

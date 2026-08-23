@@ -1,54 +1,55 @@
-// Minimal CHS floppy reader (INT 13h AH=02). No DAP.
-// lba is u16 — enough for 1.44MB floppy (max ~2880). Avoids fat 64-bit div.
+// MBR disk reader — INT 13h AH=42 (LBA). Fits in 440 bytes of boot code.
+// Reads the stage2 bootloader from the disk gap after the MBR.
 
 use core::arch::asm;
+use core::mem;
 
-const SECTOR_SIZE: u16 = 512;
-const SPT: u16 = 18;
-const HEADS: u16 = 2;
+#[repr(C, packed)]
+struct DiskAddressPacket {
+    size: u8,
+    zero: u8,
+    sectors: u16,
+    offset: u16,
+    segment: u16,
+    lba_low: u32,
+    lba_high: u32,
+}
 
 pub struct DiskReader {
-    lba: u16,
+    lba: u32,
     target: u16,
 }
 
 impl DiskReader {
-    pub fn new(lba: u16, target: u16) -> Self {
+    pub fn new(lba: u32, target: u16) -> Self {
         Self { lba, target }
     }
 
-    pub fn read_sector(&self) {
-        // LBA → CHS (all 16-bit, tiny code)
-        let sector = (self.lba % SPT) + 1;
-        let temp = self.lba / SPT;
-        let head = temp % HEADS;
-        let cyl = temp / HEADS;
+    pub fn read_sectors(&self, sectors: u16) {
+        let dap = DiskAddressPacket {
+            size: mem::size_of::<DiskAddressPacket>() as u8,
+            zero: 0,
+            sectors,
+            offset: self.target,
+            segment: 0x0000,
+            lba_low: self.lba,
+            lba_high: 0,
+        };
 
-        let cx = (cyl << 8) | sector;
-        let dx = head << 8; // DL=0
+        let dap_address = &dap as *const DiskAddressPacket;
 
         unsafe {
             asm!(
-            "xor ax, ax",
-            "mov es, ax",
-            "mov ax, 0x0201",
-            "int 0x13",
-            "jc fail",
-            in("bx") self.target,
-            in("cx") cx,
-            in("dx") dx,
-            lateout("ax") _,
-            options(nostack),
+                "mov {1:x}, si",
+                "mov si, {0:x}",
+                "int 0x13",
+                "jc fail",
+                "mov si, {1:x}",
+                in(reg) dap_address as u16,
+                out(reg) _,
+                in("ax") 0x4200u16,
+                in("dx") 0x0080u16,
             );
-        }
-    }
-
-    pub fn read_sectors(&mut self, mut n: u16) {
-        while n != 0 {
-            self.read_sector();
-            self.target = self.target.wrapping_add(SECTOR_SIZE);
-            self.lba = self.lba.wrapping_add(1);
-            n -= 1;
         }
     }
 }

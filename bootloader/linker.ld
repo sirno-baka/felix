@@ -9,38 +9,40 @@ SECTIONS {
         *(.start)
     }
 
-    /* code section */
     .text : {
         *(.text .text.*)
     }
 
-    /* static variables section */
-    .bss : {
-        *(.bss .bss.*)
-    }
-
-    /* read-only data, like consts */
     .rodata : {
         *(.rodata .rodata.*)
     }
-    
+
     .data : {
         *(.data .data.*)
     }
 
-    /* contains info about exceptions */
-    .eh_frame : {
-        *(.eh_frame .eh_frame.*)
-    }
-    .eh_frame_hdr : {
-        *(.eh_frame_hdr .eh_frame_hdr.*)
+    .bss : {
+        *(.bss .bss.*)
     }
 
-    /* in this way the bootloader size is exactly 64 sectors) */
+    /* 64 sectors = 32 KiB, stays below the 64K DMA boundary (0x10000) */
     . = _bootloader_start + 0x8000 - 2;
-    .end_marker :
-    {
+    .end_marker : {
         SHORT(0xdead)
     }
 
+    /DISCARD/ : {
+        *(.eh_frame)
+        *(.eh_frame.*)
+        *(.eh_frame_hdr)
+        *(.eh_frame_hdr.*)
+        *(.gcc_except_table)
+        *(.gcc_except_table.*)
+        *(.debug*)
+        *(.comment)
+        *(.note*)
+        *(.got)
+        *(.got.*)
+        *(.note.GNU-stack)
+    }
 }
