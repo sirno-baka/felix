@@ -245,7 +245,7 @@ impl IDEController {
 		for i in 0..4 {
 			if self.devices[i].reserved == 1 {
 				println!(
-					"Found {} Drive {:.2}MB - {}",
+					"Found {} {} Drive {:.2}MB - {}", i,
 					["ATA", "ATAPI"][self.devices[i].r#type as usize],
 					self.devices[i].size as f32 / 1024.0 / 2.0,
 					CStr::from_bytes_until_nul(&self.devices[i].model)

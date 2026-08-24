@@ -39,13 +39,13 @@ ifeq ($(UNAME), Darwin)
 	@brew list mtools > /dev/null || brew install mtools
 	@brew list binutils > /dev/null || brew install binutils
 	@brew list dosfstools > /dev/null || brew install dosfstools
-	@brew list e2tools > /dev/null || brew install e2tools     # ← добавлено
+	@brew list e2tools > /dev/null || brew install e2tools
 endif
 
 ifeq ($(UNAME), Linux)
 	@echo "Downloading Linux build tools..."
 	# TODO: Download linux build tools
-	# (на большинстве дистрибутивов достаточно: sudo apt install e2fsprogs e2tools)
+	# (на большинстве дистрибутивов достаточно: sudo apt install e2fsprogs e2tools dosfstools mtools)
 endif
 
 
@@ -163,6 +163,24 @@ image:
 	@ls -lh build/disk.img
 	@echo "=== Disk image ready (dd if=build/disk.img of=/dev/sdX) ==="
 
+# Separate FAT32 data disk (whole-disk FAT volume, no partition table).
+# Attached in run/debug as the first IDE data drive after the boot disk:
+#   index=0 → build/disk.img  (boot, BIOS 0x80 — bootloader hardcodes this)
+#   index=1 → build/fat32.img (FAT32 + /shell, BIOS 0x81)
+.PHONY: fat32-image
+fat32-image:
+	@echo "=== Creating 32 MiB FAT32 data disk ==="
+	@mkdir -p build
+	@rm -f build/fat32.img
+	@dd if=/dev/zero of=build/fat32.img bs=1M count=32 status=none
+	@$(MKFS) -F 32 -n FELIXFAT  -S 512 build/fat32.img
+	@echo "=== Copying shell to FAT32 root ==="
+	@# whole-disk FAT has odd geometry for mtools — skip the check
+	@$(MCOPY) -o -v -i build/fat32.img build/shell ::/shell \
+		&& echo "  → /shell"
+	@ls -lh build/fat32.img
+	@echo "=== FAT32 disk ready (build/fat32.img) ==="
+
 .PHONY: clean
 clean:
 	@echo "Cleaning Felix..."
@@ -190,19 +208,25 @@ run: all
 	@killall qemu-system-i386 || true
 	@qemu-system-i386 \
 		-drive file=build/disk.img,index=0,media=disk,format=raw,if=ide \
+		-drive file=build/fat32.img,index=1,media=disk,format=raw,if=ide \
 		-boot order=c \
 		-netdev user,id=net0 \
 		-device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
 		-no-reboot -no-shutdown -vga std -m 64M \
 		-debugcon file:debug.log -serial stdio
 
+# FAT32 is listed first in -drive order below (as requested), but IDE index
+# keeps disk.img on 0x80 so the existing bootloader still boots.
 .PHONY: debug
 debug: all
 	@echo "Debugging Felix..."
 	@killall qemu-system-i386 || true
-	@qemu-system-i386 -drive file=build/disk.img,index=0,media=disk,format=raw,if=ide -no-reboot -d int,guest_errors -no-reboot -debugcon file:debug.log -no-shutdown \
+	@qemu-system-i386 \
+		-drive file=build/fat32.img,index=1,media=disk,format=raw,if=ide \
+		-drive file=build/disk.img,index=0,media=disk,format=raw,if=ide \
+		-boot order=c \
+		-no-reboot -d int,guest_errors -debugcon file:debug.log -no-shutdown \
 		-netdev user,id=net0 \
 		-device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
-                                                                                                                                           -no-shutdown \
-                                                                                                                                           -m 64M \
-                                                                                                                                           -serial stdio -s -S &
+		-m 64M \
+		-serial stdio -s -S &

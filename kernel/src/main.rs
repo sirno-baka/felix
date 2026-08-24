@@ -60,6 +60,7 @@ use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::drivers::net::i8255x::SCB_STATUS;
 use crate::filesystem::{Filesystem, VFS};
 use crate::filesystem::devfs::DevFS;
+use crate::filesystem::fat32::{find_fat_partition_config, FatDisk, FatFs};
 use crate::io::outb;
 use crate::pci::ide::{IDE, IDEDevice};
 use crate::pci::print_devices;
@@ -233,39 +234,18 @@ pub extern "C" fn higher_half_entry() -> ! {
         *KEYBOARD_BUFFER.lock() = Some(Queue::new());
         crate::drivers::mouse::init();
 
-        // Real ATA disk → ext2 (MBR type 0x83). No RamFS / ramdisk.
+        // Real ATA disks → auto-detect ext2 / FAT, DevFS, network.
         IDE.lock().initialize().expect("Cannot probe IDE");
 
-        let ide_disk = match first_ata_disk() {
-            Some(d) => d,
-            None => {
-                println!("[!] No ATA disk found");
-                halt();
-            }
-        };
-
-        let devfs = Box::new(DevFS::new());
-        devfs.register_block("sda", Mutex::new(Box::new(ide_disk.clone())));
-        devfs.register_char("null", Box::new(NullDevice));
-        devfs.register_char("zero", Box::new(ZeroDevice));
-
-        let disk = Arc::new(spin::Mutex::new(ide_disk));
-        let mut ext2 = Ext2::new_with_auto_partition(disk);
-        ext2.mount(None);
-        if !ext2.mounted {
-            println!("[!] ext2 mount failed (no superblock 0xEF53)");
-        } else {
-            VFS.get().set_root(Box::new(ext2));
-            println!("[VFS] root = ext2 on ATA (/dev/sda)");
+        if !filesystem::init::init_rootfs() {
+            println!("[!] init_rootfs failed — no mountable disk");
+            halt();
         }
-
-        VFS.get().mount("/dev", devfs);
-
 
         print_info();
         print_devices();
-        crate::drivers::net::i8255x::I8255x::init().expect("NIC init failed");
-        crate::net::stack::init();
+        drivers::net::init_net();
+
         // // 7. Task Manager (после IDT!)
         TASK_MANAGER.init();
 
@@ -280,7 +260,7 @@ pub extern "C" fn higher_half_entry() -> ! {
         let data = match VFS.get().read_file("/shell") {
             Some(d) => d,
             None => {
-                println!("[!] /shell not found on ext2 root");
+                println!("[!] /shell not found on root fs");
                 halt();
             }
         };
