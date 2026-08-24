@@ -80,8 +80,9 @@ pub const KERNEL_START: u32 = KERNEL_PHYS + KERNEL_OFFSET; // 0xC100_0000
 pub const KERNEL_SIZE: u32  = 0x0010_0000;
 pub const STACK_SIZE: u32   = 0x0040_0000;  // 4 МБ стека: 0xC1200000..0xC1600000
 pub const STACK_START: u32  = 0xC160_0000;
-// Heap is 0xC1600000..0xC2000000 (allocator.rs). Frames from phys 0x02000000.
-pub const HEAP_END_VIRT: u32 = 0xC200_0000;
+// Kernel heap: virt 0xC1800000..0xC2800000 → phys 0x01800000..0x02800000 (allocator.rs).
+// Frame allocator starts at FRAME_ALLOC_START = 0x02800000 (must be past heap end).
+pub const HEAP_END_VIRT: u32 = 0xC280_0000;
 
 #[macro_export]
 macro_rules! run {
@@ -126,9 +127,10 @@ pub extern "C" fn _start() -> ! {
             *pd.add(i) = 0;
         }
 
-        // Identity map first 64 MiB with 4 MiB large pages (PSE)
-        // 16 × 4 MiB = 64 MiB — matches -m 64M / LARGE_PAGE_COUNT
-        // Also map the same physical pages at 0xC0000000 + base
+        // Early TEMP_PD: map 64 MiB so higher_half_entry + kernel heap are reachable.
+        // Full RAM-sized window is installed later in PageManager::init after
+        // detect_ram() / configure_from_ram() (cannot call those here: still at
+        // physical VMA before the higher-half jump).
         for i in 0..16u32 {
             let phys = i * 0x400000;
             let flags = 0x83u32; // Present + Writable + Large page
@@ -189,8 +191,16 @@ pub extern "C" fn higher_half_entry() -> ! {
         GDT.load();
         GDT.load_tss();
 
-        // 2. Full paging (replaces the temporary PD with the proper one)
+        // 2. Detect physical RAM (BootInfo / CMOS) → size large-page window,
+        //    then install the definitive page directory.
         {
+            let ram = crate::memory::paging::detect_ram();
+            crate::memory::paging::configure_from_ram(ram);
+            println!(
+                "[mem] detected {} MiB RAM → {} large pages",
+                crate::memory::paging::detected_ram_bytes() / (1024 * 1024),
+                crate::memory::paging::large_page_count()
+            );
             let mut pm = PAGING.lock();
             pm.init(HEAP_END_VIRT);
 
@@ -431,19 +441,17 @@ fn panic(info: &PanicInfo) -> ! {
     let used_fb = crate::fb_panic::try_panic_fb(info);
 
     // Still try VGA text + E9 (QEMU / text mode).
-    if !used_fb {
-        println!("\n\n=== KERNEL PANIC ===");
-        println!("Panic message: {}", info);
-        if let Some(location) = info.location() {
-            println!(
-                "Location: {}:{}:{}",
-                location.file(),
-                location.line(),
-                location.column()
-            );
-        }
-        println!("System halted");
+    println!("\n\n=== KERNEL PANIC ===");
+    println!("Panic message: {}", info);
+    if let Some(location) = info.location() {
+        println!(
+            "Location: {}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        );
     }
+    println!("System halted");
 
     loop {
         unsafe {

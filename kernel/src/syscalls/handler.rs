@@ -117,23 +117,55 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         // === Memory ===
         crate::syscalls::SYS_MALLOC => {
             let size = state.ebx as usize;
-            let align = state.ecx as usize;
+            // Cap align: garbage/huge align would jump heap_next by megabytes per call.
+            let align_raw = state.ecx as usize;
+            let align = if align_raw == 0 {
+                8
+            } else {
+                align_raw.next_power_of_two().max(8).min(4096)
+            };
 
-            let current_slot = unsafe { TASK_MANAGER.get_current_slot() } as usize;
+            // Use the slot fixed at syscall entry (not re-fetched) so a timer
+            // cannot race us onto another task mid-handler.
             if current_slot == 0 || current_slot >= 8 {
+                println!("[malloc] bad slot={}", current_slot);
+                0
+            } else if unsafe { TASK_MANAGER.tasks[current_slot].is_none() } {
+                println!("[malloc] no task slot={}", current_slot);
                 0
             } else {
                 unsafe {
                     let task = TASK_MANAGER.tasks[current_slot].as_mut().unwrap();
                     let mut start = task.heap_next;
-
-                    let align = if align == 0 { 8 } else { align.next_power_of_two().max(8) };
-                    if align > 0 {
-                        let align_mask = (align - 1) as u32;
-                        start = (start + align_mask) & !align_mask;
+                    // Per-slot window: 0x4000_0000 + slot*0x1000_0000, size 256 MiB.
+                    let heap_base = 0x4000_0000u32
+                        .wrapping_add((current_slot as u32).wrapping_mul(0x1000_0000));
+                    let heap_limit = heap_base.wrapping_add(128 * 1024 * 1024); // 128 MiB soft cap
+                    if start < heap_base {
+                        start = heap_base;
+                        task.heap_next = heap_base;
                     }
 
-                    if size > 0 {
+                    let align_mask = (align - 1) as u32;
+                    start = (start + align_mask) & !align_mask;
+
+                    let used = start.saturating_sub(heap_base) as usize;
+                    if size > 0 && (start.saturating_add(size as u32) > heap_limit
+                        || used.saturating_add(size) > 128 * 1024 * 1024)
+                    {
+                        println!(
+                            "[malloc] OOM slot={} size={} align={} heap_next={:#x} base={:#x} used={}",
+                            current_slot, size, align, start, heap_base, used
+                        );
+                        0
+                    } else if size > 0 {
+                        // Log suspicious large single allocs (helps catch runaway growth).
+                        if size >= 256 * 1024 {
+                            println!(
+                                "[malloc] large slot={} size={} used={} → {:#x}",
+                                current_slot, size, used, start
+                            );
+                        }
                         let page_size = crate::memory::paging::PAGE_SIZE as u32;
                         let start_page = start & !(page_size - 1);
                         let end = start + size as u32;
@@ -148,10 +180,11 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                             addr += page_size;
                         }
                         core::ptr::write_bytes(start as *mut u8, 0, size);
+                        task.heap_next = start + size as u32;
+                        start as usize
+                    } else {
+                        start as usize
                     }
-
-                    task.heap_next = start + size as u32;
-                    start as usize
                 }
             }
         }
@@ -160,8 +193,7 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
             let old_ptr = state.ebx;
             let old_size = state.ecx as usize;
             let new_size = state.edx as usize;
-
-            let current_slot = unsafe { TASK_MANAGER.get_current_slot() } as usize;
+            // Use slot fixed at syscall entry (same as SYS_MALLOC).
             if current_slot == 0 || current_slot >= 8 {
                 0
             } else {
@@ -202,23 +234,9 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
 
                     task.heap_next = new_start + new_size as u32;
 
-                    // Освобождаем старый блок
-                    if old_ptr != 0 && old_size > 0 {
-                        let page_size = crate::memory::paging::PAGE_SIZE as u32;
-                        let old_start_page = old_ptr & !(page_size - 1);
-                        let old_end = old_ptr + old_size as u32;
-                        let old_end_page = (old_end + page_size - 1) & !(page_size - 1);
-
-                        let mut addr = old_start_page;
-                        while addr < old_end_page {
-                            let should_unmap = task.page_refcounts.dec(addr);
-                            if should_unmap {
-                                task.pd_mut().unmap(addr);
-                            }
-                            addr += page_size;
-                        }
-                    }
-
+                    // Bump allocator: do NOT unmap the old range. Pages are shared
+                    // by many live blocks; unmapping on realloc free corrupts them
+                    // (user PF at low CR2 like 0xa0 / 0x20). Heap only grows.
                     new_start as usize
                 }
             }
@@ -226,33 +244,12 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
 
 
         crate::syscalls::SYS_FREE => {
-            let ptr = state.ebx as u32;
-            let layout = Layout::from_size_align(state.ecx as usize, state.edx as usize)
-                .unwrap_or(Layout::new::<u8>());
-            let size = layout.size() as u32;
-
-            if ptr == 0 || size == 0 {
-                0
-            } else {
-                unsafe {
-                    let page_size = crate::memory::paging::PAGE_SIZE as u32;
-                    let start_page = ptr & !(page_size - 1);
-                    let end = ptr + size;
-                    let end_page = (end + page_size - 1) & !(page_size - 1);
-
-                    if let Some(ref mut task) = TASK_MANAGER.tasks[current_slot] {
-                        let mut addr = start_page;
-                        while addr < end_page {
-                            let should_unmap = task.page_refcounts.dec(addr);
-                            if should_unmap {
-                                task.pd_mut().unmap(addr);
-                            }
-                            addr += page_size;
-                        }
-                    }
-                }
-                0
-            }
+            // Bump allocator: pure no-op. Never unmap.
+            // Unmapping on free was the root of PAGE_FAULT (user) CR2=0x20/0xa0:
+            // pages are shared by many live Vec/String blocks; refcount hits 0
+            // while other allocations still point into the same page.
+            let _ = (state.ebx, state.ecx, state.edx);
+            0
         }
         // === Sockets ===
         crate::syscalls::SYS_SOCKET   => sys_socket(current_slot, state.ebx as u16, state.ecx as u16, state.edx as u8),
@@ -1634,9 +1631,14 @@ pub fn sys_execve(
             let page = USER_STACK_TOP - (i + 1) * PAGE_SIZE as u32;
             task.pd_mut().alloc_and_map_user_page(page);
         }
-        // Немного heap
-        for i in 0..8u32 {
-            task.pd_mut().alloc_and_map_user_page(heap_start + i * PAGE_SIZE as u32);
+        // Pre-map a generous user heap so bump-malloc does not fault after a few
+        // format!/String allocations in the shell (was 8 pages = 32 KiB).
+        // Also seed page_refcounts so a stray FREE cannot unmap these pages.
+        const USER_HEAP_PAGES: u32 = 512; // 2 MiB
+        for i in 0..USER_HEAP_PAGES {
+            let va = heap_start + i * PAGE_SIZE as u32;
+            task.pd_mut().alloc_and_map_user_page(va);
+            let _ = task.page_refcounts.inc(va);
         }
 
         // Переключаемся на PD задачи и грузим ELF по его p_vaddr

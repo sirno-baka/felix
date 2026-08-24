@@ -23,8 +23,14 @@ impl Allocator {
     // Boot stack: ESP=0xC1600000 grows DOWN to ~0xC1200000.
     // Leave a 2 MiB guard between stack top and heap so a deep call or
     // interrupt frame cannot smash the first heap objects.
+    //
+    // After -m 128M / LARGE_PAGE_COUNT=32 the higher-half large pages cover
+    // phys 0..128 MiB. Kernel heap lives in the already-mapped window:
+    //   virt 0xC1800000..0xC2800000  →  phys 0x01800000..0x02800000 (16 MiB).
+    // Frame allocator (user PTs, stacks, surfaces) starts at FRAME_ALLOC_START
+    // = 0x02800000 so it never collides with this region.
     const HEAP_START: usize = 0xC180_0000;
-    const HEAP_END:   usize = 0xC200_0000;
+    const HEAP_END:   usize = 0xC280_0000;
 
     const HEADER_SIZE: usize = core::mem::size_of::<FreeBlock>();
     const HEADER_ALIGN: usize = core::mem::align_of::<FreeBlock>();

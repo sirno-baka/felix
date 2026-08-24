@@ -29,6 +29,7 @@ struct BootInfo {
     disk_phys: u32,
     disk_sectors: u32,
     flags: u32,
+    mem_bytes: u32,
 }
 
 struct ProbedFs {
@@ -45,13 +46,20 @@ pub fn init_rootfs() -> bool {
     devfs.register_char("null", Box::new(NullDevice));
     devfs.register_char("zero", Box::new(ZeroDevice));
 
-    // ---- Path A: bootloader already hydrated the disk into RAM ----
+    // ---- Path A: bootloader already hydrated the disk into RAM (PXE) ----
     if let Some(info) = read_bootinfo() {
         println!(
-            "[init] BootInfo: disk phys=0x{:08x} sectors={} flags={:#x}",
-            info.disk_phys, info.disk_sectors, info.flags
+            "[init] BootInfo: disk phys=0x{:08x} sectors={} flags={:#x} mem={}MiB",
+            info.disk_phys,
+            info.disk_sectors,
+            info.flags,
+            info.mem_bytes / (1024 * 1024)
         );
 
+        // Local IDE boot still publishes BootInfo for mem_bytes, but disk_phys=0.
+        if info.disk_phys == 0 || info.disk_sectors == 0 {
+            println!("[init] BootInfo has no ramdisk — IDE path");
+        } else {
         // Do not let the frame allocator hand out pages that overlap the image.
         reserve_frames_past(info.disk_phys, info.disk_sectors);
 
@@ -85,6 +93,7 @@ pub fn init_rootfs() -> bool {
                 println!("[init] BootInfo present but FS mount failed, trying IDE…");
             }
         }
+        } // end disk_phys != 0
     } else {
         println!("[init] no BootInfo (magic mismatch) — IDE path");
     }

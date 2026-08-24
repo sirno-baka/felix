@@ -35,6 +35,8 @@ struct BootInfo {
     disk_phys: u32,
     disk_sectors: u32,
     flags: u32,
+    /// Total physical RAM in bytes (INT 15h E801 / CMOS). Kernel sizes paging from this.
+    mem_bytes: u32,
 }
 
 #[panic_handler]
@@ -76,8 +78,10 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // ---- PXE/iPXE only: whole disk → RAM ----
-    // Real IDE/HDD boot skips this; kernel mounts ATA directly.
+    // Always publish RAM size; PXE also hydrates the disk image into RAM.
+    let mem_bytes = detect_memory_bytes();
+    println!("[!] Detected RAM: {} MiB", mem_bytes / (1024 * 1024));
+
     if is_network_boot() {
         use disk::DISK;
         let sectors = disk::Disk::drive_sector_count(RAMDISK_FALLBACK_SECTORS);
@@ -86,10 +90,11 @@ pub extern "C" fn _start() -> ! {
             DISK.init(0, KERNEL_BUFFER);
             DISK.copy_disk_to_ram(sectors, RAMDISK_PHYS);
         }
-        write_bootinfo(RAMDISK_PHYS, sectors);
+        write_bootinfo(RAMDISK_PHYS, sectors, mem_bytes);
         println!("[!] BootInfo @ 0x{:08x}", BOOTINFO_PHYS);
     } else {
-        clear_bootinfo();
+        // Local IDE: no ramdisk, but still pass mem_bytes to the kernel.
+        write_bootinfo(0, 0, mem_bytes);
         println!("[!] Local disk boot — skip RAM hydrate (kernel uses IDE)");
     }
 
@@ -193,12 +198,66 @@ fn clear_bootinfo() {
     }
 }
 
-fn write_bootinfo(disk_phys: u32, disk_sectors: u32) {
+/// INT 15h AX=E801 — standard way to get memory size above 1 MiB.
+/// Falls back to CMOS 0x17/0x18 if the BIOS call fails.
+fn detect_memory_bytes() -> u32 {
+    let mut ax: u16;
+    let mut bx: u16;
+    let mut cx: u16;
+    let mut dx: u16;
+    let mut cf: u16;
+    unsafe {
+        asm!(
+            "mov ax, 0xE801",
+            "int 0x15",
+            "mov {cf:x}, 0",
+            "jnc 1f",
+            "mov {cf:x}, 1",
+            "1:",
+            out("ax") ax,
+            out("bx") bx,
+            out("cx") cx,
+            out("dx") dx,
+            cf = out(reg) cf,
+        );
+    }
+    if cf == 0 {
+        // Some BIOSes return in AX/BX, others in CX/DX — use non-zero pair.
+        let (kb_1_16, blocks_64k) = if ax != 0 || bx != 0 {
+            (ax as u32, bx as u32)
+        } else {
+            (cx as u32, dx as u32)
+        };
+        // 1 MiB + (1..16 MiB region) + (above 16 MiB in 64 KiB blocks)
+        let total = (1024 * 1024)
+            + kb_1_16 * 1024
+            + blocks_64k * 64 * 1024;
+        if total >= 16 * 1024 * 1024 {
+            return total;
+        }
+    }
+    // CMOS fallback: extended memory KB at 0x17/0x18
+    let lo: u8;
+    let hi: u8;
+    unsafe {
+        asm!("mov al, 0x17", "out 0x70, al", "in al, 0x71", out("al") lo);
+        asm!("mov al, 0x18", "out 0x70, al", "in al, 0x71", out("al") hi);
+    }
+    let ext_kb = (lo as u32) | ((hi as u32) << 8);
+    if ext_kb > 0 {
+        return (1024 + ext_kb) * 1024;
+    }
+    64 * 1024 * 1024
+}
+
+fn write_bootinfo(disk_phys: u32, disk_sectors: u32, mem_bytes: u32) {
+    let flags = if disk_phys != 0 { 1 } else { 0 }; // bit0 = ramdisk present
     let info = BootInfo {
         magic: BOOTINFO_MAGIC,
         disk_phys,
         disk_sectors,
-        flags: 1, // bit0 = ramdisk present
+        flags,
+        mem_bytes,
     };
     unsafe {
         core::ptr::write_volatile(BOOTINFO_PHYS as *mut BootInfo, info);

@@ -94,12 +94,119 @@ pub const KERNEL_OFFSET: u32 = 0xC000_0000;
 pub const KERNEL_PHYS:   u32 = 0x0100_0000;
 pub const KERNEL_VIRT:   u32 = KERNEL_PHYS + KERNEL_OFFSET; // 0xC100_0000
 
-/// 4 MiB large pages covering identity + higher-half.
-/// 16 × 4 MiB = 64 MiB — must match QEMU `-m 64M` (room for 32 MiB ramdisk).
-pub const LARGE_PAGE_COUNT: u32 = 16;
-/// First free physical frame. Below this: IVT/FB_INFO/TEMP_PD/kernel/boot stack/heap.
+/// Layout (phys) — fixed kernel regions; free RAM size is detected at runtime:
+///   0x0000_0000..0x0100_0000  low mem / TEMP_PD / early
+///   0x0100_0000..0x0180_0000  kernel image
+///   0x0180_0000..0x0280_0000  kernel heap (virt 0xC1800000..0xC2800000)
+///   0x0280_0000..ram_end      free frames (user PTs, stacks, surfaces)
+///   0x0200_0000..             PXE ramdisk may sit here; reserve_frames_past()
+///
+/// Large-page window and frame limit are set by `configure_from_ram()` from
+/// CMOS / BootInfo — no hardcoded `-m N` match required.
+
+/// Upper cap: 1 GiB of 4 MiB large pages (32-bit higher-half practical limit).
+pub const LARGE_PAGE_COUNT_MAX: u32 = 256;
+/// Default until `configure_from_ram` runs (safe for -m 64M).
+pub const LARGE_PAGE_COUNT_DEFAULT: u32 = 16;
+
+/// First free physical frame. MUST be past the kernel heap end (phys 0x02800000),
+/// otherwise alloc_frame hands out pages that the kernel bump allocator is still
+/// using (Surface, Task, …) → user writes smash kernel state.
 /// NEVER allocate page 0 — that destroys FB_INFO at 0x5000.
-pub const FRAME_ALLOC_START: u32 = 0x0200_0000;
+pub const FRAME_ALLOC_START: u32 = 0x0280_0000;
+
+/// Runtime: total usable physical RAM (bytes), filled by configure_from_ram.
+static mut DETECTED_RAM_BYTES: u32 = 64 * 1024 * 1024;
+/// Runtime: how many 4 MiB large pages to map (identity + higher-half).
+static mut LARGE_PAGE_COUNT_RT: u32 = LARGE_PAGE_COUNT_DEFAULT;
+
+#[inline]
+pub fn detected_ram_bytes() -> u32 {
+    unsafe { DETECTED_RAM_BYTES }
+}
+
+#[inline]
+pub fn large_page_count() -> u32 {
+    unsafe { LARGE_PAGE_COUNT_RT }
+}
+
+/// Configure large-page window + frame ceiling from detected physical RAM.
+/// Call once before `PageManager::init` (and before early TEMP_PD if possible).
+///
+/// - Clamps to [64 MiB, 1 GiB]
+/// - large pages = floor(ram / 4 MiB)
+/// - frames may only be handed out below `ram`
+pub fn configure_from_ram(ram_bytes: u32) {
+    // Need FRAME_ALLOC_START (40 MiB) + some free frames. Require ≥64 MiB.
+    let mut ram = ram_bytes;
+    if ram < 64 * 1024 * 1024 {
+        ram = 64 * 1024 * 1024;
+    }
+    if ram > 1024 * 1024 * 1024 {
+        ram = 1024 * 1024 * 1024;
+    }
+    // Align down to 4 MiB so large-page coverage is exact.
+    ram &= !0x3F_FFFF;
+    if ram < 64 * 1024 * 1024 {
+        ram = 64 * 1024 * 1024;
+    }
+    let pages = (ram / 0x40_0000).min(LARGE_PAGE_COUNT_MAX).max(LARGE_PAGE_COUNT_DEFAULT);
+    unsafe {
+        DETECTED_RAM_BYTES = ram;
+        LARGE_PAGE_COUNT_RT = pages;
+    }
+}
+
+/// Probe total RAM via CMOS (works in protected mode; no BIOS INT).
+///
+/// Prefer word at 0x30/0x31 (KB above 16 MiB). Fall back to 0x17/0x18
+/// (extended KB above 1 MiB). QEMU fills both from `-m`.
+pub fn detect_ram_cmos() -> u32 {
+    unsafe fn cmos_read(reg: u8) -> u8 {
+        // NMI disable bit (0x80) kept clear — we only read.
+        crate::io::outb(0x70, reg);
+        crate::io::inb(0x71)
+    }
+    let above_16_kb = unsafe {
+        (cmos_read(0x30) as u32) | ((cmos_read(0x31) as u32) << 8)
+    };
+    if above_16_kb > 0 {
+        return (16 * 1024 + above_16_kb) * 1024;
+    }
+    let ext_kb = unsafe {
+        (cmos_read(0x17) as u32) | ((cmos_read(0x18) as u32) << 8)
+    };
+    if ext_kb > 0 {
+        return (1024 + ext_kb) * 1024;
+    }
+    // Last resort
+    64 * 1024 * 1024
+}
+
+/// Optional BootInfo @ phys 0x7000 (filled by bootloader).
+/// `mem_bytes` is valid when magic matches; disk fields are for PXE ramdisk.
+#[repr(C)]
+pub struct BootInfo {
+    pub magic: u32,
+    pub disk_phys: u32,
+    pub disk_sectors: u32,
+    pub flags: u32,
+    pub mem_bytes: u32,
+}
+
+pub const BOOTINFO_PHYS: u32 = 0x0000_7000;
+pub const BOOTINFO_MAGIC: u32 = 0xFE11_B007;
+
+/// Prefer BootInfo.mem_bytes if present, else CMOS.
+pub fn detect_ram() -> u32 {
+    unsafe {
+        let bi = &*(BOOTINFO_PHYS as *const BootInfo);
+        if bi.magic == BOOTINFO_MAGIC && bi.mem_bytes >= 16 * 1024 * 1024 {
+            return bi.mem_bytes;
+        }
+    }
+    detect_ram_cmos()
+}
 
 // замени существующий USER_HEAP_NEXT:
 static mut USER_HEAP_NEXT: u32 = 0x1000_0000; // низкий адрес — теперь свободно
@@ -424,6 +531,9 @@ impl PageDirectory {
                 | PTEFlags::USER
                 | PTEFlags::DIRTY;
         }
+        // TLB must see the new PTE; without invlpg a stale non-present entry
+        // can fault on the first access after mapping.
+        PageDirectory::flush_page(virt_addr);
     }
 }
 
@@ -504,11 +614,11 @@ impl PageManager {
     }
 
     pub(crate) fn alloc_frame(&mut self) -> u32 {
-        // Guard: never hand out frames past the large-page mapped window.
-        const MAX_PAGE: u32 = (128 * 1024 * 1024) >> 12;
+        // Guard: never hand out frames past detected physical RAM.
+        let max_page = detected_ram_bytes() >> 12;
         let frame = self.next_free_page;
-        if frame >= MAX_PAGE {
-            panic!("[pg] out of physical frames (next={})", frame);
+        if frame >= max_page {
+            panic!("[pg] out of physical frames (next={}, max={})", frame, max_page);
         }
         self.next_free_page += 1;
         frame
@@ -531,8 +641,9 @@ impl PageManager {
             core::arch::asm!("mov cr4, {}", in(reg) cr4);
         }
 
-        // Identity + higher-half: first 128 MiB as 4 MiB large pages.
-        for i in 0..LARGE_PAGE_COUNT {
+        // Identity + higher-half: detected RAM as 4 MiB large pages.
+        let n = large_page_count();
+        for i in 0..n {
             let phys = i * 0x400000u32;
             self.dir.map_large(
                 phys,
@@ -565,8 +676,9 @@ impl PageManager {
         let _ = kernel_end_virt;
         self.next_free_page = FRAME_ALLOC_START >> 12;
         println!(
-            "[pg] {}MiB large pages, frames from phys {:#x} (page {})",
-            LARGE_PAGE_COUNT * 4,
+            "[pg] {}MiB RAM mapped ({} large pages), frames from phys {:#x} (page {})",
+            detected_ram_bytes() / (1024 * 1024),
+            large_page_count(),
             FRAME_ALLOC_START,
             self.next_free_page
         );
@@ -737,9 +849,9 @@ pub fn copy_kernel_mappings(task_dir: &mut PageDirectory, task_pd_phys: u32) {
 
         let kernel_pd = phys_to_virt(kernel_pd_phys) as *const [u32; ENTRIES];
 
-        // 1. Identity large pages (PDE 0..LARGE_PAGE_COUNT-1)
+        // 1. Identity large pages (PDE 0..large_page_count()-1)
         //    NOTE: user ELF @ 0x400000 will overwrite PDE[1] later with 4K+USER.
-        for i in 0..LARGE_PAGE_COUNT as usize {
+        for i in 0..large_page_count() as usize {
             let pde = (*kernel_pd)[i];
             if (pde & PDEFlags::PRESENT) != 0 {
                 task_dir.entries[i] = pde;

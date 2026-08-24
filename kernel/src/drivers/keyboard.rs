@@ -48,13 +48,19 @@ pub struct Keyboard {
 }
 
 // ===================================================================
-// naked-функция остаётся без изменений
+// IRQ1 stub: MUST save all GPRs. Previously only "call; iretd" — any key
+// mid-userspace (or mid-syscall return in EAX) clobbered eax/ecx/edx and
+// produced PAGE_FAULT CR2=0x20 after typing a couple of characters, while
+// pure println loops survived (timer stub already push/pop's registers).
 // ===================================================================
 #[naked]
 pub extern "C" fn keyboard() {
     unsafe {
         asm!(
+        "cli",
+        "pusha",
         "call keyboard_handler",
+        "popa",
         "iretd",
         options(noreturn)
         );

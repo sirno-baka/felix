@@ -67,11 +67,11 @@ fn kill_current_task(esp: u32, reason: &str, exit_code: i32) -> u32 {
 
 fn kernel_halt(name: &str, eip: u32, cs: u32, eflags: u32) -> ! {
     let used_fb = crate::fb_panic::try_exception_fb(name, eip, cs, eflags);
-    if !used_fb {
-        println!("\n=== KERNEL EXCEPTION: {} ===", name);
-        println!("  EIP={:#x} CS={:#x} EFLAGS={:#b}", eip, cs, eflags);
-        println!("System halted");
-    }
+
+    println!("\n=== KERNEL EXCEPTION: {} ===", name);
+    println!("  EIP={:#x} CS={:#x} EFLAGS={:#b}", eip, cs, eflags);
+    println!("System halted");
+
     loop {
         unsafe {
             asm!("hlt");
@@ -81,12 +81,11 @@ fn kernel_halt(name: &str, eip: u32, cs: u32, eflags: u32) -> ! {
 
 fn kernel_halt_page_fault(eip: u32, cs: u32, eflags: u32, cr2: u32) -> ! {
     let used_fb = crate::fb_panic::try_page_fault_fb(eip, cs, eflags, cr2);
-    if !used_fb {
-        println!("\n=== KERNEL EXCEPTION: page_fault ===");
-        println!("  CR2={:#x}", cr2);
-        println!("  EIP={:#x} CS={:#x} EFLAGS={:#b}", eip, cs, eflags);
-        println!("System halted");
-    }
+    println!("\n=== KERNEL EXCEPTION: page_fault ===");
+    println!("  CR2={:#x}", cr2);
+    println!("  EIP={:#x} CS={:#x} EFLAGS={:#b}", eip, cs, eflags);
+    println!("System halted");
+
     loop {
         unsafe {
             asm!("hlt");
