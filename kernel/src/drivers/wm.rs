@@ -128,11 +128,17 @@ impl Surface {
         }
         let pitch = width.saturating_mul(4);
         let size = (pitch as usize).checked_mul(height as usize)?;
-        // Cap single surface (~8 MiB)
+        // Cap single surface (~8 MiB) — kernel heap is only 16 MiB total.
         if size > 8 * 1024 * 1024 {
+            crate::debugln!("[wm] surface too large {}x{} = {} bytes (>8MiB)", width, height, size);
             return None;
         }
-        let mut pixels = vec![0u8; size];
+        let mut pixels = alloc::vec::Vec::new();
+        if pixels.try_reserve_exact(size).is_err() {
+            crate::debugln!("[wm] surface OOM {}x{} = {} bytes (kernel heap)", width, height, size);
+            return None;
+        }
+        pixels.resize(size, 0);
         // dark client bg
         for chunk in pixels.chunks_exact_mut(4) {
             chunk[0] = 0x20; // B

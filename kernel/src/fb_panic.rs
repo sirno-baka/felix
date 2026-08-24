@@ -146,13 +146,9 @@ pub fn try_show(args: fmt::Arguments) -> bool {
 }
 
 fn dump_recent_log(fb: &mut Fb) {
-    // Avoid sleeping if PRINTER is held by the faulting context.
-    let Some(p) = crate::print::PRINTER.try_lock_nb() else {
-        let _ = write!(fb, "--- recent log: (printer locked) ---\n");
-        return;
-    };
+    // klog is independent of PRINTER's Mutex — always available on panic.
     let _ = write!(fb, "--- recent log ---\n");
-    p.for_each_log_line(|line| {
+    crate::print::klog_for_each_line(|line| {
         for &b in line {
             fb.putc(b as char);
         }
