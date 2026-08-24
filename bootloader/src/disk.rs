@@ -88,6 +88,85 @@ impl Disk {
         copy_high(self.buffer as u32, target, sectors as u32 * 512);
         print!(".");
     }
+
+    /// BIOS INT 13h AH=48h — total sector count (LBA). Falls back to `fallback`.
+    pub fn drive_sector_count(fallback: u32) -> u32 {
+        #[repr(C, packed)]
+        struct DriveParams {
+            size: u16,
+            flags: u16,
+            cylinders: u32,
+            heads: u32,
+            sectors_per_track: u32,
+            sectors: u64,
+            bytes_per_sector: u16,
+            // optional EDD fields omitted
+        }
+
+        let mut params = DriveParams {
+            size: 0x1A,
+            flags: 0,
+            cylinders: 0,
+            heads: 0,
+            sectors_per_track: 0,
+            sectors: 0,
+            bytes_per_sector: 0,
+        };
+
+        let ok: u16;
+        let params_off = &mut params as *mut DriveParams as u16;
+        // LLVM reserves ESI — never list si as an asm operand (same as int13).
+        unsafe {
+            asm!(
+                "push ds",
+                "push ax",
+                "xor ax, ax",
+                "mov ds, ax",
+                "pop ax",
+                "mov {1:x}, si",
+                "mov si, {0:x}",
+                "mov ah, 0x48",
+                "mov dl, 0x80",
+                "sti",
+                "int 0x13",
+                "cli",
+                "setnc al",
+                "movzx bx, al",
+                "mov si, {1:x}",
+                "pop ds",
+                in(reg) params_off,
+                out(reg) _,
+                out("bx") ok,
+                out("ax") _,
+                out("dx") _,
+            );
+        }
+
+        if ok != 0 && params.sectors > 0 && params.sectors < 0x1000_0000 {
+            params.sectors as u32
+        } else {
+            fallback
+        }
+    }
+
+    /// Copy `total` sectors from LBA 0 into high memory at `target`.
+    /// Uses low-memory scratch at `self.buffer` (must be valid).
+    pub fn copy_disk_to_ram(&mut self, total: u32, target: u32) {
+        const CHUNK: u16 = 16; // 8 KiB per BIOS call
+        let mut done = 0u32;
+        while done < total {
+            let n = core::cmp::min(CHUNK as u32, total - done) as u16;
+            self.lba = done as u64;
+            self.int13(n);
+            crate::restore_unreal();
+            let dst = target + done * 512;
+            copy_high(self.buffer as u32, dst, n as u32 * 512);
+            done += n as u32;
+            if done % 2048 == 0 || done == total {
+                println!("[disk] ram {} / {} sectors", done, total);
+            }
+        }
+    }
 }
 
 fn copy_high(src: u32, dst: u32, len: u32) {

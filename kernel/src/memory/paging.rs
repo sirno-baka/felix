@@ -95,8 +95,8 @@ pub const KERNEL_PHYS:   u32 = 0x0100_0000;
 pub const KERNEL_VIRT:   u32 = KERNEL_PHYS + KERNEL_OFFSET; // 0xC100_0000
 
 /// 4 MiB large pages covering identity + higher-half.
-/// 16 × 4 MiB = 64 MiB — must match QEMU `-m 64M`.
-pub const LARGE_PAGE_COUNT: u32 = 16;
+/// 32 × 4 MiB = 128 MiB — must match QEMU `-m 128M` (room for 64 MiB ramdisk).
+pub const LARGE_PAGE_COUNT: u32 = 32;
 /// First free physical frame. Below this: IVT/FB_INFO/TEMP_PD/kernel/boot stack/heap.
 /// NEVER allocate page 0 — that destroys FB_INFO at 0x5000.
 pub const FRAME_ALLOC_START: u32 = 0x0200_0000;
@@ -504,8 +504,8 @@ impl PageManager {
     }
 
     pub(crate) fn alloc_frame(&mut self) -> u32 {
-        // Guard: never hand out frames past mapped 64 MiB (QEMU -m 64M).
-        const MAX_PAGE: u32 = (64 * 1024 * 1024) >> 12;
+        // Guard: never hand out frames past the large-page mapped window.
+        const MAX_PAGE: u32 = (128 * 1024 * 1024) >> 12;
         let frame = self.next_free_page;
         if frame >= MAX_PAGE {
             panic!("[pg] out of physical frames (next={})", frame);
@@ -531,7 +531,7 @@ impl PageManager {
             core::arch::asm!("mov cr4, {}", in(reg) cr4);
         }
 
-        // Identity + higher-half: first 64 MiB as 4 MiB large pages.
+        // Identity + higher-half: first 128 MiB as 4 MiB large pages.
         for i in 0..LARGE_PAGE_COUNT {
             let phys = i * 0x400000u32;
             self.dir.map_large(
@@ -559,13 +559,14 @@ impl PageManager {
         self.dir.setup_recursive(pd_phys);
         self.dir.switch(); // CR3 = our new PD
 
-        // 64 MiB is already covered by large pages. Do NOT 4K-map that range:
+        // Large-page window already covers low RAM. Do NOT 4K-map that range:
         // the old loop called alloc_frame() while next_free_page was still 0
         // and turned phys pages 0..N (including FB_INFO @ 0x5000) into page tables.
         let _ = kernel_end_virt;
         self.next_free_page = FRAME_ALLOC_START >> 12;
         println!(
-            "[pg] 64MiB large pages, frames from phys {:#x} (page {})",
+            "[pg] {}MiB large pages, frames from phys {:#x} (page {})",
+            LARGE_PAGE_COUNT * 4,
             FRAME_ALLOC_START,
             self.next_free_page
         );
@@ -792,7 +793,7 @@ pub fn alloc_kernel_stack(size: usize) -> u32 {
 }
 
 /// Physical → kernel virtual (higher-half).
-/// Requires `phys` to sit in the higher-half large-page window (now 0..64 MiB).
+/// Requires `phys` to sit in the higher-half large-page window (now 0..128 MiB).
 #[inline]
 pub fn phys_to_virt(phys: u32) -> u32 {
     phys.wrapping_add(KERNEL_OFFSET)

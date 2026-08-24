@@ -125,9 +125,9 @@ pub extern "C" fn _start() -> ! {
             *pd.add(i) = 0;
         }
 
-        // Identity map first 32 MiB with 4 MiB large pages (PSE)
+        // Identity map first 128 MiB with 4 MiB large pages (PSE)
         // Also map the same physical pages at 0xC0000000 + base
-        for i in 0..8u32 {
+        for i in 0..32u32 {
             let phys = i * 0x400000;
             let flags = 0x83u32; // Present + Writable + Large page
             // Identity

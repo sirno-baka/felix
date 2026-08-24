@@ -20,6 +20,23 @@ const KERNEL_BUFFER: u16 = 0x1000; // low-memory transfer buffer (below bootload
 const KERNEL_TARGET: u32 = 0x0100_0000; // where to put kernel in memory
 const KERNEL_PATH: &str = "/kernel.bin";
 
+/// Boot info handed to the kernel (phys 0x6000).
+/// Kernel maps root from `disk_phys` when magic matches — no IDE needed (PXE).
+const BOOTINFO_PHYS: u32 = 0x0000_6000;
+const BOOTINFO_MAGIC: u32 = 0xFE11_B007;
+/// Whole-disk image in RAM (after kernel @ 0x01000000).
+const RAMDISK_PHYS: u32 = 0x0200_0000;
+/// Fallback size if INT 13h AH=48h fails (matches Makefile 64 MiB disk.img).
+const RAMDISK_FALLBACK_SECTORS: u32 = (64 * 1024 * 1024) / 512;
+
+#[repr(C)]
+struct BootInfo {
+    magic: u32,
+    disk_phys: u32,
+    disk_sectors: u32,
+    flags: u32,
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("PANIC! Info: {}", info);
@@ -59,10 +76,27 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
+    // ---- PXE/iPXE only: whole disk → RAM ----
+    // Real IDE/HDD boot skips this; kernel mounts ATA directly.
+    if is_network_boot() {
+        use disk::DISK;
+        let sectors = disk::Disk::drive_sector_count(RAMDISK_FALLBACK_SECTORS);
+        println!("[!] Network boot — hydrating disk → RAM @ 0x{:08x} ({} sectors)", RAMDISK_PHYS, sectors);
+        unsafe {
+            DISK.init(0, KERNEL_BUFFER);
+            DISK.copy_disk_to_ram(sectors, RAMDISK_PHYS);
+        }
+        write_bootinfo(RAMDISK_PHYS, sectors);
+        println!("[!] BootInfo @ 0x{:08x}", BOOTINFO_PHYS);
+    } else {
+        clear_bootinfo();
+        println!("[!] Local disk boot — skip RAM hydrate (kernel uses IDE)");
+    }
+
     // VESA after the kernel is in memory so boot messages stay visible.
     println!("[!] Setting VESA graphics mode...");
     unsafe {
-        // let _ = vesa::init_vesa();
+        let _ = vesa::init_vesa();
     }
 
     restore_unreal();
@@ -77,6 +111,93 @@ pub extern "C" fn _start() -> ! {
 pub extern "C" fn fail() -> ! {
     println!("[!] Read fail!");
     loop {}
+}
+
+/// Detect PXE / iPXE SAN boot (not a real local IDE/SATA disk).
+///
+/// Checks (any one is enough):
+/// 1. Classic PXE Installation Check — INT 1Ah AX=5650h → AL=50h
+/// 2. "PXENV+" or "!PXE" signature in low memory / option ROM area
+/// 3. "iPXE" string in 0xA0000..0xF0000 (iPXE option ROM / residual)
+fn is_network_boot() -> bool {
+    // if pxe_installation_check() {
+    //     println!("[!] PXE installation check: yes");
+    //     return true;
+    // }
+    if scan_signature(b"PXENV+") || scan_signature(b"!PXE") {
+        println!("[!] Found PXENV+/!PXE signature");
+        return true;
+    }
+    if scan_signature(b"iPXE") {
+        println!("[!] Found iPXE signature");
+        return true;
+    }
+    false
+}
+
+/// INT 1Ah, AX=5650h ("PX"). AL=50h means a PXE stack is installed.
+fn pxe_installation_check() -> bool {
+    let al: u16;
+    unsafe {
+        // Don't list ES as an asm operand — rustc/LLVM reject it on this target.
+        // BIOS may clobber ES:BX; we only care about AL.
+        asm!(
+            "push es",
+            "mov ax, 0x5650",
+            "int 0x1A",
+            "movzx {0:x}, al",
+            "pop es",
+            out(reg) al,
+            out("ax") _,
+            out("bx") _,
+        );
+    }
+    al == 0x50
+}
+
+/// Scan phys 0x80000..0xF0000 for a short ASCII needle (16-bit real/unreal).
+fn scan_signature(needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let start = 0x0008_0000u32;
+    let end = 0x000F_0000u32;
+    let n = needle.len();
+    let mut addr = start;
+    while addr + n as u32 <= end {
+        let mut ok = true;
+        for i in 0..n {
+            let b = unsafe { core::ptr::read_volatile((addr + i as u32) as *const u8) };
+            if b != needle[i] {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return true;
+        }
+        // step by 16 — signatures are usually paragraph-aligned in ROMs
+        addr += 16;
+    }
+    false
+}
+
+fn clear_bootinfo() {
+    unsafe {
+        core::ptr::write_volatile(BOOTINFO_PHYS as *mut u32, 0);
+    }
+}
+
+fn write_bootinfo(disk_phys: u32, disk_sectors: u32) {
+    let info = BootInfo {
+        magic: BOOTINFO_MAGIC,
+        disk_phys,
+        disk_sectors,
+        flags: 1, // bit0 = ramdisk present
+    };
+    unsafe {
+        core::ptr::write_volatile(BOOTINFO_PHYS as *mut BootInfo, info);
+    }
 }
 
 fn protected_mode() {

@@ -161,6 +161,7 @@ image:
 
 	@rm -f build/rootfs.img
 	@ls -lh build/disk.img
+	@cp build/disk.img pxe/assets/disk.img
 	@echo "=== Disk image ready (dd if=build/disk.img of=/dev/sdX) ==="
 
 # Separate FAT32 data disk (whole-disk FAT volume, no partition table).
@@ -197,7 +198,7 @@ run-floppy: all floppy-image
        -netdev user,id=net0,hostfwd=udp::1234-:1234 \
          -device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
          -object filter-dump,id=f1,netdev=net0,file=guest.pcap \
-       -no-reboot -vga std -no-shutdown -m 64M \
+       -no-reboot -vga std -no-shutdown -m 128M \
        -debugcon file:debug.log -s -S &
 	@#qemu-system-i386 -drive file=build/floppy.img,index=0,format=raw,if=floppy -drive file=disk.img,index=0,media=disk,format=raw,if=ide -device i82551,mac=52:54:00:12:34:56 -no-reboot -vga std  -no-shutdown -m 64M -debugcon file:debug.log  -s -S &
 
@@ -212,7 +213,7 @@ run: all
 		-boot order=c \
 		-netdev user,id=net0 \
 		-device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
-		-no-reboot -no-shutdown -vga std -m 64M \
+		-no-reboot -no-shutdown -vga std -m 128M \
 		-debugcon file:debug.log -serial stdio
 
 # FAT32 is listed first in -drive order below (as requested), but IDE index
@@ -228,5 +229,5 @@ debug: all
 		-no-reboot -d int,guest_errors -debugcon file:debug.log -no-shutdown \
 		-netdev user,id=net0 \
 		-device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
-		-m 64M \
+		-m 128M \
 		-serial stdio -s -S &

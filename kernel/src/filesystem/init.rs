@@ -1,5 +1,4 @@
-//! Early userspace-ish bring-up: DevFS, auto-detect filesystems on IDE,
-//! pick a root (prefer one that has `/shell`), mount the rest under `/mnt/*`.
+//! Early bring-up: prefer bootloader ramdisk (PXE), else IDE disks.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -9,64 +8,116 @@ use alloc::vec::Vec;
 
 use crate::device::char::{NullDevice, ZeroDevice};
 use crate::disk::interface::BlockDevice;
+use crate::disk::ramdisk::RamDisk;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::ext2::Ext2;
 use crate::filesystem::fat32::FatFs;
 use crate::filesystem::vfs::{Filesystem, VFS};
+use crate::memory::paging::{phys_to_virt, PAGING};
 use crate::pci::ide::{IDE, IDEDevice};
 use crate::println;
 use crate::spin;
 use crate::sync::mutex::Mutex;
 
-/// Result of probing one block device.
+/// Must match bootloader `BootInfo` at phys 0x6000.
+const BOOTINFO_PHYS: u32 = 0x0000_6000;
+const BOOTINFO_MAGIC: u32 = 0xFE11_B007;
+
+#[repr(C)]
+struct BootInfo {
+    magic: u32,
+    disk_phys: u32,
+    disk_sectors: u32,
+    flags: u32,
+}
+
 struct ProbedFs {
-    name: String, // sda, sdb, …
+    name: String,
     kind: &'static str,
     fs: Box<dyn Filesystem>,
     has_shell: bool,
 }
 
-/// Register `/dev`, scan ATA disks, auto-mount root + secondary volumes.
-///
-/// Call after `IDE.initialize()`. Returns `false` if no filesystem could be
-/// mounted as root.
+/// Prefer bootloader-provided ramdisk (PXE / INT 13h path).
+/// Fall back to probing real IDE disks (QEMU / local HDD) — no RAM copy.
 pub fn init_rootfs() -> bool {
-    println!("[init] probing IDE disks…");
+    let devfs = Box::new(DevFS::new());
+    devfs.register_char("null", Box::new(NullDevice));
+    devfs.register_char("zero", Box::new(ZeroDevice));
 
+    // ---- Path A: bootloader already hydrated the disk into RAM ----
+    if let Some(info) = read_bootinfo() {
+        println!(
+            "[init] BootInfo: disk phys=0x{:08x} sectors={} flags={:#x}",
+            info.disk_phys, info.disk_sectors, info.flags
+        );
+
+        // Do not let the frame allocator hand out pages that overlap the image.
+        reserve_frames_past(info.disk_phys, info.disk_sectors);
+
+        let ram = RamDisk::from_phys(info.disk_phys, info.disk_sectors);
+        let ram_fs = ram;
+        let ram_dev = ram;
+
+        devfs.register_block(
+            "ram0",
+            Mutex::new(Box::new(ram_dev) as Box<dyn BlockDevice>),
+        );
+
+        let arc: Arc<spin::Mutex<dyn BlockDevice>> =
+            Arc::new(spin::Mutex::new(ram_fs));
+
+        match try_mount(arc, "ram0") {
+            Some(root) => {
+                println!(
+                    "[VFS] root = {} on /dev/ram0 (shell={})",
+                    root.kind, root.has_shell
+                );
+                VFS.get().set_root(root.fs);
+
+                // Optional: still register any real IDE disks under /dev + /mnt
+                register_ide_disks(&devfs, true);
+
+                VFS.get().mount("/dev", devfs);
+                return true;
+            }
+            None => {
+                println!("[init] BootInfo present but FS mount failed, trying IDE…");
+            }
+        }
+    } else {
+        println!("[init] no BootInfo (magic mismatch) — IDE path");
+    }
+
+    // ---- Path B: real ATA disks (QEMU / bare metal HDD) ----
     let disks = collect_ata_disks();
     if disks.is_empty() {
-        println!("[init] no ATA disks found");
+        println!("[init] no ATA disks and no BootInfo ramdisk");
         return false;
     }
 
-    // ---- /dev ----
-    let devfs = Box::new(DevFS::new());
     for (i, dev) in disks.iter().enumerate() {
         let name = disk_name(i);
         devfs.register_block(
             &name,
             Mutex::new(Box::new(dev.clone()) as Box<dyn BlockDevice>),
         );
-        println!("[init] /dev/{}  size={} sectors type={}", name, dev.size, dev.r#type);
+        println!(
+            "[init] /dev/{}  size={} sectors (~{} MiB)",
+            name,
+            dev.size,
+            (dev.size as u64 * 512) / (1024 * 1024)
+        );
     }
-    devfs.register_char("null", Box::new(NullDevice));
-    devfs.register_char("zero", Box::new(ZeroDevice));
 
-    // ---- probe FS on each disk ----
     let mut probed: Vec<ProbedFs> = Vec::new();
     for (i, dev) in disks.into_iter().enumerate() {
         let name = disk_name(i);
         let arc: Arc<spin::Mutex<dyn BlockDevice>> =
             Arc::new(spin::Mutex::new(dev));
-
         match try_mount(arc, &name) {
             Some(p) => {
-                println!(
-                    "[init] {} → {} (shell={})",
-                    name,
-                    p.kind,
-                    p.has_shell
-                );
+                println!("[init] {} → {} (shell={})", name, p.kind, p.has_shell);
                 probed.push(p);
             }
             None => println!("[init] {} → no supported filesystem", name),
@@ -78,13 +129,14 @@ pub fn init_rootfs() -> bool {
         return false;
     }
 
-    // Prefer: has /shell, then ext2, then first available.
     let root_idx = pick_root(&probed);
     let root = probed.swap_remove(root_idx);
-    println!("[VFS] root = {} on /dev/{} ({})", root.kind, root.name, if root.has_shell { "has /shell" } else { "no /shell" });
+    println!(
+        "[VFS] root = {} on /dev/{} (shell={})",
+        root.kind, root.name, root.has_shell
+    );
     VFS.get().set_root(root.fs);
 
-    // Remaining volumes under /mnt/<name>
     for p in probed {
         let mp = format!("/mnt/{}", p.name);
         println!("[VFS] mount {} ({}) at {}", p.name, p.kind, mp);
@@ -95,8 +147,59 @@ pub fn init_rootfs() -> bool {
     true
 }
 
+fn read_bootinfo() -> Option<BootInfo> {
+    // BootInfo lives in low memory; identity/higher-half large pages cover it.
+    let ptr = phys_to_virt(BOOTINFO_PHYS) as *const BootInfo;
+    let info = unsafe { core::ptr::read_volatile(ptr) };
+    if info.magic == BOOTINFO_MAGIC && (info.flags & 1) != 0 && info.disk_sectors > 0 {
+        Some(info)
+    } else {
+        None
+    }
+}
+
+/// Bump the frame allocator past the bootloader ramdisk so we never reuse it.
+fn reserve_frames_past(disk_phys: u32, sectors: u32) {
+    let end = disk_phys as u64 + sectors as u64 * 512;
+    let end_page = ((end + 4095) / 4096) as u32;
+    interrupt_sync::without_interrupts(|| unsafe {
+        let mut pm = PAGING.lock();
+        if pm.next_free_page < end_page {
+            println!(
+                "[init] reserve frames: next {} → {}",
+                pm.next_free_page, end_page
+            );
+            pm.next_free_page = end_page;
+        }
+    });
+}
+
+fn register_ide_disks(devfs: &DevFS, mount_extra: bool) {
+    let disks = collect_ata_disks();
+    for (i, dev) in disks.iter().enumerate() {
+        let name = disk_name(i);
+        devfs.register_block(
+            &name,
+            Mutex::new(Box::new(dev.clone()) as Box<dyn BlockDevice>),
+        );
+        println!("[init] /dev/{} (physical)", name);
+    }
+    if !mount_extra {
+        return;
+    }
+    for (i, dev) in disks.into_iter().enumerate() {
+        let name = disk_name(i);
+        let arc: Arc<spin::Mutex<dyn BlockDevice>> =
+            Arc::new(spin::Mutex::new(dev));
+        if let Some(p) = try_mount(arc, &name) {
+            let mp = format!("/mnt/{}", name);
+            println!("[VFS] mount {} ({}) at {}", name, p.kind, mp);
+            VFS.get().mount(&mp, p.fs);
+        }
+    }
+}
+
 fn disk_name(index: usize) -> String {
-    // sda, sdb, sdc, …
     let letter = (b'a' + (index as u8)).min(b'z') as char;
     format!("sd{}", letter)
 }
@@ -106,7 +209,6 @@ fn collect_ata_disks() -> Vec<IDEDevice> {
     let mut out = Vec::new();
     for i in 0..4u8 {
         if let Some(dev) = ide.get_device(i) {
-            // type 0 = ATA (HDD), skip ATAPI
             if dev.r#type == 0 && dev.reserved != 0 {
                 out.push(dev);
             }
@@ -116,7 +218,6 @@ fn collect_ata_disks() -> Vec<IDEDevice> {
 }
 
 fn try_mount(disk: Arc<spin::Mutex<dyn BlockDevice>>, name: &str) -> Option<ProbedFs> {
-    // 1) EXT2
     {
         let mut ext2 = Ext2::new_with_auto_partition(disk.clone());
         ext2.mount(None);
@@ -131,7 +232,6 @@ fn try_mount(disk: Arc<spin::Mutex<dyn BlockDevice>>, name: &str) -> Option<Prob
         }
     }
 
-    // 2) FAT12/16/32
     match FatFs::mount_auto(disk) {
         Ok(fat) => {
             let has_shell = fs_has_shell(&fat);
@@ -151,13 +251,21 @@ fn fs_has_shell(fs: &dyn Filesystem) -> bool {
 }
 
 fn pick_root(probed: &[ProbedFs]) -> usize {
-    // 1. anything with /shell
     if let Some(i) = probed.iter().position(|p| p.has_shell) {
         return i;
     }
-    // 2. prefer ext2
     if let Some(i) = probed.iter().position(|p| p.kind == "ext2") {
         return i;
     }
     0
+}
+
+pub fn init_net() {
+    match crate::drivers::net::i8255x::I8255x::init() {
+        Ok(_) => {
+            crate::net::stack::init();
+            println!("[init] network ready");
+        }
+        Err(_) => println!("[init] I8255x init failed"),
+    }
 }
