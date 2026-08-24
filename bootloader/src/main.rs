@@ -22,12 +22,12 @@ const KERNEL_PATH: &str = "/kernel.bin";
 
 /// Boot info handed to the kernel (phys 0x6000).
 /// Kernel maps root from `disk_phys` when magic matches — no IDE needed (PXE).
-const BOOTINFO_PHYS: u32 = 0x0000_6000;
+const BOOTINFO_PHYS: u32 = 0x0000_7000; // not 0x6000 — VESA uses 0x6000 as scratch
 const BOOTINFO_MAGIC: u32 = 0xFE11_B007;
 /// Whole-disk image in RAM (after kernel @ 0x01000000).
 const RAMDISK_PHYS: u32 = 0x0200_0000;
-/// Fallback size if INT 13h AH=48h fails (matches Makefile 64 MiB disk.img).
-const RAMDISK_FALLBACK_SECTORS: u32 = (64 * 1024 * 1024) / 512;
+/// Fallback size if INT 13h AH=48h fails (matches Makefile 32 MiB disk.img).
+const RAMDISK_FALLBACK_SECTORS: u32 = (32 * 1024 * 1024) / 512;
 
 #[repr(C)]
 struct BootInfo {
@@ -91,6 +91,11 @@ pub extern "C" fn _start() -> ! {
     } else {
         clear_bootinfo();
         println!("[!] Local disk boot — skip RAM hydrate (kernel uses IDE)");
+    }
+
+    // Clear FB_INFO so kernel does not treat garbage as a valid LFB.
+    unsafe {
+        core::ptr::write_bytes(vesa::FB_INFO_PHYS as *mut u8, 0, core::mem::size_of::<vesa::FramebufferInfo>());
     }
 
     // VESA after the kernel is in memory so boot messages stay visible.

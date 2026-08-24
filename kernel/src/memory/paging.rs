@@ -95,8 +95,8 @@ pub const KERNEL_PHYS:   u32 = 0x0100_0000;
 pub const KERNEL_VIRT:   u32 = KERNEL_PHYS + KERNEL_OFFSET; // 0xC100_0000
 
 /// 4 MiB large pages covering identity + higher-half.
-/// 32 × 4 MiB = 128 MiB — must match QEMU `-m 128M` (room for 64 MiB ramdisk).
-pub const LARGE_PAGE_COUNT: u32 = 32;
+/// 16 × 4 MiB = 64 MiB — must match QEMU `-m 64M` (room for 32 MiB ramdisk).
+pub const LARGE_PAGE_COUNT: u32 = 16;
 /// First free physical frame. Below this: IVT/FB_INFO/TEMP_PD/kernel/boot stack/heap.
 /// NEVER allocate page 0 — that destroys FB_INFO at 0x5000.
 pub const FRAME_ALLOC_START: u32 = 0x0200_0000;

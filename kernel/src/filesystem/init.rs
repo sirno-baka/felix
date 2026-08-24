@@ -20,7 +20,7 @@ use crate::spin;
 use crate::sync::mutex::Mutex;
 
 /// Must match bootloader `BootInfo` at phys 0x6000.
-const BOOTINFO_PHYS: u32 = 0x0000_6000;
+const BOOTINFO_PHYS: u32 = 0x0000_7000; // must match bootloader (VESA uses 0x6000)
 const BOOTINFO_MAGIC: u32 = 0xFE11_B007;
 
 #[repr(C)]

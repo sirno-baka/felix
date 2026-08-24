@@ -23,6 +23,14 @@ impl<T: ?Sized> Mutex<T> {
         }
     }
 
+    /// Non-blocking lock for panic/exception paths (must not sleep).
+    pub fn try_lock_nb(&self) -> Option<MutexGuard<'_, T>> {
+        self.inner.try_lock().map(|guard| MutexGuard {
+            guard,
+            parent: self,
+        })
+    }
+
     pub fn lock(&self) -> MutexGuard<'_, T> {
         // Сохраняем исходное состояние Interrupt Flag (IF)
         let eflags: u32;

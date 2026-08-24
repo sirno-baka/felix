@@ -66,9 +66,27 @@ fn kill_current_task(esp: u32, reason: &str, exit_code: i32) -> u32 {
 }
 
 fn kernel_halt(name: &str, eip: u32, cs: u32, eflags: u32) -> ! {
-    println!("\n=== KERNEL EXCEPTION: {} ===", name);
-    println!("  EIP={:#x} CS={:#x} EFLAGS={:#b}", eip, cs, eflags);
-    println!("System halted");
+    let used_fb = crate::fb_panic::try_exception_fb(name, eip, cs, eflags);
+    if !used_fb {
+        println!("\n=== KERNEL EXCEPTION: {} ===", name);
+        println!("  EIP={:#x} CS={:#x} EFLAGS={:#b}", eip, cs, eflags);
+        println!("System halted");
+    }
+    loop {
+        unsafe {
+            asm!("hlt");
+        }
+    }
+}
+
+fn kernel_halt_page_fault(eip: u32, cs: u32, eflags: u32, cr2: u32) -> ! {
+    let used_fb = crate::fb_panic::try_page_fault_fb(eip, cs, eflags, cr2);
+    if !used_fb {
+        println!("\n=== KERNEL EXCEPTION: page_fault ===");
+        println!("  CR2={:#x}", cr2);
+        println!("  EIP={:#x} CS={:#x} EFLAGS={:#b}", eip, cs, eflags);
+        println!("System halted");
+    }
     loop {
         unsafe {
             asm!("hlt");
@@ -246,16 +264,14 @@ pub extern "C" fn page_fault_handler(esp: u32) -> u32 {
         asm!("mov {}, cr2", out(reg) cr2);
     }
 
-    // error code was discarded in the stub; re-read from CR2 context only
-    println!(
-        "PAGE FAULT! CR2={:#x} EIP={:#x} CS={:#x}",
-        cr2, state.eip, state.cs
-    );
-
     if is_user_cs(state.cs) {
+        println!(
+            "PAGE FAULT (user)! CR2={:#x} EIP={:#x} CS={:#x}",
+            cr2, state.eip, state.cs
+        );
         // SIGSEGV → 128+11 = 139
         kill_current_task(esp, "page_fault", 139)
     } else {
-        kernel_halt("page_fault", state.eip, state.cs, state.eflags)
+        kernel_halt_page_fault(state.eip, state.cs, state.eflags, cr2)
     }
 }

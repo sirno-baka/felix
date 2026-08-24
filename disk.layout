@@ -8,4 +8,4 @@ sector-size: 512
 # LBA 1..2047  : stage2 bootloader (embedded in the 1 MiB gap)
 # LBA 2048+    : ext2 with /kernel.bin, /shell, ...
 
-1 : start=        2048, size=      129024, type=83, bootable
+1 : start=        2048, size=       63488, type=83, bootable

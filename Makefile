@@ -122,9 +122,9 @@ floppy-image:
 
 .PHONY: image
 image:
-	@echo "=== Creating 64 MiB bootable disk (MBR | bootloader | ext2) ==="
+	@echo "=== Creating 32 MiB bootable disk (MBR | bootloader | ext2) ==="
 	@rm -f build/disk.img build/rootfs.img
-	@dd if=/dev/zero of=build/disk.img bs=1M count=64 status=none
+	@dd if=/dev/zero of=build/disk.img bs=1M count=32 status=none
 
 	@echo "=== Partition table (ext2 at LBA 2048) ==="
 	@$(SFDISK) build/disk.img < disk.layout
@@ -134,8 +134,8 @@ image:
 	@dd if=build/boot.bin of=build/disk.img bs=512 conv=notrunc status=none
 	@dd if=build/bootloader.bin of=build/disk.img bs=512 seek=1 conv=notrunc status=none
 
-	@echo "=== Creating ext2 rootfs (~63 MiB, 4K blocks, 128-byte inodes) ==="
-	@dd if=/dev/zero of=build/rootfs.img bs=512 count=129024 status=none
+	@echo "=== Creating ext2 rootfs (~31 MiB, 4K blocks, 128-byte inodes) ==="
+	@dd if=/dev/zero of=build/rootfs.img bs=512 count=63488 status=none
 	@$(E2MKFS) -I 128 -O ^64bit,^metadata_csum,^dir_index,^ext_attr,^resize_inode build/rootfs.img
 
 	@echo "=== Copying /kernel.bin and userspace to ext2 ==="
@@ -198,7 +198,7 @@ run-floppy: all floppy-image
        -netdev user,id=net0,hostfwd=udp::1234-:1234 \
          -device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
          -object filter-dump,id=f1,netdev=net0,file=guest.pcap \
-       -no-reboot -vga std -no-shutdown -m 128M \
+       -no-reboot -vga std -no-shutdown -m 64M \
        -debugcon file:debug.log -s -S &
 	@#qemu-system-i386 -drive file=build/floppy.img,index=0,format=raw,if=floppy -drive file=disk.img,index=0,media=disk,format=raw,if=ide -device i82551,mac=52:54:00:12:34:56 -no-reboot -vga std  -no-shutdown -m 64M -debugcon file:debug.log  -s -S &
 
@@ -213,7 +213,7 @@ run: all
 		-boot order=c \
 		-netdev user,id=net0 \
 		-device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
-		-no-reboot -no-shutdown -vga std -m 128M \
+		-no-reboot -no-shutdown -vga std -m 64M \
 		-debugcon file:debug.log -serial stdio
 
 # FAT32 is listed first in -drive order below (as requested), but IDE index
@@ -229,5 +229,5 @@ debug: all
 		-no-reboot -d int,guest_errors -debugcon file:debug.log -no-shutdown \
 		-netdev user,id=net0 \
 		-device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
-		-m 128M \
+		-m 64M \
 		-serial stdio -s -S &

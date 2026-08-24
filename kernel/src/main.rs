@@ -31,6 +31,7 @@ mod net;
 mod signal;
 mod pipe;
 mod device;
+mod fb_panic;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -125,9 +126,10 @@ pub extern "C" fn _start() -> ! {
             *pd.add(i) = 0;
         }
 
-        // Identity map first 128 MiB with 4 MiB large pages (PSE)
+        // Identity map first 64 MiB with 4 MiB large pages (PSE)
+        // 16 × 4 MiB = 64 MiB — matches -m 64M / LARGE_PAGE_COUNT
         // Also map the same physical pages at 0xC0000000 + base
-        for i in 0..32u32 {
+        for i in 0..16u32 {
             let phys = i * 0x400000;
             let flags = 0x83u32; // Present + Writable + Large page
             // Identity
@@ -425,15 +427,28 @@ fn init_network_stack() {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!("\n\n=== KERNEL PANIC ===");
-    println!("Panic message: {}", info);
-    if let Some(location) = info.location() {
-        println!("Location: {}:{}:{}",
-                 location.file(), location.line(), location.column());
+    // Prefer framebuffer if VESA is active (real HW with no serial).
+    let used_fb = crate::fb_panic::try_panic_fb(info);
+
+    // Still try VGA text + E9 (QEMU / text mode).
+    if !used_fb {
+        println!("\n\n=== KERNEL PANIC ===");
+        println!("Panic message: {}", info);
+        if let Some(location) = info.location() {
+            println!(
+                "Location: {}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            );
+        }
+        println!("System halted");
     }
-    println!("System halted");
+
     loop {
-        unsafe { core::arch::asm!("hlt"); }
+        unsafe {
+            core::arch::asm!("hlt");
+        }
     }
 }
 
