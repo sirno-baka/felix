@@ -89,3 +89,6 @@ pub const SYS_WM_SCREEN:  u32 = 406;
 pub const SYS_MOUSE_STATE: u32 = 407;
 /// wm_poll(id, *mut WmEvent, max) → number of events copied
 pub const SYS_WM_POLL: u32 = 408;
+
+/// pci_list(*mut PciInfoUser, max) → number of devices written (or needed if max=0)
+pub const SYS_PCI_LIST: u32 = 410;

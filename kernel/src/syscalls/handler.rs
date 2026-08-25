@@ -276,6 +276,12 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
             state.edx as usize,
         ),
 
+        // === PCI ===
+        crate::syscalls::SYS_PCI_LIST => sys_pci_list(
+            state.ebx as *mut PciInfoUser,
+            state.ecx as usize,
+        ),
+
         _ => 0,
     };
 
@@ -2163,6 +2169,49 @@ fn sys_mouse_state(out: *mut crate::drivers::mouse::MouseState) -> usize {
 
 fn sys_wm_poll(id: u32, out: *mut crate::drivers::wm::WmEvent, max: usize) -> usize {
     crate::drivers::wm::poll_events(id, out, max.min(32))
+}
+
+/// Compact PCI device record for userspace (`lspci`). Must match libfelix.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PciInfoUser {
+    bus: u8,
+    device: u8,
+    function: u8,
+    _pad: u8,
+    vendor_id: u16,
+    device_id: u16,
+    class_code: u8,
+    subclass: u8,
+    prog_if: u8,
+    interrupt_line: u8,
+}
+
+/// `buf` may be null with `max == 0` to query the number of devices only.
+fn sys_pci_list(buf: *mut PciInfoUser, max: usize) -> usize {
+    let devices = crate::pci::enumerate();
+    let n = devices.len();
+    if max == 0 || buf.is_null() {
+        return n;
+    }
+    let write_n = n.min(max);
+    for (i, d) in devices.iter().take(write_n).enumerate() {
+        unsafe {
+            *buf.add(i) = PciInfoUser {
+                bus: d.bus,
+                device: d.device,
+                function: d.function,
+                _pad: 0,
+                vendor_id: d.vendor_id,
+                device_id: d.device_id,
+                class_code: d.class_code,
+                subclass: d.subclass,
+                prog_if: d.prog_if,
+                interrupt_line: d.interrupt_line,
+            };
+        }
+    }
+    write_n
 }
 
 

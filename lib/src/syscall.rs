@@ -364,6 +364,39 @@ pub const SYS_WM_SCREEN:  u32 = 406;
 pub const SYS_MOUSE_STATE: u32 = 407;
 pub const SYS_WM_POLL: u32 = 408;
 
+/// pci_list(*mut PciInfo, max) → count written (or total if max=0)
+pub const SYS_PCI_LIST: u32 = 410;
+
+/// One PCI function as returned by the kernel. Must match kernel `PciInfoUser`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PciInfo {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub _pad: u8,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub class_code: u8,
+    pub subclass: u8,
+    pub prog_if: u8,
+    pub interrupt_line: u8,
+}
+
+/// Enumerate PCI devices into `out` (up to `out.len()`). Returns number written.
+/// If `out` is empty, returns total device count without writing.
+pub unsafe fn pci_list(out: *mut PciInfo, max: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_PCI_LIST => ret,
+        in("ebx") out as u32,
+        in("ecx") max,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
 #[repr(C)]
 pub struct WmCreateArgs {
     pub x: i32,

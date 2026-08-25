@@ -84,6 +84,7 @@ pub fn init_rootfs() -> bool {
                 VFS.get().set_root(root.fs);
 
                 // Optional: still register any real IDE disks under /dev + /mnt
+                println!("[init] Try mount IDE disks");
                 register_ide_disks(&devfs, true);
 
                 VFS.get().mount("/dev", devfs);
@@ -118,7 +119,7 @@ pub fn init_rootfs() -> bool {
             (dev.size as u64 * 512) / (1024 * 1024)
         );
     }
-
+    println!("[init] Try mount IDE disks");
     let mut probed: Vec<ProbedFs> = Vec::new();
     for (i, dev) in disks.into_iter().enumerate() {
         let name = disk_name(i);

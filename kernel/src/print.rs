@@ -8,7 +8,7 @@ use core::fmt;
 use core::fmt::Write;
 use crate::sync::mutex::Mutex;
 
-pub const LOG_LINES: usize = 32;
+pub const LOG_LINES: usize = 50;
 pub const LOG_WIDTH: usize = 96;
 
 // ---------------------------------------------------------------------------

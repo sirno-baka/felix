@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+use alloc::borrow::ToOwned;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -22,6 +23,95 @@ use libfelix::syscall::{
 struct Shell {
     cwd: String,
     path: String,
+    command_cache: Option<Vec<String>>,   // кэш всех команд
+
+}
+
+fn list_dir(path: &str) -> Vec<String> {
+    let mut path_buf = String::from(path);
+    if !path_buf.ends_with('/') && !path_buf.is_empty() {
+        path_buf.push('/');
+    }
+    path_buf.push('\0');
+    let mut buf = [0u8; 4096];
+    let n = unsafe { syscall::ls(path_buf.as_ptr(), buf.as_mut_ptr(), buf.len()) };
+    if n == 0 {
+        return Vec::new();
+    }
+    let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    let mut result = Vec::new();
+    for entry in text.lines() {
+        let e = entry.trim();
+        if !e.is_empty() {
+            result.push(e.to_string());
+        }
+    }
+    result
+}
+
+fn longest_common_prefix(strings: &[String]) -> String {
+    if strings.is_empty() {
+        return String::new();
+    }
+    let first = &strings[0];
+    let mut prefix = String::new();
+    for (i, ch) in first.char_indices() {
+        for s in &strings[1..] {
+            if let Some(c) = s.chars().nth(i) {
+                if c != ch {
+                    return prefix;
+                }
+            } else {
+                return prefix;
+            }
+        }
+        prefix.push(ch);
+    }
+    prefix
+}
+
+fn handle_tab_completion(shell: &mut Shell, input: &str, term: &mut TermBuffer) -> (String, bool) {
+    // Если ввод содержит пробелы — не дополняем команду (можно расширить для путей)
+    if input.contains(' ') {
+        return (input.to_string(), false);
+    }
+
+    let prefix = input.trim();
+    let all_cmds = shell.get_commands().clone();
+    let mut matches: Vec<String> = all_cmds
+        .into_iter()
+        .filter(|cmd| cmd.starts_with(prefix))
+        .collect();
+
+    if matches.is_empty() {
+        return (input.to_string(), false);
+    }
+
+    matches.sort();
+
+    if matches.len() == 1 {
+        // Единственное совпадение — заменяем ввод и добавляем пробел
+        let new_input = format!("{} ", matches[0]);
+        return (new_input, true);
+    } else {
+        // Несколько совпадений — находим общий префикс
+        let common = longest_common_prefix(&matches);
+        if common.len() > prefix.len() {
+            // Общий префикс длиннее текущего — заменяем на него (без пробела)
+            return (common, true);
+        } else {
+            // Нет общего префикса — выводим список вариантов в терминал
+            let mut msg = String::from("");
+            for (i, m) in matches.iter().enumerate() {
+                if i > 0 {
+                    msg.push_str("  ");
+                }
+                msg.push_str(m);
+            }
+            term.push(&msg);
+            return (input.to_string(), true); // dirty, чтобы перерисовать терминал с подсказкой
+        }
+    }
 }
 
 impl Shell {
@@ -29,7 +119,39 @@ impl Shell {
         Self {
             cwd: String::from("/"),
             path: String::from("/"),
+            command_cache: None,
         }
+    }
+
+
+
+    fn get_commands(&mut self) -> &Vec<String> {
+        if self.command_cache.is_none() {
+            let mut cmds = Vec::new();
+            // Встроенные команды
+            for b in BUILTINS {
+                cmds.push(b.to_string());
+            }
+            // Внешние команды из PATH
+            for dir in self.path.split(':') {
+                if dir.is_empty() {
+                    continue;
+                }
+                let files = list_dir(dir);
+                for f in files {
+                    cmds.push(f);
+                }
+            }
+            cmds.sort();
+            cmds.dedup();
+            self.command_cache = Some(cmds);
+        }
+        self.command_cache.as_ref().unwrap()
+    }
+
+    // Инвалидация кэша (вызывать при изменении PATH)
+    fn invalidate_cache(&mut self) {
+        self.command_cache = None;
     }
 
     fn prompt(&self) -> String {
@@ -267,8 +389,19 @@ impl TermBuffer {
 
     fn push(&mut self, line: &str) {
         for part in line.split('\n') {
-            self.lines.push(String::from(part));
-            if self.lines.len() > MAX_HISTORY {
+            // Soft-wrap so long lines (e.g. lspci) keep the start visible.
+            let mut rest = part;
+            loop {
+                if rest.len() <= LINE_MAX_CHARS {
+                    self.lines.push(String::from(rest));
+                    break;
+                }
+                // Prefer ASCII-safe cut; our shell text is ASCII.
+                let (head, tail) = rest.split_at(LINE_MAX_CHARS);
+                self.lines.push(String::from(head));
+                rest = tail;
+            }
+            while self.lines.len() > MAX_HISTORY {
                 self.lines.remove(0);
             }
         }
@@ -292,7 +425,7 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
     let name = cmd.args[0].as_str();
     match name {
         "help" | "exit" | "quit" | "pwd" | "cd" | "ls" | "cat" | "mkdir" | "rmdir" | "rm"
-        | "path" | "ps" | "clear" | "echo" | "head" => {}
+        | "path" | "ps" | "clear" | "echo" | "head" | "lspci" => {}
         _ => return false,
     }
 
@@ -452,6 +585,7 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
         "path" => {
             if let Some(new_path) = cmd.args.get(1) {
                 shell.path = new_path.clone();
+                shell.invalidate_cache();   // <-- добавить
                 out.push(&format!("PATH={}", shell.path));
             } else {
                 out.push(&shell.path);
@@ -478,9 +612,68 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
                 }
             }
         }
+        "lspci" => {
+            lspci_to(file_fd, out);
+            if file_fd >= 0 {
+                unsafe {
+                    close(file_fd as u32);
+                }
+            }
+        }
         _ => {}
     }
     true
+}
+
+/// List PCI devices; names from the [pci-ids](https://docs.rs/pci-ids) database.
+fn lspci_to(file_fd: i32, out: &mut TermBuffer) {
+    use pci_ids::{Device, FromId, Subclass, Vendor};
+
+    let total = unsafe { syscall::pci_list(core::ptr::null_mut(), 0) };
+    if total == 0 {
+        out.push("lspci: no PCI devices found");
+        return;
+    }
+    let mut buf = alloc::vec![syscall::PciInfo::default(); total];
+    let n = unsafe { syscall::pci_list(buf.as_mut_ptr(), buf.len()) };
+    out.push(&format!("=== PCI Devices ({} found) ===", n));
+
+    for d in buf.iter().take(n) {
+        let vendor = Vendor::from_id(d.vendor_id)
+            .map(|v| v.name())
+            .unwrap_or("Unknown vendor");
+        let device = Device::from_vid_pid(d.vendor_id, d.device_id)
+            .map(|dev| dev.name())
+            .unwrap_or("Unknown device");
+        let class = Subclass::from_cid_sid(d.class_code, d.subclass)
+            .map(|s| s.name())
+            .unwrap_or("Unknown class");
+
+        let line = format!(
+            "{:02x}:{:02x}.{}  [{:04x}:{:04x}]  {} | {} | {} ",
+            d.bus,
+            d.device,
+            d.function,
+            d.vendor_id,
+            d.device_id,
+            vendor,
+            device,
+            class,
+
+        );
+        if file_fd >= 0 {
+            let mut b = line.clone();
+            b.push('\n');
+            unsafe {
+                write(file_fd as u32, b.as_bytes().as_ptr(), b.len());
+            }
+        } else {
+            out.push(&line);
+
+
+        }
+    }
+    out.push("==============================");
 }
 
 fn ls_to(path: &str, file_fd: i32, out: &mut TermBuffer) {
@@ -496,6 +689,15 @@ fn ls_to(path: &str, file_fd: i32, out: &mut TermBuffer) {
         return;
     }
     let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    if file_fd < 0 {
+        let mut lines = String::new();
+        for entry in text.lines() {
+            lines.push_str(entry);
+            lines.push_str(" ");
+        }
+        out.push(lines.as_str());
+        return;
+    }
     for entry in text.lines() {
         if entry.is_empty() {
             continue;
@@ -581,6 +783,7 @@ fn help_text() -> String {
   pwd              - print working directory\n\
   path [dirs]      - show or set PATH\n\
   mkdir / rmdir / rm\n\
+  lspci            - list PCI devices (pci-ids names)\n\
   clear            - clear terminal\n\
   help / exit\n\n\
 Redirection / pipes as usual.\n\
@@ -981,12 +1184,14 @@ fn interpret(
 
 const SCAN_BACKSPACE: u8 = 0x0E;
 const SCAN_ENTER: u8 = 0x1C;
+const SCAN_TAB: u8 = 0x0F;
 const MAX_INPUT: usize = 96;
-const LINE_MAX_CHARS: usize = 68;
+const LINE_MAX_CHARS: usize = 69;
 
+/// Keep the **start** of the line (bus addr / prompt), not the tail.
 fn truncate_line(s: &str) -> &str {
     if s.len() > LINE_MAX_CHARS {
-        &s[s.len() - LINE_MAX_CHARS..]
+        &s[..LINE_MAX_CHARS]
     } else {
         s
     }
@@ -1012,6 +1217,11 @@ fn refresh_terminal(
     live.push('_');
     ui.set_label(line_ids[HISTORY_ROWS], truncate_line(&live));
 }
+
+const BUILTINS: &[&str] = &[
+    "help", "exit", "quit", "pwd", "cd", "ls", "cat", "mkdir",
+    "rmdir", "rm", "path", "ps", "clear", "echo", "head", "lspci",
+];
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
@@ -1076,6 +1286,17 @@ pub extern "C" fn main() -> i32 {
             } else if scancode == SCAN_BACKSPACE {
                 if input.pop().is_some() {
                     dirty = true;
+                }
+            } else if scancode == SCAN_TAB {
+                let (new_input, completed) = handle_tab_completion(&mut shell, &input, &mut term);
+                if completed {
+                    input = new_input;
+                    dirty = true;
+                    // После вывода подсказок обновляем UI
+                    let prompt = shell.prompt();
+                    refresh_terminal(&mut ui, &prompt, &term, &input, &line_ids);
+                    ui.draw(&mut win);
+                    let _ = win.flip();
                 }
             } else if ch >= 0x20 && ch < 0x7f && input.len() < MAX_INPUT {
                 input.push(ch as char);

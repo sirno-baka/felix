@@ -115,6 +115,18 @@ pub extern "C" fn keyboard_handler() {
         asm!("in al, dx", out("al") sc, in("dx") KEYBOARD_PORT);
         sc
     };
+    let released = scancode & 0x80 != 0;
+    let code = scancode & 0x7F;
+
+    // F12 → dump recent kernel log to framebuffer (same path as panic console).
+    // Does NOT halt — useful when the shell appears hung on real HW.
+    if code == 0x58 && !released {
+        let _ = crate::fb_panic::try_show(format_args!(
+            "=== F12 DEBUG DUMP ===\n(system still running; recent log above)\n"
+        ));
+        PICS.end_interrupt(KEYBOARD_INT);
+        return;
+    }
 
     // Modifier keys (press / release)
     unsafe {
@@ -128,9 +140,6 @@ pub extern "C" fn keyboard_handler() {
             _ => {}
         }
     }
-
-    let released = scancode & 0x80 != 0;
-    let code = scancode & 0x7F;
 
     // Ctrl+C → ETX to focused window (shell kills its own children).
     if code == 0x2e && unsafe { KEYBOARD.ctrl } && !released {
