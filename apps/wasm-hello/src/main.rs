@@ -1,30 +1,37 @@
-use std::fmt; // Import the `fmt` module.
+use std::io::{Bytes, Read, Write};
+use std::env::args;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::Shutdown;
+use std::net::{TcpStream};
 
-// Define a structure named `List` containing a `Vec`.
-struct List(Vec<i32>);
+const ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
+const PORT: u16 = 6666;
 
-impl fmt::Display for List {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // Create a reference to the Vec<i32> stored in the List struct.
-        let vec = &self.0;
 
-        write!(f, "[")?;
+fn main() -> std::io::Result<()> {
+    println!("Hello Client!");
+    println!("213");
 
-        // Iterate over `v` in `vec` while enumerating the iteration
-        // index in `index`.
-        for (index, v) in vec.iter().enumerate() {
-            // For every element except the first, add a comma.
-            // Use the ? operator to return on errors.
-            if index != 0 { write!(f, ", ")?; }
-            write!(f, "{}", v)?;
+
+    match TcpStream::connect(SocketAddrV4::new(ADDR, PORT)) {
+        Ok(mut stream) => {
+            println!("Connected to the server on {:?}", stream.peer_addr().unwrap());
+
+            let message = "hello".to_string();
+            match message.as_str() {
+                "#END#" => stream.shutdown(Shutdown::Both).expect("Shutdown Failed!"),
+                _ => {
+                    print!("SENT!");
+                    stream.write(&message.into_bytes())?;
+                    //stream.read(&mut [0; 128])?;
+                }
+            }
         }
-
-        // Close the opened bracket and return a fmt::Result value.
-        write!(f, "]")
+        Err(err) => {
+            println!("Error: {}", err);
+            println!("Couldn't connect to server...");
+        }
     }
-}
-
-fn main() {
-    let v = List(vec![1, 2, 3]);
-    println!("{}", v);
+    
+    Ok(())
 }

@@ -3,14 +3,16 @@
 pub const SYS_EXECVE_WASM: u32 = 1000;
 
 use crate::syscalls::handler::*;
-use wasmi::{Engine, Module, Store, Linker, Instance, Memory, MemoryType, Value, Extern, Func, Caller};
+use wasmi::{Engine, Module, Store, Linker, Instance, Memory, MemoryType, Value, Extern, Func, Caller, Error};
 use wasmi::core::HostError;
 use alloc::boxed::Box;
+use core::str::Utf8Error;
 use interrupt_sync::without_interrupts;
 use crate::filesystem::file::{FileDescriptor, FileDescriptorTable};
 use crate::memory::paging::{copy_kernel_mappings, PDEFlags};
 use crate::multitasking::task::{CPUState, Task, TASK_MANAGER};
-use crate::println;
+use crate::{print, println};
+use crate::print::klog_write_str;
 use crate::wrappers::{cli, hlt, sti};
 
 /// Сигнатура хостовых функций для WASI
@@ -26,14 +28,158 @@ fn register_wasi_functions(linker: &mut Linker<()>, _ctx: &WasmTaskContext) -> R
         "wasi_snapshot_preview1",
         "proc_exit",
         |_code: i32| -> Result<(), wasmi::core::Trap> {
-            unsafe {
-                let slot = TASK_MANAGER.get_current_slot() as usize;
-                sys_exit(slot, 0);
-            }
-            Err(wasmi::core::Trap::new("proc_exit called"))
+            without_interrupts(|| {
+                unsafe {
+                    let slot = TASK_MANAGER.get_current_slot() as usize;
+                    println!("proc exit {}", slot);
+                    sys_exit(slot, 0);
+                }
+                Err(wasmi::core::Trap::new("proc_exit called"))
+            })
         },
     )?;
 
+    // sock_open (создание сокета, необходимо для TcpStream::connect)
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "sock_open",
+        |mut caller: wasmi::Caller<'_, ()>, af: i32, socktype: i32, protocol: i32, fd_ptr: i32| -> Result<u32, wasmi::core::Trap> {
+            println!("socket open");
+            without_interrupts(|| {
+                let current_slot = unsafe { TASK_MANAGER.get_current_slot() as usize };
+                // sys_socket возвращает fd при успехе или usize::MAX при ошибке
+                let res = unsafe { sys_socket(current_slot, af as u16, socktype as u16, protocol as u8) };
+
+                if res == usize::MAX {
+                    return Ok(8); // WASI_EBADF
+                }
+
+                let memory = caller.get_export("memory").and_then(|ext| ext.into_memory()).ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
+                memory.write(&mut caller, fd_ptr as usize, &(res as u32).to_le_bytes())
+                    .map_err(|_| wasmi::core::Trap::new("write fd failed"))?;
+
+                Ok(0) // WASI_ESUCCESS
+            })
+        },
+    )?;
+
+    // sock_connect (подключение сокета)
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "sock_connect",
+        |mut caller: wasmi::Caller<'_, ()>, fd: i32, addr_ptr: i32, addr_len: i32| -> Result<u32, wasmi::core::Trap> {
+            println!("sock_connect");
+            without_interrupts(|| {
+                let current_slot = unsafe { TASK_MANAGER.get_current_slot() as usize };
+                let memory = caller.get_export("memory").and_then(|ext| ext.into_memory()).ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
+                let data = memory.data(&caller);
+
+                if addr_ptr < 0 || addr_len < 0 || (addr_ptr as usize).saturating_add(addr_len as usize) > data.len() {
+                    return Ok(14); // WASI_EFAULT
+                }
+
+                let res = unsafe { sys_connect(current_slot, fd as usize, data.as_ptr().add(addr_ptr as usize), addr_len as usize) };
+
+                if res == 0 {
+                    Ok(0) // WASI_ESUCCESS
+                } else {
+                    Ok(8) // WASI_EBADF или другая ошибка
+                }
+            })
+        },
+    )?;
+
+    // === Заглушки, которые часто вызывает std::net ===
+
+    // sock_setopt (настройка таймаутов и т.д.)
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "sock_setopt",
+        |_fd: i32, _level: i32, _option: i32, _optval_ptr: i32, _optval_len: i32| -> Result<u32, wasmi::core::Trap> {
+            Ok(0) // WASI_ESUCCESS
+        },
+    )?;
+
+    // sock_getopt
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "sock_getopt",
+        |_fd: i32, _level: i32, _option: i32, _optval_ptr: i32, _optval_len_ptr: i32| -> Result<u32, wasmi::core::Trap> {
+            Ok(0) // WASI_ESUCCESS
+        },
+    )?;
+
+    // fd_fdstat_set_flags (установка O_NONBLOCK, часто вызывается перед connect)
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "fd_fdstat_set_flags",
+        |_fd: i32, _flags: i32| -> Result<u32, wasmi::core::Trap> {
+            Ok(0) // WASI_ESUCCESS
+        },
+    )?;
+    // fd_read
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "fd_read",
+        |mut caller: wasmi::Caller<'_, ()>, fd: i32, iovs_ptr: i32, iovs_len: i32, nread_ptr: i32| -> Result<u32, wasmi::core::Trap> {
+            without_interrupts(|| {
+                if iovs_ptr < 0 || iovs_len < 0 {
+                    return Err(wasmi::core::Trap::new("invalid iovs"));
+                }
+                let iovs_start = iovs_ptr as usize;
+                let iovs_len_usize = iovs_len as usize;
+                let iovs_end = iovs_start.saturating_add(iovs_len_usize.saturating_mul(8));
+
+                let memory = caller
+                    .get_export("memory")
+                    .and_then(|ext| ext.into_memory())
+                    .ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
+
+                let data = memory.data(&caller);
+                if iovs_end > data.len() {
+                    return Err(wasmi::core::Trap::new("iovs out of bounds"));
+                }
+
+                let mut total = 0usize;
+                let current_slot = unsafe { TASK_MANAGER.get_current_slot() as usize };
+                let mem_base_ptr = data.as_ptr() as *mut u8;
+
+                for i in 0..iovs_len_usize {
+                    let base = iovs_start + i * 8;
+                    let buf_ptr = u32::from_le_bytes(data[base..base + 4].try_into().unwrap()) as usize;
+                    let buf_len = u32::from_le_bytes(data[base + 4..base + 8].try_into().unwrap()) as usize;
+
+                    // Проверка выхода за границы памяти WASM
+                    if buf_ptr.checked_add(buf_len).map_or(true, |end| end > data.len()) {
+                        return Err(wasmi::core::Trap::new("buffer out of bounds"));
+                    }
+
+                    // Получаем мутабельный слайс прямо в памяти WASM
+                    let buf_slice = unsafe { core::slice::from_raw_parts_mut(mem_base_ptr.add(buf_ptr), buf_len) };
+                    println!("sys_read {}", fd);
+                    // Вызываем sys_read из handler.rs
+                    let read = unsafe { sys_read(current_slot, fd as usize, buf_slice.as_mut_ptr(), buf_slice.len()) };
+
+                    total += read;
+                    if read < buf_len {
+                        break; // EOF или больше нет данных для чтения
+                    }
+                }
+
+                let nread_addr = nread_ptr as usize;
+                if nread_addr.checked_add(4).map_or(true, |end| end > data.len()) {
+                    return Err(wasmi::core::Trap::new("nread out of bounds"));
+                }
+
+                // Записываем количество прочитанных байт обратно в память WASM
+                memory
+                    .write(&mut caller, nread_addr, &(total as u32).to_le_bytes())
+                    .map_err(|_| wasmi::core::Trap::new("write nread failed"))?;
+
+                Ok(0) // WASI_ESUCCESS
+            })
+        },
+    )?;
     // fd_write (только для stdout/stderr)
     linker.func_wrap(
         "wasi_snapshot_preview1",
@@ -71,6 +217,14 @@ fn register_wasi_functions(linker: &mut Linker<()>, _ctx: &WasmTaskContext) -> R
                 let buf_slice = &data[buf_ptr..buf_ptr + buf_len];
 
                 let current_slot = unsafe { TASK_MANAGER.get_current_slot() as usize };
+                match core::str::from_utf8(buf_slice) {
+                    Ok(v) => {
+                        print!("{}", v);
+                    },
+                    _ => {}
+                }
+
+                println!("sys_write {}", fd);
                 let written = unsafe { sys_write(current_slot, fd as usize, buf_slice.as_ptr(), buf_slice.len()) };
                 total += written;
             }
@@ -81,9 +235,35 @@ fn register_wasi_functions(linker: &mut Linker<()>, _ctx: &WasmTaskContext) -> R
                     .write(&mut caller, nwritten_addr, &(total as u32).to_le_bytes())
                     .map_err(|_| wasmi::core::Trap::new("write nwritten failed"))?;
             }
-
-            Ok(total as u32)
+            println!("written n={}", total);
+            Ok(0)
             })
+        },
+    )?;
+
+    // fd_fdstat_get
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "fd_fdstat_get",
+        |mut caller: wasmi::Caller<'_, ()>, _fd: i32, stat_ptr: i32| -> Result<u32, wasmi::core::Trap> {
+            println!("fd_fdstat_get");
+            let memory = caller.get_export("memory").and_then(|e| e.into_memory())
+                .ok_or_else(|| wasmi::core::Trap::new("no mem"))?;
+            // нули
+            let zeros = [0u8; 24];
+            memory.write(&mut caller, stat_ptr as usize, &zeros)
+                .map_err(|_| wasmi::core::Trap::new("write"))?;
+            Ok(0)
+        },
+    )?;
+
+    // fd_fdstat_get
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "poll_oneoff",
+        |mut caller: wasmi::Caller<'_, ()>, _fd: i32, stat_ptr: i32| -> Result<u32, wasmi::core::Trap> {
+            println!("poll_oneoff");
+            Ok(0)
         },
     )?;
 
@@ -91,70 +271,203 @@ fn register_wasi_functions(linker: &mut Linker<()>, _ctx: &WasmTaskContext) -> R
     linker.func_wrap(
         "wasi_snapshot_preview1",
         "fd_close",
-        |_fd: i32| -> Result<(), wasmi::core::Trap> {
-            // Пока просто возвращаем успех, можно добавить реальный sys_close
-            Ok(())
+        |fd: i32| -> Result<u32, wasmi::core::Trap> {
+            without_interrupts(|| {
+                let current_slot = unsafe { TASK_MANAGER.get_current_slot() as usize };
+                let res = unsafe { sys_close(current_slot, fd as usize) };
+                println!("sys_close {}", fd);
+                // sys_close возвращает 0 при успехе и usize::MAX при ошибке
+                if res == 0 {
+                    Ok(0) // WASI_ESUCCESS
+                } else {
+                    Ok(8) // WASI_EBADF (Bad file descriptor)
+                }
+            })
         },
     )?;
 
     // === ДОБАВЛЕНЫ ЗАГЛУШКИ ДЛЯ WASI ===
-
-    // environ_sizes_get: сообщает размер и количество переменных окружения
+    // environ_sizes_get
     linker.func_wrap(
         "wasi_snapshot_preview1",
         "environ_sizes_get",
-        |mut caller: wasmi::Caller<'_, ()>, environ_count_ptr: i32, environ_buf_size_ptr: i32| -> Result<i32, wasmi::core::Trap> {
-            let memory = caller
-                .get_export("memory")
-                .and_then(|ext| ext.into_memory())
-                .ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
-
-            // 0 переменных окружения, 0 байт
-            memory.write(&mut caller, environ_count_ptr as usize, &0u32.to_le_bytes())
-                .map_err(|_| wasmi::core::Trap::new("write environ_count failed"))?;
-            memory.write(&mut caller, environ_buf_size_ptr as usize, &0u32.to_le_bytes())
-                .map_err(|_| wasmi::core::Trap::new("write environ_buf_size failed"))?;
-
-            Ok(0) // WASI_ESUCCESS
+        |mut caller: wasmi::Caller<'_, ()>, count_ptr: i32, buf_size_ptr: i32| -> Result<i32, wasmi::core::Trap> {
+            let memory = caller.get_export("memory").and_then(|e| e.into_memory())
+                .ok_or_else(|| wasmi::core::Trap::new("no mem"))?;
+            // 1 var, size of "RUST_BACKTRACE=1\0"
+            memory.write(&mut caller, count_ptr as usize, &1u32.to_le_bytes())
+                .map_err(|_| wasmi::core::Trap::new("write"))?;
+            memory.write(&mut caller, buf_size_ptr as usize, &17u32.to_le_bytes())
+                .map_err(|_| wasmi::core::Trap::new("write"))?;
+            Ok(0)
         },
     )?;
 
-    // environ_get: получает сами переменные окружения
+    // environ_get
     linker.func_wrap(
         "wasi_snapshot_preview1",
         "environ_get",
-        |_caller: wasmi::Caller<'_, ()>, _environ_ptrs_ptr: i32, _environ_buf_ptr: i32| -> Result<i32, wasmi::core::Trap> {
-            // Так как переменных 0, писать нечего, просто возвращаем успех
-            Ok(0) // WASI_ESUCCESS
+        |mut caller: wasmi::Caller<'_, ()>, environ_ptrs: i32, environ_buf: i32| -> Result<i32, wasmi::core::Trap> {
+            let memory = caller.get_export("memory").and_then(|e| e.into_memory())
+                .ok_or_else(|| wasmi::core::Trap::new("no mem"))?;
+            let s = b"RUST_BACKTRACE=1\0";
+            memory.write(&mut caller, environ_buf as usize, s)
+                .map_err(|_| wasmi::core::Trap::new("write"))?;
+            memory.write(&mut caller, environ_ptrs as usize, &(environ_buf as u32).to_le_bytes())
+                .map_err(|_| wasmi::core::Trap::new("write"))?;
+            Ok(0)
         },
     )?;
 
-    // args_sizes_get: сообщает размер и количество аргументов командной строки
+    // args_sizes_get
     linker.func_wrap(
         "wasi_snapshot_preview1",
         "args_sizes_get",
         |mut caller: wasmi::Caller<'_, ()>, argc_ptr: i32, argv_buf_size_ptr: i32| -> Result<i32, wasmi::core::Trap> {
-            let memory = caller
-                .get_export("memory")
+            let memory = caller.get_export("memory").and_then(|e| e.into_memory())
+                .ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
+            // 1 arg, size of "hello\0"
+            memory.write(&mut caller, argc_ptr as usize, &1u32.to_le_bytes())
+                .map_err(|_| wasmi::core::Trap::new("write argc failed"))?;
+            memory.write(&mut caller, argv_buf_size_ptr as usize, &6u32.to_le_bytes())
+                .map_err(|_| wasmi::core::Trap::new("write size failed"))?;
+            Ok(0)
+        },
+    )?;
+
+    // args_get
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "args_get",
+        |mut caller: wasmi::Caller<'_, ()>, argv_ptrs_ptr: i32, argv_buf_ptr: i32| -> Result<i32, wasmi::core::Trap> {
+            let memory = caller.get_export("memory").and_then(|e| e.into_memory())
+                .ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
+            let buf = b"hello\0";
+
+            memory.write(&mut caller, argv_buf_ptr as usize, buf).map_err(|_| wasmi::core::Trap::new("write argc failed"))?;
+            memory.write(&mut caller, argv_ptrs_ptr as usize, &(argv_buf_ptr as u32).to_le_bytes()).map_err(|_| wasmi::core::Trap::new("write argc failed"))?;
+            Ok(0)
+        },
+    )?;
+
+
+    // === WASI Sockets ===
+
+    // sock_shutdown
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "sock_shutdown",
+        |fd: i32, how: i32| -> Result<u32, wasmi::core::Trap> {
+            without_interrupts(|| {
+                let current_slot = unsafe { TASK_MANAGER.get_current_slot() as usize };
+                let res = unsafe { sys_shutdown(current_slot, fd as usize, how as u32) };
+                println!("sys_shutdown {}", fd);
+                Ok(if res == 0 { 0 } else { 8 }) // 0 = ESUCCESS, 8 = EBADF
+            })
+        },
+    )?;
+
+    // sock_recv
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "sock_recv",
+        |mut caller: wasmi::Caller<'_, ()>, fd: i32, ri_data_ptr: i32, ri_data_len: i32, _ri_flags: i32, ro_datalen_ptr: i32, ro_flags_ptr: i32| -> Result<u32, wasmi::core::Trap> {
+            without_interrupts(|| {
+                let memory = caller.get_export("memory").and_then(|ext| ext.into_memory()).ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
+                let data = memory.data(&caller);
+                let mem_base_ptr = data.as_ptr() as *mut u8;
+                let mut total = 0usize;
+                let current_slot = unsafe { TASK_MANAGER.get_current_slot() as usize };
+                println!("sys_recvfrom {}", fd);
+                for i in 0..ri_data_len as usize {
+                    let base = ri_data_ptr as usize + i * 8;
+                    if base + 8 > data.len() { break; }
+                    let buf_ptr = u32::from_le_bytes(data[base..base + 4].try_into().unwrap()) as usize;
+                    let buf_len = u32::from_le_bytes(data[base + 4..base + 8].try_into().unwrap()) as usize;
+                    if buf_ptr.checked_add(buf_len).map_or(true, |end| end > data.len()) { break; }
+
+                    let buf_slice = unsafe { core::slice::from_raw_parts_mut(mem_base_ptr.add(buf_ptr), buf_len) };
+                    let read = unsafe { sys_recvfrom(current_slot, fd as usize, buf_slice.as_mut_ptr(), buf_slice.len()) };
+                    total += read;
+                    if read < buf_len { break; }
+                }
+
+                memory.write(&mut caller, ro_datalen_ptr as usize, &(total as u32).to_le_bytes()).map_err(|_| wasmi::core::Trap::new("write datalen failed"))?;
+                memory.write(&mut caller, ro_flags_ptr as usize, &0u32.to_le_bytes()).map_err(|_| wasmi::core::Trap::new("write flags failed"))?;
+                Ok(0)
+            })
+        },
+    )?;
+
+    // sock_send
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "sock_send",
+        |mut caller: wasmi::Caller<'_, ()>, fd: i32, si_data_ptr: i32, si_data_len: i32, _si_flags: i32, so_datalen_ptr: i32| -> Result<u32, wasmi::core::Trap> {
+            without_interrupts(|| {
+                let memory = caller.get_export("memory").and_then(|ext| ext.into_memory()).ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
+                let data = memory.data(&caller);
+                let mut total = 0usize;
+                let current_slot = unsafe { TASK_MANAGER.get_current_slot() as usize };
+                println!("sys_sendto {}", fd);
+
+                for i in 0..si_data_len as usize {
+                    let base = si_data_ptr as usize + i * 8;
+                    if base + 8 > data.len() { break; }
+                    let buf_ptr = u32::from_le_bytes(data[base..base + 4].try_into().unwrap()) as usize;
+                    let buf_len = u32::from_le_bytes(data[base + 4..base + 8].try_into().unwrap()) as usize;
+                    if buf_ptr.checked_add(buf_len).map_or(true, |end| end > data.len()) { break; }
+
+                    let buf_slice = &data[buf_ptr..buf_ptr + buf_len];
+                    let written = unsafe { sys_sendto(current_slot, fd as usize, buf_slice.as_ptr(), buf_slice.len()) };
+                    total += written;
+                }
+
+                memory.write(&mut caller, so_datalen_ptr as usize, &(total as u32).to_le_bytes()).map_err(|_| wasmi::core::Trap::new("write datalen failed"))?;
+                Ok(0)
+            })
+        },
+    )?;
+    // 2. random_get (КРИТИЧНО для старта Rust std)
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "random_get",
+        |mut caller: wasmi::Caller<'_, ()>, buf_ptr: i32, buf_len: i32| -> Result<u32, wasmi::core::Trap> {
+            let memory = caller.get_export("memory")
                 .and_then(|ext| ext.into_memory())
                 .ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
 
-            // 0 аргументов, 0 байт
-            memory.write(&mut caller, argc_ptr as usize, &0u32.to_le_bytes())
-                .map_err(|_| wasmi::core::Trap::new("write argc failed"))?;
-            memory.write(&mut caller, argv_buf_size_ptr as usize, &0u32.to_le_bytes())
-                .map_err(|_| wasmi::core::Trap::new("write argv_buf_size failed"))?;
+            // ИСПОЛЬЗУЕМ data_mut для получения мутабельного среза памяти
+            let data = memory.data_mut(&mut caller);
+            let start = buf_ptr as usize;
+            let len = buf_len as usize;
 
+            if start.saturating_add(len) > data.len() {
+                return Ok(21); // WASI_EINVAL
+            }
+
+            // Заполняем псевдослучайными данными (заглушка)
+            let slice = &mut data[start..start + len];
+            for (i, byte) in slice.iter_mut().enumerate() {
+                *byte = (i as u8).wrapping_add(0x5A);
+            }
             Ok(0) // WASI_ESUCCESS
         },
     )?;
 
-    // args_get: получает сами аргументы командной строки
+    // 3. clock_time_get (Часто вызывается при инициализации)
     linker.func_wrap(
         "wasi_snapshot_preview1",
-        "args_get",
-        |_caller: wasmi::Caller<'_, ()>, _argv_ptrs_ptr: i32, _argv_buf_ptr: i32| -> Result<i32, wasmi::core::Trap> {
-            // Так как аргументов 0, писать нечего, просто возвращаем успех
+        "clock_time_get",
+        |mut caller: wasmi::Caller<'_, ()>, _clock_id: i32, _precision: i64, time_ptr: i32| -> Result<u32, wasmi::core::Trap> {
+            let memory = caller.get_export("memory")
+                .and_then(|ext| ext.into_memory())
+                .ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
+
+            // Возвращаем фейковое время в наносекундах (например, 1 секунда)
+            let fake_time_ns: u64 = 1_000_000_000;
+            memory.write(&mut caller, time_ptr as usize, &fake_time_ns.to_le_bytes())
+                .map_err(|_| wasmi::core::Trap::new("write time failed"))?;
             Ok(0) // WASI_ESUCCESS
         },
     )?;
@@ -271,12 +584,22 @@ extern "C" fn wasm_task_entry() -> ! {
     if let Some(mut exec) = exec {
         // Пытаемся найти и вызвать точку входа (_start или main)
         if let Some(start_func) = exec.instance.get_func(&mut exec.store, "_start") {
-            let _ = start_func.call(&mut exec.store, &[], &mut []);
+            let _ = match start_func.call(&mut exec.store, &[], &mut [])  {
+                Ok(_) => {}
+                Err(err) => {
+                    println!("wasm_task_entry _start call failed: {}", err);
+                }
+            };
         } else if let Some(main_func) = exec.instance.get_func(&mut exec.store, "main") {
-            let _ = main_func.call(&mut exec.store, &[], &mut []);
+            match main_func.call(&mut exec.store, &[], &mut []) {
+                Ok(_) => {}
+                Err(err) => {
+                    println!("wasm_task_entry main call failed: {}", err);
+                }
+            }
         }
     }
-
+    println!("Task {} exit", slot);
     // Завершаем задачу
     unsafe {
         sys_exit(slot, 0);

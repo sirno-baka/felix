@@ -984,7 +984,9 @@ pub fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usiz
             match desc {
                 Some(FileDescriptor::ConsoleOut) | Some(FileDescriptor::ConsoleIn) => {
                     match core::str::from_utf8(buf) {
-                        Ok(v) => print!("{}", v),
+                        Ok(v) => {
+                            print!("{}", v);
+                        },
                         Err(_) => println!("{:02x?}", &buf),
                     }
                     return count;
@@ -1734,6 +1736,7 @@ pub fn sys_execve(
 use crate::net::stack::{NET_STACK, poll_stack};
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 use smoltcp::socket::{tcp, udp};
+use crate::print::klog_write_str;
 
 pub fn sys_socket(current_slot: usize, domain: u16, ty: u16, protocol: u8) -> usize {
     let mut stack_guard = match NET_STACK.try_lock() {
