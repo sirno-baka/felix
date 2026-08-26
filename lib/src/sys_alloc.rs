@@ -5,10 +5,10 @@
 //! Reuse lives here: freed blocks go on a free list and are handed out again
 //! without another syscall when possible.
 
+use crate::syscall::{SYS_FREE, SYS_MALLOC};
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::asm;
 use core::ptr::{self, null_mut};
-use crate::syscall::{SYS_MALLOC, SYS_FREE};
 
 /// In-block header while the region is on the free list.
 #[repr(C)]
@@ -121,12 +121,7 @@ unsafe impl GlobalAlloc for SyscallAllocator {
         kernel_free(ptr, layout.size(), layout.align());
     }
 
-    unsafe fn realloc(
-        &self,
-        ptr: *mut u8,
-        layout: Layout,
-        new_size: usize,
-    ) -> *mut u8 {
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if ptr.is_null() {
             return self.alloc(Layout::from_size_align_unchecked(
                 new_size.max(1),

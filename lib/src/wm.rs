@@ -9,14 +9,14 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use embedded_graphics::{pixelcolor::Rgb888, prelude::*, Pixel};
 use embedded_graphics::primitives::Rectangle;
+use embedded_graphics::{pixelcolor::Rgb888, prelude::*, Pixel};
 
 use crate::syscall::{self};
 
 pub use crate::syscall::{
-    WindowInfo, MouseState, WmEvent, EV_NONE, EV_MOUSE_MOVE, EV_MOUSE_DOWN, EV_MOUSE_UP,
-    EV_KEY_DOWN, EV_KEY_UP, EV_CLOSE, EV_FOCUS_IN, EV_FOCUS_OUT,
+    MouseState, WindowInfo, WmEvent, EV_CLOSE, EV_FOCUS_IN, EV_FOCUS_OUT, EV_KEY_DOWN, EV_KEY_UP,
+    EV_MOUSE_DOWN, EV_MOUSE_MOVE, EV_MOUSE_UP, EV_NONE,
 };
 
 /// Must match kernel `drivers::wm::TITLE_H`.
@@ -66,9 +66,7 @@ impl Window {
         let n = bytes.len().min(31);
         title_buf[..n].copy_from_slice(&bytes[..n]);
 
-        let id = unsafe {
-            syscall::wm_create(x, y, w, h, title_buf.as_ptr())
-        };
+        let id = unsafe { syscall::wm_create(x, y, w, h, title_buf.as_ptr()) };
         if id == usize::MAX {
             return None;
         }
@@ -196,9 +194,7 @@ impl Window {
 
     /// Copy local buffer → kernel surface and compose to the LFB.
     pub fn flip(&self) -> bool {
-        unsafe {
-            syscall::wm_flip(self.id, self.buffer.as_ptr(), self.buffer.len()) == 0
-        }
+        unsafe { syscall::wm_flip(self.id, self.buffer.as_ptr(), self.buffer.len()) == 0 }
     }
 
     /// Non-blocking poll of window events (mouse/key/focus).

@@ -28,17 +28,17 @@ use alloc::vec::Vec;
 
 use embedded_graphics_unicodefonts::mono_9x18_atlas;
 
+use crate::println;
+use crate::wm::{
+    mouse, Window, WmEvent, EV_KEY_DOWN, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_MOVE, EV_MOUSE_UP,
+    TITLE_H,
+};
 use embedded_graphics::{
-    mono_font::{MonoTextStyle},
+    mono_font::MonoTextStyle,
     pixelcolor::Rgb888,
     prelude::*,
     primitives::{PrimitiveStyle, Rectangle, RoundedRectangle},
     text::{Baseline, Text},
-};
-use crate::println;
-use crate::wm::{
-    mouse, Window, TITLE_H, WmEvent, EV_KEY_DOWN, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_MOVE,
-    EV_MOUSE_UP,
 };
 
 // ---------------------------------------------------------------------------
@@ -66,12 +66,29 @@ const SCAN_ENTER: u8 = 0x1C;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiEvent {
-    Down { x: i32, y: i32 },
-    Move { x: i32, y: i32 },
-    Up { x: i32, y: i32 },
+    Down {
+        x: i32,
+        y: i32,
+    },
+    Move {
+        x: i32,
+        y: i32,
+    },
+    Up {
+        x: i32,
+        y: i32,
+    },
     /// `ch` = 0 if no printable; `mods`: bit0=shift, bit1=ctrl
-    KeyDown { scancode: u8, ch: u8, mods: u8 },
-    KeyUp { scancode: u8, ch: u8, mods: u8 },
+    KeyDown {
+        scancode: u8,
+        ch: u8,
+        mods: u8,
+    },
+    KeyUp {
+        scancode: u8,
+        ch: u8,
+        mods: u8,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -121,10 +138,7 @@ impl Button {
     }
 
     fn contains(&self, x: i32, y: i32) -> bool {
-        x >= self.x
-            && y >= self.y
-            && x < self.x + self.w as i32
-            && y < self.y + self.h as i32
+        x >= self.x && y >= self.y && x < self.x + self.w as i32 && y < self.y + self.h as i32
     }
 
     /// Returns `true` if the event was consumed.
@@ -309,10 +323,7 @@ impl TextInput {
     }
 
     fn contains(&self, x: i32, y: i32) -> bool {
-        x >= self.x
-            && y >= self.y
-            && x < self.x + self.w as i32
-            && y < self.y + self.h as i32
+        x >= self.x && y >= self.y && x < self.x + self.w as i32 && y < self.y + self.h as i32
     }
 
     fn set_focused(&mut self, f: bool) {
@@ -763,10 +774,7 @@ impl Ui {
                     if self.focus == Some(WidgetId(i)) {
                         continue;
                     }
-                    if n.process(
-                        ev,
-                        false,
-                    ) {
+                    if n.process(ev, false) {
                         if n.dirty() {
                             any = true;
                         }

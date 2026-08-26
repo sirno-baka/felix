@@ -6,8 +6,7 @@ extern crate alloc;
 use core::mem::size_of;
 use libfelix::prelude::*;
 use libfelix::syscall::{
-    socket, bind, connect, recvfrom, sendto, close, read,
-    AF_INET, SOCK_DGRAM, IPPROTO_UDP,
+    bind, close, connect, read, recvfrom, sendto, socket, AF_INET, IPPROTO_UDP, SOCK_DGRAM,
 };
 
 #[repr(C)]
@@ -100,8 +99,6 @@ fn usage() {
     println!("  hello -l <port>              UDP listen (print + echo)");
     println!("  hello <ip> <port>            UDP client (send line, print reply)");
 }
-
-
 
 fn run_server(port: u16) -> i32 {
     let sock = unsafe { socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP) };

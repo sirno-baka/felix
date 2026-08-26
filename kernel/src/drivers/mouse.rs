@@ -3,11 +3,12 @@
 //! Protocol: standard 3-byte packets. Cursor is drawn with a small
 //! under-buffer so we can erase/redraw without full-screen compose.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use crate::drivers::framebuffer::FRAMEBUFFER;
 use crate::drivers::pic::PICS;
-use crate::io::{inb, outb, io_wait};
+use crate::io::{inb, io_wait, outb};
 use crate::{debugln, println};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::arch::{asm, naked_asm};
 
 /// IRQ12 remapped: 32 + 12 = 44
 pub const MOUSE_INT: u8 = 44;
@@ -41,26 +42,26 @@ static mut CUR_OY: i32 = 0;
 
 /// Simple arrow bitmap (1 = foreground).
 const CURSOR_MASK: [[u8; CUR_W]; CUR_H] = [
-    [1,0,0,0,0,0,0,0,0,0,0,0],
-    [1,1,0,0,0,0,0,0,0,0,0,0],
-    [1,1,1,0,0,0,0,0,0,0,0,0],
-    [1,1,1,1,0,0,0,0,0,0,0,0],
-    [1,1,1,1,1,0,0,0,0,0,0,0],
-    [1,1,1,1,1,1,0,0,0,0,0,0],
-    [1,1,1,1,1,1,1,0,0,0,0,0],
-    [1,1,1,1,1,1,1,1,0,0,0,0],
-    [1,1,1,1,1,1,1,1,1,0,0,0],
-    [1,1,1,1,1,1,1,0,0,0,0,0],
-    [1,1,1,1,1,1,1,0,0,0,0,0],
-    [1,1,0,0,1,1,1,1,0,0,0,0],
-    [1,0,0,0,0,1,1,1,0,0,0,0],
-    [0,0,0,0,0,1,1,1,1,0,0,0],
-    [0,0,0,0,0,0,1,1,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,0,0,0],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+    [1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+    [1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0],
+    [1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
 ];
 
 pub fn is_ready() -> bool {
@@ -124,11 +125,7 @@ fn mouse_write(val: u8) {
 }
 
 fn mouse_read() -> u8 {
-    if wait_output_full() {
-        inb(PS2_DATA)
-    } else {
-        0
-    }
+    if wait_output_full() { inb(PS2_DATA) } else { 0 }
 }
 
 /// Initialize 8042 aux device + enable streaming. Call with IF=0 after PIC init.
@@ -143,8 +140,12 @@ pub fn init() {
     // Read controller command byte
     wait_input_clear();
     outb(PS2_CMD, 0x20);
-    let mut cmd = if wait_output_full() { inb(PS2_DATA) } else { 0x47 };
-    cmd |= 0x02;  // enable IRQ12
+    let mut cmd = if wait_output_full() {
+        inb(PS2_DATA)
+    } else {
+        0x47
+    };
+    cmd |= 0x02; // enable IRQ12
     cmd &= !0x20; // enable mouse clock (clear disable bit)
 
     wait_input_clear();
@@ -183,21 +184,20 @@ pub fn init() {
     debugln!("[mouse] ready");
 }
 
-#[naked]
+#[unsafe(naked)]
 pub extern "C" fn mouse_irq() {
     unsafe {
-        core::arch::asm!(
+        naked_asm!(
             "cli",
             "pusha",
             "call mouse_handler",
             "popa",
             "iretd",
-            options(noreturn)
         );
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn mouse_handler() {
     // Only consume AUX data
     let status = inb(PS2_STATUS);

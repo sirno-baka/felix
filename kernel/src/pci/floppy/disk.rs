@@ -1,13 +1,13 @@
 // kernel/src/pci/floppy/disk.rs
 
-use core::alloc::{GlobalAlloc, Layout};
-use core::sync::atomic::{AtomicBool, Ordering};
-use crate::io::{inb, outb};
-use crate::time::sleep;
 use crate::disk::interface::BlockDevice;
-use crate::{print, println};
+use crate::io::{inb, outb};
 use crate::memory::allocator::ALLOCATOR;
 use crate::memory::paging::PAGING;
+use crate::time::sleep;
+use crate::{print, println};
+use core::alloc::{GlobalAlloc, Layout};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 const FDC_DMA_BUF_SIZE: usize = 4096;
 // Fixed bounce buffer address below 16 MB (and below 1 MB), identity-mapped.
@@ -38,24 +38,24 @@ fn validate_fdc_dma(len: u32) -> Result<u32, u8> {
 }
 
 // --- FDC Порты ---
-const FDC_DOR:  u16 = 0x3F2;
-const FDC_MSR:  u16 = 0x3F4;
+const FDC_DOR: u16 = 0x3F2;
+const FDC_MSR: u16 = 0x3F4;
 const FDC_FIFO: u16 = 0x3F5;
-const FDC_CCR:  u16 = 0x3F7;
+const FDC_CCR: u16 = 0x3F7;
 
 // --- FDC MSR Биты ---
-const MSR_BUSY:  u8 = 0x10; // Command Busy
-const MSR_NDMA:  u8 = 0x20; // Non-DMA Execution Phase
-const MSR_DIO:   u8 = 0x40; // 0 = CPU->FDC, 1 = CPU<-FDC
-const MSR_RQM:   u8 = 0x80; // Request for Master
+const MSR_BUSY: u8 = 0x10; // Command Busy
+const MSR_NDMA: u8 = 0x20; // Non-DMA Execution Phase
+const MSR_DIO: u8 = 0x40; // 0 = CPU->FDC, 1 = CPU<-FDC
+const MSR_RQM: u8 = 0x80; // Request for Master
 
 // --- FDC Команды ---
-const CMD_SPECIFY:       u8 = 0x03;
-const CMD_RECALIBRATE:   u8 = 0x07;
-const CMD_SENSE_INT:     u8 = 0x08;
-const CMD_SEEK:          u8 = 0x0F;
-const CMD_READ_DATA:     u8 = 0x66; // MFM + Skip deleted data
-const CMD_WRITE_DATA:    u8 = 0xC5; // MT + MFM
+const CMD_SPECIFY: u8 = 0x03;
+const CMD_RECALIBRATE: u8 = 0x07;
+const CMD_SENSE_INT: u8 = 0x08;
+const CMD_SEEK: u8 = 0x0F;
+const CMD_READ_DATA: u8 = 0x66; // MFM + Skip deleted data
+const CMD_WRITE_DATA: u8 = 0xC5; // MT + MFM
 
 // --- DMA Порты (Канал 2 для FDC) ---
 const DMA_CH2_ADDR_LO: u16 = 0x04;
@@ -88,7 +88,9 @@ fn alloc_bounce_buffer(size: u32) -> Option<u32> {
 /// Освобождает bounce-буфер
 fn free_bounce_buffer(ptr: u32, size: u32) {
     let layout = Layout::from_size_align(size as usize, 4096).unwrap();
-    unsafe { ALLOCATOR.dealloc(ptr as *mut u8, layout); }
+    unsafe {
+        ALLOCATOR.dealloc(ptr as *mut u8, layout);
+    }
 }
 
 /// Настраивает DMA контроллер (8237A) для передачи данных.
@@ -183,8 +185,12 @@ impl Floppy {
         println!("[fdc] motor on");
 
         match self.recalibrate() {
-            Ok(_) => {println!("[fdc] recalibrate ok");}
-            Err(_) => {println!("[fdc] recalibrate fail");}
+            Ok(_) => {
+                println!("[fdc] recalibrate ok");
+            }
+            Err(_) => {
+                println!("[fdc] recalibrate fail");
+            }
         };
         println!("[fdc] recalibrate ok");
 
@@ -378,10 +384,10 @@ impl Floppy {
         self.send_byte(cyl)?;
         self.send_byte(head)?;
         self.send_byte(sector)?;
-        self.send_byte(2)?;        // N = 2 → 512 байт
-        self.send_byte(SPT)?;      // EOT
-        self.send_byte(0x1B)?;     // GPL
-        self.send_byte(0xFF)?;     // DTL (не используется при N≠0)
+        self.send_byte(2)?; // N = 2 → 512 байт
+        self.send_byte(SPT)?; // EOT
+        self.send_byte(0x1B)?; // GPL
+        self.send_byte(0xFF)?; // DTL (не используется при N≠0)
 
         // Ждём окончания выполнения (result phase)
         self.wait_for_result_phase()?;
@@ -393,10 +399,10 @@ impl Floppy {
         let st0 = self.recv_byte()?;
         let st1 = self.recv_byte()?;
         let st2 = self.recv_byte()?;
-        let _c  = self.recv_byte()?;
-        let _h  = self.recv_byte()?;
-        let _r  = self.recv_byte()?;
-        let _n  = self.recv_byte()?;
+        let _c = self.recv_byte()?;
+        let _h = self.recv_byte()?;
+        let _r = self.recv_byte()?;
+        let _n = self.recv_byte()?;
 
         // IC (Interrupt Code) в ST0 bits 7:6
         // 00 = Normal Termination

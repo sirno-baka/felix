@@ -1,8 +1,8 @@
+use crate::drivers::net::i8255x::I8255x;
+use crate::drivers::net::{RX_BUF_SIZE, TX_BUF_SIZE};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 use smoltcp::wire::EthernetAddress;
-use crate::drivers::net::i8255x::I8255x;
-use crate::drivers::net::{RX_BUF_SIZE, TX_BUF_SIZE};
 // ===================== smoltcp integration =====================
 
 pub struct I8255xRxToken {
@@ -48,7 +48,9 @@ impl Device for I8255x {
         let mut buf = [0u8; RX_BUF_SIZE];
         if let Some(len) = self.recv(&mut buf) {
             let rx = I8255xRxToken { data: buf, len };
-            let tx = I8255xTxToken { nic: self as *mut _ };
+            let tx = I8255xTxToken {
+                nic: self as *mut _,
+            };
             Some((rx, tx))
         } else {
             None

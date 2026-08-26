@@ -1,12 +1,15 @@
 //TASK MANAGER
 
+use crate::drivers::pic::wait;
+use crate::filesystem::file::FileDescriptorTable;
+use crate::memory::paging::{
+    KERNEL_OFFSET, PDEFlags, PageDirectory, PhysAddr, VirtAddr, alloc_kernel_stack,
+    alloc_task_page_dir, copy_kernel_mappings,
+};
+use crate::{gdt, init_network_stack, print, println};
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::u32::MAX;
-use crate::filesystem::file::FileDescriptorTable;
-use crate::memory::paging::{PageDirectory, PDEFlags, copy_kernel_mappings, PhysAddr, VirtAddr, KERNEL_OFFSET, alloc_kernel_stack, alloc_task_page_dir};
-use crate::{gdt, init_network_stack, print, println};
-use crate::drivers::pic::wait;
 
 pub const STACK_SIZE: usize = 64 * 1024;
 /// Space above the saved CPUState for the hardware interrupt frame (~few dozen bytes).
@@ -22,7 +25,9 @@ pub struct PageRefcounts {
 
 impl PageRefcounts {
     pub const fn new() -> Self {
-        PageRefcounts { entries: Vec::new() }
+        PageRefcounts {
+            entries: Vec::new(),
+        }
     }
 
     /// Увеличивает счётчик для страницы. Возвращает true если страница
@@ -79,7 +84,6 @@ pub struct Task {
     pub signal_handlers: [u32; 32],
 }
 
-
 #[repr(C)]
 pub struct CPUState {
     pub eax: u32,
@@ -89,11 +93,11 @@ pub struct CPUState {
     pub esi: u32,
     pub edi: u32,
     pub ebp: u32,
-    pub eip:    u32,
-    pub cs:     u32,
+    pub eip: u32,
+    pub cs: u32,
     pub eflags: u32,
-    pub esp:    u32,
-    pub ss:     u32,
+    pub esp: u32,
+    pub ss: u32,
 }
 
 impl Task {
@@ -130,11 +134,19 @@ impl Task {
         }
     }
 
-    pub fn new_idle() -> Self { Self::new() }
-    pub fn new_task() -> Self { Self::new() }
+    pub fn new_idle() -> Self {
+        Self::new()
+    }
+    pub fn new_task() -> Self {
+        Self::new()
+    }
 
-    pub fn sleep(&mut self) { self.running = false; }
-    pub fn wake(&mut self) { self.running = true; }
+    pub fn sleep(&mut self) {
+        self.running = false;
+    }
+    pub fn wake(&mut self) {
+        self.running = true;
+    }
 
     pub fn init(&mut self, entry_point: u32, user_stack_top: u32, heap_start: u32) {
         self.running = true;
@@ -142,15 +154,19 @@ impl Task {
         let kernel_stack_top = self.stack_base + STACK_SIZE as u32;
         self.kernel_stack = kernel_stack_top;
 
-        let state_ptr = (kernel_stack_top as usize
-            - HEADROOM
-            - core::mem::size_of::<CPUState>()) as *mut CPUState;
+        let state_ptr = (kernel_stack_top as usize - HEADROOM - core::mem::size_of::<CPUState>())
+            as *mut CPUState;
         self.cpu_state_ptr = state_ptr as u32;
 
         unsafe {
             *state_ptr = CPUState {
-                eax: 0, ebx: 0, ecx: 0, edx: 0,
-                esi: 0, edi: 0, ebp: 0,
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+                esi: 0,
+                edi: 0,
+                ebp: 0,
                 eip: entry_point,
                 cs: 0x1B,
                 eflags: 0x202,
@@ -190,14 +206,18 @@ impl TaskManager {
         copy_kernel_mappings(task.pd_mut(), pd_phys);
 
         let stack_top = task.stack_base + STACK_SIZE as u32;
-        let state_ptr = (stack_top as usize
-            - HEADROOM
-            - core::mem::size_of::<CPUState>()) as *mut CPUState;
+        let state_ptr =
+            (stack_top as usize - HEADROOM - core::mem::size_of::<CPUState>()) as *mut CPUState;
 
         unsafe {
             *state_ptr = CPUState {
-                eax: 0, ebx: 0, ecx: 0, edx: 0,
-                esi: 0, edi: 0, ebp: 0,
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+                esi: 0,
+                edi: 0,
+                ebp: 0,
                 eip: idle as u32,
                 cs: 0x08,
                 eflags: 0x202,
@@ -255,8 +275,8 @@ impl TaskManager {
 
     //CPU SCHEDULER LOGIC
     pub fn schedule(&mut self, cpu_state: *mut CPUState) -> *mut CPUState {
-        if  self.tasks[0].is_none() {
-            return cpu_state
+        if self.tasks[0].is_none() {
+            return cpu_state;
         }
         if self.first_switch {
             self.first_switch = false;
@@ -282,7 +302,10 @@ impl TaskManager {
 
         if self.current_task < 0
             || self.tasks[self.current_task as usize].is_none()
-            || !self.tasks[self.current_task as usize].as_ref().unwrap().running
+            || !self.tasks[self.current_task as usize]
+                .as_ref()
+                .unwrap()
+                .running
         {
             self.current_task = 0;
         }
@@ -404,13 +427,12 @@ fn idle() {
     let mut a = 0;
     loop {
         a += 1;
-        for _ in 0..1000000000 {
-
-        }
+        for _ in 0..1000000000 {}
         if a % 10000000 == 0 {
             a += 1;
         }
-        unsafe { asm!("hlt"); }
+        unsafe {
+            asm!("hlt");
+        }
     }
 }
-

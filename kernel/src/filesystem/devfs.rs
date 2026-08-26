@@ -4,10 +4,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp;
 
-use crate::sync::mutex::Mutex;
-use crate::filesystem::vfs::{Filesystem, DirEntry};
-use crate::disk::interface::BlockDevice;
 use crate::device::char::CharDevice;
+use crate::disk::interface::BlockDevice;
+use crate::filesystem::vfs::{DirEntry, Filesystem};
+use crate::sync::mutex::Mutex;
 
 pub enum DeviceType {
     // Mutex необходим, так как write_sectors требует &mut self
@@ -68,7 +68,10 @@ impl Filesystem for DevFS {
         // Убираем ведущий слеш для сравнения, если он есть
         let clean_name = path.strip_prefix('/').unwrap_or(path);
         let devices = self.devices.lock();
-        devices.iter().find(|d| d.name == clean_name).map(|d| d.inode)
+        devices
+            .iter()
+            .find(|d| d.name == clean_name)
+            .map(|d| d.inode)
     }
 
     fn read_at(&self, inode: u32, offset: u64, buf: &mut [u8]) -> usize {
@@ -99,26 +102,45 @@ impl Filesystem for DevFS {
 
     fn list_directory_entries(&self, _path: &str) -> Option<Vec<DirEntry>> {
         let devices = self.devices.lock();
-        Some(devices.iter().map(|d| DirEntry {
-            inode: d.inode,
-            name: d.name.clone(),
-            // 2 = S_IFCHR (символьное), 3 = S_IFBLK (блочное)
-            file_type: match d.dev_type {
-                DeviceType::Block(_) => 3,
-                DeviceType::Char(_) => 4,
-            },
-            size: 0,
-        }).collect())
+        Some(
+            devices
+                .iter()
+                .map(|d| DirEntry {
+                    inode: d.inode,
+                    name: d.name.clone(),
+                    // 2 = S_IFCHR (символьное), 3 = S_IFBLK (блочное)
+                    file_type: match d.dev_type {
+                        DeviceType::Block(_) => 3,
+                        DeviceType::Char(_) => 4,
+                    },
+                    size: 0,
+                })
+                .collect(),
+        )
     }
 
     // DevFS не поддерживает создание/удаление файлов через обычные системные вызовы
-    fn read_file(&self, _path: &str) -> Option<Vec<u8>> { None }
-    fn write_file(&mut self, _path: &str, _data: &[u8]) -> bool { false }
-    fn create_file(&mut self, _path: &str, _data: &[u8]) -> bool { false }
-    fn remove_file(&mut self, _path: &str) -> bool { false }
-    fn mkdir(&mut self, _path: &str) -> bool { false }
-    fn rmdir(&mut self, _path: &str) -> bool { false }
-    fn is_mounted(&self) -> bool { true }
+    fn read_file(&self, _path: &str) -> Option<Vec<u8>> {
+        None
+    }
+    fn write_file(&mut self, _path: &str, _data: &[u8]) -> bool {
+        false
+    }
+    fn create_file(&mut self, _path: &str, _data: &[u8]) -> bool {
+        false
+    }
+    fn remove_file(&mut self, _path: &str) -> bool {
+        false
+    }
+    fn mkdir(&mut self, _path: &str) -> bool {
+        false
+    }
+    fn rmdir(&mut self, _path: &str) -> bool {
+        false
+    }
+    fn is_mounted(&self) -> bool {
+        true
+    }
 }
 
 // ==========================
@@ -126,7 +148,9 @@ impl Filesystem for DevFS {
 // ==========================
 
 fn read_from_block_device(dev: &dyn BlockDevice, offset: u64, buf: &mut [u8]) -> usize {
-    if buf.is_empty() { return 0; }
+    if buf.is_empty() {
+        return 0;
+    }
 
     let sector_size = dev.sector_size() as u64;
     let start_sector = (offset / sector_size) as u32;
@@ -139,24 +163,31 @@ fn read_from_block_device(dev: &dyn BlockDevice, offset: u64, buf: &mut [u8]) ->
     while bytes_read < buf.len() {
         let current_sector = start_sector + ((bytes_read as u64) / sector_size) as u32;
         let current_offset = if bytes_read == 0 { sector_offset } else { 0 };
-        let chunk = cmp::min(buf.len() - bytes_read, sector_size as usize - current_offset);
+        let chunk = cmp::min(
+            buf.len() - bytes_read,
+            sector_size as usize - current_offset,
+        );
 
         // Читаем целый сектор
-        if dev.read_sectors(1, current_sector, temp_sector.as_mut_ptr() as u32).is_err() {
+        if dev
+            .read_sectors(1, current_sector, temp_sector.as_mut_ptr() as u32)
+            .is_err()
+        {
             break; // Ошибка чтения
         }
 
         // Копируем нужную часть в пользовательский буфер
-        buf[bytes_read..bytes_read + chunk].copy_from_slice(
-            &temp_sector[current_offset..current_offset + chunk]
-        );
+        buf[bytes_read..bytes_read + chunk]
+            .copy_from_slice(&temp_sector[current_offset..current_offset + chunk]);
         bytes_read += chunk;
     }
     bytes_read
 }
 
 fn write_to_block_device(dev: &mut dyn BlockDevice, offset: u64, buf: &[u8]) -> usize {
-    if buf.is_empty() { return 0; }
+    if buf.is_empty() {
+        return 0;
+    }
 
     let sector_size = dev.sector_size() as u64;
     let start_sector = (offset / sector_size) as u32;
@@ -168,10 +199,16 @@ fn write_to_block_device(dev: &mut dyn BlockDevice, offset: u64, buf: &[u8]) -> 
     while bytes_written < buf.len() {
         let current_sector = start_sector + ((bytes_written as u64) / sector_size) as u32;
         let current_offset = if bytes_written == 0 { sector_offset } else { 0 };
-        let chunk = cmp::min(buf.len() - bytes_written, sector_size as usize - current_offset);
+        let chunk = cmp::min(
+            buf.len() - bytes_written,
+            sector_size as usize - current_offset,
+        );
 
         // 1. READ: читаем существующий сектор
-        if dev.read_sectors(1, current_sector, temp_sector.as_mut_ptr() as u32).is_err() {
+        if dev
+            .read_sectors(1, current_sector, temp_sector.as_mut_ptr() as u32)
+            .is_err()
+        {
             break;
         }
 
@@ -180,7 +217,10 @@ fn write_to_block_device(dev: &mut dyn BlockDevice, offset: u64, buf: &[u8]) -> 
             .copy_from_slice(&buf[bytes_written..bytes_written + chunk]);
 
         // 3. WRITE: записываем сектор целиком обратно
-        if dev.write_sectors(1, current_sector, temp_sector.as_mut_ptr() as u32).is_err() {
+        if dev
+            .write_sectors(1, current_sector, temp_sector.as_mut_ptr() as u32)
+            .is_err()
+        {
             break;
         }
 

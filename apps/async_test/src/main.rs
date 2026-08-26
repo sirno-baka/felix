@@ -126,9 +126,7 @@ fn test_async_pipe() -> bool {
 
         let mut total = 0usize;
         loop {
-            let n = unsafe {
-                async_read(rfd, rx.as_mut_ptr().add(total), rx.len() - total).await
-            };
+            let n = unsafe { async_read(rfd, rx.as_mut_ptr().add(total), rx.len() - total).await };
             if n == 0 {
                 break; // EOF
             }

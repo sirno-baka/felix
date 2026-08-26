@@ -1,14 +1,17 @@
 // KEYBOARD DRIVER
 // Нормальная, высокоуровневая версия без хаков
 
-use crate::drivers::pic::PICS;
-use core::arch::asm;
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
+use crate::drivers::pic::PICS;
 use crate::println;
+use core::arch::asm;
 
 // Warning! Mutable static here
 // TODO: заменить на spin::Mutex или lock-free структуру
-pub static mut KEYBOARD: Keyboard = Keyboard { shift: false, ctrl: false };
+pub static mut KEYBOARD: Keyboard = Keyboard {
+    shift: false,
+    ctrl: false,
+};
 
 pub const KEYBOARD_INT: u8 = 33;
 const KEYBOARD_PORT: u16 = 0x60;
@@ -17,26 +20,22 @@ const KEYBOARD_PORT: u16 = 0x60;
 // ДВЕ ТАБЛИЦЫ ДЛЯ US QWERTY (unshifted + shifted)
 // ===================================================================
 const UNSHIFTED: [u8; 122] = [
-    0, 0, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'=', 0, 0,
-    b'q', b'w', b'e', b'r', b't', b'y', b'u', b'i', b'o', b'p', b'[', b']', 0, 0,
-    b'a', b's', b'd', b'f', b'g', b'h', b'j', b'k', b'l', b';', b'\'', b'`', 0,
-    b'\\', b'z', b'x', b'c', b'v', b'b', b'n', b'm', b',', b'.', b'/', 0, 0, 0, b' ',
+    0, 0, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'=', 0, 0, b'q', b'w',
+    b'e', b'r', b't', b'y', b'u', b'i', b'o', b'p', b'[', b']', 0, 0, b'a', b's', b'd', b'f', b'g',
+    b'h', b'j', b'k', b'l', b';', b'\'', b'`', 0, b'\\', b'z', b'x', b'c', b'v', b'b', b'n', b'm',
+    b',', b'.', b'/', 0, 0, 0, b' ',
     // F1-F12, стрелки, NumPad и т.д. можно добавить позже
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
 const SHIFTED: [u8; 122] = [
-    0, 0, b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'_', b'+', 0, 0,
-    b'Q', b'W', b'E', b'R', b'T', b'Y', b'U', b'I', b'O', b'P', b'{', b'}', 0, 0,
-    b'A', b'S', b'D', b'F', b'G', b'H', b'J', b'K', b'L', b':', b'"', b'~', 0,
-    b'|', b'Z', b'X', b'C', b'V', b'B', b'N', b'M', b'<', b'>', b'?', 0, 0, 0, b' ',
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0, 0, b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'_', b'+', 0, 0, b'Q', b'W',
+    b'E', b'R', b'T', b'Y', b'U', b'I', b'O', b'P', b'{', b'}', 0, 0, b'A', b'S', b'D', b'F', b'G',
+    b'H', b'J', b'K', b'L', b':', b'"', b'~', 0, b'|', b'Z', b'X', b'C', b'V', b'B', b'N', b'M',
+    b'<', b'>', b'?', 0, 0, 0, b' ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
 // ===================================================================
@@ -53,16 +52,15 @@ pub struct Keyboard {
 // produced PAGE_FAULT CR2=0x20 after typing a couple of characters, while
 // pure println loops survived (timer stub already push/pop's registers).
 // ===================================================================
-#[naked]
+#[unsafe(naked)]
 pub extern "C" fn keyboard() {
     unsafe {
-        asm!(
-        "cli",
-        "pusha",
-        "call keyboard_handler",
-        "popa",
-        "iretd",
-        options(noreturn)
+        core::arch::naked_asm!(
+            "cli",
+            "pusha",
+            "call keyboard_handler",
+            "popa",
+            "iretd",
         );
     }
 }
@@ -83,13 +81,11 @@ fn scancode_to_char(scancode: u8, shift: bool) -> u8 {
         //enter
         0x1c => return b'\n',
         // Цифры и символы в верхнем ряду
-        0x02..=0x0d => (scancode - 0) as usize,      // 1..0
+        0x02..=0x0d => (scancode - 0) as usize, // 1..0
         // Буквы
-        0x10..=0x21 => (scancode - 0) as usize,      // q..p
-        0x1e..=0x30 => (scancode - 0) as usize,     // a..l
-        0x2c..=0x35 => (scancode - 0) as usize,     // z..m
-
-
+        0x10..=0x21 => (scancode - 0) as usize, // q..p
+        0x1e..=0x30 => (scancode - 0) as usize, // a..l
+        0x2c..=0x35 => (scancode - 0) as usize, // z..m
 
         _ => return 0,
     };
@@ -108,7 +104,7 @@ fn scancode_to_char(scancode: u8, shift: bool) -> u8 {
 // ===================================================================
 // Главный обработчик (исправленный)
 // ===================================================================
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn keyboard_handler() {
     let scancode: u8 = unsafe {
         let mut sc: u8;
@@ -132,11 +128,19 @@ pub extern "C" fn keyboard_handler() {
     unsafe {
         match scancode {
             // Left/Right Shift
-            0x2a | 0x36 => { KEYBOARD.shift = true; }
-            0xaa | 0xb6 => { KEYBOARD.shift = false; }
+            0x2a | 0x36 => {
+                KEYBOARD.shift = true;
+            }
+            0xaa | 0xb6 => {
+                KEYBOARD.shift = false;
+            }
             // Left Ctrl (Right Ctrl is E0 1D — ignored for now)
-            0x1d => { KEYBOARD.ctrl = true; }
-            0x9d => { KEYBOARD.ctrl = false; }
+            0x1d => {
+                KEYBOARD.ctrl = true;
+            }
+            0x9d => {
+                KEYBOARD.ctrl = false;
+            }
             _ => {}
         }
     }
@@ -175,7 +179,11 @@ pub extern "C" fn keyboard_handler() {
         0x2a | 0x36 | 0xaa | 0xb6 | 0x1d | 0x9d => {}
         _ => {
             // While Ctrl held, don't inject the underlying letter into WM either
-            let ch = if unsafe { KEYBOARD.ctrl } { 0 } else { key_byte };
+            let ch = if unsafe { KEYBOARD.ctrl } {
+                0
+            } else {
+                key_byte
+            };
             crate::drivers::wm::push_key(!released, code, ch, mods);
         }
     }

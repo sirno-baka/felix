@@ -1,12 +1,11 @@
 //GLOBAL DESCRIPTOR TABLE
+use bitflags::bitflags;
 use core::arch::asm;
 use core::mem::size_of;
-use bitflags::bitflags;
 
-use crate::tss::TaskStateSegment;   // ← если tss.rs в той же crate
+use crate::tss::TaskStateSegment; // ← если tss.rs в той же crate
 
-const GDT_ENTRIES: usize = 6;       // было 5
-
+const GDT_ENTRIES: usize = 6; // было 5
 
 bitflags! {
     /// Flags for a GDT descriptor. Not all flags are valid for all descriptor types.
@@ -77,7 +76,6 @@ impl DescriptorFlags {
     /// A flat 32-bit user code segment
     pub const USER_CODE32: Self =
         Self::from_bits_truncate(Self::KERNEL_CODE32.bits() | Self::DPL_RING_3.bits());
-
 }
 #[derive(Copy, Clone, Debug)]
 #[repr(C, packed)]
@@ -105,11 +103,19 @@ pub static mut GDT: GlobalDescriptorTable = GlobalDescriptorTable {
 impl GlobalDescriptorTable {
     pub fn init() {
         unsafe {
-            let zero   = GdtEntry { entry: 0 };
-            let kcode  = GdtEntry { entry: DescriptorFlags::KERNEL_CODE32.bits() };
-            let kdata  = GdtEntry { entry: DescriptorFlags::KERNEL_DATA.bits() };
-            let ucode  = GdtEntry { entry: DescriptorFlags::USER_CODE32.bits() };
-            let udata  = GdtEntry { entry: DescriptorFlags::USER_DATA.bits() };
+            let zero = GdtEntry { entry: 0 };
+            let kcode = GdtEntry {
+                entry: DescriptorFlags::KERNEL_CODE32.bits(),
+            };
+            let kdata = GdtEntry {
+                entry: DescriptorFlags::KERNEL_DATA.bits(),
+            };
+            let ucode = GdtEntry {
+                entry: DescriptorFlags::USER_CODE32.bits(),
+            };
+            let udata = GdtEntry {
+                entry: DescriptorFlags::USER_DATA.bits(),
+            };
             let tss_desc = make_tss_descriptor();
 
             GDT.entries = [zero, kcode, kdata, ucode, udata, tss_desc];
@@ -155,7 +161,7 @@ fn make_tss_descriptor() -> GdtEntry {
     desc |= (limit & 0xFFFF) as u64;
     desc |= ((base & 0xFFFF) as u64) << 16;
     desc |= ((base >> 16 & 0xFF) as u64) << 32;
-    desc |= 0x89u64 << 40;                    // TSS 32-bit available + present
+    desc |= 0x89u64 << 40; // TSS 32-bit available + present
     desc |= ((limit >> 16 & 0xF) as u64) << 48;
     desc |= ((base >> 24 & 0xFF) as u64) << 56;
 

@@ -1,8 +1,8 @@
-use core::arch::asm;
-use core::ptr;
-use crate::memory::paging::{PhysAddr, VirtAddr, PTEFlags, PAGING, PageDirectory};
+use crate::memory::paging::{PAGING, PTEFlags, PageDirectory, PhysAddr, VirtAddr};
 use crate::sync::mutex::Mutex;
 use crate::{debugln, println};
+use core::arch::asm;
+use core::ptr;
 
 /// Run `f` with interrupts disabled so a timer tick cannot switch CR3
 /// away from the kernel PD (where the LFB is mapped) mid-draw.
@@ -64,9 +64,8 @@ pub fn map_lfb_large(dir: &mut crate::memory::paging::PageDirectory) {
 
 pub fn lfb_pde() -> u32 {
     unsafe {
-        let pd = crate::memory::paging::phys_to_virt(
-            crate::memory::paging::KERNEL_PD_PHYS,
-        ) as *const [u32; 1024];
+        let pd = crate::memory::paging::phys_to_virt(crate::memory::paging::KERNEL_PD_PHYS)
+            as *const [u32; 1024];
         (*pd)[(FB_VIRT_BASE >> 22) as usize]
     }
 }
@@ -79,9 +78,7 @@ pub struct Framebuffer {
 impl Framebuffer {
     pub fn init() -> Option<Self> {
         // Читаем информацию из low memory (identity mapped)
-        let info = unsafe {
-            ptr::read_volatile(FB_INFO_PHYS as *const FramebufferInfo)
-        };
+        let info = unsafe { ptr::read_volatile(FB_INFO_PHYS as *const FramebufferInfo) };
 
         if info.address == 0 || info.width == 0 || info.height == 0 {
             println!("[FB] No valid framebuffer info found");
@@ -96,7 +93,11 @@ impl Framebuffer {
 
         debugln!(
             "[FB] {}x{} {}bpp  pitch={}  phys=0x{:08x}",
-            width, height, bpp, pitch, address
+            width,
+            height,
+            bpp,
+            pitch,
+            address
         );
 
         let bytes_per_line = info.pitch as u32;
@@ -115,12 +116,15 @@ impl Framebuffer {
         crate::memory::paging::PageDirectory::flush_all();
         println!(
             "[FB] ready {}x{} {}bpp pitch={} virt={:#x} phys={:#x} PDE={:#x}",
-            width, height, bpp, pitch, virt_base, address, lfb_pde()
-        );
-        Some(Framebuffer {
-            info,
+            width,
+            height,
+            bpp,
+            pitch,
             virt_base,
-        })
+            address,
+            lfb_pde()
+        );
+        Some(Framebuffer { info, virt_base })
     }
 
     /// Hot path — caller must hold interrupts off (or use `put_pixel`).
@@ -275,12 +279,7 @@ pub fn init() {
     }
 }
 
-
-use embedded_graphics::{
-    pixelcolor::Rgb888,
-    prelude::*,
-    Pixel,
-};
+use embedded_graphics::{Pixel, pixelcolor::Rgb888, prelude::*};
 
 impl OriginDimensions for Framebuffer {
     fn size(&self) -> Size {
@@ -300,9 +299,7 @@ impl DrawTarget for Framebuffer {
         without_interrupts(|| {
             for Pixel(coord, color) in pixels {
                 if coord.x >= 0 && coord.y >= 0 {
-                    let c = (color.r() as u32) << 16
-                        | (color.g() as u32) << 8
-                        | (color.b() as u32);
+                    let c = (color.r() as u32) << 16 | (color.g() as u32) << 8 | (color.b() as u32);
                     self.put_pixel_raw(coord.x as u32, coord.y as u32, c);
                 }
             }

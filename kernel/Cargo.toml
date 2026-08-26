@@ -25,3 +25,8 @@ smoltcp = { version = "0.11", default-features = false, features = [
 fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn"] }
 wasmi = { version = "0.31", default-features = false }
 libm = "0.2"
+
+
+[[bin]]
+name = "felix-kernel"
+test = false

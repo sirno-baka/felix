@@ -1,6 +1,6 @@
 #![no_std]
 #![no_main]
-
+#![allow(static_mut_refs)]
 #[macro_use]
 mod print;
 
@@ -11,9 +11,9 @@ mod splash;
 mod tss;
 mod vesa;
 
+use crate::gdt::GDT;
 use core::arch::asm;
 use core::panic::PanicInfo;
-use crate::gdt::GDT;
 use ext2::Ext2Fs;
 
 const KERNEL_BUFFER: u16 = 0x1000; // low-memory transfer buffer (below bootloader)
@@ -45,8 +45,8 @@ fn panic(info: &PanicInfo) -> ! {
     loop {}
 }
 
-#[no_mangle]
-#[link_section = ".start"]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".start")]
 pub extern "C" fn _start() -> ! {
     gdt::GlobalDescriptorTable::init();
 
@@ -85,7 +85,10 @@ pub extern "C" fn _start() -> ! {
     if is_network_boot() {
         use disk::DISK;
         let sectors = disk::Disk::drive_sector_count(RAMDISK_FALLBACK_SECTORS);
-        println!("[!] Network boot — hydrating disk → RAM @ 0x{:08x} ({} sectors)", RAMDISK_PHYS, sectors);
+        println!(
+            "[!] Network boot — hydrating disk → RAM @ 0x{:08x} ({} sectors)",
+            RAMDISK_PHYS, sectors
+        );
         unsafe {
             DISK.init(0, KERNEL_BUFFER);
             DISK.copy_disk_to_ram(sectors, RAMDISK_PHYS);
@@ -100,7 +103,11 @@ pub extern "C" fn _start() -> ! {
 
     // Clear FB_INFO so kernel does not treat garbage as a valid LFB.
     unsafe {
-        core::ptr::write_bytes(vesa::FB_INFO_PHYS as *mut u8, 0, core::mem::size_of::<vesa::FramebufferInfo>());
+        core::ptr::write_bytes(
+            vesa::FB_INFO_PHYS as *mut u8,
+            0,
+            core::mem::size_of::<vesa::FramebufferInfo>(),
+        );
     }
 
     // VESA after the kernel is in memory so boot messages stay visible.
@@ -117,7 +124,7 @@ pub extern "C" fn _start() -> ! {
     loop {}
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn fail() -> ! {
     println!("[!] Read fail!");
     loop {}
@@ -211,9 +218,9 @@ fn detect_memory_bytes() -> u32 {
             "mov ax, 0xE801",
             "int 0x15",
             "mov {cf:x}, 0",
-            "jnc 1f",
+            "jnc 3f",
             "mov {cf:x}, 1",
-            "1:",
+            "3:",
             out("ax") ax,
             out("bx") bx,
             out("cx") cx,
@@ -229,9 +236,7 @@ fn detect_memory_bytes() -> u32 {
             (cx as u32, dx as u32)
         };
         // 1 MiB + (1..16 MiB region) + (above 16 MiB in 64 KiB blocks)
-        let total = (1024 * 1024)
-            + kb_1_16 * 1024
-            + blocks_64k * 64 * 1024;
+        let total = (1024 * 1024) + kb_1_16 * 1024 + blocks_64k * 64 * 1024;
         if total >= 16 * 1024 * 1024 {
             return total;
         }

@@ -1,38 +1,38 @@
 //! Wrappers for cli, sti and hlt asm instructions
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static mut cli_count: usize = 0;
 
 #[inline(always)]
 pub fn _cli() {
-	unsafe {
-		core::arch::asm!(
-		"cmp dword ptr[cli_count], 0",
-		"jne 3f",
-		"cli",
-		"3:",
-		"add dword ptr[cli_count], 1",
-		);
-	}
+    unsafe {
+        core::arch::asm!(
+            "cmp dword ptr[cli_count], 0",
+            "jne 3f",
+            "cli",
+            "3:",
+            "add dword ptr[cli_count], 1",
+        );
+    }
 }
 
 #[inline(always)]
 pub fn _sti() {
-	unsafe {
-		core::arch::asm!(
-		"sub dword ptr[cli_count], 1",
-		"cmp dword ptr[cli_count], 0",
-		"jne 4f",
-		"sti",
-		"4:",
-		);
-	}
+    unsafe {
+        core::arch::asm!(
+            "sub dword ptr[cli_count], 1",
+            "cmp dword ptr[cli_count], 0",
+            "jne 4f",
+            "sti",
+            "4:",
+        );
+    }
 }
 
 #[inline(always)]
 pub fn _rst() {
-	unsafe {
-		core::arch::asm!("mov dword ptr[cli_count], 0");
-	}
+    unsafe {
+        core::arch::asm!("mov dword ptr[cli_count], 0");
+    }
 }
 
 macro_rules! cli {

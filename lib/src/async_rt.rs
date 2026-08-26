@@ -305,11 +305,7 @@ impl Future for AsyncWrite {
         while self.offset < self.len {
             // SAFETY: caller guaranteed the buffer is valid.
             let n = unsafe {
-                syscall::write(
-                    self.fd,
-                    self.buf.add(self.offset),
-                    self.len - self.offset,
-                )
+                syscall::write(self.fd, self.buf.add(self.offset), self.len - self.offset)
             };
             if n == usize::MAX {
                 let mut pfd = PollFd {

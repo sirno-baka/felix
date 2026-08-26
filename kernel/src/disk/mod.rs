@@ -1,9 +1,9 @@
-use alloc::vec;
 use crate::alloc::boxed::Box;
 use crate::alloc::vec::Vec;
 use crate::disk::interface::BlockDevice;
 use crate::pci::ide::IDE;
 use crate::println;
+use alloc::vec;
 
 pub mod interface;
 pub mod ramdisk;

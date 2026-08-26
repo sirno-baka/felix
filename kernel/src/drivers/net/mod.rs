@@ -6,8 +6,7 @@ const RX_RING_SIZE: usize = 16;
 const RX_BUF_SIZE: usize = 1536;
 const TX_BUF_SIZE: usize = 1536;
 
-
-use crate::memory::paging::{PAGING, PAGE_SIZE, PTEFlags, PhysAddr, VirtAddr};
+use crate::memory::paging::{PAGE_SIZE, PAGING, PTEFlags, PhysAddr, VirtAddr};
 use crate::println;
 
 fn map_mmio(phys: u32, size: u32) -> Result<usize, &'static str> {
@@ -15,9 +14,7 @@ fn map_mmio(phys: u32, size: u32) -> Result<usize, &'static str> {
     // (можно 0xE000_0000 или любой другой, который точно свободен)
     const MMIO_VIRT_BASE: u32 = 0xE000_0000;
 
-    let flags = PTEFlags::new()
-        .present()
-        .writable();
+    let flags = PTEFlags::new().present().writable();
     // позже можно добавить .pcd() | .pwt() для uncacheable
 
     let mut paging = unsafe { PAGING.lock() };
@@ -25,8 +22,6 @@ fn map_mmio(phys: u32, size: u32) -> Result<usize, &'static str> {
 
     Ok(MMIO_VIRT_BASE as usize)
 }
-
-
 
 /// Optional network bring-up (does not fail boot).
 pub fn init_net() {

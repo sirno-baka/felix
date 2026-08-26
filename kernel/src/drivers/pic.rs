@@ -122,7 +122,7 @@ impl Pics {
         self.slave.write_data(MODE);
         wait();
 
-            // Do NOT restore BIOS masks — they usually leave IRQ0 (timer) open.
+        // Do NOT restore BIOS masks — they usually leave IRQ0 (timer) open.
         // Start with everything masked; caller unmasks what it needs when ready.
         let _ = (mask1, mask2);
         self.master.write_data(0xFF);

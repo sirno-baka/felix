@@ -1,56 +1,56 @@
-use alloc::vec::Vec;
-use crate::drivers::pic::PICS;
-use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
-use crate::multitasking::task::{CPUState, Task, TASK_MANAGER};
-use crate::{print, println};
-use crate::memory::allocator::ALLOCATOR;
-use core::alloc::{GlobalAlloc, Layout};
 use core::arch::asm;
-use core::ffi::CStr;
-use crate::filesystem::file::{FileDescriptor, FileDescriptorTable, FileMode, PipeEnd};
+use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
+use crate::drivers::pic::PICS;
 use crate::filesystem::VFS;
+use crate::filesystem::file::{FileDescriptor, FileDescriptorTable, FileMode, PipeEnd};
+use crate::memory::allocator::ALLOCATOR;
+use crate::memory::paging::{
+    PAGE_SIZE, PAGING, PDEFlags, PTEFlags, PageDirectory, PhysAddr, VirtAddr, copy_kernel_mappings,
+};
+use crate::multitasking::task::{CPUState, TASK_MANAGER, Task};
+use crate::net::{AF_INET, SOCK_DGRAM, SOCK_STREAM, SOCKET_TABLE, SockAddrIn, SocketState};
 use crate::pipe;
-use crate::memory::paging::{PageDirectory, PDEFlags, PTEFlags, PAGING, PhysAddr, VirtAddr, copy_kernel_mappings, PAGE_SIZE};
-use crate::net::{SockAddrIn, SocketState, AF_INET, SOCKET_TABLE, SOCK_DGRAM, SOCK_STREAM};
+use crate::{print, println};
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+use core::arch::naked_asm;
+use core::ffi::CStr;
 
 pub const SYSCALL_INT: u8 = 0x80;
 
-#[naked]
+#[unsafe(naked)]
 pub extern "C" fn syscall() {
     unsafe {
-        asm!(
-        "cli",
-
-        "push ebp",
-        "push edi",
-        "push esi",
-        "push edx",
-        "push ecx",
-        "push ebx",
-        "push eax",
-
-        "push esp",
-        "call syscall_handler",
-        "add esp, 4",
-        // Возвращаем новый esp (handler может вернуть тот же)
-        "mov esp, eax",
-        // Восстанавливаем регистры
-        "pop eax",
-        "pop ebx",
-        "pop ecx",
-        "pop edx",
-        "pop esi",
-        "pop edi",
-        "pop ebp",
-        // НЕ делать sti перед iretd:
-        // user eflags (0x202) уже с IF=1, iretd сам включит прерывания.
-        // sti здесь давал окно для IRQ0, который затирал EAX.
-        "iretd",
-        options(noreturn)
+        naked_asm!(
+            "cli",
+            "push ebp",
+            "push edi",
+            "push esi",
+            "push edx",
+            "push ecx",
+            "push ebx",
+            "push eax",
+            "push esp",
+            "call syscall_handler",
+            "add esp, 4",
+            // Возвращаем новый esp (handler может вернуть тот же)
+            "mov esp, eax",
+            // Восстанавливаем регистры
+            "pop eax",
+            "pop ebx",
+            "pop ecx",
+            "pop edx",
+            "pop esi",
+            "pop edi",
+            "pop ebp",
+            // НЕ делать sti перед iretd:
+            // user eflags (0x202) уже с IF=1, iretd сам включит прерывания.
+            // sti здесь давал окно для IRQ0, который затирал EAX.
+            "iretd"
         );
     }
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn syscall_handler(esp: u32) -> u32 {
     let state = unsafe { &mut *(esp as *mut CPUState) };
 
@@ -60,19 +60,34 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
     let current_slot = unsafe { TASK_MANAGER.get_current_slot() } as usize;
 
     // exit must switch to another task — never return to the dead one
-    if syscall_num == crate::syscalls::SYS_EXIT
-        || syscall_num == crate::syscalls::SYS_EXIT_GROUP
-    {
+    if syscall_num == crate::syscalls::SYS_EXIT || syscall_num == crate::syscalls::SYS_EXIT_GROUP {
         return sys_exit(current_slot, esp);
     }
 
     let ret = match syscall_num {
         // === File descriptors ===
-        crate::syscalls::SYS_OPEN  => sys_open(current_slot, state.ebx as *const u8, state.ecx as usize),
-        crate::syscalls::SYS_READ  => sys_read(current_slot, state.ebx as usize, state.ecx as *mut u8, state.edx as usize),
-        crate::syscalls::SYS_WRITE => sys_write(current_slot, state.ebx as usize, state.ecx as *const u8, state.edx as usize),
+        crate::syscalls::SYS_OPEN => {
+            sys_open(current_slot, state.ebx as *const u8, state.ecx as usize)
+        }
+        crate::syscalls::SYS_READ => sys_read(
+            current_slot,
+            state.ebx as usize,
+            state.ecx as *mut u8,
+            state.edx as usize,
+        ),
+        crate::syscalls::SYS_WRITE => sys_write(
+            current_slot,
+            state.ebx as usize,
+            state.ecx as *const u8,
+            state.edx as usize,
+        ),
         crate::syscalls::SYS_CLOSE => sys_close(current_slot, state.ebx as usize),
-        crate::syscalls::SYS_LSEEK => sys_lseek(current_slot, state.ebx as usize, state.ecx as i32, state.edx as u32),
+        crate::syscalls::SYS_LSEEK => sys_lseek(
+            current_slot,
+            state.ebx as usize,
+            state.ecx as i32,
+            state.edx as u32,
+        ),
         crate::syscalls::SYS_BRK => sys_brk(current_slot, state.ebx),
         crate::syscalls::SYS_MMAP => sys_mmap_old(current_slot, state.ebx as *const MmapArgStruct),
         crate::syscalls::SYS_MMAP2 => sys_mmap2(
@@ -85,14 +100,23 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
             state.ebp,
         ),
         crate::syscalls::SYS_MUNMAP => sys_munmap(current_slot, state.ebx, state.ecx as usize),
-        crate::syscalls::SYS_IOCTL => sys_ioctl(current_slot, state.ebx as usize, state.ecx, state.edx),
-        crate::syscalls::SYS_FSTAT64 => sys_fstat64(current_slot, state.ebx as usize, state.ecx as *mut Stat64),
+        crate::syscalls::SYS_IOCTL => {
+            sys_ioctl(current_slot, state.ebx as usize, state.ecx, state.edx)
+        }
+        crate::syscalls::SYS_FSTAT64 => {
+            sys_fstat64(current_slot, state.ebx as usize, state.ecx as *mut Stat64)
+        }
         crate::syscalls::SYS_STAT64 => sys_stat64(state.ebx as *const u8, state.ecx as *mut Stat64),
-        crate::syscalls::SYS_GETDENTS64 => sys_getdents64(current_slot, state.ebx as usize, state.ecx as *mut u8, state.edx as usize),
+        crate::syscalls::SYS_GETDENTS64 => sys_getdents64(
+            current_slot,
+            state.ebx as usize,
+            state.ecx as *mut u8,
+            state.edx as usize,
+        ),
 
         // === Filesystem / process ===
-        crate::syscalls::SYS_MKDIR  => sys_mkdir(state.ebx as *const u8),
-        crate::syscalls::SYS_RMDIR  => sys_rmdir(state.ebx as *const u8),
+        crate::syscalls::SYS_MKDIR => sys_mkdir(state.ebx as *const u8),
+        crate::syscalls::SYS_RMDIR => sys_rmdir(state.ebx as *const u8),
         crate::syscalls::SYS_UNLINK => sys_unlink(state.ebx as *const u8),
         crate::syscalls::SYS_EXECVE => {
             let params = read_exec_params(state.edx as *const ExecParamsUser);
@@ -105,15 +129,34 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                 params.stderr,
                 &params.argv,
             )
-        },
-        crate::syscalls::SYS_WAIT   => sys_wait(current_slot, state.ebx as i32, state.ecx as u32),
-        crate::syscalls::SYS_KILL   => sys_kill(state.ebx as i32, state.ecx as u32),
-        crate::syscalls::SYS_SIGACTION => sys_sigaction(current_slot, state.ebx as u32, state.ecx as *const SigActionUser, state.edx as *mut SigActionUser),
-        crate::syscalls::SYS_PIPE   => sys_pipe(current_slot, state.ebx as *mut u32),
-        crate::syscalls::SYS_DUP2   => sys_dup2(current_slot, state.ebx as usize, state.ecx as usize),
-        crate::syscalls::SYS_FCNTL  => sys_fcntl(current_slot, state.ebx as usize, state.ecx as u32, state.edx as u32),
-        crate::syscalls::SYS_POLL   => sys_poll(current_slot, state.ebx as *mut PollFd, state.ecx as usize, state.edx as i32),
-        crate::syscalls::SYS_LS => sys_ls(state.ebx as *const u8, state.ecx as *mut u8, state.edx as usize),
+        }
+        crate::syscalls::SYS_WAIT => sys_wait(current_slot, state.ebx as i32, state.ecx as u32),
+        crate::syscalls::SYS_KILL => sys_kill(state.ebx as i32, state.ecx as u32),
+        crate::syscalls::SYS_SIGACTION => sys_sigaction(
+            current_slot,
+            state.ebx as u32,
+            state.ecx as *const SigActionUser,
+            state.edx as *mut SigActionUser,
+        ),
+        crate::syscalls::SYS_PIPE => sys_pipe(current_slot, state.ebx as *mut u32),
+        crate::syscalls::SYS_DUP2 => sys_dup2(current_slot, state.ebx as usize, state.ecx as usize),
+        crate::syscalls::SYS_FCNTL => sys_fcntl(
+            current_slot,
+            state.ebx as usize,
+            state.ecx as u32,
+            state.edx as u32,
+        ),
+        crate::syscalls::SYS_POLL => sys_poll(
+            current_slot,
+            state.ebx as *mut PollFd,
+            state.ecx as usize,
+            state.edx as i32,
+        ),
+        crate::syscalls::SYS_LS => sys_ls(
+            state.ebx as *const u8,
+            state.ecx as *mut u8,
+            state.edx as usize,
+        ),
         // === Memory ===
         crate::syscalls::SYS_MALLOC => {
             let size = state.ebx as usize;
@@ -150,8 +193,9 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                     start = (start + align_mask) & !align_mask;
 
                     let used = start.saturating_sub(heap_base) as usize;
-                    if size > 0 && (start.saturating_add(size as u32) > heap_limit
-                        || used.saturating_add(size) > 128 * 1024 * 1024)
+                    if size > 0
+                        && (start.saturating_add(size as u32) > heap_limit
+                            || used.saturating_add(size) > 128 * 1024 * 1024)
                     {
                         println!(
                             "[malloc] OOM slot={} size={} align={} heap_next={:#x} base={:#x} used={}",
@@ -242,7 +286,6 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
             }
         }
 
-
         crate::syscalls::SYS_FREE => {
             // Bump allocator: pure no-op. Never unmap.
             // Unmapping on free was the root of PAGE_FAULT (user) CR2=0x20/0xa0:
@@ -252,24 +295,67 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
             0
         }
         // === Sockets ===
-        crate::syscalls::SYS_SOCKET   => sys_socket(current_slot, state.ebx as u16, state.ecx as u16, state.edx as u8),
-        crate::syscalls::SYS_BIND     => sys_bind(current_slot, state.ebx as usize, state.ecx as *const u8, state.edx as usize),
-        crate::syscalls::SYS_LISTEN   => sys_listen(current_slot, state.ebx as usize, state.ecx as usize),
-        crate::syscalls::SYS_ACCEPT4  => sys_accept4(current_slot, state.ebx as usize, state.ecx as *mut u8, state.edx as *mut u32, state.esi as u32),
-        crate::syscalls::SYS_CONNECT  => sys_connect(current_slot, state.ebx as usize, state.ecx as *const u8, state.edx as usize),
-        crate::syscalls::SYS_SENDTO   => sys_sendto(current_slot, state.ebx as usize, state.ecx as *const u8, state.edx as usize),
-        crate::syscalls::SYS_RECVFROM => sys_recvfrom(current_slot, state.ebx as usize, state.ecx as *mut u8, state.edx as usize),
-        crate::syscalls::SYS_SHUTDOWN => sys_shutdown(current_slot, state.ebx as usize, state.ecx as u32),
+        crate::syscalls::SYS_SOCKET => sys_socket(
+            current_slot,
+            state.ebx as u16,
+            state.ecx as u16,
+            state.edx as u8,
+        ),
+        crate::syscalls::SYS_BIND => sys_bind(
+            current_slot,
+            state.ebx as usize,
+            state.ecx as *const u8,
+            state.edx as usize,
+        ),
+        crate::syscalls::SYS_LISTEN => {
+            sys_listen(current_slot, state.ebx as usize, state.ecx as usize)
+        }
+        crate::syscalls::SYS_ACCEPT4 => sys_accept4(
+            current_slot,
+            state.ebx as usize,
+            state.ecx as *mut u8,
+            state.edx as *mut u32,
+            state.esi as u32,
+        ),
+        crate::syscalls::SYS_CONNECT => sys_connect(
+            current_slot,
+            state.ebx as usize,
+            state.ecx as *const u8,
+            state.edx as usize,
+        ),
+        crate::syscalls::SYS_SENDTO => sys_sendto(
+            current_slot,
+            state.ebx as usize,
+            state.ecx as *const u8,
+            state.edx as usize,
+        ),
+        crate::syscalls::SYS_RECVFROM => sys_recvfrom(
+            current_slot,
+            state.ebx as usize,
+            state.ecx as *mut u8,
+            state.edx as usize,
+        ),
+        crate::syscalls::SYS_SHUTDOWN => {
+            sys_shutdown(current_slot, state.ebx as usize, state.ecx as u32)
+        }
 
         // === Window manager ===
-        crate::syscalls::SYS_WM_CREATE  => sys_wm_create(current_slot, state.ebx as *const WmCreateArgs),
+        crate::syscalls::SYS_WM_CREATE => {
+            sys_wm_create(current_slot, state.ebx as *const WmCreateArgs)
+        }
         crate::syscalls::SYS_WM_DESTROY => sys_wm_destroy(state.ebx),
-        crate::syscalls::SYS_WM_MOVE    => sys_wm_move(state.ebx, state.ecx as i32, state.edx as i32),
-        crate::syscalls::SYS_WM_INFO    => sys_wm_info(state.ebx, state.ecx as *mut crate::drivers::wm::WindowInfo),
-        crate::syscalls::SYS_WM_FLIP    => sys_wm_flip(state.ebx, state.ecx as *const u8, state.edx as usize),
-        crate::syscalls::SYS_WM_FOCUS   => sys_wm_focus(state.ebx),
-        crate::syscalls::SYS_WM_SCREEN  => sys_wm_screen(state.ebx as *mut u32),
-        crate::syscalls::SYS_MOUSE_STATE => sys_mouse_state(state.ebx as *mut crate::drivers::mouse::MouseState),
+        crate::syscalls::SYS_WM_MOVE => sys_wm_move(state.ebx, state.ecx as i32, state.edx as i32),
+        crate::syscalls::SYS_WM_INFO => {
+            sys_wm_info(state.ebx, state.ecx as *mut crate::drivers::wm::WindowInfo)
+        }
+        crate::syscalls::SYS_WM_FLIP => {
+            sys_wm_flip(state.ebx, state.ecx as *const u8, state.edx as usize)
+        }
+        crate::syscalls::SYS_WM_FOCUS => sys_wm_focus(state.ebx),
+        crate::syscalls::SYS_WM_SCREEN => sys_wm_screen(state.ebx as *mut u32),
+        crate::syscalls::SYS_MOUSE_STATE => {
+            sys_mouse_state(state.ebx as *mut crate::drivers::mouse::MouseState)
+        }
         crate::syscalls::SYS_WM_POLL => sys_wm_poll(
             state.ebx,
             state.ecx as *mut crate::drivers::wm::WmEvent,
@@ -277,15 +363,14 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         ),
 
         // === PCI ===
-        crate::syscalls::SYS_PCI_LIST => sys_pci_list(
-            state.ebx as *mut PciInfoUser,
-            state.ecx as usize,
-        ),
+        crate::syscalls::SYS_PCI_LIST => {
+            sys_pci_list(state.ebx as *mut PciInfoUser, state.ecx as usize)
+        }
 
         crate::syscalls::wasm::SYS_EXECVE_WASM => crate::syscalls::wasm::sys_execve_wasm(
             current_slot,
-            state.ebx as *const u8,   // buf_ptr
-            state.ecx as usize,       // count
+            state.ebx as *const u8,             // buf_ptr
+            state.ecx as usize,                 // count
             state.edx as *const ExecParamsUser, // параметры (argc/argv и stdin/stdout/stderr)
         ),
 
@@ -306,9 +391,9 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
 // open flags (subset of Linux)
 const O_RDONLY: usize = 0;
 const O_WRONLY: usize = 1;
-const O_RDWR:   usize = 2;
-const O_CREAT:  usize = 0x40;
-const O_TRUNC:  usize = 0x200;
+const O_RDWR: usize = 2;
+const O_CREAT: usize = 0x40;
+const O_TRUNC: usize = 0x200;
 const O_APPEND: usize = 0x400;
 const O_DIRECTORY: usize = 0x10000;
 
@@ -478,9 +563,17 @@ pub fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
             if let Some(fd) = current.fd_table.alloc_fd() {
                 let desc = if is_device {
-                    FileDescriptor::Device { inode, offset, mode }
+                    FileDescriptor::Device {
+                        inode,
+                        offset,
+                        mode,
+                    }
                 } else {
-                    FileDescriptor::File { inode, offset, mode }
+                    FileDescriptor::File {
+                        inode,
+                        offset,
+                        mode,
+                    }
                 };
                 current.fd_table.insert(fd, desc);
                 return fd;
@@ -501,8 +594,16 @@ pub fn sys_lseek(current_slot: usize, fd: usize, offset: i32, whence: u32) -> us
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
             match current.fd_table.get_mut(fd) {
-                Some(FileDescriptor::File { inode, offset: ref mut off, .. })
-                | Some(FileDescriptor::Device { inode, offset: ref mut off, .. }) => {
+                Some(FileDescriptor::File {
+                    inode,
+                    offset: off,
+                    ..
+                })
+                | Some(FileDescriptor::Device {
+                    inode,
+                    offset: off,
+                    ..
+                }) => {
                     let size = probe_inode_size(*inode);
                     let base = match whence {
                         SEEK_SET => 0i64,
@@ -540,7 +641,8 @@ pub fn sys_brk(current_slot: usize, addr: u32) -> usize {
             return 0;
         };
         // Region: 0x4000_0000 + slot * 0x1000_0000
-        let heap_base = 0x4000_0000u32.wrapping_add((current_slot as u32).wrapping_mul(0x1000_0000));
+        let heap_base =
+            0x4000_0000u32.wrapping_add((current_slot as u32).wrapping_mul(0x1000_0000));
         if task.heap_next < heap_base {
             task.heap_next = heap_base;
         }
@@ -860,21 +962,33 @@ pub fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) 
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
             // Fallback: bare fd 0 with empty table still means console
             let desc = current.fd_table.get(fd).copied().or_else(|| {
-                if fd == 0 { Some(FileDescriptor::ConsoleIn) } else { None }
+                if fd == 0 {
+                    Some(FileDescriptor::ConsoleIn)
+                } else {
+                    None
+                }
             });
 
             match desc {
                 Some(FileDescriptor::ConsoleIn) => {
                     return sys_read_stdin(buf_ptr, count);
                 }
-                Some(FileDescriptor::File { inode, offset, mode }) => {
-                    if mode == FileMode::WriteOnly { return 0; }
+                Some(FileDescriptor::File {
+                    inode,
+                    offset,
+                    mode,
+                }) => {
+                    if mode == FileMode::WriteOnly {
+                        return 0;
+                    }
                     let mut temp = alloc::vec![0u8; count];
                     let bytes = VFS.get().read_at(inode, offset, &mut temp);
                     if bytes > 0 {
                         core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr, bytes);
-                        if let Some(FileDescriptor::File { offset: ref mut off, .. }) =
-                            current.fd_table.get_mut(fd)
+                        if let Some(FileDescriptor::File {
+                            offset: off,
+                            ..
+                        }) = current.fd_table.get_mut(fd)
                         {
                             *off += bytes as u64;
                         }
@@ -882,7 +996,9 @@ pub fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) 
                     return bytes;
                 }
                 Some(FileDescriptor::Pipe { pipe_id, end }) => {
-                    if end != PipeEnd::Read { return 0; }
+                    if end != PipeEnd::Read {
+                        return 0;
+                    }
                     if current.fd_table.is_nonblock(fd) {
                         return pipe::pipe_try_read(pipe_id, buf_ptr, count);
                     }
@@ -891,8 +1007,14 @@ pub fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) 
                 Some(FileDescriptor::Socket { .. }) => return 0,
                 Some(FileDescriptor::ConsoleOut) => return 0,
                 None => return 0,
-                Some(FileDescriptor::Device { inode, offset, mode }) => {
-                    if mode == FileMode::WriteOnly { return 0; }
+                Some(FileDescriptor::Device {
+                    inode,
+                    offset,
+                    mode,
+                }) => {
+                    if mode == FileMode::WriteOnly {
+                        return 0;
+                    }
 
                     let mut temp = alloc::vec![0u8; count];
                     // VFS сам разберется, что это DevFS, и вызовет read_from_block_device или CharDevice::read
@@ -902,8 +1024,10 @@ pub fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) 
                         core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr, bytes);
 
                         // Обновляем offset в таблице дескрипторов
-                        if let Some(FileDescriptor::Device { offset: ref mut off, .. }) =
-                            current.fd_table.get_mut(fd)
+                        if let Some(FileDescriptor::Device {
+                            offset: off,
+                            ..
+                        }) = current.fd_table.get_mut(fd)
                         {
                             *off += bytes as u64;
                         }
@@ -927,7 +1051,9 @@ pub fn sys_read_stdin(buf_ptr: *mut u8, count: usize) -> usize {
     let mut read = 0;
 
     // Включаем прерывания — обработчик клавиатуры сможет наполнять буфер
-    unsafe { asm!("sti"); }
+    unsafe {
+        asm!("sti");
+    }
 
     while read < count {
         let byte = {
@@ -941,18 +1067,24 @@ pub fn sys_read_stdin(buf_ptr: *mut u8, count: usize) -> usize {
 
         match byte {
             Some(b) => {
-                unsafe { *buf_ptr.add(read) = b; }
+                unsafe {
+                    *buf_ptr.add(read) = b;
+                }
                 read += 1;
             }
             None => {
                 // Буфер пуст — спим до следующего прерывания
-                unsafe { asm!("hlt"); }
+                unsafe {
+                    asm!("hlt");
+                }
             }
         }
     }
 
     // Восстанавливаем состояние (syscall entry сделал cli)
-    unsafe { asm!("cli"); }
+    unsafe {
+        asm!("cli");
+    }
     read
 }
 
@@ -973,12 +1105,14 @@ pub fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usiz
 
     // println!("KERNEL WRITE: fd={} len={} task={} {:02x?}", fd,  count, current_slot, &buf[0..buf.len().min(32)]);
 
-
-
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
             let desc = current.fd_table.get(fd).copied().or_else(|| {
-                if fd == 1 || fd == 2 { Some(FileDescriptor::ConsoleOut) } else { None }
+                if fd == 1 || fd == 2 {
+                    Some(FileDescriptor::ConsoleOut)
+                } else {
+                    None
+                }
             });
 
             match desc {
@@ -986,31 +1120,47 @@ pub fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usiz
                     match core::str::from_utf8(buf) {
                         Ok(v) => {
                             print!("{}", v);
-                        },
+                        }
                         Err(_) => println!("{:02x?}", &buf),
                     }
                     return count;
                 }
-                Some(FileDescriptor::File { inode, offset, mode }) => {
-                    if mode == FileMode::ReadOnly { return 0; }
+                Some(FileDescriptor::File {
+                    inode,
+                    offset,
+                    mode,
+                }) => {
+                    if mode == FileMode::ReadOnly {
+                        return 0;
+                    }
                     let written = VFS.get().write_at(inode, offset, buf);
-                    if let Some(FileDescriptor::File { offset: ref mut off, .. }) =
-                        current.fd_table.get_mut(fd)
+                    if let Some(FileDescriptor::File {
+                        offset: off,
+                        ..
+                    }) = current.fd_table.get_mut(fd)
                     {
                         *off += written as u64;
                     }
                     return written;
                 }
                 Some(FileDescriptor::Pipe { pipe_id, end }) => {
-                    if end != PipeEnd::Write { return 0; }
+                    if end != PipeEnd::Write {
+                        return 0;
+                    }
                     if current.fd_table.is_nonblock(fd) {
                         return pipe::pipe_try_write(pipe_id, buf_ptr, count);
                     }
                     return pipe::pipe_write(pipe_id, buf_ptr, count);
                 }
                 Some(FileDescriptor::Socket { .. }) => return 0,
-                Some(FileDescriptor::Device { inode, offset, mode }) => {
-                    if mode == FileMode::ReadOnly { return 0; }
+                Some(FileDescriptor::Device {
+                    inode,
+                    offset,
+                    mode,
+                }) => {
+                    if mode == FileMode::ReadOnly {
+                        return 0;
+                    }
 
                     let mut temp = alloc::vec![0u8; count];
                     core::ptr::copy_nonoverlapping(buf_ptr, temp.as_mut_ptr(), count);
@@ -1019,8 +1169,10 @@ pub fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usiz
                     let bytes = VFS.get().write_at(inode, offset, &temp);
 
                     if bytes > 0 {
-                        if let Some(FileDescriptor::Device { offset: ref mut off, .. }) =
-                            current.fd_table.get_mut(fd)
+                        if let Some(FileDescriptor::Device {
+                            offset: off,
+                            ..
+                        }) = current.fd_table.get_mut(fd)
                         {
                             *off += bytes as u64;
                         }
@@ -1050,12 +1202,10 @@ fn close_descriptor(desc: FileDescriptor) {
         FileDescriptor::Socket { socket_id } => {
             SOCKET_TABLE.lock().free(socket_id);
         }
-        FileDescriptor::Pipe { pipe_id, end } => {
-            match end {
-                PipeEnd::Read => pipe::pipe_close_reader(pipe_id),
-                PipeEnd::Write => pipe::pipe_close_writer(pipe_id),
-            }
-        }
+        FileDescriptor::Pipe { pipe_id, end } => match end {
+            PipeEnd::Read => pipe::pipe_close_reader(pipe_id),
+            PipeEnd::Write => pipe::pipe_close_writer(pipe_id),
+        },
         _ => {}
     }
 }
@@ -1087,7 +1237,9 @@ pub fn sys_pipe(current_slot: usize, pipefd: *mut u32) -> usize {
                     return usize::MAX;
                 }
             };
-            current.fd_table.insert(r, FileDescriptor::new_pipe(pipe_id, PipeEnd::Read));
+            current
+                .fd_table
+                .insert(r, FileDescriptor::new_pipe(pipe_id, PipeEnd::Read));
             let w = match current.fd_table.alloc_fd() {
                 Some(f) => f,
                 None => {
@@ -1097,7 +1249,9 @@ pub fn sys_pipe(current_slot: usize, pipefd: *mut u32) -> usize {
                     return usize::MAX;
                 }
             };
-            current.fd_table.insert(w, FileDescriptor::new_pipe(pipe_id, PipeEnd::Write));
+            current
+                .fd_table
+                .insert(w, FileDescriptor::new_pipe(pipe_id, PipeEnd::Write));
             *pipefd = r as u32;
             *pipefd.add(1) = w as u32;
             return 0;
@@ -1113,7 +1267,9 @@ pub fn sys_dup2(current_slot: usize, oldfd: usize, newfd: usize) -> usize {
                 return usize::MAX;
             }
             // bump pipe refcounts on duplicate
-            if let Some(FileDescriptor::Pipe { pipe_id, end }) = current.fd_table.get(oldfd).copied() {
+            if let Some(FileDescriptor::Pipe { pipe_id, end }) =
+                current.fd_table.get(oldfd).copied()
+            {
                 match end {
                     PipeEnd::Read => pipe::pipe_add_reader(pipe_id),
                     PipeEnd::Write => pipe::pipe_add_writer(pipe_id),
@@ -1156,7 +1312,11 @@ pub fn sys_unlink(path_ptr: *const u8) -> usize {
 /// (разделённые '\n') в пользовательский буфер.
 /// Возвращает количество записанных байт или 0 при ошибке.
 pub fn sys_ls(path_ptr: *const u8, buf_ptr: *mut u8, buf_size: usize) -> usize {
-    let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("/") };
+    let path = unsafe {
+        CStr::from_ptr(path_ptr as *const i8)
+            .to_str()
+            .unwrap_or("/")
+    };
     let path = if path.is_empty() { "/" } else { path };
 
     let entries = match VFS.get().list_directory_entries(path) {
@@ -1235,7 +1395,12 @@ pub struct SigActionUser {
 }
 
 /// sigaction(sig, act, oldact)
-pub fn sys_sigaction(current_slot: usize, sig: u32, act: *const SigActionUser, oldact: *mut SigActionUser) -> usize {
+pub fn sys_sigaction(
+    current_slot: usize,
+    sig: u32,
+    act: *const SigActionUser,
+    oldact: *mut SigActionUser,
+) -> usize {
     if sig == 0 || sig > 31 || sig == crate::signal::SIGKILL {
         return usize::MAX;
     }
@@ -1354,13 +1519,10 @@ fn fd_poll_revents(current_slot: usize, fd: i32, events: i16) -> i16 {
             }
             Some(FileDescriptor::ConsoleIn) => {
                 // Always report readable for simplicity (stdin may still block on read).
-                if events & POLLIN != 0 {
-                    POLLIN
-                } else {
-                    0
-                }
+                if events & POLLIN != 0 { POLLIN } else { 0 }
             }
-            Some(FileDescriptor::ConsoleOut) | Some(FileDescriptor::File { .. })
+            Some(FileDescriptor::ConsoleOut)
+            | Some(FileDescriptor::File { .. })
             | Some(FileDescriptor::Device { .. }) => {
                 let mut rev = 0i16;
                 if events & POLLIN != 0 {
@@ -1383,9 +1545,7 @@ fn fd_poll_revents(current_slot: usize, fd: i32, events: i16) -> i16 {
                 rev
             }
             None => POLLERR,
-            _ => {
-                0
-            }
+            _ => 0,
         }
     }
 }
@@ -1681,27 +1841,30 @@ pub fn sys_execve(
         TASK_MANAGER.task_count += 1;
 
         if let Some(ref mut t) = TASK_MANAGER.tasks[slot] {
-            let kernel_stack_top = t.stack_base
-                + crate::multitasking::task::STACK_SIZE as u32;
+            let kernel_stack_top = t.stack_base + crate::multitasking::task::STACK_SIZE as u32;
             t.kernel_stack = kernel_stack_top;
 
             let state_ptr = (kernel_stack_top as usize
                 - crate::multitasking::task::HEADROOM
-                - core::mem::size_of::<CPUState>())
-                as *mut CPUState;
+                - core::mem::size_of::<CPUState>()) as *mut CPUState;
             t.cpu_state_ptr = state_ptr as u32;
 
             // argv on user stack (defaults to empty argc=0)
             let user_esp = setup_user_argv(t.pd(), USER_STACK_TOP, argv);
 
             *state_ptr = CPUState {
-                eax: 0, ebx: 0, ecx: 0, edx: 0,
-                esi: 0, edi: 0, ebp: 0,
-                eip:    entry_point,
-                cs:     0x1B,
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+                esi: 0,
+                edi: 0,
+                ebp: 0,
+                eip: entry_point,
+                cs: 0x1B,
                 eflags: 0x202,
-                esp:    user_esp,
-                ss:     0x23,
+                esp: user_esp,
+                ss: 0x23,
             };
 
             let pd_phys = t.page_dir_phys;
@@ -1720,12 +1883,32 @@ pub fn sys_execve(
 
             // stdio + optional remap from parent fds
             t.fd_table = FileDescriptorTable::with_stdio();
-            install_child_fd(parent_slot, &mut t.fd_table, 0, stdin_fd, FileDescriptor::ConsoleIn);
-            install_child_fd(parent_slot, &mut t.fd_table, 1, stdout_fd, FileDescriptor::ConsoleOut);
-            install_child_fd(parent_slot, &mut t.fd_table, 2, stderr_fd, FileDescriptor::ConsoleOut);
+            install_child_fd(
+                parent_slot,
+                &mut t.fd_table,
+                0,
+                stdin_fd,
+                FileDescriptor::ConsoleIn,
+            );
+            install_child_fd(
+                parent_slot,
+                &mut t.fd_table,
+                1,
+                stdout_fd,
+                FileDescriptor::ConsoleOut,
+            );
+            install_child_fd(
+                parent_slot,
+                &mut t.fd_table,
+                2,
+                stderr_fd,
+                FileDescriptor::ConsoleOut,
+            );
 
-            println!("[execve] OK pid={} entry={:#x} stack={:#x} pd_phys={:#x} parent={}",
-                     slot, entry_point, USER_STACK_TOP, pd_phys, parent_slot);
+            println!(
+                "[execve] OK pid={} entry={:#x} stack={:#x} pd_phys={:#x} parent={}",
+                slot, entry_point, USER_STACK_TOP, pd_phys, parent_slot
+            );
         }
 
         asm!("sti");
@@ -1734,9 +1917,9 @@ pub fn sys_execve(
 }
 
 use crate::net::stack::{NET_STACK, poll_stack};
-use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
-use smoltcp::socket::{tcp, udp};
 use crate::print::klog_write_str;
+use smoltcp::socket::{tcp, udp};
+use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 pub fn sys_socket(current_slot: usize, domain: u16, ty: u16, protocol: u8) -> usize {
     let mut stack_guard = match NET_STACK.try_lock() {
@@ -1783,7 +1966,10 @@ pub fn sys_socket(current_slot: usize, domain: u16, ty: u16, protocol: u8) -> us
 }
 
 pub fn sys_bind(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: usize) -> usize {
-    println!("current_slot: {}, fd: {} addr_ptr: {:x} addrlen: {}", current_slot, fd, addr_ptr as usize, addrlen);
+    println!(
+        "current_slot: {}, fd: {} addr_ptr: {:x} addrlen: {}",
+        current_slot, fd, addr_ptr as usize, addrlen
+    );
     if addrlen < core::mem::size_of::<SockAddrIn>() {
         return usize::MAX;
     }
@@ -1820,7 +2006,9 @@ pub fn sys_bind(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: us
         IpListenEndpoint { addr: None, port }
     } else {
         IpListenEndpoint {
-            addr: Some(IpAddress::Ipv4(Ipv4Address(addr.sin_addr.s_addr.to_be_bytes()))),
+            addr: Some(IpAddress::Ipv4(Ipv4Address(
+                addr.sin_addr.s_addr.to_be_bytes(),
+            ))),
             port,
         }
     };
@@ -1926,11 +2114,17 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
     let result = if is_tcp {
         let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
         // local endpoint можно оставить unspecified
-        socket.connect(stack.iface.context(), endpoint, 0).map_err(|_| ())
+        socket
+            .connect(stack.iface.context(), endpoint, 0)
+            .map_err(|_| ())
     } else {
         // UDP connect (опционально)
         let socket = stack.sockets.get_mut::<udp::Socket>(handle);
-        socket.bind(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), 0))
+        socket
+            .bind(IpEndpoint::new(
+                IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+                0,
+            ))
             .map_err(|_| ())
             .and_then(|_| {
                 // smoltcp UDP не имеет connect, просто запоминаем peer
@@ -1979,8 +2173,11 @@ pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) ->
     let data = unsafe { core::slice::from_raw_parts(buf, len) };
 
     if is_tcp {
-        return stack.sockets.get_mut::<tcp::Socket>(handle)
-            .send_slice(data).unwrap_or(0);
+        return stack
+            .sockets
+            .get_mut::<tcp::Socket>(handle)
+            .send_slice(data)
+            .unwrap_or(0);
     }
 
     let peer = {
@@ -2036,8 +2233,11 @@ pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) ->
     let mut temp = alloc::vec![0u8; len.min(1500)];
 
     let received = if is_tcp {
-        stack.sockets.get_mut::<tcp::Socket>(handle)
-            .recv_slice(&mut temp).unwrap_or(0)
+        stack
+            .sockets
+            .get_mut::<tcp::Socket>(handle)
+            .recv_slice(&mut temp)
+            .unwrap_or(0)
     } else {
         let socket = stack.sockets.get_mut::<udp::Socket>(handle);
         match socket.recv_slice(&mut temp) {
@@ -2063,7 +2263,9 @@ pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) ->
     };
 
     if received > 0 {
-        unsafe { core::ptr::copy_nonoverlapping(temp.as_ptr(), buf, received); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(temp.as_ptr(), buf, received);
+        }
     }
     received
 }
@@ -2223,6 +2425,3 @@ pub fn sys_pci_list(buf: *mut PciInfoUser, max: usize) -> usize {
     }
     write_n
 }
-
-
-

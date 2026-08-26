@@ -12,8 +12,8 @@ use crate::println;
 
 // ====================== Signal numbers ======================
 
-pub const SIGHUP:  u32 = 1;
-pub const SIGINT:  u32 = 2;
+pub const SIGHUP: u32 = 1;
+pub const SIGINT: u32 = 2;
 pub const SIGQUIT: u32 = 3;
 pub const SIGKILL: u32 = 9;
 pub const SIGTERM: u32 = 15;

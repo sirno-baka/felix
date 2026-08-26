@@ -1,8 +1,8 @@
 //! Высокоуровневый файловый API для userspace
 
+use crate::syscall;
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::syscall;
 
 /// Ошибки файловых операций
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +137,9 @@ impl Drop for File {
     fn drop(&mut self) {
         // stdin/stdout/stderr не закрываем
         if self.fd > 2 {
-            unsafe { syscall::close(self.fd); }
+            unsafe {
+                syscall::close(self.fd);
+            }
         }
     }
 }

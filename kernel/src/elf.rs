@@ -1,8 +1,8 @@
-use elf::ElfBytes;
-use elf::endian::AnyEndian;
-use elf::abi::{ET_EXEC, EM_386, PT_LOAD};
-use crate::memory::paging::{phys_to_virt, PageDirectory, PAGE_SIZE};
+use crate::memory::paging::{PAGE_SIZE, PageDirectory, phys_to_virt};
 use crate::println;
+use elf::ElfBytes;
+use elf::abi::{EM_386, ET_EXEC, PT_LOAD};
+use elf::endian::AnyEndian;
 
 #[derive(Debug)]
 pub enum ElfLoadError {
@@ -13,17 +13,13 @@ pub enum ElfLoadError {
     InvalidAddress,
 }
 
-
 /// Загружает ELF по адресам из самого файла (p_vaddr).
 /// Перед вызовом CR3 должен быть PD задачи.
 /// `page_dir` — PD этой задачи (чтобы домапить страницы сегментов).
 /// Возвращает e_entry как есть.
-pub fn load_elf(
-    binary: &[u8],
-    page_dir: &mut PageDirectory,
-) -> Result<u32, ElfLoadError> {
-    let file = ElfBytes::<AnyEndian>::minimal_parse(binary)
-        .map_err(|_| ElfLoadError::InvalidElf)?;
+pub fn load_elf(binary: &[u8], page_dir: &mut PageDirectory) -> Result<u32, ElfLoadError> {
+    let file =
+        ElfBytes::<AnyEndian>::minimal_parse(binary).map_err(|_| ElfLoadError::InvalidElf)?;
 
     let header = &file.ehdr;
 
@@ -40,7 +36,9 @@ pub fn load_elf(
     let mut max_addr = 0u32;
 
     for phdr in segments.iter() {
-        if phdr.p_type != PT_LOAD { continue; }
+        if phdr.p_type != PT_LOAD {
+            continue;
+        }
         let v = phdr.p_vaddr as u32;
         let e = v + phdr.p_memsz as u32;
         min_addr = min_addr.min(v);
@@ -65,7 +63,10 @@ pub fn load_elf(
     }
 
     let entry = header.e_entry as u32;
-    println!("[elf] loaded, entry={:#x} min={:#x} max={:#x}", entry, min_addr, max_addr);
+    println!(
+        "[elf] loaded, entry={:#x} min={:#x} max={:#x}",
+        entry, min_addr, max_addr
+    );
     Ok(entry)
 }
 
@@ -74,23 +75,29 @@ fn load_segment(
     binary: &[u8],
     page_dir: &mut PageDirectory,
 ) -> Result<(), ElfLoadError> {
-    let vaddr  = ph.p_vaddr as u32;
-    let memsz  = ph.p_memsz as u32;
+    let vaddr = ph.p_vaddr as u32;
+    let memsz = ph.p_memsz as u32;
     let filesz = ph.p_filesz as u32;
     let offset = ph.p_offset as usize;
 
     // Не даём грузить сегменты в kernel half
     const KERNEL_OFFSET: u32 = 0xC000_0000;
     if vaddr >= KERNEL_OFFSET || vaddr.saturating_add(memsz) > KERNEL_OFFSET {
-        println!("[elf] reject segment vaddr={:#x} memsz={:#x} (kernel range)", vaddr, memsz);
+        println!(
+            "[elf] reject segment vaddr={:#x} memsz={:#x} (kernel range)",
+            vaddr, memsz
+        );
         return Err(ElfLoadError::InvalidAddress);
     }
 
-    println!("[elf] segment vaddr={:#x} filesz={:#x} memsz={:#x}", vaddr, filesz, memsz);
+    println!(
+        "[elf] segment vaddr={:#x} filesz={:#x} memsz={:#x}",
+        vaddr, filesz, memsz
+    );
 
     // Мапим все страницы, которые занимает сегмент (включая bss)
     let start_page = vaddr & !(PAGE_SIZE as u32 - 1);
-    let end_page   = (vaddr + memsz + PAGE_SIZE as u32 - 1) & !(PAGE_SIZE as u32 - 1);
+    let end_page = (vaddr + memsz + PAGE_SIZE as u32 - 1) & !(PAGE_SIZE as u32 - 1);
     let mut page = start_page;
     while page < end_page {
         page_dir.alloc_and_map_user_page(page);
@@ -127,9 +134,7 @@ fn copy_to_user_virt(page_dir: &PageDirectory, mut vaddr: u32, data: &[u8]) {
         let pt_idx = ((page >> 12) & 0x3FF) as usize;
         let pde = page_dir.entries[pd_idx];
         let pt_phys = pde & 0xFFFF_F000;
-        let pte = unsafe {
-            *((phys_to_virt(pt_phys) as *const u32).add(pt_idx))
-        };
+        let pte = unsafe { *((phys_to_virt(pt_phys) as *const u32).add(pt_idx)) };
         let frame_phys = pte & 0xFFFF_F000;
 
         unsafe {
@@ -154,9 +159,7 @@ fn zero_user_virt(page_dir: &PageDirectory, mut vaddr: u32, mut len: usize) {
         let pt_idx = ((page >> 12) & 0x3FF) as usize;
         let pde = page_dir.entries[pd_idx];
         let pt_phys = pde & 0xFFFF_F000;
-        let pte = unsafe {
-            *((phys_to_virt(pt_phys) as *const u32).add(pt_idx))
-        };
+        let pte = unsafe { *((phys_to_virt(pt_phys) as *const u32).add(pt_idx)) };
         let frame_phys = pte & 0xFFFF_F000;
 
         unsafe {

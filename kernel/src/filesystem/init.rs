@@ -13,7 +13,7 @@ use crate::filesystem::devfs::DevFS;
 use crate::filesystem::ext2::Ext2;
 use crate::filesystem::fat32::FatFs;
 use crate::filesystem::vfs::{Filesystem, VFS};
-use crate::memory::paging::{phys_to_virt, PAGING};
+use crate::memory::paging::{PAGING, phys_to_virt};
 use crate::pci::ide::{IDE, IDEDevice};
 use crate::println;
 use crate::spin;
@@ -60,40 +60,39 @@ pub fn init_rootfs() -> bool {
         if info.disk_phys == 0 || info.disk_sectors == 0 {
             println!("[init] BootInfo has no ramdisk — IDE path");
         } else {
-        // Do not let the frame allocator hand out pages that overlap the image.
-        reserve_frames_past(info.disk_phys, info.disk_sectors);
+            // Do not let the frame allocator hand out pages that overlap the image.
+            reserve_frames_past(info.disk_phys, info.disk_sectors);
 
-        let ram = RamDisk::from_phys(info.disk_phys, info.disk_sectors);
-        let ram_fs = ram;
-        let ram_dev = ram;
+            let ram = RamDisk::from_phys(info.disk_phys, info.disk_sectors);
+            let ram_fs = ram;
+            let ram_dev = ram;
 
-        devfs.register_block(
-            "ram0",
-            Mutex::new(Box::new(ram_dev) as Box<dyn BlockDevice>),
-        );
+            devfs.register_block(
+                "ram0",
+                Mutex::new(Box::new(ram_dev) as Box<dyn BlockDevice>),
+            );
 
-        let arc: Arc<spin::Mutex<dyn BlockDevice>> =
-            Arc::new(spin::Mutex::new(ram_fs));
+            let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(ram_fs));
 
-        match try_mount(arc, "ram0") {
-            Some(root) => {
-                println!(
-                    "[VFS] root = {} on /dev/ram0 (shell={})",
-                    root.kind, root.has_shell
-                );
-                VFS.get().set_root(root.fs);
+            match try_mount(arc, "ram0") {
+                Some(root) => {
+                    println!(
+                        "[VFS] root = {} on /dev/ram0 (shell={})",
+                        root.kind, root.has_shell
+                    );
+                    VFS.get().set_root(root.fs);
 
-                // Optional: still register any real IDE disks under /dev + /mnt
-                println!("[init] Try mount IDE disks");
-                register_ide_disks(&devfs, true);
+                    // Optional: still register any real IDE disks under /dev + /mnt
+                    println!("[init] Try mount IDE disks");
+                    register_ide_disks(&devfs, true);
 
-                VFS.get().mount("/dev", devfs);
-                return true;
+                    VFS.get().mount("/dev", devfs);
+                    return true;
+                }
+                None => {
+                    println!("[init] BootInfo present but FS mount failed, trying IDE…");
+                }
             }
-            None => {
-                println!("[init] BootInfo present but FS mount failed, trying IDE…");
-            }
-        }
         } // end disk_phys != 0
     } else {
         println!("[init] no BootInfo (magic mismatch) — IDE path");
@@ -123,8 +122,7 @@ pub fn init_rootfs() -> bool {
     let mut probed: Vec<ProbedFs> = Vec::new();
     for (i, dev) in disks.into_iter().enumerate() {
         let name = disk_name(i);
-        let arc: Arc<spin::Mutex<dyn BlockDevice>> =
-            Arc::new(spin::Mutex::new(dev));
+        let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(dev));
         match try_mount(arc, &name) {
             Some(p) => {
                 println!("[init] {} → {} (shell={})", name, p.kind, p.has_shell);
@@ -199,8 +197,7 @@ fn register_ide_disks(devfs: &DevFS, mount_extra: bool) {
     }
     for (i, dev) in disks.into_iter().enumerate() {
         let name = disk_name(i);
-        let arc: Arc<spin::Mutex<dyn BlockDevice>> =
-            Arc::new(spin::Mutex::new(dev));
+        let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(dev));
         if let Some(p) = try_mount(arc, &name) {
             let mp = format!("/mnt/{}", name);
             println!("[VFS] mount {} ({}) at {}", name, p.kind, mp);

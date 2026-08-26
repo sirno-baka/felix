@@ -1,14 +1,14 @@
 pub mod ide;
 
-pub mod floppy;
-mod config;
 pub(crate) mod bar;
+mod config;
 pub(crate) mod device;
+pub mod floppy;
 
 pub mod class;
 
 use alloc::vec::Vec;
-use device::{read_device, PciDevice};
+use device::{PciDevice, read_device};
 
 /// Enumerate all PCI devices on the system
 pub fn enumerate() -> Vec<PciDevice> {
@@ -49,7 +49,7 @@ fn vendor_name(vendor_id: u16) -> &'static str {
         0x10B9 => "ALi",
         0x104C => "Texas Instruments",
         0x1179 => "Toshiba",
-        0x8086 => "Intel",          // уже есть, но для ясности
+        0x8086 => "Intel", // уже есть, но для ясности
         0x15AD => "VMware",
         0x1AF4 => "Red Hat (Virtio)",
         0x1234 => "QEMU",
@@ -152,4 +152,3 @@ pub fn find_by_class(class_code: u8, subclass: u8) -> Vec<PciDevice> {
 pub fn find_network_controllers() -> Vec<PciDevice> {
     find_by_class(0x02, 0x00) // Ethernet
 }
-

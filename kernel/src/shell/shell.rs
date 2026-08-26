@@ -1,14 +1,14 @@
+use crate::print::PRINTER;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use crate::print::PRINTER;
 
-use crate::multitasking::task::TASK_MANAGER;
-use core::arch::asm;
-use interrupt_sync::SpinMutex;
-use crate::{print, println};
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::filesystem::VFS;
 use crate::filesystem::vfs::Vfs;
+use crate::multitasking::task::TASK_MANAGER;
+use crate::{print, println};
+use core::arch::asm;
+use interrupt_sync::SpinMutex;
 
 const HELP: &'static str = "Available commands:
 ls                  - lists root directory entries
@@ -49,7 +49,8 @@ impl Shell {
                         self.enter();
                         return;
                     }
-                    0x08 => {  // backspace
+                    0x08 => {
+                        // backspace
                         self.backspace();
                     }
                     c if c.is_ascii_graphic() || c == b' ' => {
@@ -98,7 +99,9 @@ impl Shell {
 
     fn parse_args(&self) -> Vec<String> {
         self.buffer
-            .lock().clone().trim()
+            .lock()
+            .clone()
+            .trim()
             .split_whitespace()
             .map(|s| s.to_string())
             .collect()
@@ -140,7 +143,7 @@ impl Shell {
                 } else {
                     println!("Usage: cat <file>");
                 }
-            },
+            }
 
             "write" => {
                 if let Some(filename) = args.get(1) {
@@ -149,18 +152,17 @@ impl Shell {
                         if success {
                             println!("Written to {}", filename);
                         }
-
                     } else {
                         println!("Usage: write <file> <data>");
                     }
                 }
-            },
+            }
             "run" => {
                 if let Some(app) = args.get(1) {
                     // Можно вызвать через syscall или напрямую
                     let result = unsafe {
                         let mut path = app.clone();
-                        path.push('\0');                    // <-- добавляем нуль-терминатор
+                        path.push('\0'); // <-- добавляем нуль-терминатор
                         // Прямой вызов для отладки (позже сделаем через int 0x80)
                         // crate::syscalls::handler::sys_execve(path.as_ptr() as *const u8)
                     };
@@ -170,27 +172,25 @@ impl Shell {
                 } else {
                     println!("Usage: run <application>");
                 }
-            },
+            }
 
             "mkdir" => {
                 if let Some(name) = args.get(1) {
                     let success = VFS.get().mkdir(name);
                     println!("mkdir {}: {}", name, success);
-
                 } else {
                     println!("Usage: mkdir <name>");
                 }
-            },
+            }
 
             "rmdir" => {
                 if let Some(name) = args.get(1) {
                     let success = VFS.get().rmdir(name);
                     println!("rmdir {}: {}", name, success);
-
                 } else {
                     println!("Usage: rmdir <name>");
                 }
-            },
+            }
 
             "rm" => {
                 if let Some(filename) = args.get(1) {
@@ -198,11 +198,12 @@ impl Shell {
                     if success {
                         println!("remove {}", filename);
                     }
-
                 }
-            },
+            }
 
-            "ps" => unsafe { TASK_MANAGER.list_tasks(); },
+            "ps" => unsafe {
+                TASK_MANAGER.list_tasks();
+            },
             "help" => println!("{}", HELP),
             _ => println!("Unknown command: {}", args[0]),
         }
@@ -221,6 +222,5 @@ impl Shell {
                 }
             }
         }
-
     }
 }

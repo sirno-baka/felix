@@ -1,10 +1,10 @@
-pub mod types;
 pub mod socket;
 pub mod stack;
+pub mod types;
 
-pub use types::*;
 pub use socket::*;
 pub use stack::*;
+pub use types::*;
 
 use crate::sync::mutex::Mutex;
 use socket::SocketTable;

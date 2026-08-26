@@ -12,8 +12,8 @@ use core::cmp;
 
 use fatfs::{FileSystem, FsOptions, Read, Seek, SeekFrom, Write};
 
-use crate::disk::interface::BlockDevice;
 use crate::disk::PartitionConfig;
+use crate::disk::interface::BlockDevice;
 use crate::filesystem::vfs::{DirEntry, Filesystem};
 use crate::println;
 use crate::spin::Mutex;
@@ -33,10 +33,7 @@ const FAT_PART_TYPES: &[u8] = &[
 /// Find first FAT partition in MBR; fallback to whole disk.
 pub fn find_fat_partition_config(device: &dyn BlockDevice) -> PartitionConfig {
     let mut mbr = [0u8; 512];
-    if device
-        .read_sectors(1, 0, mbr.as_mut_ptr() as u32)
-        .is_err()
-    {
+    if device.read_sectors(1, 0, mbr.as_mut_ptr() as u32).is_err() {
         println!("[FAT] Failed to read MBR, using whole disk");
         return PartitionConfig::whole_disk();
     }
@@ -49,18 +46,11 @@ pub fn find_fat_partition_config(device: &dyn BlockDevice) -> PartitionConfig {
         let off = 0x1BE + i * 16;
         let ptype = mbr[off + 4];
         if FAT_PART_TYPES.contains(&ptype) {
-            let lba = u32::from_le_bytes([
-                mbr[off + 8],
-                mbr[off + 9],
-                mbr[off + 10],
-                mbr[off + 11],
-            ]) as u64;
-            let sectors = u32::from_le_bytes([
-                mbr[off + 12],
-                mbr[off + 13],
-                mbr[off + 14],
-                mbr[off + 15],
-            ]) as u64;
+            let lba = u32::from_le_bytes([mbr[off + 8], mbr[off + 9], mbr[off + 10], mbr[off + 11]])
+                as u64;
+            let sectors =
+                u32::from_le_bytes([mbr[off + 12], mbr[off + 13], mbr[off + 14], mbr[off + 15]])
+                    as u64;
             println!(
                 "[FAT] partition type={:#x} LBA={} sectors={}",
                 ptype, lba, sectors

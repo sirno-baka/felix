@@ -273,9 +273,8 @@ impl Fb {
                     }
                 }
                 16 => {
-                    let v: u16 = ((r as u16 & 0xF8) << 8)
-                        | ((g as u16 & 0xFC) << 3)
-                        | ((b as u16) >> 3);
+                    let v: u16 =
+                        ((r as u16 & 0xF8) << 8) | ((g as u16 & 0xFC) << 3) | ((b as u16) >> 3);
                     ptr::write_unaligned(p as *mut u16, v);
                 }
                 _ => {}

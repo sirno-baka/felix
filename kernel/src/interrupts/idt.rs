@@ -39,12 +39,12 @@ impl InterruptDescriptorTable {
     }
 
     pub fn add(&mut self, int: usize, handler: u32) {
-        self.entries[int].set(handler, 0);   // kernel interrupts
+        self.entries[int].set(handler, 0); // kernel interrupts
     }
 
     // Новый метод специально для user-mode syscall
     pub fn add_user_interrupt(&mut self, int: usize, handler: u32) {
-        self.entries[int].set(handler, 3);   // DPL=3 — разрешаем user mode
+        self.entries[int].set(handler, 3); // DPL=3 — разрешаем user mode
     }
 
     pub fn load(&self) {
@@ -74,7 +74,7 @@ impl IdtEntry {
         self.offset_low = ((offset << 16) >> 16) as u16;
         self.offset_high = (offset >> 16) as u16;
 
-        let gate_type = 0xe << 0;  // interrupt gate
+        let gate_type = 0xe << 0; // interrupt gate
         let zero = 0 << 3;
         let dpl_bits = (dpl & 3) << 5;
         let p = 1 << 7;

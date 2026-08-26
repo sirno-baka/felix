@@ -4,4 +4,10 @@ version.workspace = true
 authors.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "wasm-hello"
+
+[build]
+target = "wasm32-wasi"
+
 [dependencies]

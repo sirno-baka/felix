@@ -7,11 +7,11 @@ use core::ptr;
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct FramebufferInfo {
-    pub address: u32,   // PhysBasePtr
-    pub pitch: u16,     // bytes per scanline
+    pub address: u32, // PhysBasePtr
+    pub pitch: u16,   // bytes per scanline
     pub width: u16,
     pub height: u16,
-    pub bpp: u8,        // bits per pixel
+    pub bpp: u8, // bits per pixel
     pub reserved: [u8; 3],
 }
 
@@ -20,47 +20,47 @@ pub const FB_INFO_PHYS: u32 = 0x0000_5000;
 
 #[repr(C, packed)]
 struct VbeInfoBlock {
-    signature: [u8; 4],     // "VESA"
+    signature: [u8; 4], // "VESA"
     version: u16,
     oem_string_ptr: u32,
     capabilities: u32,
-    video_mode_ptr: u32,    // far ptr
+    video_mode_ptr: u32, // far ptr
     total_memory: u16,
     reserved: [u8; 512 - 20],
 }
 
 #[repr(C, packed)]
 struct ModeInfoBlock {
-    attributes: u16,          // 0x00
-    win_a: u8,                // 0x02
-    win_b: u8,                // 0x03
-    granularity: u16,         // 0x04
-    winsize: u16,             // 0x06
-    segment_a: u16,           // 0x08
-    segment_b: u16,           // 0x0A
-    win_func_ptr: u32,        // 0x0C
-    pitch: u16,               // 0x10  BytesPerScanLine
-    width: u16,               // 0x12
-    height: u16,              // 0x14
-    w_char: u8,               // 0x16
-    y_char: u8,               // 0x17
-    planes: u8,               // 0x18
-    bpp: u8,                  // 0x19  ← BitsPerPixel
-    banks: u8,                // 0x1A
-    memory_model: u8,         // 0x1B
-    bank_size: u8,            // 0x1C
-    image_pages: u8,          // 0x1D
-    reserved0: u8,            // 0x1E
-    red_mask: u8,             // 0x1F
-    red_position: u8,         // 0x20
-    green_mask: u8,           // 0x21
-    green_position: u8,       // 0x22
-    blue_mask: u8,            // 0x23
-    blue_position: u8,        // 0x24
-    reserved_mask: u8,        // 0x25
-    reserved_position: u8,    // 0x26
+    attributes: u16,             // 0x00
+    win_a: u8,                   // 0x02
+    win_b: u8,                   // 0x03
+    granularity: u16,            // 0x04
+    winsize: u16,                // 0x06
+    segment_a: u16,              // 0x08
+    segment_b: u16,              // 0x0A
+    win_func_ptr: u32,           // 0x0C
+    pitch: u16,                  // 0x10  BytesPerScanLine
+    width: u16,                  // 0x12
+    height: u16,                 // 0x14
+    w_char: u8,                  // 0x16
+    y_char: u8,                  // 0x17
+    planes: u8,                  // 0x18
+    bpp: u8,                     // 0x19  ← BitsPerPixel
+    banks: u8,                   // 0x1A
+    memory_model: u8,            // 0x1B
+    bank_size: u8,               // 0x1C
+    image_pages: u8,             // 0x1D
+    reserved0: u8,               // 0x1E
+    red_mask: u8,                // 0x1F
+    red_position: u8,            // 0x20
+    green_mask: u8,              // 0x21
+    green_position: u8,          // 0x22
+    blue_mask: u8,               // 0x23
+    blue_position: u8,           // 0x24
+    reserved_mask: u8,           // 0x25
+    reserved_position: u8,       // 0x26
     direct_color_attributes: u8, // 0x27
-    framebuffer: u32,         // 0x28  PhysBasePtr
+    framebuffer: u32,            // 0x28  PhysBasePtr
     // дальше нам не нужно
     reserved1: [u8; 212],
 }

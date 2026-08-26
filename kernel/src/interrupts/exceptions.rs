@@ -8,12 +8,13 @@
 //   - switch to a fresh CPUState from schedule() which has no error-code
 //     on the stack, so iretd layout matches the timer/exit path.
 
-use core::arch::asm;
 use crate::filesystem::file::{FileDescriptor, PipeEnd};
 use crate::multitasking::task::{CPUState, TASK_MANAGER};
+use crate::net::SOCKET_TABLE;
 use crate::pipe;
 use crate::println;
-use crate::net::SOCKET_TABLE;
+use core::arch::asm;
+use core::arch::naked_asm;
 
 /// True if the interrupted code was in ring 3.
 #[inline]
@@ -59,7 +60,10 @@ fn kill_current_task(esp: u32, reason: &str, exit_code: i32) -> u32 {
             t.pending_signals = 0;
         }
 
-        println!("[exc] task {} killed: {} (exit={})", slot, reason, exit_code);
+        println!(
+            "[exc] task {} killed: {} (exit={})",
+            slot, reason, exit_code
+        );
 
         TASK_MANAGER.schedule(esp as *mut CPUState) as u32
     }
@@ -109,10 +113,10 @@ fn handle_fault(name: &str, sig_exit: i32, esp: u32, eip: u32, cs: u32, eflags: 
 
 macro_rules! exception_stub {
     ($naked_name:ident, $handler_name:ident) => {
-        #[naked]
+        #[unsafe(naked)]
         pub extern "C" fn $naked_name() {
             unsafe {
-                asm!(
+                naked_asm!(
                     "cli",
                     "push ebp",
                     "push edi",
@@ -142,8 +146,7 @@ macro_rules! exception_stub {
                     "mov es, cx",
                     "2:",
                     "iretd",
-                    handler = sym $handler_name,
-                    options(noreturn)
+                    handler = sym $handler_name
                 );
             }
         }
@@ -155,10 +158,10 @@ macro_rules! exception_stub {
 // (We never resume the faulting frame — only switch or halt.)
 macro_rules! exception_stub_with_error_code {
     ($naked_name:ident, $handler_name:ident) => {
-        #[naked]
+        #[unsafe(naked)]
         pub extern "C" fn $naked_name() {
             unsafe {
-                asm!(
+                naked_asm!(
                     "cli",
                     // error code is already on stack; drop it so layout matches
                     "add esp, 4",
@@ -189,8 +192,7 @@ macro_rules! exception_stub_with_error_code {
                     "mov es, cx",
                     "2:",
                     "iretd",
-                    handler = sym $handler_name,
-                    options(noreturn)
+                    handler = sym $handler_name
                 );
             }
         }
@@ -200,7 +202,7 @@ macro_rules! exception_stub_with_error_code {
 // ---------- #DE Division Error (no error code) ----------
 exception_stub!(div_error, div_error_handler);
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn div_error_handler(esp: u32) -> u32 {
     let state = unsafe { &*(esp as *const CPUState) };
     // Unix: SIGFPE → 128+8 = 136
@@ -210,27 +212,41 @@ pub extern "C" fn div_error_handler(esp: u32) -> u32 {
 // ---------- #UD Invalid Opcode (no error code) ----------
 exception_stub!(invalid_opcode, invalid_opcode_handler);
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn invalid_opcode_handler(esp: u32) -> u32 {
     let state = unsafe { &*(esp as *const CPUState) };
     // SIGILL → 128+4 = 132
-    handle_fault("invalid_opcode", 132, esp, state.eip, state.cs, state.eflags)
+    handle_fault(
+        "invalid_opcode",
+        132,
+        esp,
+        state.eip,
+        state.cs,
+        state.eflags,
+    )
 }
 
 // ---------- #GP General Protection (error code) ----------
 exception_stub_with_error_code!(general_protection_fault, general_protection_fault_handler);
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn general_protection_fault_handler(esp: u32) -> u32 {
     let state = unsafe { &*(esp as *const CPUState) };
     // SIGSEGV → 128+11 = 139
-    handle_fault("general_protection_fault", 139, esp, state.eip, state.cs, state.eflags)
+    handle_fault(
+        "general_protection_fault",
+        139,
+        esp,
+        state.eip,
+        state.cs,
+        state.eflags,
+    )
 }
 
 // ---------- #DF Double Fault (error code) ----------
 exception_stub_with_error_code!(double_fault, double_fault_handler);
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn double_fault_handler(esp: u32) -> u32 {
     // Double fault is almost always fatal even from user context
     let state = unsafe { &*(esp as *const CPUState) };
@@ -244,7 +260,7 @@ pub extern "C" fn double_fault_handler(esp: u32) -> u32 {
 // ---------- generic (no error code) ----------
 exception_stub!(generic_handler, generic_handler_handler);
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn generic_handler_handler(esp: u32) -> u32 {
     let state = unsafe { &*(esp as *const CPUState) };
     handle_fault("generic", 139, esp, state.eip, state.cs, state.eflags)
@@ -253,7 +269,7 @@ pub extern "C" fn generic_handler_handler(esp: u32) -> u32 {
 // ---------- #PF Page Fault (error code) ----------
 exception_stub_with_error_code!(page_fault, page_fault_handler);
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn page_fault_handler(esp: u32) -> u32 {
     // After dropping error code + pushing regs, `esp` points at a CPUState-shaped frame.
     let state = unsafe { &*(esp as *const CPUState) };

@@ -1,21 +1,20 @@
 //! Intel 8255x (82557/82558/82559) driver with proper Rx/Tx rings
 //! Uses Felix PCI subsystem + PageManager for DMA buffers
 
-use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
-use crate::drivers::net::{map_mmio, RX_BUF_SIZE, RX_RING_SIZE, TX_BUF_SIZE, TX_RING_SIZE};
-use crate::memory::paging::{PAGING, PAGE_SIZE, PhysAddr, KERNEL_OFFSET};
+use crate::drivers::net::{RX_BUF_SIZE, RX_RING_SIZE, TX_BUF_SIZE, TX_RING_SIZE, map_mmio};
+use crate::memory::paging::{KERNEL_OFFSET, PAGE_SIZE, PAGING, PhysAddr};
 use crate::pci::{self, device::PciDevice};
 use crate::println;
 use crate::sync::mutex::Mutex;
+use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ===================== Константы =====================
 const EE_SHIFT_CLK: u16 = 0x01;
-const EE_CS:        u16 = 0x02;
-const EE_DATA_WRITE:u16 = 0x04;
+const EE_CS: u16 = 0x02;
+const EE_DATA_WRITE: u16 = 0x04;
 const EE_DATA_READ: u16 = 0x08;
-const EE_ENB:       u16 = 0x4800 | EE_CS;   // 0x4802
-
+const EE_ENB: u16 = 0x4800 | EE_CS; // 0x4802
 
 // SCB offsets
 pub const SCB_STATUS: usize = 0x00;
@@ -25,10 +24,10 @@ const SCB_PORT: usize = 0x08;
 const SCB_EEPROM: usize = 0x0E;
 
 // SCB Status
-const STAT_CX:  u16 = 1 << 15;  // было << 7
-const STAT_FR:  u16 = 1 << 14;  // было << 6
-const STAT_CNA: u16 = 1 << 13;  // было << 5
-const STAT_RNR: u16 = 1 << 12;  // было << 4
+const STAT_CX: u16 = 1 << 15; // было << 7
+const STAT_FR: u16 = 1 << 14; // было << 6
+const STAT_CNA: u16 = 1 << 13; // было << 5
+const STAT_RNR: u16 = 1 << 12; // было << 4
 
 // SCB Commands
 const CU_START: u16 = 0x10;
@@ -60,8 +59,8 @@ const PORT_SOFT_RESET: u32 = 0x0;
 struct TxDesc {
     status: u16,
     command: u16,
-    link: u32,          // physical address of next TCB
-    tbd_addr: u32,      // 0xFFFFFFFF = immediate data / simplified
+    link: u32,     // physical address of next TCB
+    tbd_addr: u32, // 0xFFFFFFFF = immediate data / simplified
     tcb_byte_count: u16,
     tx_threshold: u8,
     tbd_number: u8,
@@ -74,10 +73,10 @@ struct TxDesc {
 struct RxDesc {
     status: u16,
     command: u16,
-    link: u32,          // physical of next RFD
+    link: u32, // physical of next RFD
     reserved: u32,
-    count: u16,         // actual size in low 14 bits when complete
-    size: u16,          // buffer size
+    count: u16, // actual size in low 14 bits when complete
+    size: u16,  // buffer size
     data: [u8; RX_BUF_SIZE],
 }
 
@@ -110,8 +109,8 @@ pub static NET: Mutex<Option<I8255x>> = Mutex::new(None);
 /// Проверенный Configure-блок для 82557/82558/82559
 /// (на основе Linux eepro100 + Intel рекомендаций)
 const CONFIG_DATA: [u8; 22] = [
-    0x16, 0x08, 0x00, 0x00, 0x00, 0x00, 0x32, 0x00,
-    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf2, 0x49, // promisc
+    0x16, 0x08, 0x00, 0x00, 0x00, 0x00, 0x32, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf2,
+    0x49, // promisc
     0x00, 0x40, 0xf2, 0x80, 0x3f, 0x05,
 ];
 
@@ -146,8 +145,10 @@ impl I8255x {
         println!("i8255x: MMIO mapped at virt {:#x}", mmio);
 
         // ---- Выделяем страницы под кольца ----
-        let tx_pages = ((core::mem::size_of::<TxDesc>() * TX_RING_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
-        let rx_pages = ((core::mem::size_of::<RxDesc>() * RX_RING_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
+        let tx_pages =
+            ((core::mem::size_of::<TxDesc>() * TX_RING_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
+        let rx_pages =
+            ((core::mem::size_of::<RxDesc>() * RX_RING_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
 
         let mut tx_phys = 0u32;
         let mut rx_phys = 0u32;
@@ -160,14 +161,14 @@ impl I8255x {
             for _ in 1..tx_pages {
                 let _ = paging.alloc_frame();
             }
-            tx_phys = tx_frame << 12;          // ← важно!
+            tx_phys = tx_frame << 12; // ← важно!
 
             // RX ring
             let rx_frame = paging.alloc_frame();
             for _ in 1..rx_pages {
                 let _ = paging.alloc_frame();
             }
-            rx_phys = rx_frame << 12;          // ← важно!
+            rx_phys = rx_frame << 12; // ← важно!
         }
         // Благодаря identity-mapping низкой памяти можем использовать phys как virt
         use crate::memory::paging::KERNEL_OFFSET;
@@ -221,9 +222,7 @@ impl I8255x {
     }
 
     fn wait_scb(&self) {
-        unsafe {
-            while (read_volatile((self.mmio + SCB_CMD) as *const u16) & 0xFF) != 0 {}
-        }
+        unsafe { while (read_volatile((self.mmio + SCB_CMD) as *const u16) & 0xFF) != 0 {} }
     }
 
     fn write_pointer(&self, ptr: u32) {
@@ -336,7 +335,10 @@ impl I8255x {
             for i in 0..RX_RING_SIZE {
                 let desc = &mut *self.rx_ring.add(i);
                 write_volatile(&mut desc.status, 0);
-                write_volatile(&mut desc.command, if i + 1 == RX_RING_SIZE { CMD_EL } else { 0 });
+                write_volatile(
+                    &mut desc.command,
+                    if i + 1 == RX_RING_SIZE { CMD_EL } else { 0 },
+                );
 
                 let next = if i + 1 == RX_RING_SIZE {
                     self.rx_ring_phys
@@ -378,7 +380,6 @@ impl I8255x {
         self.write_pointer(self.tx_ring_phys);
         self.scb_cmd(CU_START);
         self.wait_scb();
-
 
         // Ждём завершения Configure
         for _ in 0..300_000 {
@@ -436,7 +437,7 @@ impl I8255x {
     pub fn dump_scb(&self) {
         unsafe {
             let status = read_volatile((self.mmio + SCB_STATUS) as *const u16);
-            let cmd    = read_volatile((self.mmio + SCB_CMD) as *const u16);
+            let cmd = read_volatile((self.mmio + SCB_CMD) as *const u16);
             let rus = (status >> 2) & 0xF;
             let rus_str = match rus {
                 0 => "Idle",
@@ -445,7 +446,10 @@ impl I8255x {
                 4 => "Ready",
                 _ => "???",
             };
-            println!("SCB status={:04x} cmd={:04x}  RUS={} ({})", status, cmd, rus, rus_str);
+            println!(
+                "SCB status={:04x} cmd={:04x}  RUS={} ({})",
+                status, cmd, rus, rus_str
+            );
         }
     }
 
@@ -454,11 +458,14 @@ impl I8255x {
             println!("--- RFDs ---");
             for i in 0..RX_RING_SIZE {
                 let desc = &*self.rx_ring.add(i);
-                let st  = read_volatile(&desc.status);
+                let st = read_volatile(&desc.status);
                 let cmd = read_volatile(&desc.command);
                 let cnt = read_volatile(&desc.count);
-                let sz  = read_volatile(&desc.size);
-                println!("RFD[{:02}] st={:04x} cmd={:04x} cnt={:04x} sz={:04x}", i, st, cmd, cnt, sz);
+                let sz = read_volatile(&desc.size);
+                println!(
+                    "RFD[{:02}] st={:04x} cmd={:04x} cnt={:04x} sz={:04x}",
+                    i, st, cmd, cnt, sz
+                );
             }
         }
     }
@@ -533,11 +540,7 @@ impl I8255x {
                     && (status & CMD_OK) != 0;
 
                 if valid {
-                    core::ptr::copy_nonoverlapping(
-                        desc.data.as_ptr(),
-                        buf.as_mut_ptr(),
-                        count,
-                    );
+                    core::ptr::copy_nonoverlapping(desc.data.as_ptr(), buf.as_mut_ptr(), count);
                 }
 
                 // === Важно: правильно вернуть RFD в кольцо ===

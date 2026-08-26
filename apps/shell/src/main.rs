@@ -11,7 +11,10 @@ use core::cmp::min;
 
 use libfelix::async_rt::yield_now;
 use libfelix::prelude::*;
-use libfelix::syscall::{self, close, execve, execve_wasm, kill, mkdir, open, pipe, read, rmdir, set_nonblock, unlink, wait, wait_options, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGINT, WNOHANG};
+use libfelix::syscall::{
+    self, close, execve, execve_wasm, kill, mkdir, open, pipe, read, rmdir, set_nonblock, unlink,
+    wait, wait_options, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGINT, WNOHANG,
+};
 
 // ---------------------------------------------------------------------------
 // Shell state
@@ -20,8 +23,7 @@ use libfelix::syscall::{self, close, execve, execve_wasm, kill, mkdir, open, pip
 struct Shell {
     cwd: String,
     path: String,
-    command_cache: Option<Vec<String>>,   // кэш всех команд
-
+    command_cache: Option<Vec<String>>, // кэш всех команд
 }
 
 fn list_dir(path: &str) -> Vec<String> {
@@ -119,8 +121,6 @@ impl Shell {
             command_cache: None,
         }
     }
-
-
 
     fn get_commands(&mut self) -> &Vec<String> {
         if self.command_cache.is_none() {
@@ -582,7 +582,7 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
         "path" => {
             if let Some(new_path) = cmd.args.get(1) {
                 shell.path = new_path.clone();
-                shell.invalidate_cache();   // <-- добавить
+                shell.invalidate_cache(); // <-- добавить
                 out.push(&format!("PATH={}", shell.path));
             } else {
                 out.push(&shell.path);
@@ -648,15 +648,7 @@ fn lspci_to(file_fd: i32, out: &mut TermBuffer) {
 
         let line = format!(
             "{:02x}:{:02x}.{}  [{:04x}:{:04x}]  {} | {} | {} ",
-            d.bus,
-            d.device,
-            d.function,
-            d.vendor_id,
-            d.device_id,
-            vendor,
-            device,
-            class,
-
+            d.bus, d.device, d.function, d.vendor_id, d.device_id, vendor, device, class,
         );
         if file_fd >= 0 {
             let mut b = line.clone();
@@ -666,8 +658,6 @@ fn lspci_to(file_fd: i32, out: &mut TermBuffer) {
             }
         } else {
             out.push(&line);
-
-
         }
     }
     out.push("==============================");
@@ -820,27 +810,23 @@ fn spawn(
     }
     let ptrs: Vec<*const u8> = c_strings.iter().map(|s| s.as_ptr()).collect();
     unsafe {
-       let pid = match &data[0..4] {
-           &[0x0, 0x61, 0x73, 0x6d] => {
-                execve_wasm(
-                    data.as_ptr(),
-                    data.len(),
-                    stdin_fd,
-                    stdout_fd,
-                    stderr_fd,
-                    &ptrs,
-                )
-            },
-           b"\x7fELF" => {
-                execve(
-                    data.as_ptr(),
-                    data.len(),
-                    stdin_fd,
-                    stdout_fd,
-                    stderr_fd,
-                    &ptrs,
-                )
-            }
+        let pid = match &data[0..4] {
+            &[0x0, 0x61, 0x73, 0x6d] => execve_wasm(
+                data.as_ptr(),
+                data.len(),
+                stdin_fd,
+                stdout_fd,
+                stderr_fd,
+                &ptrs,
+            ),
+            b"\x7fELF" => execve(
+                data.as_ptr(),
+                data.len(),
+                stdin_fd,
+                stdout_fd,
+                stderr_fd,
+                &ptrs,
+            ),
             _ => {
                 println!("Not executable file");
                 usize::MAX
@@ -855,7 +841,12 @@ fn spawn(
 }
 
 /// Non-blocking line-oriented pipe drain. Returns true if any data was consumed.
-fn drain_pipe_once(fd: u32, out: &mut TermBuffer, partial: &mut String, live_idx: &mut Option<usize>) -> bool {
+fn drain_pipe_once(
+    fd: u32,
+    out: &mut TermBuffer,
+    partial: &mut String,
+    live_idx: &mut Option<usize>,
+) -> bool {
     let mut buf = [0u8; 512];
     let n = unsafe { read(fd, buf.as_mut_ptr(), buf.len()) };
     if n == 0 || n == usize::MAX {
@@ -1099,12 +1090,7 @@ fn run_external(
     }
 }
 
-fn run_pipeline(
-    shell: &Shell,
-    stages: &[String],
-    out: &mut TermBuffer,
-    ui: &mut UiBridge<'_>,
-) {
+fn run_pipeline(shell: &Shell, stages: &[String], out: &mut TermBuffer, ui: &mut UiBridge<'_>) {
     let n = stages.len();
     if n == 0 {
         return;
@@ -1127,16 +1113,8 @@ fn run_pipeline(
         if cmd.args.is_empty() {
             continue;
         }
-        let in_fd: i32 = if i == 0 {
-            -1
-        } else {
-            pipes[i - 1].0 as i32
-        };
-        let out_fd: i32 = if i + 1 == n {
-            -1
-        } else {
-            pipes[i].1 as i32
-        };
+        let in_fd: i32 = if i == 0 { -1 } else { pipes[i - 1].0 as i32 };
+        let out_fd: i32 = if i + 1 == n { -1 } else { pipes[i].1 as i32 };
         let is_last = i + 1 == n;
 
         // Only the last stage gets live UI supervision + capture.
@@ -1166,12 +1144,7 @@ fn run_pipeline(
     }
 }
 
-fn interpret(
-    shell: &mut Shell,
-    line: &str,
-    out: &mut TermBuffer,
-    ui: &mut UiBridge<'_>,
-) {
+fn interpret(shell: &mut Shell, line: &str, out: &mut TermBuffer, ui: &mut UiBridge<'_>) {
     let stages = split_pipeline(line.trim());
     if stages.is_empty() {
         return;
@@ -1231,8 +1204,8 @@ fn refresh_terminal(
 }
 
 const BUILTINS: &[&str] = &[
-    "help", "exit", "quit", "pwd", "cd", "ls", "cat", "mkdir",
-    "rmdir", "rm", "path", "ps", "clear", "echo", "head", "lspci",
+    "help", "exit", "quit", "pwd", "cd", "ls", "cat", "mkdir", "rmdir", "rm", "path", "ps",
+    "clear", "echo", "head", "lspci",
 ];
 
 #[no_mangle]

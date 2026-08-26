@@ -1,6 +1,6 @@
 // Printer → stdout (fd 1)
-use core::fmt;
 use crate::syscall::write;
+use core::fmt;
 
 pub const fn printer_new() -> Printer {
     Printer {}

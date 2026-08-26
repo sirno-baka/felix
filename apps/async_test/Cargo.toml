@@ -3,5 +3,8 @@ name = "async_test"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "async_test"
+
 [dependencies]
 libfelix = { path = "../../lib" }

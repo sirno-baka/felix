@@ -1,6 +1,6 @@
+use bitflags::bitflags;
 use core::arch::asm;
 use core::mem::size_of;
-use bitflags::bitflags;
 
 use crate::tss::TaskStateSegment;
 
@@ -78,10 +78,18 @@ impl GlobalDescriptorTable {
             let zero = GdtEntry { entry: 0 };
 
             // Стандартные flat 4 GiB дескрипторы (проверены тысячами осей)
-            let kcode  = GdtEntry { entry: 0x00CF9A000000FFFF }; // kernel code   (0x08)
-            let kdata  = GdtEntry { entry: 0x00CF92000000FFFF }; // kernel data   (0x10)
-            let ucode  = GdtEntry { entry: 0x00CFFA000000FFFF }; // user code     (0x18 → 0x1B)
-            let udata  = GdtEntry { entry: 0x00CFF2000000FFFF }; // user data     (0x20 → 0x23)
+            let kcode = GdtEntry {
+                entry: 0x00CF9A000000FFFF,
+            }; // kernel code   (0x08)
+            let kdata = GdtEntry {
+                entry: 0x00CF92000000FFFF,
+            }; // kernel data   (0x10)
+            let ucode = GdtEntry {
+                entry: 0x00CFFA000000FFFF,
+            }; // user code     (0x18 → 0x1B)
+            let udata = GdtEntry {
+                entry: 0x00CFF2000000FFFF,
+            }; // user data     (0x20 → 0x23)
             let tss_desc = make_tss_descriptor();
 
             GDT.entries = [zero, kcode, kdata, ucode, udata, tss_desc, zero];

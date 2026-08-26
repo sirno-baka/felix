@@ -1,10 +1,8 @@
 #![no_std]
-
 use core::arch::asm;
 use core::cell::UnsafeCell;
-use core::ptr::read;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use lock_api::{RawMutex, Mutex as ApiMutex};
+use lock_api::{Mutex as ApiMutex, RawMutex};
 use spinning_top::RawSpinlock;
 
 /// Отключает прерывания на x86 (32-bit) и восстанавливает предыдущее состояние
@@ -113,7 +111,7 @@ pub type SpinMutexGuard<'a, T> = lock_api::MutexGuard<'a, RawSpinMutex<RawSpinlo
 pub struct InterruptLazy<T> {
     init: UnsafeCell<Option<fn() -> T>>,
     data: UnsafeCell<Option<T>>,
-    lock: SpinMutex<()>,          // используем новый алиас
+    lock: SpinMutex<()>, // используем новый алиас
 }
 
 unsafe impl<T: Send + Sync> Sync for InterruptLazy<T> {}

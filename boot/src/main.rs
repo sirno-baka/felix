@@ -14,11 +14,11 @@ const BOOTLOADER_SIZE: u16 = 64;
 
 global_asm!(include_str!("boot.asm"));
 
-extern "C" {
+unsafe extern "C" {
     static _bootloader_start: u16;
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn main() -> ! {
     clear();
     print(b"[!] Felix\r\n\0");
@@ -44,13 +44,13 @@ fn print(msg: &[u8]) {
             "2:",
             "lodsb",
             "or al, al",
-            "jz 1f",
+            "jz 3f",
             "mov ah, 0x0e",
             "mov bh, 0",
             "out 0xe9, al",
             "int 0x10",
             "jmp 2b",
-            "1:",
+            "3:",
             in(reg) msg.as_ptr()
         );
     }
@@ -62,7 +62,7 @@ fn jump(addr: *const u16) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn fail() -> ! {
     print(b"Fail\r\n\0");
     loop {}

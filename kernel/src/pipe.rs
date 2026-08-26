@@ -3,14 +3,13 @@
 //! Each pipe has a fixed ring buffer, reader/writer refcounts, and blocking
 //! read/write via sti/hlt (same pattern as stdin).
 
-use core::arch::asm;
 use crate::println;
+use core::arch::asm;
 
 pub const PIPE_BUF_SIZE: usize = 4096;
 const MAX_PIPES: usize = 16;
 
-#[derive(Copy)]
-#[derive(Clone)]
+#[derive(Copy, Clone)]
 pub struct Pipe {
     buf: [u8; PIPE_BUF_SIZE],
     head: usize, // next write index
@@ -135,7 +134,11 @@ pub fn pipe_try_read(id: usize, buf: *mut u8, count: usize) -> usize {
             return 0;
         }
         if PIPES[id].len == 0 {
-            return if PIPES[id].writers == 0 { 0 } else { usize::MAX };
+            return if PIPES[id].writers == 0 {
+                0
+            } else {
+                usize::MAX
+            };
         }
         let mut read = 0usize;
         while read < count && PIPES[id].len > 0 {

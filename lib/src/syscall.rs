@@ -1,39 +1,39 @@
 use core::arch::asm;
 
 // Должны совпадать с kernel/src/syscalls/mod.rs
-pub const SYS_EXIT:   u32 = 1;
-pub const SYS_READ:   u32 = 3;
-pub const SYS_WRITE:  u32 = 4;
-pub const SYS_OPEN:   u32 = 5;
-pub const SYS_CLOSE:  u32 = 6;
+pub const SYS_EXIT: u32 = 1;
+pub const SYS_READ: u32 = 3;
+pub const SYS_WRITE: u32 = 4;
+pub const SYS_OPEN: u32 = 5;
+pub const SYS_CLOSE: u32 = 6;
 
-pub const SYS_MKDIR:  u32 = 7;
-pub const SYS_RMDIR:  u32 = 8;
+pub const SYS_MKDIR: u32 = 7;
+pub const SYS_RMDIR: u32 = 8;
 pub const SYS_UNLINK: u32 = 10;
 pub const SYS_EXECVE: u32 = 11;
 pub const SYS_EXECVE_WASM: u32 = 1000;
 
-pub const SYS_LSEEK:  u32 = 19;
-pub const SYS_BRK:    u32 = 45;
-pub const SYS_MMAP:   u32 = 90;
+pub const SYS_LSEEK: u32 = 19;
+pub const SYS_BRK: u32 = 45;
+pub const SYS_MMAP: u32 = 90;
 pub const SYS_MUNMAP: u32 = 91;
-pub const SYS_MMAP2:  u32 = 192;
-pub const SYS_IOCTL:  u32 = 54;
+pub const SYS_MMAP2: u32 = 192;
+pub const SYS_IOCTL: u32 = 54;
 
-pub const PROT_READ:  u32 = 1;
+pub const PROT_READ: u32 = 1;
 pub const PROT_WRITE: u32 = 2;
-pub const PROT_EXEC:  u32 = 4;
-pub const MAP_SHARED:    u32 = 0x01;
-pub const MAP_PRIVATE:   u32 = 0x02;
-pub const MAP_FIXED:     u32 = 0x10;
+pub const PROT_EXEC: u32 = 4;
+pub const MAP_SHARED: u32 = 0x01;
+pub const MAP_PRIVATE: u32 = 0x02;
+pub const MAP_FIXED: u32 = 0x10;
 pub const MAP_ANONYMOUS: u32 = 0x20;
-pub const SYS_KILL:   u32 = 37;
+pub const SYS_KILL: u32 = 37;
 pub const SYS_SIGACTION: u32 = 67;
-pub const SYS_WAIT:   u32 = 114;
-pub const SYS_PIPE:   u32 = 42;
-pub const SYS_DUP2:   u32 = 63;
-pub const SYS_FCNTL:  u32 = 55;
-pub const SYS_POLL:   u32 = 168;
+pub const SYS_WAIT: u32 = 114;
+pub const SYS_PIPE: u32 = 42;
+pub const SYS_DUP2: u32 = 63;
+pub const SYS_FCNTL: u32 = 55;
+pub const SYS_POLL: u32 = 168;
 pub const SYS_STAT64: u32 = 195;
 pub const SYS_FSTAT64: u32 = 197;
 pub const SYS_GETDENTS64: u32 = 220;
@@ -46,9 +46,9 @@ pub const SEEK_END: u32 = 2;
 // open flags
 pub const O_RDONLY: u32 = 0;
 pub const O_WRONLY: u32 = 1;
-pub const O_RDWR:   u32 = 2;
-pub const O_CREAT:  u32 = 0x40;
-pub const O_TRUNC:  u32 = 0x200;
+pub const O_RDWR: u32 = 2;
+pub const O_CREAT: u32 = 0x40;
+pub const O_TRUNC: u32 = 0x200;
 pub const O_APPEND: u32 = 0x400;
 pub const O_NONBLOCK: u32 = 0x800;
 
@@ -57,8 +57,8 @@ pub const F_SETFL: u32 = 4;
 
 pub const WNOHANG: u32 = 1;
 
-pub const SIGHUP:  u32 = 1;
-pub const SIGINT:  u32 = 2;
+pub const SIGHUP: u32 = 1;
+pub const SIGINT: u32 = 2;
 pub const SIGQUIT: u32 = 3;
 pub const SIGKILL: u32 = 9;
 pub const SIGTERM: u32 = 15;
@@ -88,10 +88,10 @@ pub struct PollFd {
 }
 
 pub const SYS_MALLOC: u32 = 200;
-pub const SYS_FREE:   u32 = 201;
+pub const SYS_FREE: u32 = 201;
 pub const SYS_REALLOC: u32 = 202;
 
-pub const SYS_LS:     u32 = 302;
+pub const SYS_LS: u32 = 302;
 
 // ====================== WRAPPERS ======================
 
@@ -372,24 +372,23 @@ pub unsafe fn ls(path: *const u8, buf: *mut u8, buf_size: usize) -> usize {
     ret
 }
 
-
-pub const SYS_SOCKET:      u32 = 359;
-pub const SYS_BIND:        u32 = 361;
-pub const SYS_CONNECT:     u32 = 362;
-pub const SYS_LISTEN:      u32 = 363;
-pub const SYS_ACCEPT4:     u32 = 364;
-pub const SYS_SENDTO:      u32 = 369;
-pub const SYS_RECVFROM:    u32 = 371;
-pub const SYS_SHUTDOWN:    u32 = 373;
+pub const SYS_SOCKET: u32 = 359;
+pub const SYS_BIND: u32 = 361;
+pub const SYS_CONNECT: u32 = 362;
+pub const SYS_LISTEN: u32 = 363;
+pub const SYS_ACCEPT4: u32 = 364;
+pub const SYS_SENDTO: u32 = 369;
+pub const SYS_RECVFROM: u32 = 371;
+pub const SYS_SHUTDOWN: u32 = 373;
 
 // Window manager — must match kernel/src/syscalls/mod.rs
-pub const SYS_WM_CREATE:  u32 = 400;
+pub const SYS_WM_CREATE: u32 = 400;
 pub const SYS_WM_DESTROY: u32 = 401;
-pub const SYS_WM_MOVE:    u32 = 402;
-pub const SYS_WM_INFO:    u32 = 403;
-pub const SYS_WM_FLIP:    u32 = 404;
-pub const SYS_WM_FOCUS:   u32 = 405;
-pub const SYS_WM_SCREEN:  u32 = 406;
+pub const SYS_WM_MOVE: u32 = 402;
+pub const SYS_WM_INFO: u32 = 403;
+pub const SYS_WM_FLIP: u32 = 404;
+pub const SYS_WM_FOCUS: u32 = 405;
+pub const SYS_WM_SCREEN: u32 = 406;
 pub const SYS_MOUSE_STATE: u32 = 407;
 pub const SYS_WM_POLL: u32 = 408;
 
@@ -590,11 +589,10 @@ pub unsafe fn wm_poll(id: u32, out: *mut WmEvent, max: usize) -> usize {
     ret
 }
 
-
-pub const AF_INET:     u32 = 2;
+pub const AF_INET: u32 = 2;
 pub const SOCK_STREAM: u32 = 1;
-pub const SOCK_DGRAM:  u32 = 2;
-pub const IPPROTO_IP:  u32 = 0;
+pub const SOCK_DGRAM: u32 = 2;
+pub const IPPROTO_IP: u32 = 0;
 pub const IPPROTO_TCP: u32 = 6;
 pub const IPPROTO_UDP: u32 = 17;
 pub unsafe fn socket(domain: u32, ty: u32, protocol: u32) -> usize {

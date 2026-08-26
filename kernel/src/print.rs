@@ -3,10 +3,10 @@
 // klog is a lock-free (cli-only) ring of recent lines so fb_panic / exceptions
 // can dump history even when PRINTER's Mutex is held by the faulting context.
 
+use crate::sync::mutex::Mutex;
 use core::arch::asm;
 use core::fmt;
 use core::fmt::Write;
-use crate::sync::mutex::Mutex;
 
 pub const LOG_LINES: usize = 50;
 pub const LOG_WIDTH: usize = 96;

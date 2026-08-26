@@ -4,5 +4,9 @@ version.workspace = true
 authors.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "felix-bootloader"
+
+test = false
 [dependencies]
 bitflags = "2.11.1"

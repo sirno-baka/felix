@@ -25,7 +25,7 @@ pub struct Socket {
     pub accept_queue: VecDeque<usize>,
     pub rx_buf: Vec<u8>,
     pub tx_buf: Vec<u8>,
-    pub owner: usize,           // task slot
+    pub owner: usize, // task slot
 }
 
 impl Socket {
@@ -56,7 +56,7 @@ impl SocketTable {
     pub const fn new() -> Self {
         Self {
             sockets: Vec::new(),
-            next_id: 1,     // 0 оставляем "невалидным"
+            next_id: 1, // 0 оставляем "невалидным"
         }
     }
 
@@ -70,7 +70,8 @@ impl SocketTable {
             return Some(id);
         }
 
-        self.sockets.push(Some(Socket::new(id, domain, ty, protocol, owner)));
+        self.sockets
+            .push(Some(Socket::new(id, domain, ty, protocol, owner)));
         Some(id)
     }
 
@@ -103,21 +104,23 @@ impl SocketTable {
     }
 
     pub fn get(&self, id: usize) -> Option<&Socket> {
-        self.sockets.iter().find_map(|s| {
-            s.as_ref().filter(|sock| sock.id == id)
-        })
+        self.sockets
+            .iter()
+            .find_map(|s| s.as_ref().filter(|sock| sock.id == id))
     }
 
     pub fn get_mut(&mut self, id: usize) -> Option<&mut Socket> {
-        self.sockets.iter_mut().find_map(|s| {
-            s.as_mut().filter(|sock| sock.id == id)
-        })
+        self.sockets
+            .iter_mut()
+            .find_map(|s| s.as_mut().filter(|sock| sock.id == id))
     }
 
     pub fn free(&mut self, id: usize) {
-        if let Some(slot) = self.sockets.iter_mut().find(|s| {
-            s.as_ref().map(|sock| sock.id) == Some(id)
-        }) {
+        if let Some(slot) = self
+            .sockets
+            .iter_mut()
+            .find(|s| s.as_ref().map(|sock| sock.id) == Some(id))
+        {
             *slot = None;
         }
     }

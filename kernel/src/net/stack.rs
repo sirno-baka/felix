@@ -6,10 +6,10 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 
 use crate::drivers::net::i8255x::{I8255x, NET};
-use crate::sync::mutex::Mutex;
-use crate::net::types::*;
 use crate::net::socket::{Socket, SocketState, SocketTable};
+use crate::net::types::*;
 use crate::println;
+use crate::sync::mutex::Mutex;
 
 pub struct NetStack {
     pub iface: Interface,
@@ -54,7 +54,12 @@ impl NetStack {
     }
 
     /// Создать smoltcp-сокет и вернуть (наш id, smoltcp handle)
-    pub fn create_socket(&mut self, domain: u16, ty: u16, protocol: u8) -> Option<(usize, SocketHandle)> {
+    pub fn create_socket(
+        &mut self,
+        domain: u16,
+        ty: u16,
+        protocol: u8,
+    ) -> Option<(usize, SocketHandle)> {
         if domain != AF_INET {
             return None;
         }
@@ -69,14 +74,10 @@ impl NetStack {
             }
             SOCK_DGRAM => {
                 // UDP
-                let rx = udp::PacketBuffer::new(
-                    vec![udp::PacketMetadata::EMPTY; 16],
-                    vec![0u8; 8192],
-                );
-                let tx = udp::PacketBuffer::new(
-                    vec![udp::PacketMetadata::EMPTY; 16],
-                    vec![0u8; 8192],
-                );
+                let rx =
+                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 8192]);
+                let tx =
+                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 8192]);
                 let socket = udp::Socket::new(rx, tx);
                 self.sockets.add(socket)
             }

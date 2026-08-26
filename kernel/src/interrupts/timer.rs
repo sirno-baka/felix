@@ -3,9 +3,10 @@
 
 use crate::drivers::pic::PICS;
 use crate::multitasking::task::{CPUState, TASK_MANAGER};
-use crate::time::{jiffies, SYSTEM_FRACTION};
-use core::arch::asm;
 use crate::println;
+use crate::time::{SYSTEM_FRACTION, jiffies};
+use core::arch::asm;
+use core::arch::naked_asm;
 
 pub const TIMER_INT: u8 = 32;
 
@@ -16,55 +17,48 @@ const NET_POLL_EVERY: usize = 10;
 static mut NET_POLL_COUNTER: usize = 0;
 
 /// Naked interrupt handler for timer (IRQ0)
-#[naked]
+#[unsafe(naked)]
 pub extern "C" fn timer() {
     unsafe {
-        asm!(
-        "cli",
-        "call jiffies_inc",
-
-        "push ebp",
-        "push edi",
-        "push esi",
-        "push edx",
-        "push ecx",
-        "push ebx",
-        "push eax",
-
-        "push esp",
-        "call timer_handler",
-        "add esp, 4",
-
-        "mov esp, eax",
-
-        "pop eax",
-        "pop ebx",
-        "pop ecx",
-        "pop edx",
-        "pop esi",
-        "pop edi",
-        "pop ebp",
-
-        // На стеке: EIP, CS, EFLAGS, [ESP, SS]
-        // ВАЖНО: не трогать EAX — там return value syscall
-        // (если IRQ0 пришёл между sti и iretd в syscall path).
-        // Раньше mov ax, 0x23 превращал ret=0 в ret=35.
-        "mov cx, [esp + 4]",   // CS
-        "and cx, 3",
-        "cmp cx, 3",
-        "jne 2f",
-        "mov cx, 0x23",
-        "mov ds, cx",
-        "mov es, cx",
-        "2:",
-
-        "iretd",
-        options(noreturn)
+        naked_asm!(
+            "cli",
+            "call jiffies_inc",
+            "push ebp",
+            "push edi",
+            "push esi",
+            "push edx",
+            "push ecx",
+            "push ebx",
+            "push eax",
+            "push esp",
+            "call timer_handler",
+            "add esp, 4",
+            "mov esp, eax",
+            "pop eax",
+            "pop ebx",
+            "pop ecx",
+            "pop edx",
+            "pop esi",
+            "pop edi",
+            "pop ebp",
+            // На стеке: EIP, CS, EFLAGS, [ESP, SS]
+            // ВАЖНО: не трогать EAX — там return value syscall
+            // (если IRQ0 пришёл между sti и iretd в syscall path).
+            // Раньше mov ax, 0x23 превращал ret=0 в ret=35.
+            "mov cx, [esp + 4]", // CS
+            "and cx, 3",
+            "cmp cx, 3",
+            "jne 2f",
+            "mov cx, 0x23",
+            "mov ds, cx",
+            "mov es, cx",
+            "2:",
+            "iretd"
         );
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn timer_handler(esp: u32) -> u32 {
     unsafe {
         // === 1. Сетевой полл (неблокирующий) ===

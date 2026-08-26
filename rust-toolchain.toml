@@ -1,3 +1,3 @@
 [toolchain]
-channel = "nightly"
+channel = "nightly" # или просто "nightly" для 1.85+
 components = ["rustfmt", "rust-src"]

@@ -52,17 +52,17 @@ endif
 
 .PHONY: build
 build:
-	@cargo clean -p felix-kernel -p hello -p shell -p async_test -p libfelix -p felix-boot
+	@cargo clean -p felix-kernel -p hello -p shell -p async_test -p libfelix -p felix-boot  -Z json-target-spec
 	@echo "Building Felix..."
-	@cargo build --target=x86_16-felix.json --package=felix-boot --release
-	@cargo build --target=x86_16-felix.json --package=felix-bootloader
-	@cargo build --target=x86_16-felix.json --package=felix-bootloader --release
-	@cargo build --target=x86_32-felix.json --package=felix-kernel
-	@cargo build --target=x86_32-felix.json --package=felix-kernel --release
-	@cargo build --target=x86_32-felix.json --package=hello --release
-	@cargo build --target=x86_32-felix.json --package=shell --release
-	@cargo build --target=x86_32-felix.json --package=async_test --release
-	@cargo build --target=wasm32-wasi --package=wasm-hello --release
+	@cargo build --target=x86_16-felix.json --package=felix-boot --release -Z json-target-spec
+	@cargo build --target=x86_16-felix.json --package=felix-bootloader -Z json-target-spec
+	@cargo build --target=x86_16-felix.json --package=felix-bootloader --release -Z json-target-spec
+	@cargo build --target=x86_32-felix.json --package=felix-kernel -Z json-target-spec
+	@cargo build --target=x86_32-felix.json --package=felix-kernel --release -Z json-target-spec
+	@cargo build --target=x86_32-felix.json --package=hello --release -Z json-target-spec
+	@cargo build --target=x86_32-felix.json --package=shell --release -Z json-target-spec
+	@cargo build --target=x86_32-felix.json --package=async_test --release -Z json-target-spec
+	@cargo build --target=wasm32-wasip2 --package=wasm-hello --release
 
 
 .PHONY: objcopy
@@ -76,7 +76,7 @@ objcopy:
 	@cp target/x86_32-felix/release/hello build/hello
 	@cp target/x86_32-felix/release/shell build/shell
 	@cp target/x86_32-felix/release/async_test build/async_test
-	@cp target/wasm32-wasi/release/wasm-hello.wasm build/wasm
+	@cp target/wasm32-wasip1/release/wasm-hello.wasm build/wasm
 
 .PHONY: floppy-image
 floppy-image:

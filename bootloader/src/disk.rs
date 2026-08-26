@@ -5,10 +5,7 @@
 use core::arch::asm;
 use core::mem;
 
-pub static mut DISK: Disk = Disk {
-    lba: 0,
-    buffer: 0,
-};
+pub static mut DISK: Disk = Disk { lba: 0, buffer: 0 };
 
 #[repr(C, packed)]
 struct DiskAddressPacket {

@@ -1,10 +1,10 @@
 // kernel/src/memory/allocator.rs
+use crate::println;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{self, null_mut};
-use core::sync::atomic::{AtomicUsize, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use interrupt_sync::SpinMutex;
 use interrupt_sync::SpinMutexGuard;
-use crate::println;
 
 /// Заголовок свободного блока
 #[repr(C)]
@@ -30,7 +30,7 @@ impl Allocator {
     // Frame allocator (user PTs, stacks, surfaces) starts at FRAME_ALLOC_START
     // = 0x02800000 so it never collides with this region.
     const HEAP_START: usize = 0xC180_0000;
-    const HEAP_END:   usize = 0xC280_0000;
+    const HEAP_END: usize = 0xC280_0000;
 
     const HEADER_SIZE: usize = core::mem::size_of::<FreeBlock>();
     const HEADER_ALIGN: usize = core::mem::align_of::<FreeBlock>();
@@ -68,7 +68,7 @@ impl Allocator {
                 current_head,
                 block,
                 Ordering::Release,
-                Ordering::Relaxed
+                Ordering::Relaxed,
             ) {
                 Ok(_) => break,
                 Err(head) => current_head = head,

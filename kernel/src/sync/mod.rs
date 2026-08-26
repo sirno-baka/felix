@@ -1,8 +1,7 @@
-use core::cell::UnsafeCell;
 use crate::spin::Mutex;
+use core::cell::UnsafeCell;
 
 pub mod mutex;
-
 
 // ====================== InterruptLazy (lazy_static) ======================
 pub struct MutexLazy<T> {

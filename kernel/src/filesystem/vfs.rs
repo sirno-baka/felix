@@ -1,17 +1,17 @@
 // kernel/src/filesystem/vfs.rs
+use crate::println;
+use crate::sync::MutexLazy;
+use crate::sync::mutex::Mutex;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use crate::println;
-use crate::sync::mutex::Mutex;
-use crate::sync::MutexLazy;
 
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     pub inode: u32,
     pub name: String,
-    pub file_type: u8,     // 1 = regular file, 2 = directory, etc.
-    pub size: u32,         // размер файла (0 для директорий)
+    pub file_type: u8, // 1 = regular file, 2 = directory, etc.
+    pub size: u32,     // размер файла (0 для директорий)
 }
 
 pub trait Filesystem: Send + Sync {
@@ -106,7 +106,9 @@ impl Vfs {
 
         // Специальная обработка для корневой директории
         if path == "/" {
-            let mut entries = inner.root_fs.as_ref()
+            let mut entries = inner
+                .root_fs
+                .as_ref()
                 .and_then(|fs| fs.list_directory_entries("/"))
                 .unwrap_or_default();
 
@@ -137,9 +139,8 @@ impl Vfs {
         let (fs, rel_path, fs_id) = resolve(&inner, path);
 
         // Кодируем fs_id в старшие 8 битах, локальный inode в младшие 24 бита
-        fs.resolve_path(&rel_path).map(|local_inode| {
-            ((fs_id as u32) << 24) | (local_inode & 0x00FFFFFF)
-        })
+        fs.resolve_path(&rel_path)
+            .map(|local_inode| ((fs_id as u32) << 24) | (local_inode & 0x00FFFFFF))
     }
 
     pub fn read_at(&self, global_inode: u32, offset: u64, buf: &mut [u8]) -> usize {

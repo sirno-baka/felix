@@ -4,18 +4,18 @@
 //! `wm_flip` copies pixels into the window surface and composes to the LFB.
 //! Title bars are drawn only by the WM. No resize in v1. Max 8 windows.
 
+use crate::drivers::framebuffer::{FRAMEBUFFER, Framebuffer};
+use crate::sync::mutex::Mutex;
+use crate::{debugln, println};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, MonoTextStyle},
+    mono_font::{MonoTextStyle, ascii::FONT_6X10},
     pixelcolor::Rgb888,
     prelude::*,
     text::{Baseline, Text},
 };
-use crate::drivers::framebuffer::{Framebuffer, FRAMEBUFFER};
-use crate::sync::mutex::Mutex;
-use crate::{debugln, println};
 
 pub const MAX_WINDOWS: usize = 8;
 pub const TITLE_H: u32 = 18;
@@ -130,12 +130,22 @@ impl Surface {
         let size = (pitch as usize).checked_mul(height as usize)?;
         // Cap single surface (~8 MiB) — kernel heap is only 16 MiB total.
         if size > 8 * 1024 * 1024 {
-            crate::debugln!("[wm] surface too large {}x{} = {} bytes (>8MiB)", width, height, size);
+            crate::debugln!(
+                "[wm] surface too large {}x{} = {} bytes (>8MiB)",
+                width,
+                height,
+                size
+            );
             return None;
         }
         let mut pixels = alloc::vec::Vec::new();
         if pixels.try_reserve_exact(size).is_err() {
-            crate::debugln!("[wm] surface OOM {}x{} = {} bytes (kernel heap)", width, height, size);
+            crate::debugln!(
+                "[wm] surface OOM {}x{} = {} bytes (kernel heap)",
+                width,
+                height,
+                size
+            );
             return None;
         }
         pixels.resize(size, 0);
@@ -416,11 +426,7 @@ impl Compositor {
         let win_w = w.w.min(sw - x);
         let win_h = w.h.min(sh - y);
 
-        let title_color = if w.focused {
-            0x003A_7CA5
-        } else {
-            0x0040_4850
-        };
+        let title_color = if w.focused { 0x003A_7CA5 } else { 0x0040_4850 };
         let th = TITLE_H.min(win_h);
         fb.fill_rect(x, y, win_w, th, title_color);
         if th > 0 {
@@ -517,10 +523,7 @@ fn hit_close(w: &Window, x: i32, y: i32) -> bool {
 }
 
 fn hit_title(w: &Window, x: i32, y: i32) -> bool {
-    x >= w.x
-        && x < w.x + w.w as i32
-        && y >= w.y
-        && y < w.y + TITLE_H as i32
+    x >= w.x && x < w.x + w.w as i32 && y >= w.y && y < w.y + TITLE_H as i32
 }
 
 fn draw_close_button(fb: &mut Framebuffer, w: &Window) {
@@ -629,14 +632,7 @@ pub fn init() {
     debugln!("[wm] ready {}x{}", sw, sh);
 }
 
-pub fn create_window(
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-    title: &str,
-    owner_slot: i8,
-) -> Option<u32> {
+pub fn create_window(x: i32, y: i32, w: u32, h: u32, title: &str, owner_slot: i8) -> Option<u32> {
     if w < 40 || h < TITLE_H + 8 {
         return None;
     }

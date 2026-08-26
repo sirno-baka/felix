@@ -1,9 +1,9 @@
-use core::arch::asm;
-use core::ptr::write_bytes;
-use core::fmt;
-use interrupt_sync::SpinMutex;
 use crate::println;
 use crate::sync::mutex::Mutex;
+use core::arch::asm;
+use core::fmt;
+use core::ptr::write_bytes;
+use interrupt_sync::SpinMutex;
 
 const PAGE_SHIFT: usize = 12;
 pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
@@ -91,8 +91,8 @@ const VIRT_PT_BASE: u32 = 0xFFC00000;
 const VIRT_PD_BASE: u32 = 0xFFFFF000;
 
 pub const KERNEL_OFFSET: u32 = 0xC000_0000;
-pub const KERNEL_PHYS:   u32 = 0x0100_0000;
-pub const KERNEL_VIRT:   u32 = KERNEL_PHYS + KERNEL_OFFSET; // 0xC100_0000
+pub const KERNEL_PHYS: u32 = 0x0100_0000;
+pub const KERNEL_VIRT: u32 = KERNEL_PHYS + KERNEL_OFFSET; // 0xC100_0000
 
 /// Layout (phys) — fixed kernel regions; free RAM size is detected at runtime:
 ///   0x0000_0000..0x0100_0000  low mem / TEMP_PD / early
@@ -150,7 +150,9 @@ pub fn configure_from_ram(ram_bytes: u32) {
     if ram < 64 * 1024 * 1024 {
         ram = 64 * 1024 * 1024;
     }
-    let pages = (ram / 0x40_0000).min(LARGE_PAGE_COUNT_MAX).max(LARGE_PAGE_COUNT_DEFAULT);
+    let pages = (ram / 0x40_0000)
+        .min(LARGE_PAGE_COUNT_MAX)
+        .max(LARGE_PAGE_COUNT_DEFAULT);
     unsafe {
         DETECTED_RAM_BYTES = ram;
         LARGE_PAGE_COUNT_RT = pages;
@@ -167,15 +169,11 @@ pub fn detect_ram_cmos() -> u32 {
         crate::io::outb(0x70, reg);
         crate::io::inb(0x71)
     }
-    let above_16_kb = unsafe {
-        (cmos_read(0x30) as u32) | ((cmos_read(0x31) as u32) << 8)
-    };
+    let above_16_kb = unsafe { (cmos_read(0x30) as u32) | ((cmos_read(0x31) as u32) << 8) };
     if above_16_kb > 0 {
         return (16 * 1024 + above_16_kb) * 1024;
     }
-    let ext_kb = unsafe {
-        (cmos_read(0x17) as u32) | ((cmos_read(0x18) as u32) << 8)
-    };
+    let ext_kb = unsafe { (cmos_read(0x17) as u32) | ((cmos_read(0x18) as u32) << 8) };
     if ext_kb > 0 {
         return (1024 + ext_kb) * 1024;
     }
@@ -321,9 +319,7 @@ impl PageDirectory {
     /// Делегирует выделение в глобальный FrameAllocator (PAGING).
     /// Это главное исправление — теперь все таски получают уникальные физические фреймы.
     pub fn alloc_frame(&mut self) -> u32 {
-        unsafe {
-            PAGING.lock().alloc_frame()
-        }
+        unsafe { PAGING.lock().alloc_frame() }
     }
 
     pub fn ensure_page_table(
@@ -370,7 +366,13 @@ impl PageDirectory {
         self.entries[RECURSIVE_INDEX] = pd_phys | PDEFlags::PRESENT | PDEFlags::WRITABLE;
     }
 
-    pub fn map(&mut self, virtual_page: u32, physical_page: u32, flags: PTEFlags, alloc_frame: &mut dyn FnMut() -> u32) {
+    pub fn map(
+        &mut self,
+        virtual_page: u32,
+        physical_page: u32,
+        flags: PTEFlags,
+        alloc_frame: &mut dyn FnMut() -> u32,
+    ) {
         let pd_index = (virtual_page >> 10) as usize;
         let pt_index = (virtual_page & 0x3FF) as usize;
         let virt_addr = virtual_page << 12;
@@ -382,10 +384,8 @@ impl PageDirectory {
             unsafe {
                 write_bytes(phys_to_virt(pt_phys) as *mut u8, 0, PAGE_SIZE);
             }
-            self.entries[pd_index] = pt_phys
-                | PDEFlags::PRESENT
-                | PDEFlags::WRITABLE
-                | PDEFlags::USER;
+            self.entries[pd_index] =
+                pt_phys | PDEFlags::PRESENT | PDEFlags::WRITABLE | PDEFlags::USER;
         }
 
         let pt = Self::pt_from_pde(self.entries[pd_index]);
@@ -397,9 +397,7 @@ impl PageDirectory {
 
     pub fn map_large(&mut self, virtual_addr: u32, physical_addr: u32, flags: PDEFlags) {
         let pd_index = (virtual_addr >> 22) as usize;
-        let pde_value = (physical_addr & 0xFFC00000)
-            | flags.bits()
-            | PDEFlags::DIR_PAGE_SIZE;
+        let pde_value = (physical_addr & 0xFFC00000) | flags.bits() | PDEFlags::DIR_PAGE_SIZE;
         self.entries[pd_index] = pde_value;
         PageDirectory::flush_page(virtual_addr & 0xFFC00000);
     }
@@ -493,20 +491,19 @@ impl PageDirectory {
         let pt_idx = (vpage & 0x3FF) as usize;
 
         let pde = self.entries[pd_idx];
-        let need_table = pde == 0
-            || (pde & PDEFlags::PRESENT) == 0
-            || (pde & PDEFlags::DIR_PAGE_SIZE) != 0; // ← важно: large page = пересоздать
+        let need_table =
+            pde == 0 || (pde & PDEFlags::PRESENT) == 0 || (pde & PDEFlags::DIR_PAGE_SIZE) != 0; // ← важно: large page = пересоздать
 
         if need_table {
             let pt_frame = self.alloc_frame();
             let pt_phys = pt_frame << 12;
-            self.entries[pd_idx] = pt_phys
-                | PDEFlags::PRESENT
-                | PDEFlags::WRITABLE
-                | PDEFlags::USER;
+            self.entries[pd_idx] =
+                pt_phys | PDEFlags::PRESENT | PDEFlags::WRITABLE | PDEFlags::USER;
 
             let pt_virt = phys_to_virt(pt_phys) as *mut u8;
-            unsafe { core::ptr::write_bytes(pt_virt, 0, 4096); }
+            unsafe {
+                core::ptr::write_bytes(pt_virt, 0, 4096);
+            }
         } else {
             // PDE есть, но вдруг без USER — допиши
             self.entries[pd_idx] |= PDEFlags::USER;
@@ -519,7 +516,9 @@ impl PageDirectory {
         let existing = unsafe { (*pt)[pt_idx] };
         if existing & PTEFlags::PRESENT != 0 {
             // уже есть — убедись что USER стоит
-            unsafe { (*pt)[pt_idx] |= PTEFlags::USER; }
+            unsafe {
+                (*pt)[pt_idx] |= PTEFlags::USER;
+            }
             return;
         }
 
@@ -579,10 +578,7 @@ impl PageManager {
                 let pt_frame = self.alloc_frame(); // возвращает номер фрейма
                 let pt_phys = pt_frame << 12;
 
-                let pde_flags = PDEFlags::new()
-                    .present()
-                    .writable()
-                    .bits(); // kernel-only
+                let pde_flags = PDEFlags::new().present().writable().bits(); // kernel-only
 
                 self.dir.entries[pd_idx] = pt_phys | pde_flags;
                 PageDirectory::flush_page((pd_idx as u32) << 22);
@@ -610,15 +606,17 @@ impl PageManager {
         frame
     }
 
-    pub fn free_phys_frame(&mut self, _frame: u32) {
-    }
+    pub fn free_phys_frame(&mut self, _frame: u32) {}
 
     pub(crate) fn alloc_frame(&mut self) -> u32 {
         // Guard: never hand out frames past detected physical RAM.
         let max_page = detected_ram_bytes() >> 12;
         let frame = self.next_free_page;
         if frame >= max_page {
-            panic!("[pg] out of physical frames (next={}, max={})", frame, max_page);
+            panic!(
+                "[pg] out of physical frames (next={}, max={})",
+                frame, max_page
+            );
         }
         self.next_free_page += 1;
         frame
@@ -693,7 +691,6 @@ impl PageManager {
         }
     }
 
-
     pub fn alloc_user_memory(&mut self, size: u32) -> u32 {
         if size == 0 {
             return 0;
@@ -728,11 +725,7 @@ impl PageManager {
             let pt_phys = self.alloc_frame();
 
             let pde = &mut self.dir.entries[pd_idx];
-            let pde_flags = PDEFlags::new()
-                .present()
-                .writable()
-                .user()
-                .bits();
+            let pde_flags = PDEFlags::new().present().writable().user().bits();
 
             *pde = (pt_phys << 12) | pde_flags;
 
@@ -788,7 +781,12 @@ pub fn setup_kernel_page_dir(pd: &mut PageManager, end_page: u32) {
         pd.dir.map_large(
             base,
             base,
-            PDEFlags::new().present().writable().accessed().user().large_page(),
+            PDEFlags::new()
+                .present()
+                .writable()
+                .accessed()
+                .user()
+                .large_page(),
         );
     }
 
@@ -804,11 +802,7 @@ pub fn setup_kernel_page_dir(pd: &mut PageManager, end_page: u32) {
         if need_table {
             let pt_phys = pd.alloc_frame();
             let pde = &mut pd.dir.entries[pd_idx];
-            let pde_flags = PDEFlags::new()
-                .present()
-                .writable()
-                .user()
-                .bits();
+            let pde_flags = PDEFlags::new().present().writable().user().bits();
             *pde = (pt_phys << 12) | pde_flags;
             PageDirectory::flush_page((pd_idx as u32) << 22);
             let pt_ptr = PageDirectory::get_page_table_ptr(pd_idx);
@@ -819,7 +813,11 @@ pub fn setup_kernel_page_dir(pd: &mut PageManager, end_page: u32) {
 
         let pt_ptr = PageDirectory::get_page_table_ptr(pd_idx);
         unsafe {
-            (*pt_ptr)[pt_idx] = (vpage << 12) | PTEFlags::PRESENT | PTEFlags::WRITABLE | PTEFlags::USER | PTEFlags::ACCESSED;
+            (*pt_ptr)[pt_idx] = (vpage << 12)
+                | PTEFlags::PRESENT
+                | PTEFlags::WRITABLE
+                | PTEFlags::USER
+                | PTEFlags::ACCESSED;
         }
         PageDirectory::flush_page((vpage << 12) as u32);
     }
@@ -869,9 +867,7 @@ pub fn copy_kernel_mappings(task_dir: &mut PageDirectory, task_pd_phys: u32) {
         }
 
         // 3. Recursive mapping → this task's own PD
-        task_dir.entries[1023] = task_pd_phys
-            | PDEFlags::PRESENT
-            | PDEFlags::WRITABLE;
+        task_dir.entries[1023] = task_pd_phys | PDEFlags::PRESENT | PDEFlags::WRITABLE;
     }
 }
 

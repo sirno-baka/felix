@@ -280,7 +280,9 @@ impl Ext2Fs {
             }
         }
 
-        if written < size && inode.blocks[13] != 0 && self.read_block_low(inode.blocks[13], INDIRECT_BUF)
+        if written < size
+            && inode.blocks[13] != 0
+            && self.read_block_low(inode.blocks[13], INDIRECT_BUF)
         {
             let bs = self.block_size as usize;
             unsafe {
@@ -356,10 +358,7 @@ impl Ext2Fs {
             return None;
         }
 
-        println!(
-            "[ext2] ino={} sz={} b0={}",
-            ino, node.size, node.blocks[0]
-        );
+        println!("[ext2] ino={} sz={} b0={}", ino, node.size, node.blocks[0]);
         let written = self.copy_file_blocks(&node, dest);
         println!("[ext2] loaded {} / {}", written, node.size);
         Some(node.size)
