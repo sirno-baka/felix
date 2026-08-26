@@ -11,6 +11,8 @@ pub const SYS_MKDIR:  u32 = 7;
 pub const SYS_RMDIR:  u32 = 8;
 pub const SYS_UNLINK: u32 = 10;
 pub const SYS_EXECVE: u32 = 11;
+pub const SYS_EXECVE_WASM: u32 = 1000;
+
 pub const SYS_LSEEK:  u32 = 19;
 pub const SYS_BRK:    u32 = 45;
 pub const SYS_MMAP:   u32 = 90;
@@ -214,6 +216,33 @@ pub unsafe fn execve(
     asm!(
     "int 0x80",
     inlateout("eax") SYS_EXECVE => ret,
+    in("ebx") buf,
+    in("ecx") buf_size,
+    in("edx") &params as *const ExecParams,
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn execve_wasm(
+    buf: *const u8,
+    buf_size: usize,
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
+    argv: &[*const u8],
+) -> usize {
+    let params = ExecParams {
+        stdin: stdin_fd,
+        stdout: stdout_fd,
+        stderr: stderr_fd,
+        argc: argv.len() as u32,
+        argv: argv.as_ptr(),
+    };
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_EXECVE_WASM => ret,
     in("ebx") buf,
     in("ecx") buf_size,
     in("edx") &params as *const ExecParams,

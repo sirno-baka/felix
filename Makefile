@@ -62,6 +62,7 @@ build:
 	@cargo build --target=x86_32-felix.json --package=hello --release
 	@cargo build --target=x86_32-felix.json --package=shell --release
 	@cargo build --target=x86_32-felix.json --package=async_test --release
+	@cargo build --target=wasm32-wasi --package=wasm-hello --release
 
 
 .PHONY: objcopy
@@ -75,6 +76,7 @@ objcopy:
 	@cp target/x86_32-felix/release/hello build/hello
 	@cp target/x86_32-felix/release/shell build/shell
 	@cp target/x86_32-felix/release/async_test build/async_test
+	@cp target/wasm32-wasi/release/wasm-hello.wasm build/wasm
 
 .PHONY: floppy-image
 floppy-image:
@@ -143,6 +145,8 @@ image:
 	@$(E2CP) -p build/shell build/rootfs.img:/shell && echo "  → /shell"
 	@$(E2CP) -p build/hello build/rootfs.img:/hello && echo "  → /hello"
 	@$(E2CP) -p build/async_test build/rootfs.img:/test && echo "  → /test"
+	@$(E2CP) -p build/wasm build/rootfs.img:/wasm && echo "  → /wasm"
+	@$(E2CP) -p build/busybox.wasm build/rootfs.img:/busybox && echo "  → /wasm"
 
 	@echo "=== Embedding ext2 at LBA 2048 ==="
 	@dd if=build/rootfs.img of=build/disk.img bs=512 seek=2048 conv=notrunc status=none

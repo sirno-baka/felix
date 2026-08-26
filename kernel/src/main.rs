@@ -483,3 +483,38 @@ fn print_info() {
     p.set_colors(0xf, 0);
     p.reset_colors();
 }
+
+
+// --- Математические заглушки для wasmi (f32) ---
+
+#[no_mangle]
+pub extern "C" fn fmodf(x: f32, y: f32) -> f32 {
+    libm::fmodf(x, y)
+}
+
+#[no_mangle]
+pub extern "C" fn fminf(x: f32, y: f32) -> f32 {
+    libm::fminf(x, y)
+}
+
+#[no_mangle]
+pub extern "C" fn fmaxf(x: f32, y: f32) -> f32 {
+    libm::fmaxf(x, y)
+}
+
+// --- Математические заглушки для wasmi (f64) ---
+
+#[no_mangle]
+pub extern "C" fn fmod(x: f64, y: f64) -> f64 {
+    libm::fmod(x, y)
+}
+
+#[no_mangle]
+pub extern "C" fn fmin(x: f64, y: f64) -> f64 {
+    libm::fmin(x, y)
+}
+
+#[no_mangle]
+pub extern "C" fn fmax(x: f64, y: f64) -> f64 {
+    libm::fmax(x, y)
+}

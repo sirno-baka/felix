@@ -282,6 +282,13 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
             state.ecx as usize,
         ),
 
+        crate::syscalls::wasm::SYS_EXECVE_WASM => crate::syscalls::wasm::sys_execve_wasm(
+            current_slot,
+            state.ebx as *const u8,   // buf_ptr
+            state.ecx as usize,       // count
+            state.edx as *const ExecParamsUser, // параметры (argc/argv и stdin/stdout/stderr)
+        ),
+
         _ => 0,
     };
 
@@ -325,7 +332,7 @@ const S_IFCHR: u32 = 0o020000;
 
 /// Linux i386 `struct stat64` (glibc layout).
 #[repr(C, packed)]
-struct Stat64 {
+pub struct Stat64 {
     st_dev: u64,
     __pad0: [u8; 4],
     __st_ino: u32,
@@ -395,7 +402,7 @@ fn fill_stat64(st: &mut Stat64, inode: u32, mode: u32, size: u64) {
     };
 }
 
-fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize {
+pub fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize {
     let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
     if path.is_empty() {
         return ENOENT;
@@ -490,7 +497,7 @@ fn EMFILE_OR_ENOMEM() -> usize {
     ENOMEM
 }
 
-fn sys_lseek(current_slot: usize, fd: usize, offset: i32, whence: u32) -> usize {
+pub fn sys_lseek(current_slot: usize, fd: usize, offset: i32, whence: u32) -> usize {
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
             match current.fd_table.get_mut(fd) {
@@ -524,7 +531,7 @@ fn sys_lseek(current_slot: usize, fd: usize, offset: i32, whence: u32) -> usize 
     EBADF
 }
 
-fn sys_brk(current_slot: usize, addr: u32) -> usize {
+pub fn sys_brk(current_slot: usize, addr: u32) -> usize {
     unsafe {
         if current_slot == 0 || current_slot >= 8 {
             return 0;
@@ -573,7 +580,7 @@ const MAP_ANONYMOUS: u32 = 0x20;
 
 /// Linux i386 old mmap arg block (syscall 90).
 #[repr(C)]
-struct MmapArgStruct {
+pub struct MmapArgStruct {
     addr: u32,
     len: u32,
     prot: u32,
@@ -582,7 +589,7 @@ struct MmapArgStruct {
     offset: u32, // byte offset
 }
 
-fn sys_mmap_old(current_slot: usize, argp: *const MmapArgStruct) -> usize {
+pub fn sys_mmap_old(current_slot: usize, argp: *const MmapArgStruct) -> usize {
     if argp.is_null() {
         return EFAULT;
     }
@@ -601,7 +608,7 @@ fn sys_mmap_old(current_slot: usize, argp: *const MmapArgStruct) -> usize {
 }
 
 /// mmap2: offset is in pages (4 KiB).
-fn sys_mmap2(
+pub fn sys_mmap2(
     current_slot: usize,
     addr: u32,
     len: usize,
@@ -700,7 +707,7 @@ fn sys_mmap2(
     }
 }
 
-fn sys_munmap(current_slot: usize, addr: u32, len: usize) -> usize {
+pub fn sys_munmap(current_slot: usize, addr: u32, len: usize) -> usize {
     if len == 0 {
         return 0;
     }
@@ -726,12 +733,12 @@ fn sys_munmap(current_slot: usize, addr: u32, len: usize) -> usize {
     EINVAL
 }
 
-fn sys_ioctl(_current_slot: usize, _fd: usize, _req: u32, _arg: u32) -> usize {
+pub fn sys_ioctl(_current_slot: usize, _fd: usize, _req: u32, _arg: u32) -> usize {
     // Most tty ioctls → ENOTTY is fine for non-interactive tools
     ENOTTY
 }
 
-fn sys_fstat64(current_slot: usize, fd: usize, st_ptr: *mut Stat64) -> usize {
+pub fn sys_fstat64(current_slot: usize, fd: usize, st_ptr: *mut Stat64) -> usize {
     if st_ptr.is_null() {
         return EFAULT;
     }
@@ -768,7 +775,7 @@ fn sys_fstat64(current_slot: usize, fd: usize, st_ptr: *mut Stat64) -> usize {
     EBADF
 }
 
-fn sys_stat64(path_ptr: *const u8, st_ptr: *mut Stat64) -> usize {
+pub fn sys_stat64(path_ptr: *const u8, st_ptr: *mut Stat64) -> usize {
     if st_ptr.is_null() || path_ptr.is_null() {
         return EFAULT;
     }
@@ -792,7 +799,7 @@ fn sys_stat64(path_ptr: *const u8, st_ptr: *mut Stat64) -> usize {
     0
 }
 
-fn sys_getdents64(current_slot: usize, fd: usize, dirp: *mut u8, count: usize) -> usize {
+pub fn sys_getdents64(current_slot: usize, fd: usize, dirp: *mut u8, count: usize) -> usize {
     if dirp.is_null() || count < 24 {
         return EINVAL;
     }
@@ -848,7 +855,7 @@ fn sys_getdents64(current_slot: usize, fd: usize, dirp: *mut u8, count: usize) -
     }
 }
 
-fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) -> usize {
+pub fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) -> usize {
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
             // Fallback: bare fd 0 with empty table still means console
@@ -916,7 +923,7 @@ fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) -> u
 /// могли срабатывать. Когда буфер пуст, `hlt` усыпляет CPU до следующего
 /// прерывания. KMutex буфера сам делает `cli`/`sti` при lock/unlock,
 /// поэтому гонки между чтением и обработчиком клавиатуры нет.
-fn sys_read_stdin(buf_ptr: *mut u8, count: usize) -> usize {
+pub fn sys_read_stdin(buf_ptr: *mut u8, count: usize) -> usize {
     let mut read = 0;
 
     // Включаем прерывания — обработчик клавиатуры сможет наполнять буфер
@@ -949,7 +956,7 @@ fn sys_read_stdin(buf_ptr: *mut u8, count: usize) -> usize {
     read
 }
 
-fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usize) -> usize {
+pub fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usize) -> usize {
     if count == 0 {
         return 0;
     }
@@ -964,7 +971,7 @@ fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usize) -
 
     let buf = &kernel_buf[..];
 
-    // println!("KERNEL WRITE: fd={} ptr={:p} ptr_usr={:p} len={} task={} {:02x?}", fd, buf_ptr, src_ptr, count, current_slot, &buf[0..buf.len().min(32)]);
+    // println!("KERNEL WRITE: fd={} len={} task={} {:02x?}", fd,  count, current_slot, &buf[0..buf.len().min(32)]);
 
 
 
@@ -1051,7 +1058,7 @@ fn close_descriptor(desc: FileDescriptor) {
     }
 }
 
-fn sys_close(current_slot: usize, fd: usize) -> usize {
+pub fn sys_close(current_slot: usize, fd: usize) -> usize {
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
             if let Some(desc) = current.fd_table.close(fd) {
@@ -1063,7 +1070,7 @@ fn sys_close(current_slot: usize, fd: usize) -> usize {
     usize::MAX
 }
 
-fn sys_pipe(current_slot: usize, pipefd: *mut u32) -> usize {
+pub fn sys_pipe(current_slot: usize, pipefd: *mut u32) -> usize {
     let pipe_id = match pipe::pipe_create() {
         Some(id) => id,
         None => return usize::MAX,
@@ -1097,7 +1104,7 @@ fn sys_pipe(current_slot: usize, pipefd: *mut u32) -> usize {
     usize::MAX
 }
 
-fn sys_dup2(current_slot: usize, oldfd: usize, newfd: usize) -> usize {
+pub fn sys_dup2(current_slot: usize, oldfd: usize, newfd: usize) -> usize {
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
             if current.fd_table.get(oldfd).is_none() {
@@ -1125,19 +1132,19 @@ fn sys_dup2(current_slot: usize, oldfd: usize, newfd: usize) -> usize {
 
 // ====================== FILESYSTEM OPERATIONS ======================
 
-fn sys_mkdir(path_ptr: *const u8) -> usize {
+pub fn sys_mkdir(path_ptr: *const u8) -> usize {
     let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
     let success = VFS.get().mkdir(path);
     if success { 0 } else { usize::MAX }
 }
 
-fn sys_rmdir(path_ptr: *const u8) -> usize {
+pub fn sys_rmdir(path_ptr: *const u8) -> usize {
     let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
     let success = VFS.get().rmdir(path);
     if success { 0 } else { usize::MAX }
 }
 
-fn sys_unlink(path_ptr: *const u8) -> usize {
+pub fn sys_unlink(path_ptr: *const u8) -> usize {
     let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
     let success = VFS.get().remove_file(path);
     if success { 0 } else { usize::MAX }
@@ -1146,7 +1153,7 @@ fn sys_unlink(path_ptr: *const u8) -> usize {
 /// Читает содержимое директории и записывает имена файлов
 /// (разделённые '\n') в пользовательский буфер.
 /// Возвращает количество записанных байт или 0 при ошибке.
-fn sys_ls(path_ptr: *const u8, buf_ptr: *mut u8, buf_size: usize) -> usize {
+pub fn sys_ls(path_ptr: *const u8, buf_ptr: *mut u8, buf_size: usize) -> usize {
     let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("/") };
     let path = if path.is_empty() { "/" } else { path };
 
@@ -1185,7 +1192,7 @@ fn sys_ls(path_ptr: *const u8, buf_ptr: *mut u8, buf_size: usize) -> usize {
 /// Mark current task as zombie and switch to another task.
 /// Returns the new task's CPU-state pointer so the syscall iretd
 /// resumes a different task (never the dead one).
-fn sys_exit(current_slot: usize, esp: u32) -> u32 {
+pub fn sys_exit(current_slot: usize, esp: u32) -> u32 {
     unsafe {
         if current_slot != 0 {
             if let Some(ref mut t) = TASK_MANAGER.tasks[current_slot] {
@@ -1210,7 +1217,7 @@ fn sys_exit(current_slot: usize, esp: u32) -> u32 {
 pub const WNOHANG: u32 = 1;
 
 /// kill(pid, sig) — queue `sig` for task slot `pid`.
-fn sys_kill(pid: i32, sig: u32) -> usize {
+pub fn sys_kill(pid: i32, sig: u32) -> usize {
     if crate::signal::send_signal(pid as i8, sig) {
         0
     } else {
@@ -1219,14 +1226,14 @@ fn sys_kill(pid: i32, sig: u32) -> usize {
 }
 
 #[repr(C)]
-struct SigActionUser {
+pub struct SigActionUser {
     sa_handler: u32,
     sa_mask: u32,
     sa_flags: u32,
 }
 
 /// sigaction(sig, act, oldact)
-fn sys_sigaction(current_slot: usize, sig: u32, act: *const SigActionUser, oldact: *mut SigActionUser) -> usize {
+pub fn sys_sigaction(current_slot: usize, sig: u32, act: *const SigActionUser, oldact: *mut SigActionUser) -> usize {
     if sig == 0 || sig > 31 || sig == crate::signal::SIGKILL {
         return usize::MAX;
     }
@@ -1249,7 +1256,7 @@ fn sys_sigaction(current_slot: usize, sig: u32, act: *const SigActionUser, oldac
     usize::MAX
 }
 
-fn sys_wait(current_slot: usize, pid: i32, options: u32) -> usize {
+pub fn sys_wait(current_slot: usize, pid: i32, options: u32) -> usize {
     let parent = current_slot as i8;
     let nohang = options & WNOHANG != 0;
 
@@ -1280,7 +1287,7 @@ fn sys_wait(current_slot: usize, pid: i32, options: u32) -> usize {
 const F_GETFL: u32 = 3;
 const F_SETFL: u32 = 4;
 
-fn sys_fcntl(current_slot: usize, fd: usize, cmd: u32, arg: u32) -> usize {
+pub fn sys_fcntl(current_slot: usize, fd: usize, cmd: u32, arg: u32) -> usize {
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
             if current.fd_table.get(fd).is_none() {
@@ -1306,7 +1313,7 @@ fn sys_fcntl(current_slot: usize, fd: usize, cmd: u32, arg: u32) -> usize {
 /// Linux-ish pollfd (32-bit).
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct PollFd {
+pub struct PollFd {
     fd: i32,
     events: i16,
     revents: i16,
@@ -1381,7 +1388,7 @@ fn fd_poll_revents(current_slot: usize, fd: i32, events: i16) -> i16 {
     }
 }
 
-fn sys_poll(current_slot: usize, fds: *mut PollFd, nfds: usize, timeout_ms: i32) -> usize {
+pub fn sys_poll(current_slot: usize, fds: *mut PollFd, nfds: usize, timeout_ms: i32) -> usize {
     if fds.is_null() || nfds == 0 {
         return 0;
     }
@@ -1427,7 +1434,7 @@ fn sys_poll(current_slot: usize, fds: *mut PollFd, nfds: usize, timeout_ms: i32)
 
 /// Userspace layout of `libfelix::syscall::ExecParams`.
 #[repr(C)]
-struct ExecParamsUser {
+pub struct ExecParamsUser {
     stdin: i32,
     stdout: i32,
     stderr: i32,
@@ -1435,15 +1442,15 @@ struct ExecParamsUser {
     argv: *const *const u8,
 }
 
-struct ExecParamsKernel {
-    stdin: i32,
-    stdout: i32,
-    stderr: i32,
+pub struct ExecParamsKernel {
+    pub(crate) stdin: i32,
+    pub(crate) stdout: i32,
+    pub(crate) stderr: i32,
     /// Owned C-string copies of argv.
     argv: alloc::vec::Vec<alloc::vec::Vec<u8>>,
 }
 
-fn read_exec_params(ptr: *const ExecParamsUser) -> ExecParamsKernel {
+pub fn read_exec_params(ptr: *const ExecParamsUser) -> ExecParamsKernel {
     if ptr.is_null() {
         return ExecParamsKernel {
             stdin: -1,
@@ -1558,7 +1565,7 @@ fn setup_user_argv(
 }
 
 /// Copy parent fd into child slot, bumping pipe refcounts when needed.
-fn install_child_fd(
+pub fn install_child_fd(
     parent_slot: usize,
     child_table: &mut FileDescriptorTable,
     child_fd: usize,
@@ -1728,7 +1735,7 @@ use crate::net::stack::{NET_STACK, poll_stack};
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 use smoltcp::socket::{tcp, udp};
 
-fn sys_socket(current_slot: usize, domain: u16, ty: u16, protocol: u8) -> usize {
+pub fn sys_socket(current_slot: usize, domain: u16, ty: u16, protocol: u8) -> usize {
     let mut stack_guard = match NET_STACK.try_lock() {
         Some(g) => g,
         None => return usize::MAX,
@@ -1772,7 +1779,7 @@ fn sys_socket(current_slot: usize, domain: u16, ty: u16, protocol: u8) -> usize 
     usize::MAX
 }
 
-fn sys_bind(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: usize) -> usize {
+pub fn sys_bind(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: usize) -> usize {
     println!("current_slot: {}, fd: {} addr_ptr: {:x} addrlen: {}", current_slot, fd, addr_ptr as usize, addrlen);
     if addrlen < core::mem::size_of::<SockAddrIn>() {
         return usize::MAX;
@@ -1844,7 +1851,7 @@ fn sys_bind(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: usize)
     if result.is_ok() { 0 } else { usize::MAX }
 }
 
-fn sys_listen(current_slot: usize, fd: usize, backlog: usize) -> usize {
+pub fn sys_listen(current_slot: usize, fd: usize, backlog: usize) -> usize {
     // Для smoltcp TCP listen уже делается в bind (socket.listen()).
     // Здесь просто меняем состояние.
     let socket_id = unsafe {
@@ -1869,7 +1876,7 @@ fn sys_listen(current_slot: usize, fd: usize, backlog: usize) -> usize {
     usize::MAX
 }
 
-fn sys_accept4(
+pub fn sys_accept4(
     current_slot: usize,
     fd: usize,
     _addr: *mut u8,
@@ -1881,7 +1888,7 @@ fn sys_accept4(
     usize::MAX
 }
 
-fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: usize) -> usize {
+pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: usize) -> usize {
     if addrlen < core::mem::size_of::<SockAddrIn>() {
         return usize::MAX;
     }
@@ -1939,7 +1946,7 @@ fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: usi
         usize::MAX
     }
 }
-fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) -> usize {
+pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) -> usize {
     let socket_id = unsafe {
         match TASK_MANAGER.tasks[current_slot]
             .as_ref()
@@ -1995,7 +2002,7 @@ fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) -> usi
     }
 }
 
-fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) -> usize {
+pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) -> usize {
     let socket_id = unsafe {
         match TASK_MANAGER.tasks[current_slot]
             .as_ref()
@@ -2058,7 +2065,7 @@ fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) -> usi
     received
 }
 
-fn sys_shutdown(current_slot: usize, fd: usize, _how: u32) -> usize {
+pub fn sys_shutdown(current_slot: usize, fd: usize, _how: u32) -> usize {
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
             if let Some(FileDescriptor::Socket { socket_id }) = current.fd_table.get(fd) {
@@ -2076,7 +2083,7 @@ fn sys_shutdown(current_slot: usize, fd: usize, _how: u32) -> usize {
 // ====================== WINDOW MANAGER ======================
 
 #[repr(C)]
-struct WmCreateArgs {
+pub struct WmCreateArgs {
     x: i32,
     y: i32,
     w: u32,
@@ -2084,7 +2091,7 @@ struct WmCreateArgs {
     title: *const u8,
 }
 
-fn sys_wm_create(current_slot: usize, args: *const WmCreateArgs) -> usize {
+pub fn sys_wm_create(current_slot: usize, args: *const WmCreateArgs) -> usize {
     if args.is_null() {
         return usize::MAX;
     }
@@ -2100,7 +2107,7 @@ fn sys_wm_create(current_slot: usize, args: *const WmCreateArgs) -> usize {
     }
 }
 
-fn sys_wm_destroy(id: u32) -> usize {
+pub fn sys_wm_destroy(id: u32) -> usize {
     if crate::drivers::wm::destroy_window(id) {
         0
     } else {
@@ -2108,7 +2115,7 @@ fn sys_wm_destroy(id: u32) -> usize {
     }
 }
 
-fn sys_wm_move(id: u32, x: i32, y: i32) -> usize {
+pub fn sys_wm_move(id: u32, x: i32, y: i32) -> usize {
     if crate::drivers::wm::move_window(id, x, y) {
         0
     } else {
@@ -2116,7 +2123,7 @@ fn sys_wm_move(id: u32, x: i32, y: i32) -> usize {
     }
 }
 
-fn sys_wm_info(id: u32, out: *mut crate::drivers::wm::WindowInfo) -> usize {
+pub fn sys_wm_info(id: u32, out: *mut crate::drivers::wm::WindowInfo) -> usize {
     if out.is_null() {
         return usize::MAX;
     }
@@ -2129,7 +2136,7 @@ fn sys_wm_info(id: u32, out: *mut crate::drivers::wm::WindowInfo) -> usize {
     }
 }
 
-fn sys_wm_flip(id: u32, pixels: *const u8, len: usize) -> usize {
+pub fn sys_wm_flip(id: u32, pixels: *const u8, len: usize) -> usize {
     if crate::drivers::wm::flip(id, pixels, len) {
         0
     } else {
@@ -2137,7 +2144,7 @@ fn sys_wm_flip(id: u32, pixels: *const u8, len: usize) -> usize {
     }
 }
 
-fn sys_wm_focus(id: u32) -> usize {
+pub fn sys_wm_focus(id: u32) -> usize {
     if crate::drivers::wm::focus_window(id) {
         0
     } else {
@@ -2145,7 +2152,7 @@ fn sys_wm_focus(id: u32) -> usize {
     }
 }
 
-fn sys_wm_screen(out: *mut u32) -> usize {
+pub fn sys_wm_screen(out: *mut u32) -> usize {
     if out.is_null() {
         return usize::MAX;
     }
@@ -2157,7 +2164,7 @@ fn sys_wm_screen(out: *mut u32) -> usize {
     0
 }
 
-fn sys_mouse_state(out: *mut crate::drivers::mouse::MouseState) -> usize {
+pub fn sys_mouse_state(out: *mut crate::drivers::mouse::MouseState) -> usize {
     if out.is_null() {
         return usize::MAX;
     }
@@ -2167,14 +2174,14 @@ fn sys_mouse_state(out: *mut crate::drivers::mouse::MouseState) -> usize {
     0
 }
 
-fn sys_wm_poll(id: u32, out: *mut crate::drivers::wm::WmEvent, max: usize) -> usize {
+pub fn sys_wm_poll(id: u32, out: *mut crate::drivers::wm::WmEvent, max: usize) -> usize {
     crate::drivers::wm::poll_events(id, out, max.min(32))
 }
 
 /// Compact PCI device record for userspace (`lspci`). Must match libfelix.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct PciInfoUser {
+pub struct PciInfoUser {
     bus: u8,
     device: u8,
     function: u8,
@@ -2188,7 +2195,7 @@ struct PciInfoUser {
 }
 
 /// `buf` may be null with `max == 0` to query the number of devices only.
-fn sys_pci_list(buf: *mut PciInfoUser, max: usize) -> usize {
+pub fn sys_pci_list(buf: *mut PciInfoUser, max: usize) -> usize {
     let devices = crate::pci::enumerate();
     let n = devices.len();
     if max == 0 || buf.is_null() {

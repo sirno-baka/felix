@@ -41,7 +41,7 @@ SECTIONS {
     }
 
     /* Keep image size exactly 1 MiB (2048 sectors) as before */
-    . = _kernel_start + 0x00100000 - 2;
+    . = _kernel_start + 0x00200000 - 2;
     .end_marker : AT(ADDR(.end_marker) - KERNEL_OFFSET) {
         SHORT(0xdead)
     }

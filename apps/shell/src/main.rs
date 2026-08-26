@@ -11,10 +11,7 @@ use core::cmp::min;
 
 use libfelix::async_rt::yield_now;
 use libfelix::prelude::*;
-use libfelix::syscall::{
-    self, close, execve, kill, mkdir, open, pipe, read, rmdir, set_nonblock, unlink, wait,
-    wait_options, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGINT, WNOHANG,
-};
+use libfelix::syscall::{self, close, execve, execve_wasm, kill, mkdir, open, pipe, read, rmdir, set_nonblock, unlink, wait, wait_options, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGINT, WNOHANG};
 
 // ---------------------------------------------------------------------------
 // Shell state
@@ -800,7 +797,7 @@ enum UiTick {
     Interrupt,
 }
 
-fn spawn_elf(
+fn spawn(
     path: &str,
     stdin_fd: i32,
     stdout_fd: i32,
@@ -809,9 +806,6 @@ fn spawn_elf(
 ) -> Option<i32> {
     let mut f = File::open(path).ok()?;
     let data = f.read_to_end().ok()?;
-    if data.len() < 4 || &data[0..4] != b"\x7fELF" {
-        return None;
-    }
     let mut c_strings: Vec<String> = Vec::new();
     if args.is_empty() {
         let mut s = String::from(path);
@@ -826,14 +820,32 @@ fn spawn_elf(
     }
     let ptrs: Vec<*const u8> = c_strings.iter().map(|s| s.as_ptr()).collect();
     unsafe {
-        let pid = execve(
-            data.as_ptr(),
-            data.len(),
-            stdin_fd,
-            stdout_fd,
-            stderr_fd,
-            &ptrs,
-        );
+       let pid = match &data[0..4] {
+           &[0x0, 0x61, 0x73, 0x6d] => {
+                execve_wasm(
+                    data.as_ptr(),
+                    data.len(),
+                    stdin_fd,
+                    stdout_fd,
+                    stderr_fd,
+                    &ptrs,
+                )
+            },
+           b"\x7fELF" => {
+                execve(
+                    data.as_ptr(),
+                    data.len(),
+                    stdin_fd,
+                    stdout_fd,
+                    stderr_fd,
+                    &ptrs,
+                )
+            }
+            _ => {
+                println!("Not executable file");
+                usize::MAX
+            }
+        };
         if pid == usize::MAX {
             None
         } else {
@@ -1051,7 +1063,7 @@ fn run_external(
         }
     }
 
-    let pid = spawn_elf(&full, sin, sout, serr, &cmd.args);
+    let pid = spawn(&full, sin, sout, serr, &cmd.args);
 
     if capture_w >= 0 {
         unsafe {
@@ -1134,7 +1146,7 @@ fn run_pipeline(
             // Intermediate stages: fire-and-forget wait after all spawned.
             let name = cmd.args[0].as_str();
             if let Some(full) = shell.find_executable(name) {
-                if let Some(p) = spawn_elf(&full, in_fd, out_fd, -1, &cmd.args) {
+                if let Some(p) = spawn(&full, in_fd, out_fd, -1, &cmd.args) {
                     pids.push(p);
                 }
             }

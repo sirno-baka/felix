@@ -1,5 +1,6 @@
 pub mod handler;
 mod alloc;
+pub mod wasm;
 
 pub const SYS_EXIT: u32 = 1;
 pub const SYS_READ: u32 = 3;
@@ -92,3 +93,5 @@ pub const SYS_WM_POLL: u32 = 408;
 
 /// pci_list(*mut PciInfoUser, max) → number of devices written (or needed if max=0)
 pub const SYS_PCI_LIST: u32 = 410;
+
+

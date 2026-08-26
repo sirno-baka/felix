@@ -23,3 +23,5 @@ smoltcp = { version = "0.11", default-features = false, features = [
 ] }
 # 0.3.6 needs core_io (broken on modern nightly). 0.4 has native Read/Write/Seek.
 fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn"] }
+wasmi = { version = "0.31", default-features = false }
+libm = "0.2"
