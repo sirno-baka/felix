@@ -3,4 +3,6 @@ build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
 
 [build]
+rustflags = ["--cfg", "test_disabled"]
 target = "x86_32-felix.json"
+

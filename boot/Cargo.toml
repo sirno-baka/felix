@@ -6,5 +6,6 @@ edition.workspace = true
 
 [[bin]]
 name = "felix-boot"
+test = false
 
 [dependencies]
