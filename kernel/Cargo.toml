@@ -9,7 +9,7 @@ interrupt-sync = { path = "../interrupt-sync" }
 elf = { version = "0.7.4", default-features = false}
 bitflags = "1.3"
 embedded-graphics = "0.8.2"
-smoltcp = { version = "0.11", default-features = false, features = [
+smoltcp = { version = "0.14", default-features = false, features = [
     "medium-ethernet",
     "proto-ipv4",
     "proto-ipv6",

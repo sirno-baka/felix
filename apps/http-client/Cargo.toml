@@ -1,13 +1,11 @@
 [package]
-name = "hello"
+name = "http-client"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "hello"
+name = "http-client"
 test = false
 
 [dependencies.libfelix]
 path = "../../lib"
-
-

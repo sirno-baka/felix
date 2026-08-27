@@ -84,7 +84,7 @@ type BoxFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
 /// # Example
 /// ```ignore
 /// let mut rt = Executor::new();
-/// rt.spawn(async { println!("hello"); });
+/// rt.spawn(async { println!("http-client"); });
 /// rt.run_until_done();
 /// ```
 pub struct Executor {

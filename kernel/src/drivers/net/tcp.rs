@@ -3,6 +3,7 @@ use crate::drivers::net::{RX_BUF_SIZE, TX_BUF_SIZE};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 use smoltcp::wire::EthernetAddress;
+use crate::println;
 // ===================== smoltcp integration =====================
 
 pub struct I8255xRxToken {
@@ -14,14 +15,16 @@ pub struct I8255xTxToken {
     nic: *mut I8255x, // сырой указатель — аккуратно, только внутри токена
 }
 
+// RxToken: теперь &[u8] (immutable)
 impl RxToken for I8255xRxToken {
-    fn consume<R, F>(mut self, f: F) -> R
+    fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
-        f(&mut self.data[..self.len])
+        f(&self.data[..self.len])
     }
 }
+
 
 impl TxToken for I8255xTxToken {
     fn consume<R, F>(self, len: usize, f: F) -> R
@@ -30,10 +33,14 @@ impl TxToken for I8255xTxToken {
     {
         let mut buf = [0u8; TX_BUF_SIZE];
         let result = f(&mut buf[..len]);
-
+        println!("TX: {} bytes, dst_mac={:02x?}, type={:02x}{:02x}",
+                 len, &buf[0..6], buf[12], buf[13]);
         unsafe {
             if !self.nic.is_null() {
-                let _ = (*self.nic).send(&buf[..len]);
+                match (*self.nic).send(&buf[..len]) {
+                    Ok(()) => println!("TX: sent OK"),
+                    Err(e) => println!("TX: send FAILED: {}", e),
+                }
             }
         }
         result

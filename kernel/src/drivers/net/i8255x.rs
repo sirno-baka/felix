@@ -507,6 +507,7 @@ impl I8255x {
         self.scb_cmd(CU_START);
 
         self.tx_head.store(next, Ordering::Release);
+        println!("TX head: {}", next);
         Ok(())
     }
 

@@ -8,7 +8,7 @@ use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address}
 use crate::drivers::net::i8255x::{I8255x, NET};
 use crate::net::socket::{Socket, SocketState, SocketTable};
 use crate::net::types::*;
-use crate::println;
+use crate::{print, println};
 use crate::sync::mutex::Mutex;
 
 pub struct NetStack {
@@ -49,6 +49,7 @@ impl NetStack {
 
     /// Поллим стек (вызывать из таймера / из syscalls)
     pub fn poll(&mut self, timestamp_ms: i64) {
+        print!(".");
         let ts = Instant::from_millis(timestamp_ms);
         self.iface.poll(ts, &mut self.device, &mut self.sockets);
     }

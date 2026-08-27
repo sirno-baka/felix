@@ -18,7 +18,7 @@ fn main() -> std::io::Result<()> {
                 stream.peer_addr().unwrap()
             );
 
-            let message = "hello".to_string();
+            let message = "http-client".to_string();
             match message.as_str() {
                 "#END#" => stream.shutdown(Shutdown::Both).expect("Shutdown Failed!"),
                 _ => {

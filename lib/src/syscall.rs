@@ -697,3 +697,18 @@ pub unsafe fn shutdown(sockfd: u32, how: u32) -> usize {
     );
     ret
 }
+
+
+pub unsafe fn sys_sleep(ms: u32) {
+    // Используем poll с timeout как простой сон
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_POLL => ret,
+    in("ebx") 0usize,   // fds = null
+    in("ecx") 0usize,   // nfds = 0
+    in("edx") ms as i32,
+    options(nostack, preserves_flags)
+    );
+    let _ = ret;
+}

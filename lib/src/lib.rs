@@ -21,6 +21,7 @@ pub use embedded_graphics;
 /// Applications should define `#[no_mangle] pub extern "C" fn main() -> i32`
 /// and must NOT define their own `_start` or `#[panic_handler]`.
 pub mod rt;
+pub mod net;
 
 /// Convenient re-exports for application code.
 pub mod prelude {

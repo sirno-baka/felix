@@ -1,3 +1,4 @@
+use alloc::string::ToString;
 use core::arch::asm;
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::drivers::pic::PICS;
@@ -9,12 +10,13 @@ use crate::memory::paging::{
 };
 use crate::multitasking::task::{CPUState, TASK_MANAGER, Task};
 use crate::net::{AF_INET, SOCK_DGRAM, SOCK_STREAM, SOCKET_TABLE, SockAddrIn, SocketState};
-use crate::pipe;
+use crate::{pipe, utils};
 use crate::{print, println};
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::naked_asm;
 use core::ffi::CStr;
+use core::net::Ipv4Addr;
 
 pub const SYSCALL_INT: u8 = 0x80;
 
@@ -1533,14 +1535,29 @@ fn fd_poll_revents(current_slot: usize, fd: i32, events: i16) -> i16 {
                 }
                 rev
             }
-            Some(FileDescriptor::Socket { .. }) => {
-                // UDP recv is already non-blocking-ish (returns 0).
+            Some(FileDescriptor::Socket { socket_id }) => {
                 let mut rev = 0i16;
-                if events & POLLIN != 0 {
-                    rev |= POLLIN;
-                }
-                if events & POLLOUT != 0 {
-                    rev |= POLLOUT;
+                if let Some(stack_guard) = crate::net::stack::NET_STACK.try_lock() {
+                    if let Some(ref stack) = *stack_guard {
+                        if let Some((handle, is_tcp)) = stack.get_handle(socket_id) {
+                            if is_tcp {
+                                let socket = stack.sockets.get::<tcp::Socket>(handle);
+                                if events & POLLIN != 0 && socket.can_recv() {
+                                    rev |= POLLIN;
+                                }
+                                if events & POLLOUT != 0 && socket.can_send() {
+                                    rev |= POLLOUT;
+                                }
+                            } else {
+                                // UDP: всегда можно писать, читать если есть данные
+                                if events & POLLOUT != 0 { rev |= POLLOUT; }
+                                if events & POLLIN != 0 {
+                                    let socket = stack.sockets.get::<udp::Socket>(handle);
+                                    if socket.can_recv() { rev |= POLLIN; }
+                                }
+                            }
+                        }
+                    }
                 }
                 rev
             }
@@ -1919,7 +1936,10 @@ pub fn sys_execve(
 use crate::net::stack::{NET_STACK, poll_stack};
 use crate::print::klog_write_str;
 use smoltcp::socket::{tcp, udp};
+use smoltcp::socket::tcp::ConnectError;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
+use crate::time::sleep;
+use crate::utils::rand_int;
 
 pub fn sys_socket(current_slot: usize, domain: u16, ty: u16, protocol: u8) -> usize {
     let mut stack_guard = match NET_STACK.try_lock() {
@@ -1931,7 +1951,7 @@ pub fn sys_socket(current_slot: usize, domain: u16, ty: u16, protocol: u8) -> us
         None => return usize::MAX,
     };
 
-    let (socket_id, _handle) = match stack.create_socket(domain, ty, protocol) {
+    let (socket_id, handle) = match stack.create_socket(domain, ty, protocol) {
         Some(v) => v,
         None => return usize::MAX,
     };
@@ -2006,8 +2026,8 @@ pub fn sys_bind(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: us
         IpListenEndpoint { addr: None, port }
     } else {
         IpListenEndpoint {
-            addr: Some(IpAddress::Ipv4(Ipv4Address(
-                addr.sin_addr.s_addr.to_be_bytes(),
+            addr: Some(IpAddress::Ipv4(Ipv4Addr::from_bits(
+                addr.sin_addr.s_addr,
             ))),
             port,
         }
@@ -2079,6 +2099,7 @@ pub fn sys_accept4(
     usize::MAX
 }
 
+
 pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: usize) -> usize {
     if addrlen < core::mem::size_of::<SockAddrIn>() {
         return usize::MAX;
@@ -2095,53 +2116,113 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
         }
     };
 
-    let mut stack_guard = NET_STACK.lock();
-    let stack = match stack_guard.as_mut() {
-        Some(s) => s,
-        None => return usize::MAX,
-    };
-
-    let (handle, is_tcp) = match stack.get_handle(socket_id) {
-        Some(h) => h,
-        None => return usize::MAX,
-    };
-
     let endpoint = IpEndpoint {
-        addr: IpAddress::Ipv4(Ipv4Address(addr.sin_addr.s_addr.to_be_bytes())),
+        addr: IpAddress::Ipv4(Ipv4Addr::from_bits(addr.sin_addr.s_addr)),
         port: u16::from_be(addr.sin_port),
     };
+    let local_port = 49152u16 + (socket_id as u16 & 0x3FFF);
+    // --- UDP: простой bind, без retry ---
+    {
+        let mut guard = NET_STACK.lock();
+        let stack = match guard.as_mut() {
+            Some(s) => s,
+            None => return usize::MAX,
+        };
+        let (handle, is_tcp) = match stack.get_handle(socket_id) {
+            Some(h) => h,
+            None => return usize::MAX,
+        };
 
-    let result = if is_tcp {
-        let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-        // local endpoint можно оставить unspecified
-        socket
-            .connect(stack.iface.context(), endpoint, 0)
-            .map_err(|_| ())
-    } else {
-        // UDP connect (опционально)
-        let socket = stack.sockets.get_mut::<udp::Socket>(handle);
-        socket
-            .bind(IpEndpoint::new(
-                IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
-                0,
-            ))
-            .map_err(|_| ())
-            .and_then(|_| {
-                // smoltcp UDP не имеет connect, просто запоминаем peer
-                Ok(())
-            })
+        if !is_tcp {
+            let socket = stack.sockets.get_mut::<udp::Socket>(handle);
+            let listen = IpListenEndpoint {
+                addr: None,
+                port: local_port,
+            };
+            match socket.bind(listen) {
+                Ok(()) => {
+                    let mut table = SOCKET_TABLE.lock();
+                    if let Some(sock) = table.get_mut(socket_id) {
+                        sock.peer_addr = Some(addr);
+                        sock.state = SocketState::Connected;
+                    }
+                    return 0;
+                }
+                Err(_) => return usize::MAX,
+            }
+        }
+    }
+
+    // --- TCP: retry loop с поллингом ---
+    let mut connect_issued = false;
+
+    // Явный эфемерный порт (49152 + socket_id чтобы не было коллизий)
+    let local_port = 49152u16 + (socket_id as u16 & 0x3FFF);
+    let local = IpListenEndpoint {
+        addr: Some(IpAddress::v4(10, 0, 2, 15)),
+        port: local_port,
     };
 
-    if result.is_ok() {
-        let mut table = SOCKET_TABLE.lock();
-        if let Some(sock) = table.get_mut(socket_id) {
-            sock.peer_addr = Some(addr);
-            sock.state = SocketState::Connected;
+    for attempt in 0..200 {
+        {
+            let mut guard = NET_STACK.lock();
+            let stack = match guard.as_mut() {
+                Some(s) => s,
+                None => return usize::MAX,
+            };
+
+            stack.poll(crate::time::jiffies() as i64);
+
+            let (handle, _is_tcp) = match stack.get_handle(socket_id) {
+                Some(h) => h,
+                None => return usize::MAX,
+            };
+
+            let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+
+            if !connect_issued {
+                match socket.connect(stack.iface.context(), endpoint, local) {
+                    Ok(()) => {
+                        connect_issued = true;
+                        // Поллим ещё раз чтобы smoltcp отправил ARP + SYN
+                        stack.poll(crate::time::jiffies() as i64);
+                    }
+                    Err(smoltcp::socket::tcp::ConnectError::Unaddressable) => {
+                        // ARP ещё не прошёл — отпустим лок и попробуем снова
+                    }
+                    Err(e) => {
+                        println!("connect: fatal err {:?} (attempt {})", e, attempt);
+                        return usize::MAX;
+                    }
+                }
+            } else {
+                match socket.state() {
+                    smoltcp::socket::tcp::State::Established => {
+                        let mut table = SOCKET_TABLE.lock();
+                        if let Some(sock) = table.get_mut(socket_id) {
+                            sock.peer_addr = Some(addr);
+                            sock.state = SocketState::Connected;
+                        }
+                        return 0;
+                    }
+                    smoltcp::socket::tcp::State::Closed
+                    | smoltcp::socket::tcp::State::CloseWait => {
+                        return usize::MAX;
+                    }
+                    _ => {} // SynSent / SynReceived — продолжаем поллить
+                }
+            }
+        } // лок отпущен
+
+        // Короткий сон, даём таймеру поллить сеть
+        unsafe {
+            asm!("sti");
+            asm!("hlt");
+            asm!("cli");
         }
-        0
-    } else {
-        usize::MAX
     }
+
+    usize::MAX // timeout
 }
 pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) -> usize {
     let socket_id = unsafe {
@@ -2173,11 +2254,11 @@ pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) ->
     let data = unsafe { core::slice::from_raw_parts(buf, len) };
 
     if is_tcp {
-        return stack
-            .sockets
-            .get_mut::<tcp::Socket>(handle)
-            .send_slice(data)
-            .unwrap_or(0);
+        let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+        match socket.send_slice(data) {
+            Ok(n) => return n,
+            Err(_) => return usize::MAX,  // буфер полон
+        }
     }
 
     let peer = {
@@ -2188,7 +2269,9 @@ pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) ->
     let Some(peer) = peer else { return 0 };
 
     let endpoint = IpEndpoint {
-        addr: IpAddress::Ipv4(Ipv4Address(peer.sin_addr.s_addr.to_be_bytes())),
+        addr: IpAddress::Ipv4(Ipv4Addr::from_bits(
+            peer.sin_addr.s_addr,
+        )),
         port: u16::from_be(peer.sin_port),
     };
 
@@ -2233,11 +2316,21 @@ pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) ->
     let mut temp = alloc::vec![0u8; len.min(1500)];
 
     let received = if is_tcp {
-        stack
-            .sockets
-            .get_mut::<tcp::Socket>(handle)
-            .recv_slice(&mut temp)
-            .unwrap_or(0)
+        let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+        match socket.recv_slice(&mut temp) {
+            Ok(n) if n > 0 => n,
+            Ok(_) => {
+                // 0 байт — проверяем состояние
+                if socket.state() == smoltcp::socket::tcp::State::CloseWait
+                    || socket.state() == smoltcp::socket::tcp::State::Closed
+                {
+                    0  // настоящий EOF
+                } else {
+                    return usize::MAX;  // данных нет, попробовать позже
+                }
+            }
+            Err(_) => return usize::MAX,
+        }
     } else {
         let socket = stack.sockets.get_mut::<udp::Socket>(handle);
         match socket.recv_slice(&mut temp) {
@@ -2246,7 +2339,7 @@ pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) ->
                 let mut table = SOCKET_TABLE.lock();
                 if let Some(sock) = table.get_mut(socket_id) {
                     let ip = match ep.endpoint.addr {
-                        IpAddress::Ipv4(a) => u32::from_be_bytes(a.0),
+                        IpAddress::Ipv4(a) => a.to_bits(),
                         _ => 0,
                     };
                     sock.peer_addr = Some(SockAddrIn {

@@ -430,7 +430,7 @@ fn register_wasi_functions(
                 .get_export("memory")
                 .and_then(|e| e.into_memory())
                 .ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
-            // 1 arg, size of "hello\0"
+            // 1 arg, size of "http-client\0"
             memory
                 .write(&mut caller, argc_ptr as usize, &1u32.to_le_bytes())
                 .map_err(|_| wasmi::core::Trap::new("write argc failed"))?;
@@ -453,7 +453,7 @@ fn register_wasi_functions(
                 .get_export("memory")
                 .and_then(|e| e.into_memory())
                 .ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
-            let buf = b"hello\0";
+            let buf = b"http-client\0";
 
             memory
                 .write(&mut caller, argv_buf_ptr as usize, buf)

@@ -52,16 +52,15 @@ endif
 
 .PHONY: build
 build:
-	@cargo clean -p felix-kernel -p hello -p shell -p async_test -p libfelix -p felix-boot  -Z json-target-spec
+	@cargo clean -p felix-kernel -p http-client -p shell  -p libfelix -p felix-boot  -Z json-target-spec
 	@echo "Building Felix..."
 	@cargo build --target=x86_16-felix.json --package=felix-boot --release -Z json-target-spec
 	@cargo build --target=x86_16-felix.json --package=felix-bootloader -Z json-target-spec
 	@cargo build --target=x86_16-felix.json --package=felix-bootloader --release -Z json-target-spec
 	@cargo build --target=x86_32-felix.json --package=felix-kernel -Z json-target-spec
 	@cargo build --target=x86_32-felix.json --package=felix-kernel --release -Z json-target-spec
-	@cargo build --target=x86_32-felix.json --package=hello --release -Z json-target-spec
+	@cargo build --target=x86_32-felix.json --package=http-client --release -Z json-target-spec
 	@cargo build --target=x86_32-felix.json --package=shell --release -Z json-target-spec
-	@cargo build --target=x86_32-felix.json --package=async_test --release -Z json-target-spec
 	@cargo build --target=wasm32-wasip2 --package=wasm-hello --release
 
 
@@ -73,10 +72,9 @@ objcopy:
         target/x86_16-felix/release/felix-boot build/boot.bin
 	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_16-felix/debug/felix-bootloader build/bootloader.bin
 	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_32-felix/debug/felix-kernel build/kernel.bin
-	@cp target/x86_32-felix/release/hello build/hello
+	@cp target/x86_32-felix/release/http-client build/http-client
 	@cp target/x86_32-felix/release/shell build/shell
-	@cp target/x86_32-felix/release/async_test build/async_test
-	@cp target/wasm32-wasip1/release/wasm-hello.wasm build/wasm
+	@cp target/wasm32-wasip2/release/wasm-hello.wasm build/wasm
 
 .PHONY: floppy-image
 floppy-image:
@@ -107,8 +105,7 @@ floppy-image:
 	dd if=/dev/zero of=build/ext2.img bs=1 count=$$EXT2_SIZE_BYTES status=none; \
 	mkfs.ext2 -I 128 -O ^64bit,^metadata_csum,^dir_index,^ext_attr,^resize_inode build/ext2.img; \
 	$(E2CP) -p build/shell build/ext2.img:/shell; \
-	$(E2CP) -p build/hello build/ext2.img:/hello; \
-	$(E2CP) -p build/async_test build/ext2.img:/test; \
+	$(E2CP) -p build/http-client build/ext2.img:/http-client; \
 	echo "  → shell copied to ext2"; \
 	dd if=build/ext2.img of=build/floppy.img bs=512 seek=$$EXT2_START_SECTOR conv=notrunc status=none; \
 
@@ -143,8 +140,7 @@ image:
 	@echo "=== Copying /kernel.bin and userspace to ext2 ==="
 	@$(E2CP) -p build/kernel.bin build/rootfs.img:/kernel.bin && echo "  → /kernel.bin"
 	@$(E2CP) -p build/shell build/rootfs.img:/shell && echo "  → /shell"
-	@$(E2CP) -p build/hello build/rootfs.img:/hello && echo "  → /hello"
-	@$(E2CP) -p build/async_test build/rootfs.img:/test && echo "  → /test"
+	@$(E2CP) -p build/http-client build/rootfs.img:/http-client && echo "  → /hello"
 	@$(E2CP) -p build/wasm build/rootfs.img:/wasm && echo "  → /wasm"
 	@$(E2CP) -p build/busybox.wasm build/rootfs.img:/busybox && echo "  → /wasm"
 
@@ -231,7 +227,7 @@ debug: all
 		-drive file=build/disk.img,index=0,media=disk,format=raw,if=ide \
 		-boot order=c \
 		-no-reboot -d int,guest_errors -debugcon file:debug.log -no-shutdown \
-		-netdev user,id=net0 \
-		-device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
-		-m 128M \
-		-serial stdio -s -S &
+		-netdev user,id=net0,dns=10.0.2.3 \
+                 -device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
+                 -object filter-dump,id=f1,netdev=net0,file=guest.pcap \
+		-m 128M -s -S &

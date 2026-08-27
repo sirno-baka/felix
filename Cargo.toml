@@ -1,11 +1,12 @@
 [workspace]
-members = ["boot", "bootloader", "kernel", "apps/hello", "apps/shell", "apps/async_test", "apps/wasm-hello"]
+members = ["boot", "bootloader", "kernel", "apps/http-client", "apps/shell", "apps/wasm-hello"]
 resolver = "2"
 
 [workspace.package]
 version = "0.4.0"
 authors = ["Gianmatteo Palmieri <mail@gian.im>"]
 edition = "2024"
+
 
 
 [profile.dev]
