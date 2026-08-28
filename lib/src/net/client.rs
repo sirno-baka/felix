@@ -10,16 +10,17 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::str::FromStr;
+use core::str::{from_utf8, FromStr};
 use embedded_io_async::{Read, Write};
 use embedded_tls::{Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext, UnsecureProvider};
-use rand_core_06::{CryptoRng, Error, RngCore};
+use rand_core::{CryptoRng, RngCore, Error};
 
 
 use super::edge_adapter::FelixStack;
 use edge_nal::TcpConnect;
 use crate::net::dns;
 use crate::net::dns::DnsError;
+use crate::println;
 
 /// HTTP methods
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,9 +114,7 @@ impl RngCore for SimpleRng {
             chunk[..len].copy_from_slice(&bytes[..len]);
         }
     }
-
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core_06::Error> {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
         self.fill_bytes(dest);
         Ok(())
     }
@@ -255,46 +254,121 @@ async fn do_http_request<S: Read + Write>(
     // Send request
     stream.write_all(&request).await.map_err(|_| HttpError::WriteFailed)?;
 
-    // Read response
+    let mut header_end = 0;
+
+
     let mut response = Vec::new();
-    let mut chunk = [0u8; 2048];
     loop {
-        match stream.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(n) => response.extend_from_slice(&chunk[..n]),
+        let old_len = response.len();
+        response.resize(old_len + 16384, 0); // расширяем на 16 КБ
+
+        match stream.read(&mut response[old_len..]).await {
+            Ok(0) => {
+                response.truncate(old_len);
+                break;
+            }
+            Ok(n) => {
+                response.truncate(old_len + n);
+                if let Some(pos) = find_header_end(&response) {
+                    header_end = pos;
+                    break;
+                }
+            }
             Err(_) => return Err(HttpError::ReadFailed),
         }
     }
 
-    // Parse HTTP response
+
+    // Парсим заголовки
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut resp = httparse::Response::new(&mut headers);
 
-    match resp.parse(&response) {
-        Ok(httparse::Status::Complete(header_len)) => {
+    let status = match resp.parse(&response) {
+        Ok(httparse::Status::Complete(_)) => {
             let status = resp.code.unwrap_or(0);
             let reason = resp.reason.map(String::from);
-
-            let headers = resp
-                .headers
-                .iter()
-                .map(|h| {
-                    (
-                        String::from(h.name),
-                        core::str::from_utf8(h.value).unwrap_or("").into(),
-                    )
-                })
-                .collect();
-
-            let body = response[header_len..].to_vec();
-
-            Ok(HttpResponse {
-                status,
-                reason,
-                headers,
-                body,
-            })
+            let headers = resp.headers.iter().map(|h| {
+                (String::from(h.name), core::str::from_utf8(h.value).unwrap_or("").into())
+            }).collect();
+            (status, reason, headers)
         }
-        _ => Err(HttpError::ParseFailed),
+        _ => return Err(HttpError::ParseFailed),
+    };
+
+    // Ищем Content-Length
+    let content_length = find_content_length(&response);
+
+    // Читаем тело
+    let body_start = header_end;
+    let mut body = Vec::new();
+
+    if let Some(len) = content_length {
+        let total_needed = header_end + len;
+        response.reserve(total_needed);
+
+        while response.len() < total_needed {
+            let old_len = response.len();
+            response.resize(response.len() + 16384, 0);
+
+            match stream.read(&mut response[old_len..]).await {
+                Ok(0) => { response.truncate(old_len); break; }
+                Ok(n) => { response.truncate(old_len + n); }
+                Err(_) => return Err(HttpError::ReadFailed),
+            }
+        }
+        response.truncate(total_needed);
+        // Тело — это &response[header_end..]
+    } else {
+        // Нет Content-Length — читаем до закрытия соединения
+        body.extend_from_slice(&response[body_start..]);
+
+        // Агрессивное чтение прямо в Vec
+        loop {
+            let old_len = body.len();
+            body.resize(body.len() + 16384, 0); // расширяем на 16 КБ
+
+            match stream.read(&mut body[old_len..]).await {
+                Ok(0) => {
+                    body.truncate(old_len);
+                    break;
+                }
+                Ok(n) => {
+                    body.truncate(old_len + n);
+                }
+                Err(_) => {
+                    body.truncate(old_len);
+                    break;
+                }
+            }
+        }
     }
+
+    Ok(HttpResponse {
+        status: status.0,
+        reason: status.1,
+        headers: status.2,
+        body,
+    })
+}
+
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    for i in 0..data.len().saturating_sub(3) {
+        if &data[i..i+4] == b"\r\n\r\n" {
+            return Some(i + 4);
+        }
+    }
+    None
+}
+
+fn find_content_length(data: &[u8]) -> Option<usize> {
+    let s = core::str::from_utf8(data).ok()?;
+    for line in s.lines() {
+        let lower = line.to_lowercase();
+        if lower.starts_with("content-length:") {
+            if let Some(val) = line.split(':').nth(1) {
+                return val.trim().parse().ok();
+            }
+        }
+    }
+    None
 }

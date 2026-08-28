@@ -97,6 +97,9 @@ pub const SYS_LS: u32 = 302;
 
 pub unsafe fn exit() -> ! {
     asm!("int 0x80", in("eax") SYS_EXIT, options(noreturn));
+    loop {
+
+    }
 }
 
 pub unsafe fn write(fd: u32, buf: *const u8, len: usize) -> usize {

@@ -290,7 +290,6 @@ impl UdpReceive for FelixUdpSocket {
             if n == usize::MAX {
                 async_rt::wait_readable(self.fd).await;
             } else {
-                // TODO: if your kernel can return the sender addr, fill it here
                 let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
                 return Ok((n, addr));
             }

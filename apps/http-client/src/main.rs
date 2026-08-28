@@ -5,6 +5,7 @@ extern crate alloc;
 use libfelix::prelude::*;
 use libfelix::async_rt::block_on;
 use libfelix::net::client::{fetch, request, HttpMethod, HttpRequest};
+use libfelix::syscall::write;
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
@@ -15,21 +16,22 @@ pub extern "C" fn main() -> i32 {
         // Простой GET запрос
         match fetch(url).await {
             Ok(response) => {
-                println!("=== HTTP Response ===");
-                println!("Status: {}", response.status);
-                if let Some(reason) = &response.reason {
-                    println!("Reason: {}", reason);
-                }
-                println!("--- Headers ---");
-                for (key, value) in &response.headers {
-                    println!("{}: {}", key, value);
-                }
-                println!("--- Body ({} bytes) ---", response.body.len());
-                if let Ok(s) = core::str::from_utf8(&response.body) {
-                    println!("{}", s);
-                } else {
-                    println!("[Binary data]");
-                }
+                // println!("=== HTTP Response ===");
+                // println!("Status: {}", response.status);
+                // if let Some(reason) = &response.reason {
+                //     println!("Reason: {}", reason);
+                // }
+                // println!("--- Headers ---");
+                // for (key, value) in &response.headers {
+                //     println!("{}: {}", key, value);
+                // }
+                // println!("--- Body ({} bytes) ---", response.body.len());
+                // if let Ok(s) = core::str::from_utf8(&response.body) {
+                //     println!("{}", s);
+                // } else {
+                //     println!("[Binary data]");
+                // }
+                unsafe { write(1, response.body.as_ptr(), response.body.len()) };
             }
             Err(e) => {
                 println!("Error: {:?}", e);

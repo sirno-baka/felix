@@ -2286,6 +2286,10 @@ pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) ->
 }
 
 pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) -> usize {
+    if buf.is_null() || len == 0 {
+        return 0;
+    }
+
     let socket_id = unsafe {
         match TASK_MANAGER.tasks[current_slot]
             .as_ref()
@@ -2305,7 +2309,7 @@ pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) ->
         None => return 0,
     };
 
-    let ts = crate::time::jiffies() as i64; // лучше реальное время
+    let ts = crate::time::jiffies() as i64;
     stack.poll(ts);
 
     let (handle, is_tcp) = match stack.get_handle(socket_id) {
@@ -2313,29 +2317,30 @@ pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) ->
         None => return 0,
     };
 
-    let mut temp = alloc::vec![0u8; len.min(1500)];
+    // Прямой slice из пользовательского буфера — без аллокации
+    let user_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
 
-    let received = if is_tcp {
+    if is_tcp {
         let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-        match socket.recv_slice(&mut temp) {
+        match socket.recv_slice(user_buf) {
             Ok(n) if n > 0 => n,
             Ok(_) => {
                 // 0 байт — проверяем состояние
-                if socket.state() == smoltcp::socket::tcp::State::CloseWait
-                    || socket.state() == smoltcp::socket::tcp::State::Closed
+                if socket.state() == tcp::State::CloseWait
+                    || socket.state() == tcp::State::Closed
                 {
                     0  // настоящий EOF
                 } else {
-                    return usize::MAX;  // данных нет, попробовать позже
+                    usize::MAX  // данных нет, попробовать позже
                 }
             }
-            Err(_) => return usize::MAX,
+            Err(_) => usize::MAX,
         }
     } else {
         let socket = stack.sockets.get_mut::<udp::Socket>(handle);
-        match socket.recv_slice(&mut temp) {
+        match socket.recv_slice(user_buf) {
             Ok((size, ep)) => {
-                // peer для последующего sendto (ep: IpEndpoint)
+                // сохраняем peer для последующего sendto
                 let mut table = SOCKET_TABLE.lock();
                 if let Some(sock) = table.get_mut(socket_id) {
                     let ip = match ep.endpoint.addr {
@@ -2351,16 +2356,13 @@ pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) ->
                 }
                 size
             }
+            Err(smoltcp::socket::udp::RecvError::Truncated) => {
+                // Буфер был меньше UDP-пакета — пакет потерян
+                0
+            }
             Err(_) => 0,
         }
-    };
-
-    if received > 0 {
-        unsafe {
-            core::ptr::copy_nonoverlapping(temp.as_ptr(), buf, received);
-        }
     }
-    received
 }
 
 pub fn sys_shutdown(current_slot: usize, fd: usize, _how: u32) -> usize {

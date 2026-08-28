@@ -68,17 +68,17 @@ impl NetStack {
         let handle = match ty {
             SOCK_STREAM => {
                 // TCP
-                let rx = tcp::SocketBuffer::new(vec![0u8; 8192]);
-                let tx = tcp::SocketBuffer::new(vec![0u8; 8192]);
+                let rx = tcp::SocketBuffer::new(vec![0u8; 65536]);
+                let tx = tcp::SocketBuffer::new(vec![0u8; 65536]);
                 let socket = tcp::Socket::new(rx, tx);
                 self.sockets.add(socket)
             }
             SOCK_DGRAM => {
                 // UDP
                 let rx =
-                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 8192]);
+                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0u8; 65536]);
                 let tx =
-                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 8192]);
+                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0u8; 65536]);
                 let socket = udp::Socket::new(rx, tx);
                 self.sockets.add(socket)
             }

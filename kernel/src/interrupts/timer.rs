@@ -12,7 +12,7 @@ pub const TIMER_INT: u8 = 32;
 
 // Как часто поллить сеть (в тиках таймера)
 // При SYSTEM_FRACTION ≈ 1.0 (1 мс) → каждые 10 мс
-const NET_POLL_EVERY: usize = 10;
+const NET_POLL_EVERY: usize = 1;
 
 static mut NET_POLL_COUNTER: usize = 0;
 
