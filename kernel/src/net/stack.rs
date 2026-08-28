@@ -49,7 +49,7 @@ impl NetStack {
 
     /// Поллим стек (вызывать из таймера / из syscalls)
     pub fn poll(&mut self, timestamp_ms: i64) {
-        print!(".");
+        // print!(".");
         let ts = Instant::from_millis(timestamp_ms);
         self.iface.poll(ts, &mut self.device, &mut self.sockets);
     }

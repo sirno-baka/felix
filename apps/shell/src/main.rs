@@ -1171,6 +1171,9 @@ const SCAN_BACKSPACE: u8 = 0x0E;
 const SCAN_ENTER: u8 = 0x1C;
 const SCAN_TAB: u8 = 0x0F;
 const MAX_INPUT: usize = 96;
+const SCAN_UP: u8 = 0x48;
+const SCAN_DOWN: u8 = 0x50;
+const CMD_HISTORY_MAX: usize = 64;
 const LINE_MAX_CHARS: usize = 69;
 
 /// Keep the **start** of the line (bus addr / prompt), not the tail.
@@ -1225,7 +1228,9 @@ pub extern "C" fn main() -> i32 {
     let mut shell = Shell::new();
     let mut term = TermBuffer::new();
     let mut input = String::new();
-
+    let mut cmd_hist: Vec<String> = Vec::new();
+    let mut hist_pos: Option<usize> = None; // None = текущая строка
+    let mut draft = String::new();          // то, что набирали до ↑
     term.push("=== Felix User Shell ===");
     term.push("help — builtins · clear — wipe · Ctrl+C stops a running program");
     term.push("");
@@ -1253,6 +1258,16 @@ pub extern "C" fn main() -> i32 {
 
             if scancode == SCAN_ENTER {
                 let cmd = input.clone();
+                let t = cmd.trim();
+                if !t.is_empty() && cmd_hist.last().map(|s| s.as_str()) != Some(t) {
+                    cmd_hist.push(t.to_string());
+                    if cmd_hist.len() > CMD_HISTORY_MAX {
+                        cmd_hist.remove(0);
+                    }
+                }
+                hist_pos = None;
+                draft.clear();
+
                 input.clear();
                 term.push(&format!("{}{}", shell.prompt(), cmd.trim()));
 
@@ -1268,6 +1283,31 @@ pub extern "C" fn main() -> i32 {
                     }
                 }
                 dirty = true;
+            } else if scancode == SCAN_UP {
+                if !cmd_hist.is_empty() {
+                    let next = match hist_pos {
+                        None => {
+                            draft = input.clone();
+                            cmd_hist.len() - 1
+                        }
+                        Some(0) => 0,
+                        Some(i) => i - 1,
+                    };
+                    hist_pos = Some(next);
+                    input = cmd_hist[next].clone();
+                    dirty = true;
+                }
+            } else if scancode == SCAN_DOWN {
+                if let Some(i) = hist_pos {
+                    if i + 1 < cmd_hist.len() {
+                        hist_pos = Some(i + 1);
+                        input = cmd_hist[i + 1].clone();
+                    } else {
+                        hist_pos = None;
+                        input = draft.clone();
+                    }
+                    dirty = true;
+                }
             } else if scancode == SCAN_BACKSPACE {
                 if input.pop().is_some() {
                     dirty = true;

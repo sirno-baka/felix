@@ -32,6 +32,7 @@ mod time;
 mod tss;
 mod utils;
 mod wrappers;
+mod pit;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -67,6 +68,7 @@ use crate::pci::print_devices;
 use crate::sync::mutex::Mutex;
 use crate::utils::queue::Queue;
 use multitasking::task::TASK_MANAGER;
+use crate::pit::init;
 
 static mut TEST_WRITE: [u32; 128] = [0; 128];
 static mut TEST_READ: [u32; 128] = [0; 128];
@@ -303,6 +305,7 @@ pub extern "C" fn higher_half_entry() -> ! {
         crate::drivers::wm::init();
         // 4. PIC
         PICS.init();
+
         // Use nesting cli so KMutex unlock cannot sti mid-boot.
         crate::wrappers::_cli();
         // 5. Keyboard buffer + PS/2 mouse (after PIC, still IF=0)
@@ -372,7 +375,7 @@ pub extern "C" fn higher_half_entry() -> ! {
         // Enable interrupts. The next timer tick will first_switch into the
         // idle task; subsequent ticks round-robin to the shell.
         asm!("sti");
-
+        init(1000);
         loop {
             asm!("hlt");
         }

@@ -11,7 +11,7 @@ use core::net::Ipv4Addr;
 use crate::println;
 
 /// DNS-сервер QEMU user networking
-const DNS_SERVER: [u8; 4] = [10, 0, 2, 3];
+const DNS_SERVER: [u8; 4] = [10, 254, 0, 112];
 const DNS_PORT: u16 = 53;
 
 /// Ошибки резолвинга
@@ -45,7 +45,6 @@ pub fn resolve(name: &str) -> Result<[u8; 4], DnsError> {
     // Подключаем к DNS-серверу
     let dns_ip = Ipv4Addr::from(DNS_SERVER);
     let addr = SockAddrIn::new(dns_ip, DNS_PORT);
-    println!("{}", dns_ip);
     let ret = unsafe {
         connect(
             sock as u32,

@@ -9,29 +9,29 @@ use libfelix::syscall::write;
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
-    let url = arg(1).unwrap_or("http://10.0.2.2:6666/");
+    let url = arg(1).unwrap_or("http://10.0.2.2:8899/b");
     println!("Fetching: {}", url);
 
     block_on(async {
         // Простой GET запрос
         match fetch(url).await {
             Ok(response) => {
-                // println!("=== HTTP Response ===");
-                // println!("Status: {}", response.status);
-                // if let Some(reason) = &response.reason {
-                //     println!("Reason: {}", reason);
-                // }
-                // println!("--- Headers ---");
-                // for (key, value) in &response.headers {
-                //     println!("{}: {}", key, value);
-                // }
-                // println!("--- Body ({} bytes) ---", response.body.len());
+                println!("=== HTTP Response ===");
+                println!("Status: {}", response.status);
+                if let Some(reason) = &response.reason {
+                    println!("Reason: {}", reason);
+                }
+                println!("--- Headers ---");
+                for (key, value) in &response.headers {
+                    println!("{}: {}", key, value);
+                }
+                println!("--- Body ({} bytes) ---", response.body.len());
                 // if let Ok(s) = core::str::from_utf8(&response.body) {
                 //     println!("{}", s);
                 // } else {
                 //     println!("[Binary data]");
                 // }
-                unsafe { write(1, response.body.as_ptr(), response.body.len()) };
+                // unsafe { write(1, response.body.as_ptr(), response.body.len()) };
             }
             Err(e) => {
                 println!("Error: {:?}", e);
@@ -42,6 +42,6 @@ pub extern "C" fn main() -> i32 {
         // let req = HttpRequest::post("http://10.0.2.2:6666/api", b"data=test");
         // let response = request(req).await;
     });
-
+    println!("Done");
     0
 }

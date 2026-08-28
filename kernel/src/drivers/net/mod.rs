@@ -2,7 +2,7 @@ pub mod i8255x;
 pub mod tcp;
 
 const TX_RING_SIZE: usize = 16;
-const RX_RING_SIZE: usize = 16;
+const RX_RING_SIZE: usize = 128;
 const RX_BUF_SIZE: usize = 1536;
 const TX_BUF_SIZE: usize = 1536;
 

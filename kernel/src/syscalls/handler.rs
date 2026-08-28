@@ -1575,6 +1575,11 @@ pub fn sys_poll(current_slot: usize, fds: *mut PollFd, nfds: usize, timeout_ms: 
     let start = crate::time::jiffies();
 
     loop {
+        if let Some(mut g) = crate::net::stack::NET_STACK.try_lock() {
+            if let Some(ref mut stack) = *g {
+                stack.poll(crate::time::jiffies() as i64);
+            }
+        }
         let mut ready = 0usize;
         for i in 0..nfds {
             unsafe {
@@ -2237,14 +2242,15 @@ pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) ->
 
     let mut stack_guard = match NET_STACK.try_lock() {
         Some(g) => g,
-        None => return 0,
+        None => return usize::MAX,
     };
     let stack = match stack_guard.as_mut() {
         Some(s) => s,
-        None => return 0,
+        None => return usize::MAX,
     };
 
-    stack.poll(crate::time::jiffies() as i64);
+    let ts = crate::time::jiffies() as i64;
+    stack.poll(ts);
 
     let (handle, is_tcp) = match stack.get_handle(socket_id) {
         Some(h) => h,
@@ -2255,10 +2261,12 @@ pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) ->
 
     if is_tcp {
         let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-        match socket.send_slice(data) {
-            Ok(n) => return n,
-            Err(_) => return usize::MAX,  // буфер полон
-        }
+        let n = match socket.send_slice(data) {
+            Ok(n) => n,
+            Err(_) => return usize::MAX,
+        };
+        stack.poll(ts);
+        return n;
     }
 
     let peer = {
@@ -2302,11 +2310,11 @@ pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) ->
 
     let mut stack_guard = match NET_STACK.try_lock() {
         Some(g) => g,
-        None => return 0,
+        None => return usize::MAX,
     };
     let stack = match stack_guard.as_mut() {
         Some(s) => s,
-        None => return 0,
+        None => return usize::MAX,
     };
 
     let ts = crate::time::jiffies() as i64;
@@ -2321,21 +2329,24 @@ pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) ->
     let user_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
 
     if is_tcp {
-        let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-        match socket.recv_slice(user_buf) {
-            Ok(n) if n > 0 => n,
-            Ok(_) => {
-                // 0 байт — проверяем состояние
-                if socket.state() == tcp::State::CloseWait
-                    || socket.state() == tcp::State::Closed
-                {
-                    0  // настоящий EOF
-                } else {
-                    usize::MAX  // данных нет, попробовать позже
+        let ret = {
+            let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+            match socket.recv_slice(user_buf) {
+                Ok(n) if n > 0 => n,
+                Ok(_) => {
+                    if socket.state() == tcp::State::CloseWait
+                        || socket.state() == tcp::State::Closed
+                    {
+                        0
+                    } else {
+                        usize::MAX
+                    }
                 }
+                Err(_) => usize::MAX,
             }
-            Err(_) => usize::MAX,
-        }
+        };
+        stack.poll(ts);
+        ret
     } else {
         let socket = stack.sockets.get_mut::<udp::Socket>(handle);
         match socket.recv_slice(user_buf) {

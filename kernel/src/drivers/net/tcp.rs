@@ -33,14 +33,10 @@ impl TxToken for I8255xTxToken {
     {
         let mut buf = [0u8; TX_BUF_SIZE];
         let result = f(&mut buf[..len]);
-        println!("TX: {} bytes, dst_mac={:02x?}, type={:02x}{:02x}",
-                 len, &buf[0..6], buf[12], buf[13]);
+
         unsafe {
             if !self.nic.is_null() {
-                match (*self.nic).send(&buf[..len]) {
-                    Ok(()) => println!("TX: sent OK"),
-                    Err(e) => println!("TX: send FAILED: {}", e),
-                }
+                let _ = (*self.nic).send(&buf[..len]);
             }
         }
         result
@@ -73,7 +69,7 @@ impl Device for I8255x {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.max_transmission_unit = 1500;
-        caps.max_burst_size = Some(1);
+        caps.max_burst_size = Some(512);
         caps.medium = Medium::Ethernet;
         caps
     }

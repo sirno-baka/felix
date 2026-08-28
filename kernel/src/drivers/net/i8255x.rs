@@ -335,10 +335,9 @@ impl I8255x {
             for i in 0..RX_RING_SIZE {
                 let desc = &mut *self.rx_ring.add(i);
                 write_volatile(&mut desc.status, 0);
-                write_volatile(
-                    &mut desc.command,
-                    if i + 1 == RX_RING_SIZE { CMD_EL } else { 0 },
-                );
+                // Circular RFD ring: no EL. EL on the last slot stops RU after
+                // one pass (RNR) and drops the rest of a slirp burst.
+                write_volatile(&mut desc.command, 0);
 
                 let next = if i + 1 == RX_RING_SIZE {
                     self.rx_ring_phys
@@ -421,13 +420,14 @@ impl I8255x {
     }
 
     fn start_ru(&self) -> Result<(), &'static str> {
-        // 1. Установить RU Base = 0
         self.write_pointer(0);
         self.scb_cmd(RU_LOAD_BASE);
         self.wait_scb();
 
-        // 2. Указать на первый RFD и запустить
-        self.write_pointer(self.rx_ring_phys);
+        // Restart from the RFD we will read next, not always slot 0.
+        let idx = self.rx_idx.load(Ordering::Relaxed);
+        let ptr = self.rx_ring_phys + (idx * core::mem::size_of::<RxDesc>()) as u32;
+        self.write_pointer(ptr);
         self.scb_cmd(RU_START);
         self.wait_scb();
 
@@ -507,7 +507,6 @@ impl I8255x {
         self.scb_cmd(CU_START);
 
         self.tx_head.store(next, Ordering::Release);
-        println!("TX head: {}", next);
         Ok(())
     }
 
@@ -518,58 +517,51 @@ impl I8255x {
             return None;
         }
 
-        // Идём по кольцу последовательно (не сканируем все RFD каждый раз)
-        let start = self.rx_idx.load(Ordering::Relaxed);
-        for offset in 0..RX_RING_SIZE {
-            let i = (start + offset) % RX_RING_SIZE;
-            unsafe {
-                let desc = &mut *self.rx_ring.add(i);
-                let status = read_volatile(&desc.status);
+        let i = self.rx_idx.load(Ordering::Relaxed);
+        unsafe {
+            let desc = &mut *self.rx_ring.add(i);
+            let status = read_volatile(&desc.status);
 
-                // Нужен Complete; OK желателен (без OK — часто мусор/ошибка)
-                if status & CMD_C == 0 {
-                    continue;
-                }
-
-                let count = (read_volatile(&desc.count) & 0x3FFF) as usize;
-
-                // Минимальный Ethernet-frame = 14 (заголовок).
-                // Мельче — мусор; его нельзя отдавать в smoltcp.
-                let valid = count >= 14
-                    && count <= buf.len()
-                    && count <= RX_BUF_SIZE
-                    && (status & CMD_OK) != 0;
-
-                if valid {
-                    core::ptr::copy_nonoverlapping(desc.data.as_ptr(), buf.as_mut_ptr(), count);
-                }
-
-                // === Важно: правильно вернуть RFD в кольцо ===
-                // Раньше ставили command=0 и сбрасывали EL у последнего
-                // дескриптора → RU ломался и при RNR/рестарте
-                // отдавал старые/пустые кадры (n=35 нулей).
-                write_volatile(&mut desc.status, 0);
-                write_volatile(&mut desc.count, 0);
-                write_volatile(&mut desc.size, RX_BUF_SIZE as u16);
-                write_volatile(
-                    &mut desc.command,
-                    if i + 1 == RX_RING_SIZE { CMD_EL } else { 0 },
-                );
-
-                self.rx_idx.store((i + 1) % RX_RING_SIZE, Ordering::Release);
-
+            // Sequential ring: do not skip this RFD if it is not complete yet.
+            // Scanning ahead orphaned the in-order segment (pcap hole at seq 17486).
+            if status & CMD_C == 0 {
                 let scb = read_volatile((self.mmio + SCB_STATUS) as *const u16);
                 if (scb & STAT_RNR) != 0 {
+                    write_volatile((self.mmio + SCB_STATUS) as *mut u16, STAT_RNR);
                     let _ = self.start_ru();
                 }
+                return None;
+            }
 
-                if valid {
-                    return Some(count);
-                }
-                // невалидный кадр — RFD уже освобождён, ищем дальше
+            let count = (read_volatile(&desc.count) & 0x3FFF) as usize;
+            let valid = count >= 14
+                && count <= buf.len()
+                && count <= RX_BUF_SIZE
+                && (status & CMD_OK) != 0;
+
+            if valid {
+                core::ptr::copy_nonoverlapping(desc.data.as_ptr(), buf.as_mut_ptr(), count);
+            }
+
+            write_volatile(&mut desc.status, 0);
+            write_volatile(&mut desc.count, 0);
+            write_volatile(&mut desc.size, RX_BUF_SIZE as u16);
+            write_volatile(&mut desc.command, 0);
+
+            self.rx_idx.store((i + 1) % RX_RING_SIZE, Ordering::Release);
+
+            let scb = read_volatile((self.mmio + SCB_STATUS) as *const u16);
+            if (scb & STAT_RNR) != 0 {
+                write_volatile((self.mmio + SCB_STATUS) as *mut u16, STAT_RNR);
+                let _ = self.start_ru();
+            }
+
+            if valid {
+                Some(count)
+            } else {
+                None
             }
         }
-        None
     }
 
     pub fn mac(&self) -> [u8; 6] {

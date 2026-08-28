@@ -185,12 +185,13 @@ pub async fn request(req: HttpRequest<'_>) -> Result<HttpResponse, HttpError> {
 
     // TCP connect
     let stack = FelixStack;
+    println!("[http] tcp connect {}:{}", ip, parsed.port);
     let mut tcp_stream = stack.connect(addr).await.map_err(|_| HttpError::TcpConnectFailed)?;
+    println!("[http] tcp connected");
 
     if parsed.scheme == "https" {
-        // HTTPS path
-        let mut read_buf = [0u8; 16384];
-        let mut write_buf = [0u8; 16384];
+        let mut read_buf = [0u8; 16640];
+        let mut write_buf = [0u8; 16640];
         let mut rng = SimpleRng(0xDEAD_BEEF);
 
         let config = TlsConfig::new()
@@ -199,16 +200,21 @@ pub async fn request(req: HttpRequest<'_>) -> Result<HttpResponse, HttpError> {
 
         let mut tls = TlsConnection::new(tcp_stream, &mut read_buf, &mut write_buf);
 
-        tls.open(TlsContext::new(
-            &config,
-            UnsecureProvider::new::<Aes128GcmSha256>(&mut rng),
-        ))
+        println!("[http] tls handshake start (host={})", parsed.host);
+        if let Err(e) = tls
+            .open(TlsContext::new(
+                &config,
+                UnsecureProvider::new::<Aes128GcmSha256>(&mut rng),
+            ))
             .await
-            .map_err(|_| HttpError::TlsHandshakeFailed)?;
+        {
+            println!("[http] tls handshake failed: {:?}", e);
+            return Err(HttpError::TlsHandshakeFailed);
+        }
+        println!("[http] tls handshake ok");
 
         do_http_request(&mut tls, parsed.host, parsed.path, &req).await
     } else {
-        // HTTP path
         do_http_request(&mut tcp_stream, parsed.host, parsed.path, &req).await
     }
 }
@@ -287,7 +293,7 @@ async fn do_http_request<S: Read + Write>(
         Ok(httparse::Status::Complete(_)) => {
             let status = resp.code.unwrap_or(0);
             let reason = resp.reason.map(String::from);
-            let headers = resp.headers.iter().map(|h| {
+            let headers: Vec<(String, String)> = resp.headers.iter().map(|h| {
                 (String::from(h.name), core::str::from_utf8(h.value).unwrap_or("").into())
             }).collect();
             (status, reason, headers)
@@ -296,7 +302,7 @@ async fn do_http_request<S: Read + Write>(
     };
 
     // Ищем Content-Length
-    let content_length = find_content_length(&response);
+    let content_length = find_content_length(status.2.clone());
 
     // Читаем тело
     let body_start = header_end;
@@ -317,6 +323,7 @@ async fn do_http_request<S: Read + Write>(
             }
         }
         response.truncate(total_needed);
+        body = response[header_end..].to_vec();
         // Тело — это &response[header_end..]
     } else {
         // Нет Content-Length — читаем до закрытия соединения
@@ -360,14 +367,11 @@ fn find_header_end(data: &[u8]) -> Option<usize> {
     None
 }
 
-fn find_content_length(data: &[u8]) -> Option<usize> {
-    let s = core::str::from_utf8(data).ok()?;
-    for line in s.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("content-length:") {
-            if let Some(val) = line.split(':').nth(1) {
-                return val.trim().parse().ok();
-            }
+fn find_content_length(headers: Vec<(String, String)>) -> Option<usize> {
+    for (name, value) in headers {
+        println!("{} = {:.10}", name, value);
+        if name.eq_ignore_ascii_case("content-length") {
+            return value.trim().parse().ok();
         }
     }
     None
