@@ -10,17 +10,13 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::str::{from_utf8, FromStr};
+use core::str::FromStr;
 use embedded_io_async::{Read, Write};
 use embedded_tls::{Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext, UnsecureProvider};
-use rand_core::{CryptoRng, RngCore, Error};
-
+use rand_core::{CryptoRng, RngCore};
 
 use super::edge_adapter::FelixStack;
 use edge_nal::TcpConnect;
-use crate::net::dns;
-use crate::net::dns::DnsError;
-use crate::println;
 
 /// HTTP methods
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,7 +168,6 @@ pub async fn fetch(url: &str) -> Result<HttpResponse, HttpError> {
 pub async fn request(req: HttpRequest<'_>) -> Result<HttpResponse, HttpError> {
     let parsed = parse_url(req.url).ok_or(HttpError::InvalidUrl)?;
 
-    // Resolve host to IP
     let ip = match core::net::Ipv4Addr::from_str(parsed.host) {
         Ok(ip) => ip,
         Err(_) => {
@@ -183,11 +178,11 @@ pub async fn request(req: HttpRequest<'_>) -> Result<HttpResponse, HttpError> {
 
     let addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(ip, parsed.port));
 
-    // TCP connect
     let stack = FelixStack;
-    println!("[http] tcp connect {}:{}", ip, parsed.port);
-    let mut tcp_stream = stack.connect(addr).await.map_err(|_| HttpError::TcpConnectFailed)?;
-    println!("[http] tcp connected");
+    let mut tcp_stream = stack
+        .connect(addr)
+        .await
+        .map_err(|_| HttpError::TcpConnectFailed)?;
 
     if parsed.scheme == "https" {
         let mut read_buf = [0u8; 16640];
@@ -200,18 +195,12 @@ pub async fn request(req: HttpRequest<'_>) -> Result<HttpResponse, HttpError> {
 
         let mut tls = TlsConnection::new(tcp_stream, &mut read_buf, &mut write_buf);
 
-        println!("[http] tls handshake start (host={})", parsed.host);
-        if let Err(e) = tls
-            .open(TlsContext::new(
-                &config,
-                UnsecureProvider::new::<Aes128GcmSha256>(&mut rng),
-            ))
-            .await
-        {
-            println!("[http] tls handshake failed: {:?}", e);
-            return Err(HttpError::TlsHandshakeFailed);
-        }
-        println!("[http] tls handshake ok");
+        tls.open(TlsContext::new(
+            &config,
+            UnsecureProvider::new::<Aes128GcmSha256>(&mut rng),
+        ))
+        .await
+        .map_err(|_| HttpError::TlsHandshakeFailed)?;
 
         do_http_request(&mut tls, parsed.host, parsed.path, &req).await
     } else {
@@ -225,7 +214,6 @@ async fn do_http_request<S: Read + Write>(
     path: &str,
     req: &HttpRequest<'_>,
 ) -> Result<HttpResponse, HttpError> {
-    // Build HTTP request
     let mut request = Vec::new();
     request.extend_from_slice(req.method.as_str().as_bytes());
     request.extend_from_slice(b" ");
@@ -234,7 +222,6 @@ async fn do_http_request<S: Read + Write>(
     request.extend_from_slice(host.as_bytes());
     request.extend_from_slice(b"\r\n");
 
-    // Add custom headers
     for (key, value) in req.headers {
         request.extend_from_slice(key.as_bytes());
         request.extend_from_slice(b": ");
@@ -242,7 +229,6 @@ async fn do_http_request<S: Read + Write>(
         request.extend_from_slice(b"\r\n");
     }
 
-    // Add Content-Length if body exists
     if let Some(body) = req.body {
         request.extend_from_slice(b"Content-Length: ");
         let len_str = body.len().to_string();
@@ -252,126 +238,153 @@ async fn do_http_request<S: Read + Write>(
 
     request.extend_from_slice(b"Connection: close\r\n\r\n");
 
-    // Add body if present
     if let Some(body) = req.body {
         request.extend_from_slice(body);
     }
 
-    // Send request
-    stream.write_all(&request).await.map_err(|_| HttpError::WriteFailed)?;
+    stream
+        .write_all(&request)
+        .await
+        .map_err(|_| HttpError::WriteFailed)?;
+    stream.flush().await.map_err(|_| HttpError::WriteFailed)?;
 
     let mut header_end = 0;
-
-
     let mut response = Vec::new();
     loop {
-        let old_len = response.len();
-        response.resize(old_len + 16384, 0); // расширяем на 16 КБ
-
-        match stream.read(&mut response[old_len..]).await {
-            Ok(0) => {
-                response.truncate(old_len);
-                break;
-            }
-            Ok(n) => {
-                response.truncate(old_len + n);
-                if let Some(pos) = find_header_end(&response) {
-                    header_end = pos;
-                    break;
-                }
-            }
-            Err(_) => return Err(HttpError::ReadFailed),
+        if !read_more(stream, &mut response).await? {
+            break;
+        }
+        if let Some(pos) = find_header_end(&response) {
+            header_end = pos;
+            break;
         }
     }
+    if header_end == 0 {
+        return Err(HttpError::ParseFailed);
+    }
 
+    let mut headers_buf = [httparse::EMPTY_HEADER; 128];
+    let mut resp = httparse::Response::new(&mut headers_buf);
 
-    // Парсим заголовки
-    let mut headers = [httparse::EMPTY_HEADER; 32];
-    let mut resp = httparse::Response::new(&mut headers);
-
-    let status = match resp.parse(&response) {
+    let (status_code, reason, headers) = match resp.parse(&response[..header_end]) {
         Ok(httparse::Status::Complete(_)) => {
             let status = resp.code.unwrap_or(0);
             let reason = resp.reason.map(String::from);
-            let headers: Vec<(String, String)> = resp.headers.iter().map(|h| {
-                (String::from(h.name), core::str::from_utf8(h.value).unwrap_or("").into())
-            }).collect();
+            let headers: Vec<(String, String)> = resp
+                .headers
+                .iter()
+                .filter(|h| !h.name.is_empty())
+                .map(|h| {
+                    (
+                        String::from(h.name),
+                        core::str::from_utf8(h.value).unwrap_or("").into(),
+                    )
+                })
+                .collect();
             (status, reason, headers)
         }
         _ => return Err(HttpError::ParseFailed),
     };
 
-    // Ищем Content-Length
-    let content_length = find_content_length(status.2.clone());
+    let content_length = header_value(&headers, "content-length").and_then(|v| v.trim().parse().ok());
+    let chunked = header_value(&headers, "transfer-encoding")
+        .map(|v| v.to_ascii_lowercase().contains("chunked"))
+        .unwrap_or(false);
 
-    // Читаем тело
-    let body_start = header_end;
-    let mut body = Vec::new();
+    let mut raw_body = response[header_end..].to_vec();
 
     if let Some(len) = content_length {
-        let total_needed = header_end + len;
-        response.reserve(total_needed);
-
-        while response.len() < total_needed {
-            let old_len = response.len();
-            response.resize(response.len() + 16384, 0);
-
-            match stream.read(&mut response[old_len..]).await {
-                Ok(0) => { response.truncate(old_len); break; }
-                Ok(n) => { response.truncate(old_len + n); }
-                Err(_) => return Err(HttpError::ReadFailed),
+        while raw_body.len() < len {
+            if !read_more(stream, &mut raw_body).await? {
+                break;
             }
         }
-        response.truncate(total_needed);
-        body = response[header_end..].to_vec();
-        // Тело — это &response[header_end..]
-    } else {
-        // Нет Content-Length — читаем до закрытия соединения
-        body.extend_from_slice(&response[body_start..]);
-
-        // Агрессивное чтение прямо в Vec
+        raw_body.truncate(len);
+    } else if chunked {
         loop {
-            let old_len = body.len();
-            body.resize(body.len() + 16384, 0); // расширяем на 16 КБ
-
-            match stream.read(&mut body[old_len..]).await {
-                Ok(0) => {
-                    body.truncate(old_len);
-                    break;
-                }
-                Ok(n) => {
-                    body.truncate(old_len + n);
-                }
-                Err(_) => {
-                    body.truncate(old_len);
-                    break;
-                }
+            if let Some(decoded) = decode_chunked(&raw_body) {
+                raw_body = decoded;
+                break;
+            }
+            if !read_more(stream, &mut raw_body).await? {
+                raw_body = decode_chunked(&raw_body).unwrap_or(raw_body);
+                break;
+            }
+        }
+    } else {
+        loop {
+            if !read_more(stream, &mut raw_body).await? {
+                break;
             }
         }
     }
 
     Ok(HttpResponse {
-        status: status.0,
-        reason: status.1,
-        headers: status.2,
-        body,
+        status: status_code,
+        reason,
+        headers,
+        body: raw_body,
     })
 }
 
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    for i in 0..data.len().saturating_sub(3) {
-        if &data[i..i+4] == b"\r\n\r\n" {
-            return Some(i + 4);
+async fn read_more<S: Read>(stream: &mut S, buf: &mut Vec<u8>) -> Result<bool, HttpError> {
+    let old_len = buf.len();
+    buf.resize(old_len + 16384, 0);
+    match stream.read(&mut buf[old_len..]).await {
+        Ok(0) => {
+            buf.truncate(old_len);
+            Ok(false)
+        }
+        Ok(n) => {
+            buf.truncate(old_len + n);
+            Ok(true)
+        }
+        Err(_) => {
+            buf.truncate(old_len);
+            Err(HttpError::ReadFailed)
         }
     }
-    None
 }
 
-fn find_content_length(headers: Vec<(String, String)>) -> Option<usize> {
-    for (name, value) in headers {
-        println!("{} = {:.10}", name, value);
-        if name.eq_ignore_ascii_case("content-length") {
-            return value.trim().parse().ok();
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+        .or_else(|| data.windows(2).position(|w| w == b"\n\n").map(|i| i + 2))
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// Returns decoded body when the last `0\r\n\r\n` chunk is present.
+fn decode_chunked(input: &[u8]) -> Option<Vec<u8>> {
+    let mut i = 0;
+    let mut out = Vec::new();
+    while i < input.len() {
+        let rest = &input[i..];
+        let line_end = rest.windows(2).position(|w| w == b"\r\n")?;
+        let line = core::str::from_utf8(&rest[..line_end]).ok()?.trim();
+        if line.is_empty() {
+            i += line_end + 2;
+            continue;
+        }
+        let size_str = line.split(';').next()?.trim();
+        let size = usize::from_str_radix(size_str, 16).ok()?;
+        i += line_end + 2;
+        if size == 0 {
+            return Some(out);
+        }
+        if i + size > input.len() {
+            return None;
+        }
+        out.extend_from_slice(&input[i..i + size]);
+        i += size;
+        if i + 2 <= input.len() && &input[i..i + 2] == b"\r\n" {
+            i += 2;
+        } else if i < input.len() && input[i] == b'\n' {
+            i += 1;
         }
     }
     None
