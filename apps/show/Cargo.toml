@@ -1,0 +1,15 @@
+[package]
+name = "show"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "show"
+test = false
+
+[dependencies]
+libfelix = { path = "../../lib" }
+embedded-graphics-unicodefonts = "0.2.0"
+zune-core = { version = "0.4", default-features = false }
+zune-jpeg = { version = "0.4", default-features = false }
+zune-png = { version = "0.4", default-features = false }
