@@ -229,7 +229,7 @@ fn event_loop(win: &mut Window) {
                     if scan == SCAN_ESC || scan == SCAN_Q {
                         return;
                     }
-                }
+                },
                 _ => {}
             }
         }

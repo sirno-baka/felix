@@ -71,11 +71,19 @@ fn longest_common_prefix(strings: &[String]) -> String {
 
 fn handle_tab_completion(shell: &mut Shell, input: &str, term: &mut TermBuffer) -> (String, bool) {
     // Если ввод содержит пробелы — не дополняем команду (можно расширить для путей)
-    if input.contains(' ') {
-        return (input.to_string(), false);
-    }
+    // if input.contains(' ') {
+    //     return (input.to_string(), false);
+    // }
+    let (tr_input, prefix) = match input.rsplit_once(' ') {
+        None => {
+            ("", input)
+        }
+        Some((tr_input, prefix)) => {
+            (tr_input, prefix)
 
-    let prefix = input.trim();
+        }
+    };
+    println!("{}", prefix);
     let all_cmds = shell.get_commands().clone();
     let mut matches: Vec<String> = all_cmds
         .into_iter()
@@ -90,14 +98,24 @@ fn handle_tab_completion(shell: &mut Shell, input: &str, term: &mut TermBuffer) 
 
     if matches.len() == 1 {
         // Единственное совпадение — заменяем ввод и добавляем пробел
-        let new_input = format!("{} ", matches[0]);
-        return (new_input, true);
+        if tr_input.is_empty() {
+            let new_input = format!("{} ", matches[0]);
+            return (new_input, true);
+        }
+        let new_input = format!("{} {}", tr_input, matches[0]);
+        (new_input, true)
     } else {
         // Несколько совпадений — находим общий префикс
         let common = longest_common_prefix(&matches);
         if common.len() > prefix.len() {
             // Общий префикс длиннее текущего — заменяем на него (без пробела)
-            return (common, true);
+            if tr_input.is_empty() {
+                let new_input = format!("{} ", common);
+                return (new_input, true);
+            }
+            let new_input = format!("{} {}", tr_input, common);
+            (new_input, true)
+
         } else {
             // Нет общего префикса — выводим список вариантов в терминал
             let mut msg = String::from("");

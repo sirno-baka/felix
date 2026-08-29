@@ -793,7 +793,16 @@ pub fn on_mouse_down(x: i32, y: i32) {
             // destroy without holding extra borrows
             for slot in wm.windows.iter_mut() {
                 if slot.as_ref().map(|ww| ww.id) == Some(target) {
-                    *slot = None;
+                    if let Some(window) = slot {
+                        window.events.push(WmEvent {
+                            kind: EV_CLOSE,
+                            a: 0,
+                            b: 0,
+                            c: 0,
+                            d: 0,
+                        });
+                    }
+                    // *slot = None;
                     break;
                 }
             }
