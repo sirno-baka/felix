@@ -1,5 +1,5 @@
 [workspace]
-members = ["boot", "bootloader", "kernel", "apps/http-client", "apps/shell", "apps/wasm-hello"]
+members = ["boot", "bootloader", "kernel", "apps/*"]
 resolver = "2"
 
 [workspace.package]
