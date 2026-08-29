@@ -1,11 +1,15 @@
-//! HTTP/HTTPS client for Felix OS
+//! HTTP/HTTPS client for Felix OS.
 //!
-//! # Example
 //! ```no_run
-//! use libfelix::net::http_client::{fetch, HttpMethod};
+//! use libfelix::net::{get, post, ContentType, HttpRequest};
 //!
-//! let response = fetch("https://example.com/").await?;
-//! println!("Status: {}", response.status);
+//! let page = get("https://example.com/").await?;
+//! let created = post("http://10.0.2.2:8899/api", br#"{"a":1}"#, ContentType::ApplicationJson).await?;
+//! let custom = HttpRequest::get("https://example.com/search")
+//!     .accept(ContentType::ApplicationJson)
+//!     .headers(&[("User-Agent", "Felix/0.1"), ("X-Token", "abc")])
+//!     .send()
+//!     .await?;
 //! ```
 
 use alloc::string::{String, ToString};
@@ -16,9 +20,11 @@ use embedded_tls::{Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext, Unsecu
 use rand_core::{CryptoRng, RngCore};
 
 use super::edge_adapter::FelixStack;
+use super::headers::{write_header, ContentType};
 use edge_nal::TcpConnect;
 
-/// HTTP methods
+pub use super::headers::ContentType as HttpContentType;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMethod {
     Get,
@@ -26,49 +32,146 @@ pub enum HttpMethod {
     Put,
     Delete,
     Head,
+    Patch,
 }
 
 impl HttpMethod {
-    fn as_str(&self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             HttpMethod::Get => "GET",
             HttpMethod::Post => "POST",
             HttpMethod::Put => "PUT",
             HttpMethod::Delete => "DELETE",
             HttpMethod::Head => "HEAD",
+            HttpMethod::Patch => "PATCH",
         }
     }
 }
 
-/// HTTP request configuration
+/// HTTP request. Built via `get`/`post`/`HttpRequest::get` and sent with `.send()`.
 pub struct HttpRequest<'a> {
     pub url: &'a str,
     pub method: HttpMethod,
-    pub headers: &'a [(&'a str, &'a str)],
+    pub content_type: Option<ContentType>,
+    pub accept: Option<ContentType>,
+    pub extra_headers: &'a [(&'a str, &'a str)],
     pub body: Option<&'a [u8]>,
 }
 
 impl<'a> HttpRequest<'a> {
-    pub fn get(url: &'a str) -> Self {
+    pub fn new(method: HttpMethod, url: &'a str) -> Self {
         Self {
             url,
-            method: HttpMethod::Get,
-            headers: &[],
+            method,
+            content_type: None,
+            accept: None,
+            extra_headers: &[],
             body: None,
         }
     }
 
+    pub fn get(url: &'a str) -> Self {
+        Self::new(HttpMethod::Get, url)
+    }
+
     pub fn post(url: &'a str, body: &'a [u8]) -> Self {
-        Self {
-            url,
-            method: HttpMethod::Post,
-            headers: &[("Content-Type", "application/x-www-form-urlencoded")],
-            body: Some(body),
+        Self::new(HttpMethod::Post, url)
+            .body(body)
+            .content_type(ContentType::ApplicationFormUrlEncoded)
+    }
+
+    pub fn put(url: &'a str, body: &'a [u8]) -> Self {
+        Self::new(HttpMethod::Put, url).body(body)
+    }
+
+    pub fn delete(url: &'a str) -> Self {
+        Self::new(HttpMethod::Delete, url)
+    }
+
+    pub fn head(url: &'a str) -> Self {
+        Self::new(HttpMethod::Head, url)
+    }
+
+    pub fn patch(url: &'a str, body: &'a [u8]) -> Self {
+        Self::new(HttpMethod::Patch, url).body(body)
+    }
+
+    pub fn content_type(mut self, content_type: ContentType) -> Self {
+        self.content_type = Some(content_type);
+        self
+    }
+
+    pub fn accept(mut self, accept: ContentType) -> Self {
+        self.accept = Some(accept);
+        self
+    }
+
+    pub fn headers(mut self, headers: &'a [(&'a str, &'a str)]) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    pub fn body(mut self, body: &'a [u8]) -> Self {
+        self.body = Some(body);
+        self
+    }
+
+    pub async fn send(self) -> Result<HttpResponse, HttpError> {
+        request(self).await
+    }
+
+    fn write_header(&self, host: &str, path: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(self.method.as_str().as_bytes());
+        out.extend_from_slice(b" ");
+        out.extend_from_slice(path.as_bytes());
+        out.extend_from_slice(b" HTTP/1.1\r\n");
+
+        write_header(&mut out, "Host", host);
+
+        if let Some(ct) = self.content_type {
+            write_header(&mut out, "Content-Type", ct.as_str());
         }
+        if let Some(accept) = self.accept {
+            write_header(&mut out, "Accept", accept.as_str());
+        }
+        if let Some(body) = self.body {
+            write_header(&mut out, "Content-Length", &body.len().to_string());
+        }
+
+        let mut has_ua = false;
+        let mut has_connection = false;
+        for (name, value) in self.extra_headers {
+            if name.eq_ignore_ascii_case("host")
+                || name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("content-type") && self.content_type.is_some()
+                || name.eq_ignore_ascii_case("accept") && self.accept.is_some()
+            {
+                continue;
+            }
+            if name.eq_ignore_ascii_case("user-agent") {
+                has_ua = true;
+            }
+            if name.eq_ignore_ascii_case("connection") {
+                has_connection = true;
+            }
+            write_header(&mut out, name, value);
+        }
+        if !has_ua {
+            write_header(&mut out, "User-Agent", "Felix/0.1");
+        }
+        if !has_connection {
+            write_header(&mut out, "Connection", "close");
+        }
+
+        out.extend_from_slice(b"\r\n");
+        if let Some(body) = self.body {
+            out.extend_from_slice(body);
+        }
+        out
     }
 }
 
-/// HTTP response
 pub struct HttpResponse {
     pub status: u16,
     pub reason: Option<String>,
@@ -76,7 +179,16 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
-/// HTTP client errors
+impl HttpResponse {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        header_value(&self.headers, name)
+    }
+
+    pub fn content_type(&self) -> Option<&str> {
+        self.header("content-type")
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum HttpError {
     InvalidUrl,
@@ -88,7 +200,6 @@ pub enum HttpError {
     ParseFailed,
 }
 
-/// Simple PRNG for TLS (xorshift64)
 struct SimpleRng(u64);
 
 impl RngCore for SimpleRng {
@@ -118,7 +229,6 @@ impl RngCore for SimpleRng {
 
 impl CryptoRng for SimpleRng {}
 
-/// Parsed URL components
 struct ParsedUrl<'a> {
     scheme: &'a str,
     host: &'a str,
@@ -145,8 +255,12 @@ fn parse_url(url: &str) -> Option<ParsedUrl<'_>> {
 
     let (host, port) = if let Some(colon) = authority.rfind(':') {
         let h = &authority[..colon];
-        let p: u16 = authority[colon + 1..].parse().ok()?;
-        (h, p)
+        if h.is_empty() || authority[colon + 1..].bytes().any(|b| !b.is_ascii_digit()) {
+            (authority, if scheme == "https" { 443 } else { 80 })
+        } else {
+            let p: u16 = authority[colon + 1..].parse().ok()?;
+            (h, p)
+        }
     } else {
         (authority, if scheme == "https" { 443 } else { 80 })
     };
@@ -159,12 +273,40 @@ fn parse_url(url: &str) -> Option<ParsedUrl<'_>> {
     })
 }
 
-/// Fetch a URL with GET request
 pub async fn fetch(url: &str) -> Result<HttpResponse, HttpError> {
-    request(HttpRequest::get(url)).await
+    get(url).await
 }
 
-/// Send an HTTP request
+pub async fn get(url: &str) -> Result<HttpResponse, HttpError> {
+    HttpRequest::get(url).send().await
+}
+
+pub async fn post(
+    url: &str,
+    body: &[u8],
+    content_type: ContentType,
+) -> Result<HttpResponse, HttpError> {
+    HttpRequest::post(url, body)
+        .content_type(content_type)
+        .send()
+        .await
+}
+
+pub async fn put(
+    url: &str,
+    body: &[u8],
+    content_type: ContentType,
+) -> Result<HttpResponse, HttpError> {
+    HttpRequest::put(url, body)
+        .content_type(content_type)
+        .send()
+        .await
+}
+
+pub async fn delete(url: &str) -> Result<HttpResponse, HttpError> {
+    HttpRequest::delete(url).send().await
+}
+
 pub async fn request(req: HttpRequest<'_>) -> Result<HttpResponse, HttpError> {
     let parsed = parse_url(req.url).ok_or(HttpError::InvalidUrl)?;
 
@@ -177,7 +319,6 @@ pub async fn request(req: HttpRequest<'_>) -> Result<HttpResponse, HttpError> {
     };
 
     let addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(ip, parsed.port));
-
     let stack = FelixStack;
     let mut tcp_stream = stack
         .connect(addr)
@@ -185,27 +326,36 @@ pub async fn request(req: HttpRequest<'_>) -> Result<HttpResponse, HttpError> {
         .map_err(|_| HttpError::TcpConnectFailed)?;
 
     if parsed.scheme == "https" {
-        let mut read_buf = [0u8; 16640];
-        let mut write_buf = [0u8; 16640];
-        let mut rng = SimpleRng(0xDEAD_BEEF);
-
-        let config = TlsConfig::new()
-            .with_server_name(parsed.host)
-            .enable_rsa_signatures();
-
-        let mut tls = TlsConnection::new(tcp_stream, &mut read_buf, &mut write_buf);
-
-        tls.open(TlsContext::new(
-            &config,
-            UnsecureProvider::new::<Aes128GcmSha256>(&mut rng),
-        ))
-        .await
-        .map_err(|_| HttpError::TlsHandshakeFailed)?;
-
-        do_http_request(&mut tls, parsed.host, parsed.path, &req).await
+        https_request(tcp_stream, parsed.host, parsed.path, &req).await
     } else {
         do_http_request(&mut tcp_stream, parsed.host, parsed.path, &req).await
     }
+}
+
+async fn https_request<S: Read + Write>(
+    tcp_stream: S,
+    host: &str,
+    path: &str,
+    req: &HttpRequest<'_>,
+) -> Result<HttpResponse, HttpError> {
+    // Heap: these are 16KiB each and must not live in the async state machine.
+    let mut read_buf = alloc::vec![0u8; 16640];
+    let mut write_buf = alloc::vec![0u8; 16640];
+    let mut rng = SimpleRng(0xDEAD_BEEF);
+
+    let config = TlsConfig::new()
+        .with_server_name(host)
+        .enable_rsa_signatures();
+
+    let mut tls = TlsConnection::new(tcp_stream, &mut read_buf, &mut write_buf);
+    tls.open(TlsContext::new(
+        &config,
+        UnsecureProvider::new::<Aes128GcmSha256>(&mut rng),
+    ))
+    .await
+    .map_err(|_| HttpError::TlsHandshakeFailed)?;
+
+    do_http_request(&mut tls, host, path, req).await
 }
 
 async fn do_http_request<S: Read + Write>(
@@ -214,36 +364,9 @@ async fn do_http_request<S: Read + Write>(
     path: &str,
     req: &HttpRequest<'_>,
 ) -> Result<HttpResponse, HttpError> {
-    let mut request = Vec::new();
-    request.extend_from_slice(req.method.as_str().as_bytes());
-    request.extend_from_slice(b" ");
-    request.extend_from_slice(path.as_bytes());
-    request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-    request.extend_from_slice(host.as_bytes());
-    request.extend_from_slice(b"\r\n");
-
-    for (key, value) in req.headers {
-        request.extend_from_slice(key.as_bytes());
-        request.extend_from_slice(b": ");
-        request.extend_from_slice(value.as_bytes());
-        request.extend_from_slice(b"\r\n");
-    }
-
-    if let Some(body) = req.body {
-        request.extend_from_slice(b"Content-Length: ");
-        let len_str = body.len().to_string();
-        request.extend_from_slice(len_str.as_bytes());
-        request.extend_from_slice(b"\r\n");
-    }
-
-    request.extend_from_slice(b"Connection: close\r\n\r\n");
-
-    if let Some(body) = req.body {
-        request.extend_from_slice(body);
-    }
-
+    let wire = req.write_header(host, path);
     stream
-        .write_all(&request)
+        .write_all(&wire)
         .await
         .map_err(|_| HttpError::WriteFailed)?;
     stream.flush().await.map_err(|_| HttpError::WriteFailed)?;
@@ -286,14 +409,17 @@ async fn do_http_request<S: Read + Write>(
         _ => return Err(HttpError::ParseFailed),
     };
 
-    let content_length = header_value(&headers, "content-length").and_then(|v| v.trim().parse().ok());
+    let content_length =
+        header_value(&headers, "content-length").and_then(|v| v.trim().parse().ok());
     let chunked = header_value(&headers, "transfer-encoding")
         .map(|v| v.to_ascii_lowercase().contains("chunked"))
         .unwrap_or(false);
 
     let mut raw_body = response[header_end..].to_vec();
 
-    if let Some(len) = content_length {
+    if req.method == HttpMethod::Head {
+        raw_body.clear();
+    } else if let Some(len) = content_length {
         while raw_body.len() < len {
             if !read_more(stream, &mut raw_body).await? {
                 break;
@@ -347,7 +473,9 @@ async fn read_more<S: Read>(stream: &mut S, buf: &mut Vec<u8>) -> Result<bool, H
 }
 
 fn find_header_end(data: &[u8]) -> Option<usize> {
-    data.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+    data.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
         .or_else(|| data.windows(2).position(|w| w == b"\n\n").map(|i| i + 2))
 }
 
@@ -358,7 +486,6 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
         .map(|(_, v)| v.as_str())
 }
 
-/// Returns decoded body when the last `0\r\n\r\n` chunk is present.
 fn decode_chunked(input: &[u8]) -> Option<Vec<u8>> {
     let mut i = 0;
     let mut out = Vec::new();

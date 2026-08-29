@@ -1,6 +1,6 @@
 //! Высокоуровневый файловый API для userspace
 
-use crate::syscall;
+use crate::syscall::{self, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -28,17 +28,32 @@ pub struct File {
 }
 
 impl File {
-    /// Открыть файл по пути.
-    /// flags пока игнорируются ядром, но передаём 0.
-    pub fn open(path: &str) -> IoResult<Self> {
+    fn from_syscall(path: &str, flags: u32) -> IoResult<Self> {
         let cpath = path_to_cstr(path);
-        let fd = unsafe { syscall::open(cpath.as_ptr(), 0) };
-        // Linux-style: negative = -errno; also accept legacy usize::MAX
+        let fd = unsafe { syscall::open(cpath.as_ptr(), flags) };
         if fd == usize::MAX || (fd as i32) < 0 {
             Err(IoError::NotFound)
         } else {
             Ok(Self { fd: fd as u32 })
         }
+    }
+
+    /// Open an existing file (read-write).
+    pub fn open(path: &str) -> IoResult<Self> {
+        Self::from_syscall(path, O_RDWR)
+    }
+
+    pub fn open_ro(path: &str) -> IoResult<Self> {
+        Self::from_syscall(path, O_RDONLY)
+    }
+
+    /// Create or truncate a file for writing (`O_CREAT | O_WRONLY | O_TRUNC`).
+    pub fn create(path: &str) -> IoResult<Self> {
+        Self::from_syscall(path, O_CREAT | O_WRONLY | O_TRUNC)
+    }
+
+    pub fn open_flags(path: &str, flags: u32) -> IoResult<Self> {
+        Self::from_syscall(path, flags)
     }
 
     /// Создать File из уже известного fd (stdin=0, stdout=1 и т.д.)
@@ -158,10 +173,9 @@ pub fn read_to_string(path: &str) -> IoResult<String> {
     Ok(String::from_utf8_lossy(&data).into_owned())
 }
 
-/// Записать данные в файл (перезаписывает).
+/// Write data to a file, creating it if needed.
 pub fn write(path: &str, data: &[u8]) -> IoResult<()> {
-    // пока у ядра нет O_CREAT/O_TRUNC — просто open + write
-    let mut f = File::open(path)?;
+    let mut f = File::create(path)?;
     f.write_all(data)
 }
 
