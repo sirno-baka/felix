@@ -146,7 +146,10 @@ pub fn init() {
         0x47
     };
     cmd |= 0x02; // enable IRQ12
+    cmd |= 0x01; // keep IRQ1 (keyboard) enabled — writing the command byte
+                 // without this bit kills the kbd on many laptops.
     cmd &= !0x20; // enable mouse clock (clear disable bit)
+    cmd &= !0x10; // enable keyboard clock
 
     wait_input_clear();
     outb(PS2_CMD, 0x60);
@@ -190,8 +193,19 @@ pub extern "C" fn mouse_irq() {
         naked_asm!(
             "cli",
             "pusha",
+            "mov ax, 0x10",
+            "mov ds, ax",
+            "mov es, ax",
             "call mouse_handler",
             "popa",
+            "mov cx, [esp + 4]",
+            "and cx, 3",
+            "cmp cx, 3",
+            "jne 2f",
+            "mov cx, 0x23",
+            "mov ds, cx",
+            "mov es, cx",
+            "2:",
             "iretd",
         );
     }

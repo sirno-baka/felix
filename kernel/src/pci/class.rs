@@ -33,4 +33,7 @@ pub mod subclass {
     pub const HOST: u8 = 0x00;
     pub const ISA: u8 = 0x01;
     pub const PCI_TO_PCI: u8 = 0x04;
+
+    // Serial bus
+    pub const USB: u8 = 0x03;
 }

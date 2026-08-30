@@ -323,10 +323,6 @@ pub extern "C" fn higher_half_entry() -> ! {
         print_info();
         print_devices();
         drivers::net::init_net();
-
-        // // 7. Task Manager (после IDT!)
-        TASK_MANAGER.init();
-
         // ---------------------------------------------------------------
         // Launch shell WHILE TIMER IS STILL MASKED and IF=0.
         // First IRQ0 does first_switch → abandons this boot context forever.
@@ -334,6 +330,8 @@ pub extern "C" fn higher_half_entry() -> ! {
         // ---------------------------------------------------------------
         // Keep nested cli for the entire critical section.
         crate::wrappers::_cli();
+        // // 7. Task Manager (после IDT!)
+        TASK_MANAGER.init();
 
         let data = match VFS.get().read_file("/shell") {
             Some(d) => d,

@@ -30,15 +30,60 @@ const FAT_PART_TYPES: &[u8] = &[
     0x0E, // FAT16 LBA
 ];
 
-/// Find first FAT partition in MBR; fallback to whole disk.
+fn is_fat_vbr(sec: &[u8; 512]) -> bool {
+    if sec[510] != 0x55 || sec[511] != 0xAA {
+        return false;
+    }
+    let jmp = sec[0];
+    if jmp != 0xEB && jmp != 0xE9 {
+        return false;
+    }
+    let bps = u16::from_le_bytes([sec[11], sec[12]]);
+    if bps != 512 && bps != 1024 && bps != 2048 && bps != 4096 {
+        return false;
+    }
+    let spc = sec[13];
+    if spc == 0 || (spc & (spc - 1)) != 0 {
+        return false;
+    }
+    sec[38] == b'F' && sec[39] == b'A' && sec[40] == b'T'
+        || sec[82] == b'F' && sec[83] == b'A' && sec[84] == b'T'
+}
+
+fn dump_bpb(sec: &[u8; 512], lba: u32) {
+    let bps = u16::from_le_bytes([sec[11], sec[12]]);
+    let spc = sec[13];
+    let reserved = u16::from_le_bytes([sec[14], sec[15]]);
+    let fats = sec[16];
+    let root = u16::from_le_bytes([sec[17], sec[18]]);
+    let tot16 = u16::from_le_bytes([sec[19], sec[20]]);
+    let fat16 = u16::from_le_bytes([sec[22], sec[23]]);
+    let tot32 = u32::from_le_bytes([sec[32], sec[33], sec[34], sec[35]]);
+    let fat32 = u32::from_le_bytes([sec[36], sec[37], sec[38], sec[39]]);
+    println!(
+        "[FAT] VBR LBA={} bps={} spc={} reserved={} fats={} root={} tot16={} fat16={} tot32={} fat32sz={}",
+        lba, bps, spc, reserved, fats, root, tot16, fat16, tot32, fat32
+    );
+}
+
+/// Find first FAT partition in MBR; fallback to whole-disk VBR (mkfs.vfat superfloppy).
 pub fn find_fat_partition_config(device: &dyn BlockDevice) -> PartitionConfig {
     let mut mbr = [0u8; 512];
     if device.read_sectors(1, 0, mbr.as_mut_ptr() as u32).is_err() {
-        println!("[FAT] Failed to read MBR, using whole disk");
+        println!("[FAT] Failed to read LBA0, using whole disk");
         return PartitionConfig::whole_disk();
     }
+
+    // mkfs.vfat without a partition table writes a VBR at LBA0.
+    // It also ends with 55AA, so it is easy to mistake for an MBR.
+    if is_fat_vbr(&mbr) {
+        println!("[FAT] LBA0 is a FAT boot sector (no partition table)");
+        dump_bpb(&mbr, 0);
+        return PartitionConfig::whole_disk();
+    }
+
     if mbr[510] != 0x55 || mbr[511] != 0xAA {
-        println!("[FAT] No MBR signature, using whole disk");
+        println!("[FAT] No 55AA on LBA0, using whole disk");
         return PartitionConfig::whole_disk();
     }
 
@@ -55,6 +100,13 @@ pub fn find_fat_partition_config(device: &dyn BlockDevice) -> PartitionConfig {
                 "[FAT] partition type={:#x} LBA={} sectors={}",
                 ptype, lba, sectors
             );
+            let mut vbr = [0u8; 512];
+            if device
+                .read_sectors(1, lba as u32, vbr.as_mut_ptr() as u32)
+                .is_ok()
+            {
+                dump_bpb(&vbr, lba as u32);
+            }
             return PartitionConfig::new(lba);
         }
     }

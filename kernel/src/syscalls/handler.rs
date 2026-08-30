@@ -368,6 +368,9 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         crate::syscalls::SYS_PCI_LIST => {
             sys_pci_list(state.ebx as *mut PciInfoUser, state.ecx as usize)
         }
+        crate::syscalls::SYS_IFCONFIG => {
+            sys_ifconfig(state.ebx as u32, state.ecx as *mut crate::net::stack::IfConfigUser)
+        }
 
         crate::syscalls::wasm::SYS_EXECVE_WASM => crate::syscalls::wasm::sys_execve_wasm(
             current_slot,
@@ -2161,10 +2164,10 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
     // --- TCP: retry loop с поллингом ---
     let mut connect_issued = false;
 
-    // Явный эфемерный порт (49152 + socket_id чтобы не было коллизий)
+    // Эфемерный порт; addr=None — smoltcp берёт source с iface (ДHCP/static).
     let local_port = 49152u16 + (socket_id as u16 & 0x3FFF);
     let local = IpListenEndpoint {
-        addr: Some(IpAddress::v4(10, 0, 2, 15)),
+        addr: None,
         port: local_port,
     };
 
@@ -2530,4 +2533,54 @@ pub fn sys_pci_list(buf: *mut PciInfoUser, max: usize) -> usize {
         }
     }
     write_n
+}
+
+const IFCFG_GET: u32 = 0;
+const IFCFG_STATIC: u32 = 1;
+const IFCFG_DHCP: u32 = 2;
+
+pub fn sys_ifconfig(cmd: u32, buf: *mut crate::net::stack::IfConfigUser) -> usize {
+    use crate::net::stack::{ifconfig_dhcp, ifconfig_get, ifconfig_static};
+    use smoltcp::wire::Ipv4Address;
+
+    fn ip4(v: u32) -> Ipv4Address {
+        let o = v.to_be_bytes();
+        Ipv4Address::new(o[0], o[1], o[2], o[3])
+    }
+
+    match cmd {
+        IFCFG_GET => {
+            let Some(info) = ifconfig_get() else {
+                return usize::MAX;
+            };
+            if buf.is_null() {
+                return usize::MAX;
+            }
+            unsafe {
+                *buf = info;
+            }
+            0
+        }
+        IFCFG_STATIC => {
+            if buf.is_null() {
+                return usize::MAX;
+            }
+            let cfg = unsafe { *buf };
+            let ip = ip4(cfg.ip);
+            let gw = if cfg.gateway == 0 {
+                None
+            } else {
+                Some(ip4(cfg.gateway))
+            };
+            match ifconfig_static(ip, cfg.prefix as u8, gw) {
+                Ok(()) => 0,
+                Err(_) => usize::MAX,
+            }
+        }
+        IFCFG_DHCP => match ifconfig_dhcp() {
+            Ok(()) => 0,
+            Err(_) => usize::MAX,
+        },
+        _ => usize::MAX,
+    }
 }

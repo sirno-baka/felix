@@ -437,6 +437,7 @@ dependencies = [
  "fatfs",
  "interrupt-sync",
  "libm",
+ "log",
  "smoltcp",
  "wasmi",
 ]
@@ -917,6 +918,7 @@ dependencies = [
  "cfg-if",
  "defmt",
  "heapless",
+ "log",
  "managed",
 ]
 

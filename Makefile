@@ -175,20 +175,39 @@ run-floppy: all floppy-image
        -no-reboot -vga std -no-shutdown -m 128M \
        -debugcon file:debug.log -s -S &
 
+.PHONY: usb-image
+usb-image:
+	@mkdir -p build
+	@if [ ! -f build/usb.img ]; then \
+		echo "=== Creating 64 MiB USB stick (MBR + FAT16 partition) ==="; \
+		dd if=/dev/zero of=build/usb.img bs=1M count=64 status=none; \
+		printf 'label: dos\nstart=2048, type=0e\n' | $(SFDISK) build/usb.img; \
+		if command -v mkfs.vfat >/dev/null 2>&1; then \
+			mkfs.vfat -F 16 -n FELIXUSB --offset 2048 build/usb.img; \
+		elif command -v newfs_msdos >/dev/null 2>&1; then \
+			newfs_msdos -F 16 -v FELIXUSB -S 512 -o 2048 build/usb.img; \
+		else \
+			echo "install dosfstools (mkfs.vfat)"; \
+		fi; \
+	fi
+
 .PHONY: run
-run: all
+run: all usb-image
 	@echo "Running Felix from HDD image..."
 	@killall qemu-system-i386 || true
 	@qemu-system-i386 \
 		-drive file=build/disk.img,index=0,media=disk,format=raw,if=ide \
 		-boot order=c \
 		-netdev user,id=net0 \
-		-device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
+		-device rtl8139,netdev=net0,mac=52:54:00:12:34:56 \
+		-device pci-ohci,id=ohci \
+		-drive if=none,id=usbstick,format=raw,file=build/usb.img \
+		-device usb-storage,bus=ohci.0,drive=usbstick \
 		-no-reboot -no-shutdown -vga std -m 128M \
 		-debugcon file:debug.log -serial stdio
 
 .PHONY: debug
-debug: all
+debug: all usb-image
 	@echo "Debugging Felix..."
 	@killall qemu-system-i386 || true
 	@qemu-system-i386 \
@@ -196,6 +215,9 @@ debug: all
 		-boot order=c \
 		-no-reboot -d int,guest_errors -debugcon file:debug.log -no-shutdown \
 		-netdev user,id=net0,dns=10.0.2.3 \
-                 -device i82559er,netdev=net0,mac=52:54:00:12:34:56 \
+                 -device rtl8139,netdev=net0,mac=52:54:00:12:34:56 \
                  -object filter-dump,id=f1,netdev=net0,file=guest.pcap \
+                 -device pci-ohci,id=ohci \
+                 -drive if=none,id=usbstick,format=raw,file=build/usb.img \
+                 -device usb-storage,bus=ohci.0,drive=usbstick \
 		-m 128M -s -S &

@@ -220,7 +220,7 @@ impl TaskManager {
                 ebp: 0,
                 eip: idle as u32,
                 cs: 0x08,
-                eflags: 0x202,
+                eflags: 0x0000_0202, // IF=1, reserved1=1
                 esp: stack_top,
                 ss: 0x10,
             };
@@ -280,8 +280,32 @@ impl TaskManager {
         }
         if self.first_switch {
             self.first_switch = false;
+            // Kernel bootstrap is not a task. Jump into a constructed CPUState.
+            // Prefer pid>=1 if execve already spawned the shell — otherwise the
+            // first tick always entered idle and pid=1 waited for IRQ0 #2.
+            // On real PIC/APIC that second tick is often missing.
+            self.current_task = 0;
+            let next = self.get_next_task();
+            if next != 0 {
+                self.current_task = next;
+            }
+            // Make sure timer/kbd/cascade/mouse are unmasked after sti.
+            crate::drivers::pic::PICS.unmask_irq(0);
+            crate::drivers::pic::PICS.unmask_irq(1);
+            crate::drivers::pic::PICS.unmask_irq(2);
+            crate::drivers::pic::PICS.unmask_irq(12);
+            let master = crate::drivers::pic::PICS.master_mask();
+            let slave = crate::drivers::pic::PICS.slave_mask();
+            let eflags = unsafe {
+                let t = self.tasks[self.current_task as usize].as_ref().unwrap();
+                (*(t.cpu_state_ptr as *const CPUState)).eflags
+            };
+            println!(
+                "[TASK] first switch -> {} eflags={:#x} pic={:#x}/{:#x}",
+                self.current_task, eflags, master, slave
+            );
 
-            let task = unsafe { self.tasks[0].as_ref().unwrap() };
+            let task = unsafe { self.tasks[self.current_task as usize].as_ref().unwrap() };
             let new_cpustate = task.cpu_state_ptr as *mut CPUState;
             unsafe {
                 gdt::TSS.esp0 = task.kernel_stack;

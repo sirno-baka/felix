@@ -397,6 +397,32 @@ pub const SYS_WM_POLL: u32 = 408;
 
 /// pci_list(*mut PciInfo, max) → count written (or total if max=0)
 pub const SYS_PCI_LIST: u32 = 410;
+pub const SYS_IFCONFIG: u32 = 411;
+
+pub const IFCFG_GET: u32 = 0;
+pub const IFCFG_STATIC: u32 = 1;
+pub const IFCFG_DHCP: u32 = 2;
+
+pub const IF_MODE_NONE: u32 = 0;
+pub const IF_MODE_STATIC: u32 = 1;
+pub const IF_MODE_DHCP: u32 = 2;
+
+pub const IF_STATE_DOWN: u32 = 0;
+pub const IF_STATE_CONFIGURING: u32 = 1;
+pub const IF_STATE_UP: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IfConfig {
+    pub mode: u32,
+    pub state: u32,
+    pub ip: u32,
+    pub prefix: u32,
+    pub gateway: u32,
+    pub dns: u32,
+    pub mac: [u8; 6],
+    pub _pad: [u8; 2],
+}
 
 /// One PCI function as returned by the kernel. Must match kernel `PciInfoUser`.
 #[repr(C)]
@@ -416,6 +442,18 @@ pub struct PciInfo {
 
 /// Enumerate PCI devices into `out` (up to `out.len()`). Returns number written.
 /// If `out` is empty, returns total device count without writing.
+pub unsafe fn ifconfig(cmd: u32, cfg: *mut IfConfig) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_IFCONFIG => ret,
+        in("ebx") cmd,
+        in("ecx") cfg,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
 pub unsafe fn pci_list(out: *mut PciInfo, max: usize) -> usize {
     let ret: usize;
     asm!(

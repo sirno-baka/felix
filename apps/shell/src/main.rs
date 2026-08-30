@@ -440,7 +440,7 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
     let name = cmd.args[0].as_str();
     match name {
         "help" | "exit" | "quit" | "pwd" | "cd" | "ls" | "cat" | "mkdir" | "rmdir" | "rm"
-        | "path" | "ps" | "clear" | "echo" | "head" | "lspci" => {}
+        | "path" | "ps" | "clear" | "echo" | "head" | "lspci" | "ifconfig" => {}
         _ => return false,
     }
 
@@ -635,9 +635,141 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
                 }
             }
         }
+        "ifconfig" => {
+            ifconfig_to(&cmd.args, file_fd, out);
+            if file_fd >= 0 {
+                unsafe {
+                    close(file_fd as u32);
+                }
+            }
+        }
         _ => {}
     }
     true
+}
+
+fn parse_ipv4(s: &str) -> Option<u32> {
+    let mut parts = s.split('.');
+    let a: u8 = parts.next()?.parse().ok()?;
+    let b: u8 = parts.next()?.parse().ok()?;
+    let c: u8 = parts.next()?.parse().ok()?;
+    let d: u8 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(u32::from_be_bytes([a, b, c, d]))
+}
+
+fn fmt_ipv4(v: u32) -> String {
+    let o = v.to_be_bytes();
+    format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3])
+}
+
+fn ifconfig_push(file_fd: i32, out: &mut TermBuffer, line: &str) {
+    if file_fd >= 0 {
+        let mut b = String::from(line);
+        b.push('\n');
+        unsafe {
+            write(file_fd as u32, b.as_bytes().as_ptr(), b.len());
+        }
+    } else {
+        out.push(line);
+    }
+}
+
+fn ifconfig_show(file_fd: i32, out: &mut TermBuffer) {
+    use syscall::{IfConfig, IFCFG_GET, IF_MODE_DHCP, IF_MODE_STATIC, IF_STATE_CONFIGURING, IF_STATE_UP};
+    let mut cfg = IfConfig::default();
+    let rc = unsafe { syscall::ifconfig(IFCFG_GET, &mut cfg as *mut _) };
+    if rc == usize::MAX {
+        ifconfig_push(file_fd, out, "ifconfig: no nic");
+        return;
+    }
+    let mode = match cfg.mode {
+        IF_MODE_STATIC => "static",
+        IF_MODE_DHCP => "dhcp",
+        _ => "none",
+    };
+    let state = match cfg.state {
+        IF_STATE_UP => "up",
+        IF_STATE_CONFIGURING => "configuring",
+        _ => "down",
+    };
+    ifconfig_push(
+        file_fd,
+        out,
+        &format!(
+            "eth0  {}
+  inet {}/{}
+  gw {}
+  dns {}
+  ether {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            state,
+            fmt_ipv4(cfg.ip),
+            cfg.prefix,
+            fmt_ipv4(cfg.gateway),
+            fmt_ipv4(cfg.dns),
+            cfg.mac[0],
+            cfg.mac[1],
+            cfg.mac[2],
+            cfg.mac[3],
+            cfg.mac[4],
+            cfg.mac[5],
+        ),
+    );
+    ifconfig_push(file_fd, out, &format!("  mode {}", mode));
+}
+
+fn ifconfig_to(args: &[String], file_fd: i32, out: &mut TermBuffer) {
+    use syscall::{IfConfig, IFCFG_DHCP, IFCFG_GET, IFCFG_STATIC, IF_STATE_UP};
+    if args.len() == 1 {
+        ifconfig_show(file_fd, out);
+        return;
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("dhcp") {
+        let rc = unsafe { syscall::ifconfig(IFCFG_DHCP, core::ptr::null_mut()) };
+        if rc == usize::MAX {
+            ifconfig_push(file_fd, out, "ifconfig: dhcp failed");
+            return;
+        }
+        ifconfig_push(file_fd, out, "dhcp started");
+        for _ in 0..40 {
+            unsafe {
+                syscall::sys_sleep(100);
+            }
+            let mut cfg = IfConfig::default();
+            let _ = unsafe { syscall::ifconfig(IFCFG_GET, &mut cfg as *mut _) };
+            if cfg.state == IF_STATE_UP {
+                ifconfig_show(file_fd, out);
+                return;
+            }
+        }
+        ifconfig_push(file_fd, out, "dhcp: still configuring (check ifconfig)");
+        return;
+    }
+    let spec = args[1].as_str();
+    let (ip_s, pfx_s) = spec.split_once('/').unwrap_or((spec, "24"));
+    let Some(ip) = parse_ipv4(ip_s) else {
+        ifconfig_push(file_fd, out, "Usage: ifconfig | ifconfig dhcp | ifconfig IP/PREFIX [GW]");
+        return;
+    };
+    let Ok(prefix) = pfx_s.parse::<u32>() else {
+        ifconfig_push(file_fd, out, "bad prefix");
+        return;
+    };
+    let gw = args.get(2).and_then(|s| parse_ipv4(s)).unwrap_or(0);
+    let mut cfg = IfConfig {
+        ip,
+        prefix,
+        gateway: gw,
+        ..IfConfig::default()
+    };
+    let rc = unsafe { syscall::ifconfig(IFCFG_STATIC, &mut cfg as *mut _) };
+    if rc == usize::MAX {
+        ifconfig_push(file_fd, out, "ifconfig: static failed");
+        return;
+    }
+    ifconfig_show(file_fd, out);
 }
 
 /// List PCI devices; names from the [pci-ids](https://docs.rs/pci-ids) database.
@@ -789,6 +921,9 @@ fn help_text() -> String {
   path [dirs]      - show or set PATH\n\
   mkdir / rmdir / rm\n\
   lspci            - list PCI devices (pci-ids names)\n\
+  ifconfig         - show iface\n\
+  ifconfig dhcp    - DHCP\n\
+  ifconfig IP/PFX [GW]  - static\n\
   clear            - clear terminal\n\
   help / exit\n\n\
 Redirection / pipes as usual.\n\
@@ -1226,7 +1361,7 @@ fn refresh_terminal(
 
 const BUILTINS: &[&str] = &[
     "help", "exit", "quit", "pwd", "cd", "ls", "cat", "mkdir", "rmdir", "rm", "path", "ps",
-    "clear", "echo", "head", "lspci",
+    "clear", "echo", "head", "lspci", "ifconfig",
 ];
 
 #[no_mangle]

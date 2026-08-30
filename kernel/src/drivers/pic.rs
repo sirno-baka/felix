@@ -160,6 +160,14 @@ impl Pics {
         self.slave.write_data(slave);
     }
 
+    pub fn master_mask(&self) -> u8 {
+        self.master.read_data()
+    }
+
+    pub fn slave_mask(&self) -> u8 {
+        self.slave.read_data()
+    }
+
     //check if one of the pics is handling an interrupt
     pub fn handles_interrupt(&self, interrupt: u8) -> bool {
         self.master.handles_interrupt(interrupt) || self.slave.handles_interrupt(interrupt)

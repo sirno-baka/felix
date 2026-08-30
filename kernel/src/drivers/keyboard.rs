@@ -58,8 +58,20 @@ pub extern "C" fn keyboard() {
         core::arch::naked_asm!(
             "cli",
             "pusha",
+            "mov ax, 0x10",
+            "mov ds, ax",
+            "mov es, ax",
             "call keyboard_handler",
             "popa",
+            // Restore user DS/ES if we return to ring 3 (iretd does not load them).
+            "mov cx, [esp + 4]",
+            "and cx, 3",
+            "cmp cx, 3",
+            "jne 2f",
+            "mov cx, 0x23",
+            "mov ds, cx",
+            "mov es, cx",
+            "2:",
             "iretd",
         );
     }

@@ -86,6 +86,12 @@ fn device_name(vendor_id: u16, device_id: u16) -> &'static str {
         (0x1023, 0x9680) => "TGUI 9680",
 
         // === Realtek ===
+        (0x10B9, 0x5237) => "M5237 USB OHCI",
+        (0x10B9, 0x5229) => "M5229 IDE",
+        (0x10B9, 0x1533) => "M1533 PCI-ISA",
+        (0x10B9, 0x7101) => "M7101 PMU",
+        (0x104C, 0x8023) => "TSB43AB22 OHCI 1394",
+
         (0x10EC, 0x8139) => "RTL-8139 Fast Ethernet",
         (0x10EC, 0x8168) => "RTL8111/8168 Gigabit Ethernet",
         (0x10EC, 0x8169) => "RTL8169 Gigabit Ethernet",

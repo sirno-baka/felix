@@ -92,3 +92,6 @@ pub const SYS_WM_POLL: u32 = 408;
 
 /// pci_list(*mut PciInfoUser, max) → number of devices written (or needed if max=0)
 pub const SYS_PCI_LIST: u32 = 410;
+/// ifconfig(cmd, *mut IfConfigUser) → 0 / usize::MAX
+/// cmd: 0=get, 1=static, 2=dhcp
+pub const SYS_IFCONFIG: u32 = 411;
