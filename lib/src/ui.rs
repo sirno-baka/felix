@@ -853,7 +853,7 @@ impl MouseTracker {
         }
     }
 
-    pub fn poll_ui(&mut self, win: &Window) -> Option<UiEvent> {
+    pub fn poll_ui(&mut self, win: &mut Window) -> Option<UiEvent> {
         let mut buf = [WmEvent::default(); 8];
         let n = win.poll_events(&mut buf);
         for e in &buf[..n] {

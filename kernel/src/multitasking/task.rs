@@ -389,13 +389,55 @@ impl TaskManager {
         0
     }
 
-    pub fn get_free_slot(&self) -> i8 {
+    pub fn get_free_slot(&mut self) -> i8 {
+        self.reap_orphans();
         for i in 0..MAX_TASKS {
             if self.tasks[i as usize].is_none() {
                 return i as i8;
             }
         }
+        // Last resort: steal any zombie so exec is not stuck at 8 slots.
+        for i in 1..MAX_TASKS {
+            if let Some(ref t) = self.tasks[i as usize] {
+                if t.zombie {
+                    let id = i as usize;
+                    let _ = self.reap(id);
+                    return i;
+                }
+            }
+        }
         -1
+    }
+
+    fn parent_gone(&self, parent: i8) -> bool {
+        if parent <= 0 {
+            return true;
+        }
+        match self.tasks.get(parent as usize) {
+            Some(Some(t)) => t.zombie,
+            _ => true,
+        }
+    }
+
+    /// Free zombie tasks whose parent is dead / idle / missing.
+    pub fn reap_orphans(&mut self) {
+        loop {
+            let mut victim = None;
+            for i in 1..MAX_TASKS as usize {
+                if let Some(ref t) = self.tasks[i] {
+                    if t.zombie && self.parent_gone(t.parent) {
+                        victim = Some(i);
+                        break;
+                    }
+                }
+            }
+            match victim {
+                Some(id) => {
+                    let _ = self.reap(id);
+                }
+                None => break,
+            }
+        }
     }
 
     pub fn get_current_slot(&self) -> i8 {

@@ -16,7 +16,7 @@ use crate::syscall::{self};
 
 pub use crate::syscall::{
     MouseState, WindowInfo, WmEvent, EV_CLOSE, EV_FOCUS_IN, EV_FOCUS_OUT, EV_KEY_DOWN, EV_KEY_UP,
-    EV_MOUSE_DOWN, EV_MOUSE_MOVE, EV_MOUSE_UP, EV_NONE,
+    EV_MOUSE_DOWN, EV_MOUSE_MOVE, EV_MOUSE_UP, EV_NONE, EV_RESIZE,
 };
 
 /// Must match kernel `drivers::wm::TITLE_H`.
@@ -197,13 +197,56 @@ impl Window {
         unsafe { syscall::wm_flip(self.id, self.buffer.as_ptr(), self.buffer.len()) == 0 }
     }
 
-    /// Non-blocking poll of window events (mouse/key/focus).
+    /// Non-blocking poll of window events (mouse/key/focus/resize).
     /// Returns how many events were written into `out`.
-    pub fn poll_events(&self, out: &mut [WmEvent]) -> usize {
+    /// On `EV_RESIZE` the local pixel buffer is rebuilt to the new client size.
+    pub fn poll_events(&mut self, out: &mut [WmEvent]) -> usize {
         if out.is_empty() {
             return 0;
         }
-        unsafe { syscall::wm_poll(self.id, out.as_mut_ptr(), out.len()) }
+        let n = unsafe { syscall::wm_poll(self.id, out.as_mut_ptr(), out.len()) };
+        for ev in out.iter().take(n) {
+            if ev.kind == EV_RESIZE {
+                self.apply_resize(ev.a as u32, ev.b as u32);
+            }
+        }
+        n
+    }
+
+    fn apply_resize(&mut self, client_w: u32, client_h: u32) {
+        let client_w = client_w.max(1);
+        let client_h = client_h.max(1);
+        let old_w = self.info.client_w.max(1);
+        let old_h = self.info.client_h.max(1);
+        let old_pitch = self.info.pitch as usize;
+        let old = self.buffer.clone();
+
+        self.info.client_w = client_w;
+        self.info.client_h = client_h;
+        self.info.w = client_w;
+        self.info.h = client_h + TITLE_H as u32;
+        self.info.pitch = client_w.saturating_mul(4);
+        let pitch = self.info.pitch as usize;
+        let size = pitch.saturating_mul(client_h as usize);
+        let mut buffer = alloc::vec![0u8; size];
+        for chunk in buffer.chunks_exact_mut(4) {
+            chunk[0] = 0x20;
+            chunk[1] = 0x18;
+            chunk[2] = 0x10;
+            chunk[3] = 0x00;
+        }
+        let copy_w = old_w.min(client_w) as usize;
+        let copy_h = old_h.min(client_h) as usize;
+        let row_bytes = copy_w.saturating_mul(4);
+        for y in 0..copy_h {
+            let src = y.saturating_mul(old_pitch);
+            let dst = y.saturating_mul(pitch);
+            if src + row_bytes <= old.len() && dst + row_bytes <= buffer.len() {
+                buffer[dst..dst + row_bytes].copy_from_slice(&old[src..src + row_bytes]);
+            }
+        }
+        self.buffer = buffer;
+        let _ = self.flip();
     }
 
     /// Destroy the window. Consumes `self`.

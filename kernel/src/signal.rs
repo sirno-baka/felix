@@ -7,7 +7,9 @@
 //!
 //! Signal numbers intentionally mirror Linux where practical.
 
+use crate::filesystem::file::{FileDescriptor, PipeEnd};
 use crate::multitasking::task::{CPUState, TASK_MANAGER};
+use crate::net::SocketState;
 use crate::println;
 
 // ====================== Signal numbers ======================
@@ -70,9 +72,43 @@ pub fn force_kill(slot: i8, sig: u32) -> bool {
             return false;
         }
     }
+    close_task_fds(slot);
     crate::drivers::wm::destroy_windows_of(slot);
+    unsafe {
+        TASK_MANAGER.reap_orphans();
+    }
     println!("[signal] task {} force-killed ({})", slot, sig);
     true
+}
+
+/// Drop every fd of `slot` so pipes/sockets get EOF immediately.
+fn close_task_fds(slot: i8) {
+    if slot <= 0 {
+        return;
+    }
+    let mut taken: [Option<FileDescriptor>; 64] = [None; 64];
+    unsafe {
+        if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
+            for i in 0..64 {
+                taken[i] = t.fd_table.close(i);
+            }
+        }
+    }
+    for desc in taken.into_iter().flatten() {
+        match desc {
+            FileDescriptor::Pipe { pipe_id, end } => match end {
+                PipeEnd::Read => crate::pipe::pipe_close_reader(pipe_id),
+                PipeEnd::Write => crate::pipe::pipe_close_writer(pipe_id),
+            },
+            FileDescriptor::Socket { socket_id } => {
+                let mut table = crate::net::SOCKET_TABLE.lock();
+                if let Some(sock) = table.get_mut(socket_id) {
+                    sock.state = SocketState::Closed;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 // ====================== Delivery ======================

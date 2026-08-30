@@ -22,6 +22,8 @@ pub const TITLE_H: u32 = 18;
 /// Close button size (square) inside the title bar.
 pub const CLOSE_SZ: i32 = 14;
 pub const CLOSE_PAD: i32 = 2;
+/// Bottom-right resize grip.
+pub const RESIZE_SZ: i32 = 12;
 
 const EV_CAP: usize = 32;
 
@@ -46,6 +48,8 @@ pub const EV_KEY_UP: u32 = 5;
 pub const EV_CLOSE: u32 = 6;
 pub const EV_FOCUS_IN: u32 = 7;
 pub const EV_FOCUS_OUT: u32 = 8;
+/// Client size changed: a=client_w, b=client_h.
+pub const EV_RESIZE: u32 = 9;
 
 /// Fixed ring of window events (drop oldest on overflow).
 struct EventQueue {
@@ -256,10 +260,15 @@ impl Window {
 }
 
 /// Active title-bar drag: window id + cursor offset from window origin.
+#[derive(Clone, Copy)]
 struct DragState {
     id: u8,
     grab_dx: i32,
     grab_dy: i32,
+    /// 0 = title move, 1 = bottom-right resize
+    kind: u8,
+    orig_w: u32,
+    orig_h: u32,
 }
 
 pub struct Compositor {
@@ -786,7 +795,48 @@ pub fn screen_size() -> (u32, u32) {
     (wm.screen_w, wm.screen_h)
 }
 
-/// Left button down: close / start title drag / focus.
+fn hit_resize(w: &Window, x: i32, y: i32) -> bool {
+    let gx = w.x + w.w as i32 - RESIZE_SZ;
+    let gy = w.y + w.h as i32 - RESIZE_SZ;
+    x >= gx && x < w.x + w.w as i32 && y >= gy && y < w.y + w.h as i32
+}
+
+fn apply_resize(w: &mut Window, new_w: u32, new_h: u32) {
+    let new_w = new_w.clamp(80, 1600);
+    let new_h = new_h.clamp(TITLE_H + 40, 1200);
+    w.w = new_w;
+    w.h = new_h;
+    let cw = new_w;
+    let ch = new_h.saturating_sub(TITLE_H);
+    if w.surface.width != cw || w.surface.height != ch {
+        if let Some(mut surf) = Surface::new(cw, ch) {
+            let copy_w = w.surface.width.min(cw) as usize;
+            let copy_h = w.surface.height.min(ch) as usize;
+            let src_pitch = w.surface.pitch as usize;
+            let dst_pitch = surf.pitch as usize;
+            let row = copy_w.saturating_mul(4);
+            for y in 0..copy_h {
+                let s = y.saturating_mul(src_pitch);
+                let d = y.saturating_mul(dst_pitch);
+                if s + row <= w.surface.pixels.len() && d + row <= surf.pixels.len() {
+                    surf.pixels[d..d + row]
+                        .copy_from_slice(&w.surface.pixels[s..s + row]);
+                }
+            }
+            w.surface = surf;
+        }
+    }
+    w.dirty = true;
+    w.events.push(WmEvent {
+        kind: EV_RESIZE,
+        a: w.surface.width as i32,
+        b: w.surface.height as i32,
+        c: 0,
+        d: 0,
+    });
+}
+
+/// Left button down: close / start title drag / resize / focus.
 pub fn on_mouse_down(x: i32, y: i32) {
     let Some(mut wm) = WM.try_lock() else {
         return;
@@ -829,6 +879,31 @@ pub fn on_mouse_down(x: i32, y: i32) {
                 // cannot keep the task runnable.
                 let _ = crate::signal::force_kill(owner, crate::signal::SIGKILL);
             }
+            return;
+        }
+
+        if hit_resize(w, x, y) {
+            let orig_w = w.w;
+            let orig_h = w.h;
+            let new_z = wm.next_z;
+            wm.next_z = wm.next_z.wrapping_add(1);
+            for win in wm.windows.iter_mut().flatten() {
+                let is = win.id == target;
+                win.focused = is;
+                if is {
+                    win.z = new_z;
+                    win.dirty = true;
+                }
+            }
+            wm.drag = Some(DragState {
+                id: target,
+                grab_dx: x,
+                grab_dy: y,
+                kind: 1,
+                orig_w,
+                orig_h,
+            });
+            wm.compose_dirty();
             return;
         }
 
@@ -889,6 +964,9 @@ pub fn on_mouse_down(x: i32, y: i32) {
                 id: target,
                 grab_dx,
                 grab_dy,
+                kind: 0,
+                orig_w: 0,
+                orig_h: 0,
             });
         } else {
             wm.drag = None;
@@ -905,8 +983,25 @@ pub fn on_mouse_move(x: i32, y: i32) {
         return;
     };
 
-    if let Some(drag) = &wm.drag {
+    if let Some(drag) = wm.drag {
         let id = drag.id;
+        if drag.kind == 1 {
+            let dw = x - drag.grab_dx;
+            let dh = y - drag.grab_dy;
+            let nw = (drag.orig_w as i32 + dw).clamp(80, wm.screen_w as i32) as u32;
+            let nh = (drag.orig_h as i32 + dh).clamp((TITLE_H as i32) + 40, wm.screen_h as i32) as u32;
+            if let Some(w) = wm.find_mut(id) {
+                if w.w != nw || w.h != nh {
+                    w.w = nw;
+                    w.h = nh;
+                    w.dirty = true;
+                    wm.compose();
+                }
+            } else {
+                wm.drag = None;
+            }
+            return;
+        }
         let nx = x - drag.grab_dx;
         let ny = y - drag.grab_dy;
         let max_x = wm.screen_w.saturating_sub(40) as i32;
@@ -959,7 +1054,17 @@ pub fn on_mouse_up(x: i32, y: i32) {
     let Some(mut wm) = WM.try_lock() else {
         return;
     };
-    wm.drag = None;
+    let finishing = wm.drag.take();
+    if let Some(drag) = finishing {
+        if drag.kind == 1 {
+            if let Some(w) = wm.find_mut(drag.id) {
+                let nw = w.w;
+                let nh = w.h;
+                apply_resize(w, nw, nh);
+            }
+            wm.compose();
+        }
+    }
 
     let ids = wm.sorted_ids();
     for id in ids.iter().rev().flatten() {

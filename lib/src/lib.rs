@@ -39,7 +39,7 @@ pub mod prelude {
     pub use crate::wm::{self, mouse, rgb, screen_size, MouseState, Window, WindowInfo, WmEvent};
     pub use crate::wm::{
         EV_CLOSE, EV_FOCUS_IN, EV_FOCUS_OUT, EV_KEY_DOWN, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_MOVE,
-        EV_MOUSE_UP,
+        EV_MOUSE_UP, EV_RESIZE,
     };
     pub use alloc::boxed::Box;
     pub use alloc::string::String;

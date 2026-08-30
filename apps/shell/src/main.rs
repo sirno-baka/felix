@@ -410,6 +410,11 @@ impl TermBuffer {
         (cols, rows)
     }
 
+    fn resize_to(&mut self, win: &Window) {
+        let (cols, rows) = Self::fit(win);
+        self.inner.resize(cols, rows);
+    }
+
     fn new(win: &Window) -> Self {
         let (cols, rows) = Self::fit(win);
         Self {
@@ -1035,6 +1040,9 @@ impl UiBridge<'_> {
         let mut evbuf = [WmEvent::default(); 32];
         let n = self.win.poll_events(&mut evbuf);
         for e in &evbuf[..n] {
+            if e.kind == EV_RESIZE {
+                continue;
+            }
             if e.kind != EV_KEY_DOWN {
                 continue;
             }
@@ -1309,7 +1317,7 @@ const SCAN_DOWN: u8 = 0x50;
 const SCAN_PGUP: u8 = 0x49;
 const SCAN_PGDN: u8 = 0x51;
 const CMD_HISTORY_MAX: usize = 64;
-const LINE_MAX_CHARS: usize = 69;
+const LINE_MAX_CHARS: usize = 69; // unused for wrap; VT reflows by window cols
 const HIST_PATH: &str = "/shell_hist";
 
 fn load_cmd_history() -> Vec<String> {
@@ -1347,11 +1355,7 @@ fn save_cmd_history(hist: &[String]) {
 
 /// Keep the **start** of the line (bus addr / prompt), not the tail.
 fn truncate_line(s: &str) -> &str {
-    if s.len() > LINE_MAX_CHARS {
-        &s[..LINE_MAX_CHARS]
-    } else {
-        s
-    }
+    s
 }
 
 fn refresh_terminal(win: &mut Window, term: &TermBuffer) {
@@ -1391,6 +1395,11 @@ pub extern "C" fn main() -> i32 {
         let n = win.poll_events(&mut evbuf);
 
         for e in &evbuf[..n] {
+            if e.kind == EV_RESIZE {
+                term.resize_to(&win);
+                dirty = true;
+                continue;
+            }
             if e.kind != EV_KEY_DOWN {
                 continue;
             }

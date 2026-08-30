@@ -615,6 +615,7 @@ pub const EV_KEY_UP: u32 = 5;
 pub const EV_CLOSE: u32 = 6;
 pub const EV_FOCUS_IN: u32 = 7;
 pub const EV_FOCUS_OUT: u32 = 8;
+pub const EV_RESIZE: u32 = 9;
 
 /// Non-blocking: copy up to `max` events for window `id` into `out`.
 pub unsafe fn wm_poll(id: u32, out: *mut WmEvent, max: usize) -> usize {
