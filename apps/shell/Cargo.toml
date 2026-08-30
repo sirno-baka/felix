@@ -10,3 +10,6 @@ test = false
 [dependencies]
 libfelix = { path = "../../lib" }
 pci-ids = "0.2"
+vte = { version = "0.13.1", default-features = false, features = ["no_std"] }
+embedded-graphics = { version = "0.8.2", default-features = false }
+embedded-graphics-unicodefonts = "0.2.0"

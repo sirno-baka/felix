@@ -10,7 +10,10 @@ use alloc::vec::Vec;
 use core::cmp::min;
 
 use libfelix::async_rt::yield_now;
+use libfelix::embedded_graphics;
 use libfelix::prelude::*;
+mod terminal;
+use terminal::{Terminal, CELL_H, CELL_W};
 use libfelix::syscall::{
     self, close, execve, execve_wasm, kill, mkdir, open, pipe, read, rmdir, set_nonblock, unlink,
     wait, wait_options, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGINT, WNOHANG,
@@ -390,45 +393,72 @@ fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
 // ---------------------------------------------------------------------------
 
 const MAX_HISTORY: usize = 64;
-const VISIBLE_LINES: usize = 22;
-const HISTORY_ROWS: usize = VISIBLE_LINES - 1;
+const TERM_PAD: i32 = 8;
 
-struct TermBuffer {
-    lines: Vec<String>,
+pub struct TermBuffer {
+    inner: Terminal,
+    /// Last rendered row strings (label path / tab completion).
+    cache: Vec<String>,
 }
 
 impl TermBuffer {
-    fn new() -> Self {
-        Self { lines: Vec::new() }
+    fn fit(win: &Window) -> (usize, usize) {
+        let w = win.client_width() as i32;
+        let h = win.client_height() as i32;
+        let cols = ((w - TERM_PAD * 2) / CELL_W).max(1) as usize;
+        let rows = ((h - TERM_PAD * 2) / CELL_H).max(1) as usize;
+        (cols, rows)
     }
 
-    fn push(&mut self, line: &str) {
-        for part in line.split('\n') {
-            // Soft-wrap so long lines (e.g. lspci) keep the start visible.
-            let mut rest = part;
-            loop {
-                if rest.len() <= LINE_MAX_CHARS {
-                    self.lines.push(String::from(rest));
-                    break;
-                }
-                // Prefer ASCII-safe cut; our shell text is ASCII.
-                let (head, tail) = rest.split_at(LINE_MAX_CHARS);
-                self.lines.push(String::from(head));
-                rest = tail;
-            }
-            while self.lines.len() > MAX_HISTORY {
-                self.lines.remove(0);
-            }
+    fn new(win: &Window) -> Self {
+        let (cols, rows) = Self::fit(win);
+        Self {
+            inner: Terminal::new(cols, rows),
+            cache: Vec::new(),
         }
     }
 
+    fn push(&mut self, line: &str) {
+        // Keep `\n` as line break; VTE handles wrap + CSI.
+        self.inner.write_str(line);
+        if !line.ends_with('\n') {
+            self.inner.process(b"\r\n");
+        }
+        self.cache = self.inner.visible_lines();
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        self.inner.process(bytes);
+        self.cache = self.inner.visible_lines();
+    }
+
     fn clear(&mut self) {
-        self.lines.clear();
+        self.inner.clear();
+        self.cache = self.inner.visible_lines();
     }
 
     fn visible_history(&self) -> impl Iterator<Item = &str> {
-        let start = self.lines.len().saturating_sub(HISTORY_ROWS);
-        self.lines[start..].iter().map(|s| s.as_str())
+        self.cache.iter().map(|s| s.as_str())
+    }
+
+    fn draw(&self, win: &mut Window) {
+        self.inner
+            .draw(win, embedded_graphics::prelude::Point::new(TERM_PAD, TERM_PAD));
+    }
+
+    fn prompt_line(&mut self, prompt: &str) {
+        self.inner.write_str(prompt);
+        self.cache = self.inner.visible_lines();
+    }
+
+    fn rubout_n(&mut self, n: usize) {
+        for _ in 0..n {
+            self.write_bytes(b"\x08 \x08");
+        }
+    }
+
+    fn scroll(&mut self, delta: i32) {
+        self.inner.scroll(delta);
     }
 }
 
@@ -462,7 +492,8 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
                 }
             } else {
                 for line in msg.lines() {
-                    out.push(line);
+                    out.write_bytes(line.as_bytes());
+                    out.write_bytes(b"\n");
                 }
             }
         }
@@ -695,29 +726,13 @@ fn ifconfig_show(file_fd: i32, out: &mut TermBuffer) {
         IF_STATE_CONFIGURING => "configuring",
         _ => "down",
     };
-    ifconfig_push(
-        file_fd,
-        out,
-        &format!(
-            "eth0  {}
-  inet {}/{}
-  gw {}
-  dns {}
-  ether {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            state,
-            fmt_ipv4(cfg.ip),
-            cfg.prefix,
-            fmt_ipv4(cfg.gateway),
-            fmt_ipv4(cfg.dns),
-            cfg.mac[0],
-            cfg.mac[1],
-            cfg.mac[2],
-            cfg.mac[3],
-            cfg.mac[4],
-            cfg.mac[5],
-        ),
-    );
-    ifconfig_push(file_fd, out, &format!("  mode {}", mode));
+
+    ifconfig_push(file_fd, out, &format!(" eth0  {}", state));
+    ifconfig_push(file_fd, out, &format!(" inet {}/{}", fmt_ipv4(cfg.ip), cfg.prefix));
+    ifconfig_push(file_fd, out, &format!(" gw {}", fmt_ipv4(cfg.gateway)));
+    ifconfig_push(file_fd, out, &format!(" dns {}", fmt_ipv4(cfg.dns)));
+    ifconfig_push(file_fd, out, &format!(" ether {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", cfg.mac[0], cfg.mac[1], cfg.mac[2], cfg.mac[3], cfg.mac[4], cfg.mac[5]));
+    ifconfig_push(file_fd, out, &format!(" mode {}", mode));
 }
 
 fn ifconfig_to(args: &[String], file_fd: i32, out: &mut TermBuffer) {
@@ -993,60 +1008,26 @@ fn spawn(
     }
 }
 
-/// Non-blocking line-oriented pipe drain. Returns true if any data was consumed.
+/// Non-blocking pipe drain into the VT screen. Returns true if any data was consumed.
 fn drain_pipe_once(
     fd: u32,
     out: &mut TermBuffer,
-    partial: &mut String,
-    live_idx: &mut Option<usize>,
+    _partial: &mut String,
+    _live_idx: &mut Option<usize>,
 ) -> bool {
     let mut buf = [0u8; 512];
     let n = unsafe { read(fd, buf.as_mut_ptr(), buf.len()) };
     if n == 0 || n == usize::MAX {
         return false;
     }
-    match core::str::from_utf8(&buf[..n]) {
-        Ok(s) => partial.push_str(s),
-        Err(_) => {
-            out.push(&format!("<{} bytes>", n));
-            return true;
-        }
-    }
-
-    let mut dirty = false;
-    while let Some(pos) = partial.find('\n') {
-        let line: String = partial.drain(..=pos).collect();
-        let line = line.trim_end_matches(&['\n', '\r'][..]);
-        if let Some(i) = live_idx.take() {
-            if i < out.lines.len() {
-                out.lines[i] = String::from(line);
-            } else {
-                out.push(line);
-            }
-        } else {
-            out.push(line);
-        }
-        dirty = true;
-    }
-    if !partial.is_empty() {
-        if let Some(i) = *live_idx {
-            if i < out.lines.len() {
-                out.lines[i] = partial.clone();
-            }
-        } else {
-            out.push(partial);
-            *live_idx = Some(out.lines.len().saturating_sub(1));
-        }
-        dirty = true;
-    }
-    dirty
+    out.write_bytes(&buf[..n]);
+    true
 }
 
 /// UI bridge: one mutable owner of the window so tick + redraw don't conflict.
 struct UiBridge<'a> {
     win: &'a mut Window,
-    ui: &'a mut Ui,
-    line_ids: &'a [WidgetId],
+    prompt: String,
 }
 
 impl UiBridge<'_> {
@@ -1068,8 +1049,7 @@ impl UiBridge<'_> {
     }
 
     fn redraw(&mut self, term: &TermBuffer) {
-        refresh_terminal(self.ui, "", term, "", self.line_ids);
-        self.ui.draw(self.win);
+        refresh_terminal(self.win, term);
         let _ = self.win.flip();
     }
 }
@@ -1124,8 +1104,8 @@ fn supervise_child(pid: i32, capture_fd: Option<u32>, out: &mut TermBuffer, ui: 
         }
         if !partial.is_empty() {
             if let Some(i) = live_idx {
-                if i < out.lines.len() {
-                    out.lines[i] = partial;
+                if i < out.cache.len() {
+                    let _ = i;
                 }
             } else {
                 out.push(&partial);
@@ -1326,8 +1306,44 @@ const SCAN_TAB: u8 = 0x0F;
 const MAX_INPUT: usize = 96;
 const SCAN_UP: u8 = 0x48;
 const SCAN_DOWN: u8 = 0x50;
+const SCAN_PGUP: u8 = 0x49;
+const SCAN_PGDN: u8 = 0x51;
 const CMD_HISTORY_MAX: usize = 64;
 const LINE_MAX_CHARS: usize = 69;
+const HIST_PATH: &str = "/shell_hist";
+
+fn load_cmd_history() -> Vec<String> {
+    let mut f = match File::open_ro(HIST_PATH) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let data = f.read_to_end().unwrap_or_default();
+    let text = core::str::from_utf8(&data).unwrap_or("");
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if !t.is_empty() {
+            out.push(t.to_string());
+        }
+    }
+    if out.len() > CMD_HISTORY_MAX {
+        out.drain(0..out.len() - CMD_HISTORY_MAX);
+    }
+    out
+}
+
+fn save_cmd_history(hist: &[String]) {
+    let mut f = match File::create(HIST_PATH) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let mut buf = String::new();
+    for line in hist {
+        buf.push_str(line);
+        buf.push('\n');
+    }
+    let _ = f.write(buf.as_bytes());
+}
 
 /// Keep the **start** of the line (bus addr / prompt), not the tail.
 fn truncate_line(s: &str) -> &str {
@@ -1338,25 +1354,8 @@ fn truncate_line(s: &str) -> &str {
     }
 }
 
-fn refresh_terminal(
-    ui: &mut Ui,
-    prompt: &str,
-    term: &TermBuffer,
-    input: &str,
-    line_ids: &[WidgetId],
-) {
-    let mut hist: Vec<&str> = term.visible_history().collect();
-    while hist.len() < HISTORY_ROWS {
-        hist.insert(0, "");
-    }
-    for i in 0..HISTORY_ROWS {
-        let text = hist.get(i).copied().unwrap_or("");
-        ui.set_label(line_ids[i], truncate_line(text));
-    }
-    let mut live = String::from(prompt);
-    live.push_str(input);
-    live.push('_');
-    ui.set_label(line_ids[HISTORY_ROWS], truncate_line(&live));
+fn refresh_terminal(win: &mut Window, term: &TermBuffer) {
+    term.draw(win);
 }
 
 const BUILTINS: &[&str] = &[
@@ -1370,27 +1369,20 @@ pub extern "C" fn main() -> i32 {
         Window::create(40, 40, 480, 320, "Felix Shell").expect("wm_create failed")
     });
     let mut ui = Ui::new();
-    let mut line_ids: Vec<WidgetId> = Vec::new();
-    let line_y0 = 8;
-    let line_h = 16;
-    for i in 0..VISIBLE_LINES {
-        let y = line_y0 + (i as i32) * line_h;
-        line_ids.push(ui.add_label(Label::new(10, y, "")));
-    }
+    let _ = ui;
 
     let mut shell = Shell::new();
-    let mut term = TermBuffer::new();
+    let mut term = TermBuffer::new(&win);
     let mut input = String::new();
-    let mut cmd_hist: Vec<String> = Vec::new();
+    let mut cmd_hist: Vec<String> = load_cmd_history();
     let mut hist_pos: Option<usize> = None; // None = текущая строка
     let mut draft = String::new();          // то, что набирали до ↑
     term.push("=== Felix User Shell ===");
-    term.push("help — builtins · clear — wipe · Ctrl+C stops a running program");
+    term.push("\x1b[32mVT\x1b[0m · \x1b[31mESC\x1b[0m · help / clear / Ctrl+C");
     term.push("");
 
-    let prompt = shell.prompt();
-    refresh_terminal(&mut ui, &prompt, &term, &input, &line_ids);
-    ui.draw(&mut win);
+    term.prompt_line(&shell.prompt());
+    refresh_terminal(&mut win, &term);
     let _ = win.flip();
 
     loop {
@@ -1417,24 +1409,31 @@ pub extern "C" fn main() -> i32 {
                     if cmd_hist.len() > CMD_HISTORY_MAX {
                         cmd_hist.remove(0);
                     }
+                    save_cmd_history(&cmd_hist);
                 }
                 hist_pos = None;
                 draft.clear();
 
+                term.write_bytes(b"\r\n");
                 input.clear();
-                term.push(&format!("{}{}", shell.prompt(), cmd.trim()));
 
                 {
                     let mut bridge = UiBridge {
                         win: &mut win,
-                        ui: &mut ui,
-                        line_ids: &line_ids,
+                        prompt: shell.prompt(),
                     };
                     bridge.redraw(&term);
                     if !cmd.trim().is_empty() {
                         interpret(&mut shell, &cmd, &mut term, &mut bridge);
                     }
                 }
+                term.prompt_line(&shell.prompt());
+                dirty = true;
+            } else if scancode == SCAN_PGUP {
+                term.scroll(8);
+                dirty = true;
+            } else if scancode == SCAN_PGDN {
+                term.scroll(-8);
                 dirty = true;
             } else if scancode == SCAN_UP {
                 if !cmd_hist.is_empty() {
@@ -1447,11 +1446,14 @@ pub extern "C" fn main() -> i32 {
                         Some(i) => i - 1,
                     };
                     hist_pos = Some(next);
+                    term.rubout_n(input.len());
                     input = cmd_hist[next].clone();
+                    term.write_bytes(input.as_bytes());
                     dirty = true;
                 }
             } else if scancode == SCAN_DOWN {
                 if let Some(i) = hist_pos {
+                    term.rubout_n(input.len());
                     if i + 1 < cmd_hist.len() {
                         hist_pos = Some(i + 1);
                         input = cmd_hist[i + 1].clone();
@@ -1459,33 +1461,36 @@ pub extern "C" fn main() -> i32 {
                         hist_pos = None;
                         input = draft.clone();
                     }
+                    term.write_bytes(input.as_bytes());
                     dirty = true;
                 }
             } else if scancode == SCAN_BACKSPACE {
                 if input.pop().is_some() {
+                    term.write_bytes(b"\x08 \x08");
                     dirty = true;
                 }
             } else if scancode == SCAN_TAB {
                 let (new_input, completed) = handle_tab_completion(&mut shell, &input, &mut term);
                 if completed {
+                    term.rubout_n(input.len());
                     input = new_input;
+                    term.write_bytes(input.as_bytes());
                     dirty = true;
                     // После вывода подсказок обновляем UI
                     let prompt = shell.prompt();
-                    refresh_terminal(&mut ui, &prompt, &term, &input, &line_ids);
-                    ui.draw(&mut win);
+                    refresh_terminal(&mut win, &term);
                     let _ = win.flip();
                 }
             } else if ch >= 0x20 && ch < 0x7f && input.len() < MAX_INPUT {
                 input.push(ch as char);
+                term.write_bytes(&[ch]);
                 dirty = true;
             }
         }
 
         if dirty {
             let prompt = shell.prompt();
-            refresh_terminal(&mut ui, &prompt, &term, &input, &line_ids);
-            ui.draw(&mut win);
+            refresh_terminal(&mut win, &term);
             let _ = win.flip();
         }
     }
