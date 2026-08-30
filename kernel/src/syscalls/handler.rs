@@ -1362,6 +1362,7 @@ pub fn sys_ls(path_ptr: *const u8, buf_ptr: *mut u8, buf_size: usize) -> usize {
 pub fn sys_exit(current_slot: usize, esp: u32) -> u32 {
     unsafe {
         if current_slot != 0 {
+            crate::drivers::wm::destroy_windows_of(current_slot as i8);
             if let Some(ref mut t) = TASK_MANAGER.tasks[current_slot] {
                 // Close all fds so pipe writers release EOF to readers
                 let fds: alloc::vec::Vec<_> = t.fd_table.take_all().collect();

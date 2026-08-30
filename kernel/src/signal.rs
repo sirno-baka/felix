@@ -52,6 +52,29 @@ pub fn send_signal(slot: i8, sig: u32) -> bool {
     }
 }
 
+/// Kill `slot` now. No handler, no ignore, scheduler will not pick it again.
+pub fn force_kill(slot: i8, sig: u32) -> bool {
+    if slot <= 0 {
+        return false;
+    }
+    unsafe {
+        if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
+            if t.zombie {
+                return false;
+            }
+            t.pending_signals = 0;
+            t.running = false;
+            t.zombie = true;
+            t.exit_code = 128 + (if sig == 0 { SIGKILL } else { sig }) as i32;
+        } else {
+            return false;
+        }
+    }
+    crate::drivers::wm::destroy_windows_of(slot);
+    println!("[signal] task {} force-killed ({})", slot, sig);
+    true
+}
+
 // ====================== Delivery ======================
 
 /// Apply default actions for any pending signals on the *current* task.
@@ -118,6 +141,7 @@ pub fn deliver_pending(esp: u32) -> u32 {
                         t.zombie = true;
                         t.exit_code = 128 + sig as i32;
                     }
+                    crate::drivers::wm::destroy_windows_of(slot);
                     println!("[signal] task {} killed by signal {}", slot, sig);
                     let new_esp = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
                     return deliver_pending_after_switch(new_esp);
@@ -155,6 +179,7 @@ fn deliver_pending_after_switch(esp: u32) -> u32 {
                 t.zombie = true;
                 t.exit_code = 128 + sig as i32;
             }
+            crate::drivers::wm::destroy_windows_of(slot);
             return TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
         }
         if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {

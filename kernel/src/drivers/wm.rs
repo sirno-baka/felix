@@ -693,6 +693,27 @@ pub fn destroy_window(id: u32) -> bool {
     })
 }
 
+/// Drop every window owned by `owner_slot` (process exit / kill).
+pub fn destroy_windows_of(owner_slot: i8) {
+    if owner_slot < 0 {
+        return;
+    }
+    with_lfb(|| {
+        let mut wm = WM.lock();
+        let mut any = false;
+        for slot in wm.windows.iter_mut() {
+            if slot.as_ref().map(|w| w.owner_slot) == Some(owner_slot) {
+                *slot = None;
+                any = true;
+            }
+        }
+        if any {
+            wm.drag = None;
+            wm.compose();
+        }
+    });
+}
+
 pub fn move_window(id: u32, x: i32, y: i32) -> bool {
     with_lfb(|| {
         let mut wm = WM.lock();
@@ -788,26 +809,26 @@ pub fn on_mouse_down(x: i32, y: i32) {
 
         let target = *id;
 
-        // Close button?
+        // Close button: tear the window down in the WM immediately.
+        // Also SIGTERM the owner — if it is hung / ignores the event, the
+        // frame is already gone. Default signal action reaps the task.
         if hit_close(w, x, y) {
-            // destroy without holding extra borrows
+            let mut owner = -1i8;
             for slot in wm.windows.iter_mut() {
                 if slot.as_ref().map(|ww| ww.id) == Some(target) {
-                    if let Some(window) = slot {
-                        window.events.push(WmEvent {
-                            kind: EV_CLOSE,
-                            a: 0,
-                            b: 0,
-                            c: 0,
-                            d: 0,
-                        });
-                    }
-                    // *slot = None;
+                    owner = slot.as_ref().map(|ww| ww.owner_slot).unwrap_or(-1);
+                    *slot = None;
                     break;
                 }
             }
             wm.drag = None;
             wm.compose();
+            drop(wm);
+            if owner > 0 {
+                // Not a queued signal — mark zombie immediately so ignore/hang
+                // cannot keep the task runnable.
+                let _ = crate::signal::force_kill(owner, crate::signal::SIGKILL);
+            }
             return;
         }
 
