@@ -465,7 +465,23 @@ fn probe_inode_size(inode: u32) -> u64 {
 }
 
 fn path_is_dir(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    if path.is_empty() || path == "/" {
+        return true;
+    }
+    let (parent, name) = match path.rfind('/') {
+        Some(0) => ("/", &path[1..]),
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("/", path),
+    };
+    if let Some(entries) = VFS.get().list_directory_entries(parent) {
+        if let Some(e) = entries.iter().find(|e| e.name == name) {
+            return e.file_type == 2;
+        }
+    }
+    // точка монтирования без записи в родителе (`/mnt/sda`)
     VFS.get().list_directory_entries(path).is_some()
+        && VFS.get().list_directory_entries(parent).is_none()
 }
 
 fn fill_stat64(st: &mut Stat64, inode: u32, mode: u32, size: u64) {
@@ -492,9 +508,28 @@ fn fill_stat64(st: &mut Stat64, inode: u32, mode: u32, size: u64) {
     };
 }
 
+fn copy_cstr_from_user(ptr: *const u8) -> alloc::string::String {
+    if ptr.is_null() {
+        return alloc::string::String::new();
+    }
+    let mut buf = Vec::with_capacity(64);
+    unsafe {
+        for i in 0..255 {
+            let b = core::ptr::read_volatile(ptr.add(i));
+            if b == 0 {
+                break;
+            }
+            buf.push(b);
+        }
+    }
+    alloc::string::String::from_utf8_lossy(&buf).into_owned()
+}
+
 pub fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize {
-    let path = unsafe { CStr::from_ptr(path_ptr as *const i8).to_str().unwrap_or("") };
+    let path_buf = copy_cstr_from_user(path_ptr);
+    let path = path_buf.as_str();
     if path.is_empty() {
+        println!("[open] empty path ptr={:p}", path_ptr);
         return ENOENT;
     }
 

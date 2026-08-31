@@ -176,6 +176,14 @@ impl Vfs {
 
 // ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
 
+/// `/dev` matches `/dev` and `/dev/sda`, but not `/devfoo`.
+fn is_mount_prefix(path: &str, mp: &str) -> bool {
+    if mp == "/" {
+        return true;
+    }
+    path == mp || path.starts_with(mp) && path.as_bytes().get(mp.len()) == Some(&b'/')
+}
+
 fn resolve<'a>(inner: &'a VfsInner, path: &'a str) -> (&'a dyn Filesystem, String, u8) {
     let path = if path.is_empty() { "/" } else { path };
     let mut best_fs: &dyn Filesystem = inner
@@ -187,7 +195,7 @@ fn resolve<'a>(inner: &'a VfsInner, path: &'a str) -> (&'a dyn Filesystem, Strin
     let mut best_id: u8 = 0; // 0 = root_fs
 
     for (idx, (mp, fs_box)) in inner.mounts.iter().enumerate() {
-        if path.starts_with(mp) && mp.len() > best_prefix.len() {
+        if is_mount_prefix(path, mp) && mp.len() > best_prefix.len() {
             best_fs = fs_box.as_ref();
             best_prefix = mp;
             best_id = (idx + 1) as u8; // 1-based ID для точек монтирования
@@ -216,7 +224,7 @@ fn resolve_mut<'a>(inner: &'a mut VfsInner, path: &'a str) -> (&'a mut dyn Files
     let mut best_id: u8 = 0;
 
     for (idx, (mp, fs_box)) in inner.mounts.iter_mut().enumerate() {
-        if path.starts_with(mp.as_str()) && mp.len() > best_prefix.len() {
+        if is_mount_prefix(path, mp.as_str()) && mp.len() > best_prefix.len() {
             best_fs = fs_box.as_mut();
             best_prefix = mp;
             best_id = (idx + 1) as u8;

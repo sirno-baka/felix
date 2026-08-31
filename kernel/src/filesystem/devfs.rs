@@ -65,8 +65,14 @@ impl DevFS {
 
 impl Filesystem for DevFS {
     fn resolve_path(&self, path: &str) -> Option<u32> {
-        // Убираем ведущий слеш для сравнения, если он есть
-        let clean_name = path.strip_prefix('/').unwrap_or(path);
+        // `/sda`, `sda`, `/dev/sda` → имя узла `sda`
+        let clean_name = path
+            .rsplit('/')
+            .find(|s| !s.is_empty())
+            .unwrap_or(path);
+        if clean_name.is_empty() || clean_name == "dev" {
+            return None;
+        }
         let devices = self.devices.lock();
         devices
             .iter()
@@ -100,7 +106,12 @@ impl Filesystem for DevFS {
         }
     }
 
-    fn list_directory_entries(&self, _path: &str) -> Option<Vec<DirEntry>> {
+    fn list_directory_entries(&self, path: &str) -> Option<Vec<DirEntry>> {
+        // Каталог только корень DevFS (`/`, `/dev`). Узел `/dev/sda` — файл устройства.
+        let rest = path.trim_matches('/');
+        if !rest.is_empty() && rest != "." && rest != "dev" {
+            return None;
+        }
         let devices = self.devices.lock();
         Some(
             devices
@@ -108,7 +119,7 @@ impl Filesystem for DevFS {
                 .map(|d| DirEntry {
                     inode: d.inode,
                     name: d.name.clone(),
-                    // 2 = S_IFCHR (символьное), 3 = S_IFBLK (блочное)
+                    // 2 = directory, 3 = block, 4 = char
                     file_type: match d.dev_type {
                         DeviceType::Block(_) => 3,
                         DeviceType::Char(_) => 4,
