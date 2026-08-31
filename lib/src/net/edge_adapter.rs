@@ -20,7 +20,7 @@ use crate::syscall::{
     self, bind, close, connect, read, recvfrom, sendto, socket, write,
     AF_INET, IPPROTO_TCP, IPPROTO_UDP, POLLOUT, SOCK_DGRAM, SOCK_STREAM,
 };
-use crate::async_rt;
+use crate::{async_rt, println};
 
 // ===========================================================================
 // Error type
@@ -77,7 +77,7 @@ pub struct SockAddrIn {
 
 
 impl SockAddrIn {
-    pub(crate) fn new(ip: Ipv4Addr, port: u16) -> Self {
+    pub fn new(ip: Ipv4Addr, port: u16) -> Self {
         Self {
             sin_family: AF_INET as u16,
             sin_port: port.to_be(),
@@ -188,7 +188,8 @@ impl ErrorType for FelixTcpReadHalf {
 impl Read for FelixTcpReadHalf {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         loop {
-            let n = unsafe { read(self.fd, buf.as_mut_ptr(), buf.len()) };
+            // TCP must use recvfrom, not SYS_READ (file path returns 0 → fake EOF).
+            let n = unsafe { recvfrom(self.fd, buf.as_mut_ptr(), buf.len()) };
             if n == usize::MAX {
                 async_rt::wait_readable(self.fd).await;
             } else {
@@ -212,7 +213,7 @@ impl ErrorType for FelixTcpWriteHalf {
 impl Write for FelixTcpWriteHalf {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         loop {
-            let n = unsafe { write(self.fd, buf.as_ptr(), buf.len()) };
+            let n = unsafe { sendto(self.fd, buf.as_ptr(), buf.len()) };
             if n == usize::MAX {
                 let mut pfd = syscall::PollFd {
                     fd: self.fd as i32,

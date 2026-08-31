@@ -61,7 +61,7 @@ build:
 	done
 	@for p in $(WASM_APPS); do \
 		echo "  cargo build $$p (wasm)"; \
-		cargo build --target=wasm32-wasip2 --package=$$p --release; \
+		cargo build --target=wasm32-wasip1 --package=$$p --release; \
 	done
 
 .PHONY: objcopy

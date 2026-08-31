@@ -2269,6 +2269,7 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
     usize::MAX // timeout
 }
 pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) -> usize {
+    print!("{:?}", buf);
     let socket_id = unsafe {
         match TASK_MANAGER.tasks[current_slot]
             .as_ref()

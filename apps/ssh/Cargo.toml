@@ -1,0 +1,27 @@
+[package]
+name = "ssh"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+
+
+[[bin]]
+name = "ssh"
+test = false
+
+
+
+[dependencies]
+libfelix = { path = "../../lib" }
+edge-nal = "0.7.0"
+sunset = { version = "0.6.0", default-features = false, features = ["alloc", "ecdsa256"] }
+getrandom = { version = "^0.4", default-features = false }
+embassy-futures = { version = "0.1.2", default-features = false }
+
+# ИСПРАВЛЕНИЕ: Убрали "futures-io", оставили только "alloc"
+sunset-async = { version = "0.6.0", default-features = false, features = ["alloc"] }
+
+embedded-io = { version = "0.7", features = ["alloc", "defmt"] }
+embedded-io-async = { version = "0.7", features = ["alloc", "defmt"] }
+heapless = { version = "0.9", default-features = false }

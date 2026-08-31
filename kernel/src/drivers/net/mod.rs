@@ -8,6 +8,7 @@ const RX_BUF_SIZE: usize = 1536;
 const TX_BUF_SIZE: usize = 1536;
 
 use crate::memory::paging::{PAGE_SIZE, PAGING, PTEFlags, PhysAddr, VirtAddr};
+use crate::net::ifconfig_dhcp;
 use crate::println;
 
 use self::i8255x::I8255x;
@@ -74,5 +75,7 @@ pub fn init_net() {
             Err(_) => println!("[init] no supported NIC"),
         }
     }
+
+    ifconfig_dhcp();
     crate::drivers::usb::init();
 }

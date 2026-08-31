@@ -958,6 +958,34 @@ Ctrl+C interrupts a running program (userspace).\n",
 enum UiTick {
     None,
     Interrupt,
+    /// Bytes to push into the child's stdin pipe.
+    Data([u8; 8], usize),
+}
+
+const SCAN_ESC: u8 = 0x01;
+const SCAN_LEFT: u8 = 0x4B;
+const SCAN_RIGHT: u8 = 0x4D;
+
+fn map_child_key(scancode: u8, ch: u8, mods: u8) -> ([u8; 8], usize) {
+    let ctrl = (mods & 2) != 0;
+    if ch == 0x03 || (scancode == 0x2e && ctrl) {
+        return ([0x03, 0, 0, 0, 0, 0, 0, 0], 1);
+    }
+    if ctrl && ch >= b'a' && ch <= b'z' {
+        return ([ch - b'a' + 1, 0, 0, 0, 0, 0, 0, 0], 1);
+    }
+    match scancode {
+        SCAN_ENTER => ([b'\r', 0, 0, 0, 0, 0, 0, 0], 1),
+        SCAN_BACKSPACE => ([0x7f, 0, 0, 0, 0, 0, 0, 0], 1),
+        SCAN_TAB => ([b'\t', 0, 0, 0, 0, 0, 0, 0], 1),
+        SCAN_ESC => ([0x1b, 0, 0, 0, 0, 0, 0, 0], 1),
+        SCAN_UP => ([0x1b, b'[', b'A', 0, 0, 0, 0, 0], 3),
+        SCAN_DOWN => ([0x1b, b'[', b'B', 0, 0, 0, 0, 0], 3),
+        SCAN_RIGHT => ([0x1b, b'[', b'C', 0, 0, 0, 0, 0], 3),
+        SCAN_LEFT => ([0x1b, b'[', b'D', 0, 0, 0, 0, 0], 3),
+        _ if ch >= 0x20 && ch < 0x7f => ([ch, 0, 0, 0, 0, 0, 0, 0], 1),
+        _ => ([0; 8], 0),
+    }
 }
 
 fn spawn(
@@ -1052,6 +1080,10 @@ impl UiBridge<'_> {
             if ch == 0x03 || (sc == 0x2e && (mods & 2) != 0) {
                 return UiTick::Interrupt;
             }
+            let (buf, n) = map_child_key(sc, ch, mods);
+            if n > 0 {
+                return UiTick::Data(buf, n);
+            }
         }
         UiTick::None
     }
@@ -1063,7 +1095,13 @@ impl UiBridge<'_> {
 }
 
 /// Ctrl+C in this window → kill(child, SIGINT).
-fn supervise_child(pid: i32, capture_fd: Option<u32>, out: &mut TermBuffer, ui: &mut UiBridge<'_>) {
+fn supervise_child(
+    pid: i32,
+    capture_fd: Option<u32>,
+    stdin_w: Option<u32>,
+    out: &mut TermBuffer,
+    ui: &mut UiBridge<'_>,
+) {
     if let Some(fd) = capture_fd {
         let _ = unsafe { set_nonblock(fd) };
     }
@@ -1084,13 +1122,29 @@ fn supervise_child(pid: i32, capture_fd: Option<u32>, out: &mut TermBuffer, ui: 
             }
         }
 
-        if matches!(ui.poll_keys(), UiTick::Interrupt) && !sent_sigint {
-            unsafe {
-                let _ = kill(pid, SIGINT);
+        match ui.poll_keys() {
+            UiTick::Interrupt if !sent_sigint => {
+                unsafe {
+                    let _ = kill(pid, SIGINT);
+                }
+                if let Some(w) = stdin_w {
+                    let b = [0x03u8];
+                    unsafe {
+                        let _ = write(w, b.as_ptr(), 1);
+                    }
+                }
+                out.push("^C");
+                ui.redraw(out);
+                sent_sigint = true;
             }
-            out.push("^C");
-            ui.redraw(out);
-            sent_sigint = true;
+            UiTick::Data(buf, n) => {
+                if let Some(w) = stdin_w {
+                    unsafe {
+                        let _ = write(w, buf.as_ptr(), n);
+                    }
+                }
+            }
+            _ => {}
         }
 
         let w = unsafe { wait_options(pid, WNOHANG) };
@@ -1122,6 +1176,11 @@ fn supervise_child(pid: i32, capture_fd: Option<u32>, out: &mut TermBuffer, ui: 
         }
         unsafe {
             close(fd);
+        }
+    }
+    if let Some(w) = stdin_w {
+        unsafe {
+            close(w);
         }
     }
 }
@@ -1175,6 +1234,17 @@ fn run_external(
         sout = forced_out;
     }
 
+    let mut stdin_r: i32 = -1;
+    let mut stdin_w: i32 = -1;
+    if sin < 0 {
+        let mut fds = [0u32; 2];
+        if unsafe { pipe(fds.as_mut_ptr()) } == 0 {
+            stdin_r = fds[0] as i32;
+            stdin_w = fds[1] as i32;
+            sin = stdin_r;
+        }
+    }
+
     let mut capture_r: i32 = -1;
     let mut capture_w: i32 = -1;
     let mut serr: i32 = -1;
@@ -1213,18 +1283,34 @@ fn run_external(
         }
     }
 
+    if stdin_r >= 0 {
+        unsafe {
+            close(stdin_r as u32);
+        }
+    }
+
     if let Some(p) = pid {
         let cap = if capture_r >= 0 {
             Some(capture_r as u32)
         } else {
             None
         };
-        supervise_child(p, cap, out, ui);
+        let kin = if stdin_w >= 0 {
+            Some(stdin_w as u32)
+        } else {
+            None
+        };
+        supervise_child(p, cap, kin, out, ui);
         None
     } else {
         if capture_r >= 0 {
             unsafe {
                 close(capture_r as u32);
+            }
+        }
+        if stdin_w >= 0 {
+            unsafe {
+                close(stdin_w as u32);
             }
         }
         None
