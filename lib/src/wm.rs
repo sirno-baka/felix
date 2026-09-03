@@ -55,6 +55,8 @@ pub struct Window {
     /// Local client surface (BGRX). Drawn by the app, sent on flip.
     buffer: Vec<u8>,
     alive: bool,
+    /// Optional local drawing clip used by retained-mode dirty rendering.
+    clip: Option<Rectangle>,
 }
 
 pub const WINDOW_TITLE_HINT: u8 = 0;
@@ -114,6 +116,7 @@ impl Window {
             info,
             buffer,
             alive: true,
+            clip: None,
         })
     }
 
@@ -205,6 +208,27 @@ impl Window {
     /// Copy local buffer → kernel surface and compose to the LFB.
     pub fn flip(&self) -> bool {
         unsafe { syscall::wm_flip(self.id, self.buffer.as_ptr(), self.buffer.len()) == 0 }
+    }
+
+    /// Copy just one client rectangle to the compositor. The descriptor ABI keeps
+    /// `SYS_WM_FLIP` backwards compatible with full-buffer callers.
+    pub fn flip_rect(&self, rect: Rectangle) -> bool {
+        let bounds = Rectangle::new(Point::zero(), Size::new(self.info.client_w, self.info.client_h));
+        let rect = rect.intersection(&bounds);
+        if rect.size.width == 0 || rect.size.height == 0 { return true; }
+        let desc = syscall::WmFlipRect {
+            x: rect.top_left.x as u32, y: rect.top_left.y as u32,
+            w: rect.size.width, h: rect.size.height, pitch: self.info.pitch,
+            pixels: self.buffer.as_ptr(),
+        };
+        unsafe { syscall::wm_flip(self.id, (&desc as *const syscall::WmFlipRect).cast(), usize::MAX) == 0 }
+    }
+
+    #[inline]
+    pub(crate) fn set_clip(&mut self, clip: Option<Rectangle>) { self.clip = clip; }
+    #[inline]
+    pub(crate) fn intersect_clip(&mut self, clip: Rectangle) {
+        self.clip = Some(match self.clip { Some(current) => current.intersection(&clip), None => clip });
     }
 
     /// Non-blocking poll of window events (mouse/key/focus/resize).
@@ -314,9 +338,14 @@ impl Window {
         let y1 = y.min(ch);
         let x2 = x.saturating_add(w).min(cw);
         let y2 = y.saturating_add(h).min(ch);
-        if x1 >= x2 || y1 >= y2 {
-            return;
-        }
+        let (x1, y1, x2, y2) = if let Some(clip) = self.clip {
+            let cx1 = clip.top_left.x.max(0) as u32;
+            let cy1 = clip.top_left.y.max(0) as u32;
+            let cx2 = (clip.top_left.x + clip.size.width as i32).max(0) as u32;
+            let cy2 = (clip.top_left.y + clip.size.height as i32).max(0) as u32;
+            (x1.max(cx1), y1.max(cy1), x2.min(cx2), y2.min(cy2))
+        } else { (x1, y1, x2, y2) };
+        if x1 >= x2 || y1 >= y2 { return; }
         let b = (color & 0xFF) as u8;
         let g = ((color >> 8) & 0xFF) as u8;
         let r = ((color >> 16) & 0xFF) as u8;
@@ -367,8 +396,9 @@ impl DrawTarget for Window {
         let buf_len = self.buffer.len();
 
         for Pixel(coord, color) in pixels.into_iter() {
-            if coord.x < 0 || coord.y < 0 || coord.x >= cw || coord.y >= ch {
-                continue;
+            if coord.x < 0 || coord.y < 0 || coord.x >= cw || coord.y >= ch { continue; }
+            if let Some(clip) = self.clip {
+                if !clip.contains(coord) { continue; }
             }
             let off = (coord.y as usize) * pitch + (coord.x as usize) * 4;
             if off + 3 >= buf_len {

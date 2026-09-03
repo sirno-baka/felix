@@ -585,6 +585,14 @@ pub unsafe fn wm_info(id: u32, out: *mut WindowInfo) -> usize {
     ret
 }
 
+/// Partial-flip descriptor. Pass its pointer to `wm_flip` with `len == usize::MAX`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WmFlipRect {
+    pub x: u32, pub y: u32, pub w: u32, pub h: u32, pub pitch: u32,
+    pub pixels: *const u8,
+}
+
 /// Copy `pixels` (BGRx 32bpp, pitch from WindowInfo) into the window surface and compose.
 pub unsafe fn wm_flip(id: u32, pixels: *const u8, len: usize) -> usize {
     let ret: usize;

@@ -108,6 +108,13 @@ pub fn is_ready() -> bool {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
+pub struct WmFlipRect {
+    pub x: u32, pub y: u32, pub w: u32, pub h: u32, pub pitch: u32,
+    pub pixels: *const u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 pub struct WindowInfo {
     pub id: u32,
     pub x: i32,
@@ -198,6 +205,18 @@ impl Surface {
 
     /// Caller MUST hold interrupts disabled so timer cannot switch CR3
     /// while we touch the user pointer.
+    fn copy_rect_from_user(&mut self, src: *const u8, src_pitch: u32, x: u32, y: u32, w: u32, h: u32) {
+        if src.is_null() || src_pitch < 4 { return; }
+        let w = w.min(self.width.saturating_sub(x)); let h = h.min(self.height.saturating_sub(y));
+        let row = (w as usize).saturating_mul(4);
+        for yy in 0..h as usize {
+            let from = unsafe { src.add((y as usize + yy).saturating_mul(src_pitch as usize) + x as usize * 4) };
+            let to = (y as usize + yy).saturating_mul(self.pitch as usize) + x as usize * 4;
+            if to + row > self.pixels.len() { break; }
+            unsafe { core::ptr::copy_nonoverlapping(from, self.pixels.as_mut_ptr().add(to), row); }
+        }
+    }
+
     fn copy_from_user(&mut self, src: *const u8, len: usize) {
         if src.is_null() || len == 0 {
             return;
@@ -396,6 +415,26 @@ impl Compositor {
         crate::drivers::mouse::invalidate_cursor();
     }
 
+    /// Region-aware client update used by partial flips. The changed client
+    /// rectangle is copied directly; only higher windows intersecting that
+    /// screen region are replayed to preserve z-order.
+    pub fn compose_client_rect(&self, id: u8, rx: u32, ry: u32, rw: u32, rh: u32) {
+        let Some(w) = self.find(id) else { return; };
+        if !w.visible || rw == 0 || rh == 0 { return; }
+        let mut guard = FRAMEBUFFER.lock(); let Some(fb) = guard.as_mut() else { return; };
+        let sx = w.x.saturating_add(rx as i32); let sy = w.y.saturating_add(w.title_height() as i32).saturating_add(ry as i32);
+        if sx >= 0 && sy >= 0 { blit_surface_rect(fb, sx as u32, sy as u32, rx, ry, rw, rh, &w.surface); }
+        let my_z = w.z;
+        for oid in self.sorted_ids().iter().flatten() {
+            if *oid == id { continue; }
+            if let Some(ow) = self.find(*oid) {
+                let ox2 = ow.x + ow.w as i32; let oy2 = ow.y + ow.h as i32;
+                if ow.z > my_z && ow.x < sx + rw as i32 && ox2 > sx && ow.y < sy + rh as i32 && oy2 > sy { self.draw_window(fb, ow); }
+            }
+        }
+        drop(guard); crate::drivers::mouse::invalidate_cursor();
+    }
+
     /// Fast path for flip: only re-blit the dirty window's client surface.
     /// No full-screen clear → no flicker. Higher-z windows that overlap this
     /// one are re-drawn after so occlusion stays correct.
@@ -520,6 +559,18 @@ impl Compositor {
                 fb.fill_rect(x + win_w - 1, y, 1, win_h, 0x0000_0000);
             }
         }
+    }
+}
+
+fn blit_surface_rect(fb: &mut Framebuffer, dx: u32, dy: u32, sx: u32, sy: u32, w: u32, h: u32, surf: &Surface) {
+    if sx >= surf.width || sy >= surf.height || dx >= fb.info.width as u32 || dy >= fb.info.height as u32 { return; }
+    let w = w.min(surf.width - sx).min(fb.info.width as u32 - dx);
+    let h = h.min(surf.height - sy).min(fb.info.height as u32 - dy);
+    let dst_pitch = fb.info.pitch as usize; let src_pitch = surf.pitch as usize; let row = w as usize * 4;
+    for y in 0..h as usize {
+        let src = (sy as usize + y) * src_pitch + sx as usize * 4;
+        let dst = (dy as usize + y) * dst_pitch;
+        unsafe { core::ptr::copy_nonoverlapping(surf.pixels.as_ptr().add(src), (fb.virt_base as *mut u8).add(dst), row); }
     }
 }
 
@@ -819,22 +870,23 @@ pub fn window_info(id: u32) -> Option<WindowInfo> {
 /// mid-copy would switch page directories and page-fault (e.g. CR2=0x40e000).
 pub fn flip(id: u32, user_pixels: *const u8, len: usize) -> bool {
     // copy_from_user must run under user CR3; compose under kernel CR3.
+    let mut partial = None;
     let mut wm = WM.lock();
     if let Some(w) = wm.find_mut(id as u8) {
         if !user_pixels.is_null() && len > 0 {
             without_interrupts(|| {
-                w.surface.copy_from_user(user_pixels, len);
+                if len == usize::MAX {
+                    let desc = unsafe { core::ptr::read_unaligned(user_pixels as *const WmFlipRect) };
+                    w.surface.copy_rect_from_user(desc.pixels, desc.pitch, desc.x, desc.y, desc.w, desc.h);
+                    partial = Some((desc.x, desc.y, desc.w, desc.h));
+                } else { w.surface.copy_from_user(user_pixels, len); }
             });
         }
-        w.dirty = true;
+        w.dirty = partial.is_none();
         drop(wm);
-        with_lfb(|| {
-            WM.lock().compose_dirty();
-        });
+        with_lfb(|| { let wm = WM.lock(); if let Some((x,y,w,h)) = partial { wm.compose_client_rect(id as u8, x, y, w, h); } else { drop(wm); WM.lock().compose_dirty(); } });
         true
-    } else {
-        false
-    }
+    } else { false }
 }
 
 pub fn focus_window(id: u32) -> bool {
