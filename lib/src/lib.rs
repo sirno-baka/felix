@@ -36,7 +36,9 @@ pub mod prelude {
     pub use crate::signal::{
         self, default, exit, exit_on_terminate, ignore, on, SIGINT, SIGKILL, SIGTERM,
     };
-    pub use crate::ui::{self, Button, Label, MouseTracker, TextInput, Ui, UiEvent, WidgetId};
+    pub use crate::ui::{
+        self, Button, Label, LayoutRect, NodeId, TextInput, Ui, UiEvent, WidgetId,
+    };
     pub use crate::wm::{self, mouse, rgb, screen_size, MouseState, Window, WindowInfo, WmEvent};
     pub use crate::wm::{
         EV_CLOSE, EV_FOCUS_IN, EV_FOCUS_OUT, EV_KEY_DOWN, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_MOVE,
