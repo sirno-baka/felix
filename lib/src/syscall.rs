@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::arch::asm;
 
 // Должны совпадать с kernel/src/syscalls/mod.rs
@@ -394,10 +395,13 @@ pub const SYS_WM_FOCUS: u32 = 405;
 pub const SYS_WM_SCREEN: u32 = 406;
 pub const SYS_MOUSE_STATE: u32 = 407;
 pub const SYS_WM_POLL: u32 = 408;
+pub const SYS_WM_WINDOWS: u32 = 409;
 
 /// pci_list(*mut PciInfo, max) → count written (or total if max=0)
 pub const SYS_PCI_LIST: u32 = 410;
 pub const SYS_IFCONFIG: u32 = 411;
+pub const SYS_FB_INFO: u32 = 412;
+pub const SYS_FB_BLIT: u32 = 413;
 
 pub const IFCFG_GET: u32 = 0;
 pub const IFCFG_STATIC: u32 = 1;
@@ -454,6 +458,49 @@ pub unsafe fn ifconfig(cmd: u32, cfg: *mut IfConfig) -> usize {
     ret
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FbInfo {
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub bpp: u32,
+    pub virt: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FbBlit {
+    pub src: *const u32,
+    pub stride: u32,
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+pub unsafe fn fb_info(out: *mut FbInfo) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_FB_INFO => ret,
+        in("ebx") out,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn fb_blit(arg: *const FbBlit) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_FB_BLIT => ret,
+        in("ebx") arg,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
 pub unsafe fn pci_list(out: *mut PciInfo, max: usize) -> usize {
     let ret: usize;
     asm!(
@@ -473,6 +520,7 @@ pub struct WmCreateArgs {
     pub w: u32,
     pub h: u32,
     pub title: *const u8,
+    pub flags: *const u8
 }
 
 #[repr(C)]
@@ -489,8 +537,8 @@ pub struct WindowInfo {
     pub focused: u32,
 }
 
-pub unsafe fn wm_create(x: i32, y: i32, w: u32, h: u32, title: *const u8) -> usize {
-    let args = WmCreateArgs { x, y, w, h, title };
+pub unsafe fn wm_create(x: i32, y: i32, w: u32, h: u32, title: *const u8, flags: *const u8) -> usize {
+    let args = WmCreateArgs { x, y, w, h, title, flags};
     let ret: usize;
     asm!(
         "int 0x80",
@@ -630,6 +678,52 @@ pub unsafe fn wm_poll(id: u32, out: *mut WmEvent, max: usize) -> usize {
     );
     ret
 }
+
+// Эта структура должна байт-в-байт совпадать с ядерной
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowListItem {
+    pub id: u8,
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    pub focused: u8,
+    pub visible: u8,
+    pub owner_slot: i8,
+    pub title: [u8; 32],
+}
+
+/// Небезопасный системный вызов для получения списка окон.
+/// Заполняет буфер `out` максимум `max` элементами. Возвращает реальное количество.
+pub unsafe fn wm_get_window_list(out: *mut WindowListItem, max: usize) -> usize {
+    let ret: usize;
+    asm!(
+    "int 0x80",
+    inlateout("eax") SYS_WM_WINDOWS => ret,
+    in("ebx") out,
+    in("ecx") max,
+    options(nostack, preserves_flags)
+    );
+    ret
+}
+/// Безопасная обёртка. Возвращает Vec с актуальным списком окон.
+pub fn get_window_list() -> Vec<WindowListItem> {
+    // MAX_WINDOWS обычно равен 8, выделяем с запасом
+    let mut list = Vec::with_capacity(8);
+
+    unsafe {
+        // Передаём сырой указатель на буфер и его вместимость
+        let count = wm_get_window_list(list.as_mut_ptr(), list.capacity());
+
+        // SAFETY: syscall гарантированно инициализировал `count` элементов,
+        // и count <= capacity. Мы можем безопасно изменить длину вектора.
+        list.set_len(count);
+    }
+
+    list
+}
+
 
 pub const AF_INET: u32 = 2;
 pub const SOCK_STREAM: u32 = 1;

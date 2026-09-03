@@ -23,6 +23,7 @@ pub use embedded_graphics;
 /// and must NOT define their own `_start` or `#[panic_handler]`.
 pub mod rt;
 pub mod net;
+pub mod flags;
 
 /// Convenient re-exports for application code.
 pub mod prelude {

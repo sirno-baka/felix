@@ -171,8 +171,8 @@ pub unsafe fn init_vesa() -> bool {
 
         // Prefer 800×600 (target resolution), then higher bpp.
         let mut score = width as u32 * height as u32;
-        if width == 800 && height == 600 {
-            score = score.saturating_add(50_000_000);
+        if height > 1000 {
+            score = 0;
         }
         if bpp >= 32 {
             score = score.saturating_add(5_000_000);

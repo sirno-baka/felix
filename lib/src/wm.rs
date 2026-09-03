@@ -8,10 +8,10 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-
+use core::sync::atomic::AtomicU8;
 use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::{pixelcolor::Rgb888, prelude::*, Pixel};
-
+use crate::flags::{FlagOp, Flags, WindowFlags};
 use crate::syscall::{self};
 
 pub use crate::syscall::{
@@ -57,16 +57,26 @@ pub struct Window {
     alive: bool,
 }
 
+pub const WINDOW_TITLE_HINT: u8 = 0;
+pub const WINDOW_CLOSE_BUTTON_HINT: u8 = 1;
+pub const WINDOW_FULLSCREEN_BUTTON_HINT: u8 = 2;
+pub const FRAMELESS_WINDOW_HINT: u8 = 3;
+
 impl Window {
     /// Create a window. `title` is truncated to 31 bytes.
     /// Returns `None` if the kernel rejects the request (too small, no slots, …).
+    ///
     pub fn create(x: i32, y: i32, w: u32, h: u32, title: &str) -> Option<Self> {
+        Self::create_with_flags(x, y, w, h, title, WindowFlags::new())
+    }
+
+    pub fn create_with_flags(x: i32, y: i32, w: u32, h: u32, title: &str, flags: WindowFlags) -> Option<Self> {
         let mut title_buf = [0u8; 32];
         let bytes = title.as_bytes();
         let n = bytes.len().min(31);
         title_buf[..n].copy_from_slice(&bytes[..n]);
 
-        let id = unsafe { syscall::wm_create(x, y, w, h, title_buf.as_ptr()) };
+        let id = unsafe { syscall::wm_create(x, y, w, h, title_buf.as_ptr(), flags.as_ptr()) };
         if id == usize::MAX {
             return None;
         }

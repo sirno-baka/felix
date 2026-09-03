@@ -78,8 +78,8 @@ objcopy:
 		echo "  → build/$$p"; \
 	done
 	@for p in $(WASM_APPS); do \
-		if [ -f target/wasm32-wasip2/release/$$p.wasm ]; then \
-			cp -f target/wasm32-wasip2/release/$$p.wasm build/$$p.wasm; \
+		if [ -f target/wasm32-wasip1/release/$$p.wasm ]; then \
+			cp -f target/wasm32-wasip1/release/$$p.wasm build/$$p.wasm; \
 			echo "  → build/$$p.wasm"; \
 		fi; \
 	done

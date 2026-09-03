@@ -17,6 +17,8 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::arch::naked_asm;
 use core::ffi::CStr;
 use core::net::Ipv4Addr;
+use core::ops::Deref;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 pub const SYSCALL_INT: u8 = 0x80;
 
@@ -364,10 +366,17 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
             state.edx as usize,
         ),
 
+        crate::syscalls::SYS_WM_WINDOWS => sys_wm_window_list(
+            state.ebx as *mut WindowListItem,
+            state.ecx as usize, // max
+        ),
+
         // === PCI ===
         crate::syscalls::SYS_PCI_LIST => {
             sys_pci_list(state.ebx as *mut PciInfoUser, state.ecx as usize)
         }
+        crate::syscalls::SYS_FB_INFO => sys_fb_info(state.ebx as *mut FbInfoUser),
+        crate::syscalls::SYS_FB_BLIT => sys_fb_blit(state.ebx as *const FbBlit),
         crate::syscalls::SYS_IFCONFIG => {
             sys_ifconfig(state.ebx as u32, state.ecx as *mut crate::net::stack::IfConfigUser)
         }
@@ -1982,7 +1991,10 @@ use crate::print::klog_write_str;
 use smoltcp::socket::{tcp, udp};
 use smoltcp::socket::tcp::ConnectError;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
+use crate::drivers::wm::WindowListItem;
+use crate::drivers::wm_flags::WindowFlags;
 use crate::time::sleep;
+use crate::utils::flags::{FlagOp, Flags};
 use crate::utils::rand_int;
 
 pub fn sys_socket(current_slot: usize, domain: u16, ty: u16, protocol: u8) -> usize {
@@ -2433,6 +2445,7 @@ pub fn sys_shutdown(current_slot: usize, fd: usize, _how: u32) -> usize {
 
 // ====================== WINDOW MANAGER ======================
 
+
 #[repr(C)]
 pub struct WmCreateArgs {
     x: i32,
@@ -2440,6 +2453,7 @@ pub struct WmCreateArgs {
     w: u32,
     h: u32,
     title: *const u8,
+    flags: *const u8
 }
 
 pub fn sys_wm_create(current_slot: usize, args: *const WmCreateArgs) -> usize {
@@ -2452,7 +2466,15 @@ pub fn sys_wm_create(current_slot: usize, args: *const WmCreateArgs) -> usize {
     } else {
         unsafe { CStr::from_ptr(a.title as *const i8).to_str().unwrap_or("") }
     };
-    match crate::drivers::wm::create_window(a.x, a.y, a.w, a.h, title, current_slot as i8) {
+    let flags = if !a.flags.is_null() {
+        unsafe {
+            let atomic_ptr = a.flags as *const AtomicU8;
+            WindowFlags::from_base((*atomic_ptr).load(Ordering::Relaxed))
+        }
+    } else {
+        WindowFlags::new()
+    };
+    match crate::drivers::wm::create_window(a.x, a.y, a.w, a.h, title, flags, current_slot as i8) {
         Some(id) => id as usize,
         None => usize::MAX,
     }
@@ -2527,6 +2549,10 @@ pub fn sys_mouse_state(out: *mut crate::drivers::mouse::MouseState) -> usize {
 
 pub fn sys_wm_poll(id: u32, out: *mut crate::drivers::wm::WmEvent, max: usize) -> usize {
     crate::drivers::wm::poll_events(id, out, max.min(32))
+}
+
+pub fn sys_wm_window_list(out: *mut WindowListItem, max: usize) -> usize {
+    crate::drivers::wm::window_list(out, max)
 }
 
 /// Compact PCI device record for userspace (`lspci`). Must match libfelix.
@@ -2620,4 +2646,94 @@ pub fn sys_ifconfig(cmd: u32, buf: *mut crate::net::stack::IfConfigUser) -> usiz
         },
         _ => usize::MAX,
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FbInfoUser {
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub bpp: u32,
+    pub virt: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FbBlit {
+    pub src: *const u32,
+    pub stride: u32,
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+pub fn sys_fb_info(out: *mut FbInfoUser) -> usize {
+    if out.is_null() {
+        return usize::MAX;
+    }
+    let guard = crate::drivers::framebuffer::FRAMEBUFFER.lock();
+    let Some(fb) = guard.as_ref() else {
+        return usize::MAX;
+    };
+    unsafe {
+        *out = FbInfoUser {
+            width: fb.info.width as u32,
+            height: fb.info.height as u32,
+            pitch: fb.info.pitch as u32,
+            bpp: fb.info.bpp as u32,
+            virt: fb.virt_base,
+        };
+    }
+    0
+}
+
+pub fn sys_fb_blit(arg: *const FbBlit) -> usize {
+    if arg.is_null() {
+        return usize::MAX;
+    }
+    let blit = unsafe { *arg };
+    if blit.src.is_null() || blit.w == 0 || blit.h == 0 {
+        return usize::MAX;
+    }
+    let guard = crate::drivers::framebuffer::FRAMEBUFFER.lock();
+    let Some(fb) = guard.as_ref() else {
+        return usize::MAX;
+    };
+    let fb_w = fb.info.width as u32;
+    let fb_h = fb.info.height as u32;
+    if blit.x >= fb_w || blit.y >= fb_h {
+        return 0;
+    }
+    let w = blit.w.min(fb_w - blit.x);
+    let h = blit.h.min(fb_h - blit.y);
+    if blit.stride < w {
+        return usize::MAX;
+    }
+    let bpp = ((fb.info.bpp as u32 + 7) / 8) as usize;
+    let pitch = fb.info.pitch as usize;
+    let dst_base = fb.virt_base as *mut u8;
+    unsafe {
+        for row in 0..h {
+            let src = blit.src.add(((row) * blit.stride) as usize);
+            let dst = dst_base.add(((blit.y + row) as usize) * pitch + (blit.x as usize) * bpp);
+            if bpp == 4 {
+                core::ptr::copy_nonoverlapping(src as *const u8, dst, (w as usize) * 4);
+            } else {
+                for col in 0..w {
+                    let px = *src.add(col as usize);
+                    let p = dst.add((col as usize) * bpp);
+                    *p = (px & 0xFF) as u8;
+                    if bpp > 1 {
+                        *p.add(1) = ((px >> 8) & 0xFF) as u8;
+                    }
+                    if bpp > 2 {
+                        *p.add(2) = ((px >> 16) & 0xFF) as u8;
+                    }
+                }
+            }
+        }
+    }
+    0
 }

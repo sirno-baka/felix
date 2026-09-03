@@ -89,9 +89,13 @@ pub const SYS_WM_SCREEN: u32 = 406;
 pub const SYS_MOUSE_STATE: u32 = 407;
 /// wm_poll(id, *mut WmEvent, max) → number of events copied
 pub const SYS_WM_POLL: u32 = 408;
-
+pub const SYS_WM_WINDOWS: u32 = 409;
 /// pci_list(*mut PciInfoUser, max) → number of devices written (or needed if max=0)
 pub const SYS_PCI_LIST: u32 = 410;
 /// ifconfig(cmd, *mut IfConfigUser) → 0 / usize::MAX
 /// cmd: 0=get, 1=static, 2=dhcp
 pub const SYS_IFCONFIG: u32 = 411;
+/// fb_info(*mut FbInfoUser) → 0 / usize::MAX
+pub const SYS_FB_INFO: u32 = 412;
+/// fb_blit(*const FbBlit) → 0 / usize::MAX — copy a rect from user shadow to LFB
+pub const SYS_FB_BLIT: u32 = 413;

@@ -9,13 +9,15 @@ use crate::sync::mutex::Mutex;
 use crate::{debugln, println};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use embedded_graphics::{
     mono_font::{MonoTextStyle, ascii::FONT_6X10},
     pixelcolor::Rgb888,
     prelude::*,
     text::{Baseline, Text},
 };
+use crate::drivers::wm_flags::WindowFlags;
+use crate::utils::flags::{FlagOp, Flags};
 
 pub const MAX_WINDOWS: usize = 8;
 pub const TITLE_H: u32 = 18;
@@ -116,6 +118,20 @@ pub struct WindowInfo {
     pub client_h: u32,
     pub pitch: u32,
     pub focused: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowListItem {
+    pub id: u8,
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    pub focused: u8,
+    pub visible: u8,
+    pub owner_slot: i8,
+    pub title: [u8; 32],
 }
 
 struct Surface {
@@ -221,19 +237,28 @@ struct Window {
     visible: bool,
     dirty: bool,
     title: [u8; 32],
+    flags: WindowFlags,
     surface: Surface,
     owner_slot: i8, // task slot that created it (-1 = kernel)
     events: EventQueue,
 }
 
 impl Window {
-    fn client_rect(&self) -> (i32, i32, u32, u32) {
-        let cx = self.x;
-        let cy = self.y + TITLE_H as i32;
-        let cw = self.w;
-        let ch = self.h.saturating_sub(TITLE_H);
-        (cx, cy, cw, ch)
+    // Добавь эти методы в начало impl Window
+    fn has_title_bar(&self) -> bool {
+        !self.flags.is_enable(WindowFlags::FRAMELESS_WINDOW_HINT) &&
+            self.flags.is_enable(WindowFlags::WINDOW_TITLE_HINT)
     }
+
+    fn title_height(&self) -> u32 {
+        if self.has_title_bar() { TITLE_H } else { 0 }
+    }
+
+    fn client_rect(&self) -> (i32, i32, u32, u32) {
+        let th = self.title_height() as i32;
+        (self.x, self.y + th, self.w, self.h.saturating_sub(th as u32))
+    }
+
 
     fn title_str(&self) -> &str {
         let end = self
@@ -292,6 +317,24 @@ impl Compositor {
             next_z: 1,
             drag: None,
         }
+    }
+
+    pub fn get_window_list(&self) -> Vec<WindowListItem> {
+        self.windows
+            .iter()
+            .filter_map(|opt| opt.as_ref())
+            .map(|w| WindowListItem {
+                id: w.id,
+                x: w.x,
+                y: w.y,
+                w: w.w,
+                h: w.h,
+                focused: u8::from(w.focused),
+                visible: u8::from(w.visible),
+                owner_slot: w.owner_slot,
+                title: w.title,
+            })
+            .collect()
     }
 
     fn slot_free(&self) -> Option<usize> {
@@ -428,40 +471,54 @@ impl Compositor {
         let y = w.y.max(0) as u32;
         let sw = self.screen_w;
         let sh = self.screen_h;
-        if x >= sw || y >= sh {
+        if x > sw || y > sh {
             return;
         }
 
         let win_w = w.w.min(sw - x);
         let win_h = w.h.min(sh - y);
 
-        let title_color = if w.focused { 0x003A_7CA5 } else { 0x0040_4850 };
-        let th = TITLE_H.min(win_h);
-        fb.fill_rect(x, y, win_w, th, title_color);
-        if th > 0 {
-            fb.fill_rect(x, y + th.saturating_sub(1), win_w, 1, 0x0010_1010);
-        }
-        draw_title_text(fb, x + 6, y + 4, w.title_str());
-        draw_close_button(fb, w);
+        let is_frameless = w.flags.is_enable(WindowFlags::FRAMELESS_WINDOW_HINT);
+        // 1. Title Bar
+        let th = w.title_height();
+        let title_h_drawn = th.min(win_h);
 
-        // client surface blit
-        let cy = y + TITLE_H;
+        if title_h_drawn > 0 {
+            let title_color = if w.focused { 0x003A_7CA5 } else { 0x0040_4850 };
+            fb.fill_rect(x, y, win_w, title_h_drawn, title_color);
+            fb.fill_rect(x, y + title_h_drawn.saturating_sub(1), win_w, 1, 0x0010_1010);
+            draw_title_text(fb, x + 6, y + 4, w.title_str());
+
+            if w.flags.is_enable(WindowFlags::WINDOW_CLOSE_BUTTON_HINT) {
+                draw_close_button(fb, w);
+            }
+
+            th
+        } else {
+            0 // Если title нет, отступ равен 0
+        };
+
+        // 2. Client Surface
+        let cy = y + title_h_drawn; // cy теперь корректно зависит от реальной высоты title
         if cy >= y + win_h {
-            return;
+            return; // Не осталось места для контента
         }
+
         let ch = (y + win_h).saturating_sub(cy);
         let cw = win_w.min(w.surface.width);
         let ch = ch.min(w.surface.height);
         blit_surface(fb, x, cy, cw, ch, &w.surface);
 
-        // border
-        fb.fill_rect(x, y, win_w, 1, 0x0000_0000);
-        if win_h > 0 {
-            fb.fill_rect(x, y + win_h - 1, win_w, 1, 0x0000_0000);
-        }
-        fb.fill_rect(x, y, 1, win_h, 0x0000_0000);
-        if win_w > 0 {
-            fb.fill_rect(x + win_w - 1, y, 1, win_h, 0x0000_0000);
+        // 3. Border (не рисуем для frameless)
+        if !is_frameless {
+            fb.fill_rect(x, y, win_w, 1, 0x0000_0000);
+            if win_h > 0 {
+                fb.fill_rect(x, y + win_h - 1, win_w, 1, 0x0000_0000);
+            }
+            fb.fill_rect(x, y, 1, win_h, 0x0000_0000);
+            if win_w > 0 {
+                fb.fill_rect(x + win_w - 1, y, 1, win_h, 0x0000_0000);
+            }
         }
     }
 }
@@ -532,6 +589,9 @@ fn hit_close(w: &Window, x: i32, y: i32) -> bool {
 }
 
 fn hit_title(w: &Window, x: i32, y: i32) -> bool {
+    if !w.has_title_bar() {
+        return false;
+    }
     x >= w.x && x < w.x + w.w as i32 && y >= w.y && y < w.y + TITLE_H as i32
 }
 
@@ -641,23 +701,31 @@ pub fn init() {
     debugln!("[wm] ready {}x{}", sw, sh);
 }
 
-pub fn create_window(x: i32, y: i32, w: u32, h: u32, title: &str, owner_slot: i8) -> Option<u32> {
-    if w < 40 || h < TITLE_H + 8 {
+pub fn create_window(x: i32, y: i32, client_w: u32, client_h: u32, title: &str, flags: WindowFlags, owner_slot: i8) -> Option<u32> {
+    // Минимальный размер клиентской области
+    if client_w < 40 || client_h < 40 {
         return None;
     }
-    // Copy title under *current* (user) CR3 — user pages vanish after with_lfb.
+
     let mut title_buf = [0u8; 32];
     let tbytes = title.as_bytes();
     let n = tbytes.len().min(31);
     title_buf[..n].copy_from_slice(&tbytes[..n]);
 
+    // Вычисляем итоговые размеры окна на основе флагов
+    let has_title = !flags.is_enable(WindowFlags::FRAMELESS_WINDOW_HINT) &&
+        flags.is_enable(WindowFlags::WINDOW_TITLE_HINT);
+
+    let total_w = client_w;
+    let total_h = client_h + if has_title { TITLE_H } else { 0 };
+
     with_lfb(|| {
         let mut wm = WM.lock();
         let slot = wm.slot_free()?;
-        let client_w = w;
-        let client_h = h.saturating_sub(TITLE_H);
+
+        // Surface создается строго с клиентскими размерами
         let surface = Surface::new(client_w, client_h)?;
-        println!("surface: {:p}", &surface);
+
         let id = wm.next_id;
         wm.next_id = wm.next_id.wrapping_add(1).max(1);
         let z = wm.next_z;
@@ -671,13 +739,14 @@ pub fn create_window(x: i32, y: i32, w: u32, h: u32, title: &str, owner_slot: i8
             id,
             x,
             y,
-            w,
-            h,
+            w: total_w,       // Сохраняем ОБЩУЮ ширину
+            h: total_h,       // Сохраняем ОБЩУЮ высоту
             z,
             focused: true,
             visible: true,
             dirty: true,
             title: title_buf,
+            flags,
             surface,
             owner_slot,
             events: EventQueue::new(),
@@ -803,11 +872,16 @@ fn hit_resize(w: &Window, x: i32, y: i32) -> bool {
 
 fn apply_resize(w: &mut Window, new_w: u32, new_h: u32) {
     let new_w = new_w.clamp(80, 1600);
-    let new_h = new_h.clamp(TITLE_H + 40, 1200);
+    // Минимальная высота зависит от наличия заголовка
+    let min_h = w.title_height() + 40;
+    let new_h = new_h.clamp(min_h, 1200);
+
     w.w = new_w;
     w.h = new_h;
+
     let cw = new_w;
-    let ch = new_h.saturating_sub(TITLE_H);
+    let ch = new_h.saturating_sub(w.title_height());
+
     if w.surface.width != cw || w.surface.height != ch {
         if let Some(mut surf) = Surface::new(cw, ch) {
             let copy_w = w.surface.width.min(cw) as usize;
@@ -910,8 +984,8 @@ pub fn on_mouse_down(x: i32, y: i32) {
         // Focus + raise + optional client click / title drag
         let in_title = hit_title(w, x, y);
         let cx = x - w.x;
-        let cy = y - (w.y + TITLE_H as i32);
-        let client_h = w.h.saturating_sub(TITLE_H) as i32;
+        let cy = y - (w.y + w.title_height() as i32);
+        let client_h = w.h.saturating_sub(w.title_height()) as i32;
         let in_client = !in_title && cx >= 0 && cy >= 0 && cx < w.w as i32 && cy < client_h;
 
         let new_z = wm.next_z;
@@ -941,6 +1015,7 @@ pub fn on_mouse_down(x: i32, y: i32) {
                     start_drag = true;
                 }
                 if in_client {
+                    println!("kernel mouse {:?}", EV_MOUSE_DOWN);
                     win.events.push(WmEvent {
                         kind: EV_MOUSE_DOWN,
                         a: cx,
@@ -950,6 +1025,7 @@ pub fn on_mouse_down(x: i32, y: i32) {
                     });
                 }
             } else if was {
+
                 win.events.push(WmEvent {
                     kind: EV_FOCUS_OUT,
                     a: 0,
@@ -1030,9 +1106,10 @@ pub fn on_mouse_move(x: i32, y: i32) {
         if !w.visible {
             continue;
         }
+        let th = w.title_height() as i32;
         let cx = x - w.x;
-        let cy = y - (w.y + TITLE_H as i32);
-        let client_h = w.h.saturating_sub(TITLE_H) as i32;
+        let cy = y - (w.y + th);
+        let client_h = w.h.saturating_sub(th as u32) as i32;
         if cx >= 0 && cy >= 0 && cx < w.w as i32 && cy < client_h {
             w.events.push(WmEvent {
                 kind: EV_MOUSE_MOVE,
@@ -1074,9 +1151,10 @@ pub fn on_mouse_up(x: i32, y: i32) {
         if !w.visible {
             continue;
         }
+        let th = w.title_height() as i32;
         let cx = x - w.x;
-        let cy = y - (w.y + TITLE_H as i32);
-        let client_h = w.h.saturating_sub(TITLE_H) as i32;
+        let cy = y - (w.y + th);
+        let client_h = w.h.saturating_sub(th as u32) as i32;
         if cx >= 0 && cy >= 0 && cx < w.w as i32 && cy < client_h {
             w.events.push(WmEvent {
                 kind: EV_MOUSE_UP,
@@ -1132,6 +1210,41 @@ pub fn poll_events(id: u32, out: *mut WmEvent, max: usize) -> usize {
         n += 1;
     }
     n
+}
+
+/// Заполняет пользовательский буфер списком окон. Возвращает количество записанных окон.
+pub fn window_list(out: *mut WindowListItem, max: usize) -> usize {
+    if out.is_null() || max == 0 {
+        return 0;
+    }
+
+    let wm = WM.lock();
+    let mut count = 0;
+
+    for w in wm.windows.iter().flatten() {
+        if count >= max {
+            break; // Буфер заполнен
+        }
+
+        let item = WindowListItem {
+            id: w.id,
+            x: w.x,
+            y: w.y,
+            w: w.w,
+            h: w.h,
+            focused: w.focused as u8,
+            visible: w.visible as u8,
+            owner_slot: w.owner_slot,
+            title: w.title,
+        };
+
+        unsafe {
+            *out.add(count) = item;
+        }
+        count += 1;
+    }
+
+    count
 }
 
 /// Legacy: treat as down (focus).
