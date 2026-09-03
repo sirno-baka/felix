@@ -3,283 +3,153 @@
 
 extern crate alloc;
 
-use alloc::format;
-use alloc::vec::Vec;
-use taffy::AlignItems;
 use libfelix::prelude::*;
-use libfelix::layout::{presets, UiLayoutExt};
-use libfelix::ui::FlexDirection;
+use libfelix::ui::layout;
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
-    let mut win = Window::create(1, 1, 900, 600, "layouts").unwrap();
-
+    let mut win = Window::create(1, 1, 900, 600, "Felix UI 2.0").unwrap();
     let mut ui = Ui::with_size(900, 600);
-
-    // ============================================================
-    // ROOT
-    // ============================================================
-
-    let root = ui.root_node();
+    let root = ui.root();
 
     ui.style(root, |s| {
         s.flex_direction = FlexDirection::Column;
-        s.gap = taffy::geometry::Size {
-            width: taffy::prelude::LengthPercentage::length(8.0),
-            height: taffy::prelude::LengthPercentage::length(8.0),
-        };
-        s.padding = taffy::geometry::Rect {
-            left: taffy::prelude::LengthPercentage::length(12.0),
-            right: taffy::prelude::LengthPercentage::length(12.0),
-            top: taffy::prelude::LengthPercentage::length(12.0),
-            bottom: taffy::prelude::LengthPercentage::length(12.0),
-        };
+        s.padding = taffy::geometry::Rect::from_length(12.0);
+        s.gap = taffy::geometry::Size::from_length(8.0);
     });
 
-    // ============================================================
-    // HEADER
-    // ============================================================
-
-    let header = ui.row_in(root);
-
+    let header = ui.row(root);
     ui.style(header, |s| {
-        s.min_size.height =
-            taffy::prelude::LengthPercentageAuto::length(52.0);
-
-        s.padding = taffy::geometry::Rect {
-            left: taffy::prelude::LengthPercentage::length(12.0),
-            right: taffy::prelude::LengthPercentage::length(12.0),
-            top: taffy::prelude::LengthPercentage::length(8.0),
-            bottom: taffy::prelude::LengthPercentage::length(8.0),
-        };
-
+        s.min_size.height = taffy::prelude::LengthPercentageAuto::length(48.0);
         s.align_items = Some(AlignItems::CENTER);
+        s.gap = taffy::geometry::Size::from_length(8.0);
     });
+    ui.label(header, "Felix UI 2.0");
+    ui.spacer(header);
+    let refresh = ui.button(header, "Refresh");
 
-    let title = ui.label_in(header, "Felix UI");
-    let _ = title;
-
-    let _header_spacer = ui.spacer_in(header);
-
-    let status = ui.label_in(header, "Taffy layout");
-    let _ = status;
-
-    // ============================================================
-    // BODY
-    // ============================================================
-
-    let body = ui.row_in(root);
-
+    let body = ui.row(root);
     ui.style(body, |s| {
         s.flex_grow = 1.0;
-        s.min_size.height =
-            taffy::prelude::LengthPercentageAuto::length(0.0);
-
-        s.gap = taffy::geometry::Size {
-            width: taffy::prelude::LengthPercentage::length(8.0),
-            height: taffy::prelude::LengthPercentage::length(8.0),
-        };
+        s.min_size.width = taffy::prelude::LengthPercentageAuto::length(0.0);
+        s.min_size.height = taffy::prelude::LengthPercentageAuto::length(0.0);
+        s.gap = taffy::geometry::Size::from_length(8.0);
     });
 
-    // ============================================================
-    // SIDEBAR
-    // ============================================================
-
-    let sidebar = ui.panel_in(body);
-
+    let sidebar = ui.panel(body);
     ui.style(sidebar, |s| {
-        s.size.width =
-            taffy::prelude::Dimension::length(190.0);
-
-        s.padding = taffy::geometry::Rect {
-            left: taffy::prelude::LengthPercentage::length(10.0),
-            right: taffy::prelude::LengthPercentage::length(10.0),
-            top: taffy::prelude::LengthPercentage::length(10.0),
-            bottom: taffy::prelude::LengthPercentage::length(10.0),
-        };
-
-        s.gap = taffy::geometry::Size {
-            width: taffy::prelude::LengthPercentage::length(6.0),
-            height: taffy::prelude::LengthPercentage::length(6.0),
-        };
+        s.size.width = taffy::prelude::Dimension::length(190.0);
+        s.gap = taffy::geometry::Size::from_length(6.0);
     });
+    ui.label(sidebar, "Navigation");
+    let home = ui.button(sidebar, "Home");
+    let files = ui.button(sidebar, "Files");
+    let settings = ui.button(sidebar, "Settings");
+    ui.spacer(sidebar);
+    ui.label(sidebar, "ScrollView: PageUp/PageDown");
 
-    let _sidebar_title = ui.label_in(sidebar, "Navigation");
-
-    let home = ui.button_in(sidebar, "Home");
-    let files = ui.button_in(sidebar, "Files");
-    let settings = ui.button_in(sidebar, "Settings");
-
-    let _sidebar_spacer = ui.spacer_in(sidebar);
-
-    let _version = ui.label_in(sidebar, "Felix OS");
-
-    // ============================================================
-    // MAIN CONTENT
-    // ============================================================
-
-    let content = ui.column_in(body);
-
-    ui.style(content, |s| {
+    let main = ui.column(body);
+    ui.style(main, |s| {
         s.flex_grow = 1.0;
-        s.min_size.width =
-            taffy::prelude::LengthPercentageAuto::length(0.0);
-        s.min_size.height =
-            taffy::prelude::LengthPercentageAuto::length(0.0);
-
-        s.gap = taffy::geometry::Size {
-            width: taffy::prelude::LengthPercentage::length(8.0),
-            height: taffy::prelude::LengthPercentage::length(8.0),
-        };
+        s.min_size.width = taffy::prelude::LengthPercentageAuto::length(0.0);
+        s.min_size.height = taffy::prelude::LengthPercentageAuto::length(0.0);
+        s.gap = taffy::geometry::Size::from_length(8.0);
     });
 
-    // ------------------------------------------------------------
-    // CONTENT HEADER
-    // ------------------------------------------------------------
-
-    let content_header = ui.row_in(content);
-
+    let content_header = ui.row(main);
     ui.style(content_header, |s| {
-        s.min_size.height =
-            taffy::prelude::LengthPercentageAuto::length(40.0);
-
+        s.min_size.height = taffy::prelude::LengthPercentageAuto::length(38.0);
         s.align_items = Some(AlignItems::CENTER);
     });
+    ui.label(content_header, "Dashboard");
+    ui.spacer(content_header);
+    let clear = ui.button(content_header, "Clear");
 
-    let page_title = ui.label_in(content_header, "Dashboard");
-
-    let _ = page_title;
-
-    let _ = ui.spacer_in(content_header);
-
-    let refresh = ui.button_in(content_header, "Refresh");
-
-    // ------------------------------------------------------------
-    // INFORMATION PANEL
-    // ------------------------------------------------------------
-
-    let info = ui.panel_in(content);
-
+    let info = ui.panel(main);
     ui.style(info, |s| {
-        s.flex_grow = 1.0;
-        s.min_size.height =
-            taffy::prelude::LengthPercentageAuto::length(0.0);
+        s.min_size.height = taffy::prelude::LengthPercentageAuto::length(72.0);
+        s.gap = taffy::geometry::Size::from_length(5.0);
+    });
+    ui.label(info, "Layout and widgets are separate.");
+    ui.label(info, "Every leaf implements the common Widget trait.");
+    ui.label(info, "Intrinsic measurement receives explicit Constraints.");
 
-        s.gap = taffy::geometry::Size {
-            width: taffy::prelude::LengthPercentage::length(6.0),
-            height: taffy::prelude::LengthPercentage::length(6.0),
+    let scroll = ui.scroll_view(main);
+    let scroll_content = ui.scroll_content(scroll).unwrap();
+    ui.style(scroll_content, |s| {
+        s.gap = taffy::geometry::Size::from_length(4.0);
+        s.padding = taffy::geometry::Rect::from_length(4.0);
+    });
+    for i in 1..=24 {
+        let row = ui.row(scroll_content);
+        ui.style(row, |s| {
+            s.min_size.height = taffy::prelude::LengthPercentageAuto::length(30.0);
+            s.align_items = Some(AlignItems::CENTER);
+            s.gap = taffy::geometry::Size::from_length(8.0);
+        });
+        let label = match i {
+            1 => "01  Scrollable row",
+            2 => "02  Scrollable row",
+            3 => "03  Scrollable row",
+            4 => "04  Scrollable row",
+            5 => "05  Scrollable row",
+            6 => "06  Scrollable row",
+            7 => "07  Scrollable row",
+            8 => "08  Scrollable row",
+            9 => "09  Scrollable row",
+            10 => "10  Scrollable row",
+            11 => "11  Scrollable row",
+            12 => "12  Scrollable row",
+            13 => "13  Scrollable row",
+            14 => "14  Scrollable row",
+            15 => "15  Scrollable row",
+            16 => "16  Scrollable row",
+            17 => "17  Scrollable row",
+            18 => "18  Scrollable row",
+            19 => "19  Scrollable row",
+            20 => "20  Scrollable row",
+            21 => "21  Scrollable row",
+            22 => "22  Scrollable row",
+            23 => "23  Scrollable row",
+            _ => "24  Scrollable row",
         };
-    });
-
-    let _info_title = ui.label_in(info, "Layout information");
-
-    let _info1 = ui.label_in(
-        info,
-        "This application demonstrates Taffy flexbox layouts.",
-    );
-
-    let _info2 = ui.label_in(
-        info,
-        "Every widget belongs to an explicit parent node.",
-    );
-
-    let _info3 = ui.label_in(
-        info,
-        "The UI tree is independent from application state.",
-    );
-
-    // ------------------------------------------------------------
-    // INPUT ROW
-    // ------------------------------------------------------------
-
-    let input_row = ui.row_in(content);
-
-    ui.style(input_row, |s| {
-        s.min_size.height =
-            taffy::prelude::LengthPercentageAuto::length(38.0);
-
-        s.gap = taffy::geometry::Size {
-            width: taffy::prelude::LengthPercentage::length(8.0),
-            height: taffy::prelude::LengthPercentage::length(8.0),
-        };
-
-        s.align_items = Some(AlignItems::CENTER);
-    });
-
-    let _input_label = ui.label_in(input_row, "Name:");
-
-    let input = ui.text_input_with_in(input_row, "Felix");
-
-    ui.style(
-        ui.node_of(input).unwrap(),
-        |s| {
-            s.flex_grow = 1.0;
-            s.min_size.width =
-                taffy::prelude::LengthPercentageAuto::length(100.0);
-        },
-    );
-
-    let submit = ui.button_in(input_row, "Apply");
-
-    // ------------------------------------------------------------
-    // FOOTER
-    // ------------------------------------------------------------
-
-    let footer = ui.row_in(root);
-
-    ui.style(footer, |s| {
-        s.min_size.height =
-            taffy::prelude::LengthPercentageAuto::length(34.0);
-
-        s.align_items = Some(AlignItems::CENTER);
-    });
-
-    let footer_text = ui.label_in(
-        footer,
-        "Ready",
-    );
-
-    let _ = footer_text;
-
-    let _ = ui.spacer_in(footer);
-
-    let _footer_status = ui.label_in(
-        footer,
-        "900 x 600",
-    );
-
-    // ============================================================
-    // EVENTS
-    // ============================================================
-
-    ui.on_click(home, |_ui| {
-        println!("Home clicked");
-    });
-
-    ui.on_click(files, |_ui| {
-        println!("Files clicked");
-    });
-
-    ui.on_click(settings, |_ui| {
-        println!("Settings clicked");
-    });
-
-    ui.on_click(refresh, |_ui| {
-        println!("Refresh clicked");
-    });
-
-    ui.on_click(submit, move |ui| {
-        if let Some(text) = ui.text(input) {
-            println!("Name: {}", text);
-        }
-    });
-
-    // ============================================================
-    // MAIN LOOP
-    // ============================================================
-
-    loop {
-        ui.process(&mut win);
+        ui.label(row, label);
+        ui.spacer(row);
+        if i == 24 { ui.button(row, "End"); }
     }
-}
 
+    let input_row = ui.row(main);
+    ui.style(input_row, |s| {
+        s.min_size.height = taffy::prelude::LengthPercentageAuto::length(38.0);
+        s.align_items = Some(AlignItems::CENTER);
+        s.gap = taffy::geometry::Size::from_length(8.0);
+    });
+    ui.label(input_row, "Name:");
+    let input = ui.text_input_with(input_row, "Felix");
+    ui.style(ui.node_of(input).unwrap(), |s| {
+        s.flex_grow = 1.0;
+        s.min_size.width = taffy::prelude::LengthPercentageAuto::length(100.0);
+    });
+    let apply = ui.button(input_row, "Apply");
+
+    let footer = ui.row(root);
+    ui.style(footer, |s| {
+        s.min_size.height = taffy::prelude::LengthPercentageAuto::length(32.0);
+        s.align_items = Some(AlignItems::CENTER);
+    });
+    ui.label(footer, "Ready");
+    ui.spacer(footer);
+    ui.label(footer, "Taffy + Widget trait + Constraints + ScrollView");
+
+    ui.on_click(home, |_ui| println!("Home clicked"));
+    ui.on_click(files, |_ui| println!("Files clicked"));
+    ui.on_click(settings, |_ui| println!("Settings clicked"));
+    ui.on_click(refresh, |_ui| println!("Refresh clicked"));
+    ui.on_click(clear, |ui| { ui.scroll_to_top(scroll); });
+    ui.on_click(apply, move |ui| {
+        if let Some(text) = ui.text(input) { println!("Name: {}", text); }
+    });
+
+    let _ = layout::fill();
+    loop { ui.process(&mut win); }
+}
