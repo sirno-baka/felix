@@ -119,7 +119,6 @@ impl Widget for TextInput {
                 }
                 if scancode == SCAN_BACKSPACE {
                     if self.text.pop().is_some() {
-                        self.dirty = true;
                         return EventResult::Changed;
                     }
                     return EventResult::Consumed;
@@ -129,7 +128,6 @@ impl Widget for TextInput {
                 }
                 if ch >= 0x20 && ch < 0x7f && self.text.len() < self.max_len {
                     self.text.push(ch as char);
-                    self.dirty = true;
                     return EventResult::Changed;
                 }
                 EventResult::Consumed
@@ -158,7 +156,7 @@ impl Widget for TextInput {
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
-    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 }
