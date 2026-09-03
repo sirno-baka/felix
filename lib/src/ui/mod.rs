@@ -15,7 +15,7 @@ pub mod widgets;
 
 use alloc::{boxed::Box, vec::Vec};
 use embedded_graphics::{pixelcolor::Rgb888, prelude::*, primitives::{PrimitiveStyle, Rectangle}};
-use taffy::{compute_leaf_layout, geometry::Size as TSize, prelude::{AvailableSpace, Dimension, LengthPercentage as LP, LengthPercentageAuto as LPA, Overflow}, tree::TaffyTree};
+use taffy::{geometry::Size as TSize, prelude::{AvailableSpace, Dimension, LengthPercentage as LP, LengthPercentageAuto as LPA, Overflow}, tree::TaffyTree};
 
 use crate::wm::{Window, WmEvent, EV_KEY_DOWN, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_MOVE, EV_MOUSE_UP};
 pub use geometry::{Constraints, Rect};
@@ -109,13 +109,12 @@ impl Ui {
     pub fn set_root_size(&mut self, w: u32, h: u32) { let w = w.max(1); let h = h.max(1); if w == self.root_w && h == self.root_h { return; } self.root_w = w; self.root_h = h; let _ = self.style(self.root, |s| s.size = TSize { width: Dimension::length(w as f32), height: Dimension::length(h as f32) }); }
     fn compute(&mut self) {
         let root = self.root; let rw = self.root_w; let rh = self.root_h; let widgets = &self.widgets; let taffy = &mut self.taffy; let space = TSize { width: AvailableSpace::Definite(rw as f32), height: AvailableSpace::Definite(rh as f32) };
-        let _ = taffy.compute_layout_with_measure(root, space, |known, available, _node, ctx, style| { let content = match ctx { Some(NodeCtx::Widget(id)) => widgets[id.0].measure(constraints_from_taffy(known, available)), _ => TSize::ZERO }; compute_leaf_layout(known, style, |_, _| 0.0, |known, _| TSize { width: known.width.unwrap_or(content.width), height: known.height.unwrap_or(content.height) }) });
+        let _ = taffy.compute_layout_with_measure(root, space, |known, available, _node, ctx| { match ctx { Some(NodeCtx::Widget(id)) => widgets[id.0].measure(constraints_from_taffy(known, available)), _ => TSize::ZERO } });
         self.update_scroll_metrics(); self.apply_layout();
     }
     fn update_scroll_metrics(&mut self) { for i in 0..self.scrolls.len() { let v = self.taffy.layout(self.scroll_nodes[i]).ok().copied(); let c = self.taffy.layout(self.scroll_contents[i]).ok().copied(); if let (Some(v), Some(c)) = (v, c) { self.scrolls[i].viewport_height = v.size.height.max(0.0); self.scrolls[i].content_height = c.size.height.max(0.0); let max = self.scrolls[i].max_offset(); if self.scrolls[i].offset_y > max { self.scrolls[i].offset_y = max; } } } }
     fn apply_layout(&mut self) { self.apply_node(self.root, 0, 0, None); }
     fn apply_node(&mut self, node: NodeId, ox: i32, oy: i32, clip: Option<Rect>) { let l = match self.taffy.layout(node) { Ok(v) => *v, Err(_) => return }; let x = ox + l.location.x as i32; let y = oy + l.location.y as i32; let ctx = self.taffy.get_node_context(node).copied(); let mut child_y = y; let mut child_clip = clip; if let Some(NodeCtx::ScrollView(sid)) = ctx { let viewport = Rect::new(x, y, l.size.width.max(0.0) as u32, l.size.height.max(0.0) as u32); child_clip = child_clip.and_then(|c| c.intersect(viewport)).or(Some(viewport)); child_y -= self.scrolls[sid.0].offset_y as i32; } if let Some(NodeCtx::Widget(id)) = ctx { self.widgets[id.0].set_rect(Rect::new(x, y, l.size.width.max(0.0) as u32, l.size.height.max(0.0) as u32)); } if let Ok(children) = self.taffy.children(node) { for child in children { self.apply_node(child, x, child_y, child_clip); } } }
-
     fn dispatch(&mut self, ev: &UiEvent, clicked: &mut Vec<WidgetId>) -> bool {
         let mut changed = false;
         if let UiEvent::Down { x, y } = *ev { if let Some(sid) = self.scrollbar_at(x, y) { let l = match self.taffy.layout(self.scroll_nodes[sid.0]) { Ok(v) => *v, Err(_) => return false }; let r = Rect::new(l.location.x as i32, l.location.y as i32, l.size.width as u32, l.size.height as u32); let state = self.scrolls[sid.0]; let thumb_h = (r.h as f32 * r.h as f32 / state.content_height).max(16.0).min(r.h as f32) as u32; let travel = r.h.saturating_sub(thumb_h).max(1) as f32; let thumb_y = r.y + (travel * state.offset_y / state.max_offset().max(1.0)) as i32; self.scrolls[sid.0].dragging = true; self.scrolls[sid.0].drag_grab = (y - thumb_y) as f32; return true; } let hit = self.hit_test(x, y); if hit != self.focus { self.set_focus(hit); changed = true; } }
