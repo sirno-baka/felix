@@ -7,6 +7,7 @@ extern crate alloc;
 pub mod args;
 pub mod async_rt;
 pub mod fs;
+pub mod layout;
 pub mod mutex;
 pub mod print;
 pub mod signal;
@@ -30,6 +31,7 @@ pub mod prelude {
     pub use crate::async_rt::{self, block_on, wait_readable, yield_now, Executor};
     pub use crate::fs::{File, IoError, IoResult};
     pub use crate::args::Args;
+    pub use crate::layout::UiLayoutExt;
     pub use crate::print;
     pub use crate::println;
     pub use crate::rt::{arg, argc, args};
