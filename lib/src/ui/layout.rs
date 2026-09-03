@@ -1,6 +1,5 @@
-//! Layout API 2.0: explicit-parent helpers around Taffy.
 use crate::ui::{ScrollViewId, Ui};
-use taffy::{geometry::{Point, Rect, Size}, prelude::{AlignItems, Dimension, FlexDirection, JustifyContent, LengthPercentage as LP, LengthPercentageAuto as LPA, Overflow, Position, Style}, tree::NodeId};
+use taffy::{geometry::{Point, Rect, Size}, prelude::{AlignItems, Dimension, FlexDirection, JustifyContent, LengthPercentage as LP, LengthPercentageAuto as LPA, Position, Style}, tree::NodeId, Overflow};
 
 pub trait LayoutApi {
     fn column(&mut self, parent: NodeId) -> NodeId;
@@ -13,7 +12,6 @@ pub trait LayoutApi {
     fn style(&mut self, node: NodeId, update: impl FnOnce(&mut Style)) -> bool;
     fn set_style(&mut self, node: NodeId, style: Style) -> bool;
 }
-
 impl LayoutApi for Ui {
     fn column(&mut self, parent: NodeId) -> NodeId { Ui::column(self, parent) }
     fn row(&mut self, parent: NodeId) -> NodeId { Ui::row(self, parent) }
@@ -25,7 +23,6 @@ impl LayoutApi for Ui {
     fn style(&mut self, node: NodeId, update: impl FnOnce(&mut Style)) -> bool { Ui::style(self, node, update) }
     fn set_style(&mut self, node: NodeId, style: Style) -> bool { Ui::set_style(self, node, style) }
 }
-
 pub fn column() -> Style { let mut s = Style::default(); s.flex_direction = FlexDirection::Column; s }
 pub fn row() -> Style { let mut s = Style::default(); s.flex_direction = FlexDirection::Row; s }
 pub fn fill() -> Style { let mut s = Style::default(); s.flex_grow = 1.0; s.min_size = Size { width: LPA::length(0.0), height: LPA::length(0.0) }; s }
