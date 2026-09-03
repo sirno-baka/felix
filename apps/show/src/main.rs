@@ -4,7 +4,6 @@
 extern crate alloc;
 
 use libfelix::prelude::*;
-use libfelix::ui::layout;
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
@@ -46,7 +45,7 @@ pub extern "C" fn main() -> i32 {
     let files = ui.button(sidebar, "Files");
     let settings = ui.button(sidebar, "Settings");
     ui.spacer(sidebar);
-    ui.label(sidebar, "ScrollView: PageUp/PageDown");
+    ui.label(sidebar, "PageUp/PageDown scroll");
 
     let main = ui.column(body);
     ui.style(main, |s| {
@@ -63,7 +62,7 @@ pub extern "C" fn main() -> i32 {
     });
     ui.label(content_header, "Dashboard");
     ui.spacer(content_header);
-    let clear = ui.button(content_header, "Clear");
+    let clear = ui.button(content_header, "Top");
 
     let info = ui.panel(main);
     ui.style(info, |s| {
@@ -80,42 +79,22 @@ pub extern "C" fn main() -> i32 {
         s.gap = taffy::geometry::Size::from_length(4.0);
         s.padding = taffy::geometry::Rect::from_length(4.0);
     });
-    for i in 1..=24 {
+    for label in [
+        "01  Scrollable row", "02  Scrollable row", "03  Scrollable row", "04  Scrollable row",
+        "05  Scrollable row", "06  Scrollable row", "07  Scrollable row", "08  Scrollable row",
+        "09  Scrollable row", "10  Scrollable row", "11  Scrollable row", "12  Scrollable row",
+        "13  Scrollable row", "14  Scrollable row", "15  Scrollable row", "16  Scrollable row",
+        "17  Scrollable row", "18  Scrollable row", "19  Scrollable row", "20  Scrollable row",
+        "21  Scrollable row", "22  Scrollable row", "23  Scrollable row", "24  Scrollable row",
+    ] {
         let row = ui.row(scroll_content);
         ui.style(row, |s| {
             s.min_size.height = taffy::prelude::LengthPercentageAuto::length(30.0);
             s.align_items = Some(AlignItems::CENTER);
             s.gap = taffy::geometry::Size::from_length(8.0);
         });
-        let label = match i {
-            1 => "01  Scrollable row",
-            2 => "02  Scrollable row",
-            3 => "03  Scrollable row",
-            4 => "04  Scrollable row",
-            5 => "05  Scrollable row",
-            6 => "06  Scrollable row",
-            7 => "07  Scrollable row",
-            8 => "08  Scrollable row",
-            9 => "09  Scrollable row",
-            10 => "10  Scrollable row",
-            11 => "11  Scrollable row",
-            12 => "12  Scrollable row",
-            13 => "13  Scrollable row",
-            14 => "14  Scrollable row",
-            15 => "15  Scrollable row",
-            16 => "16  Scrollable row",
-            17 => "17  Scrollable row",
-            18 => "18  Scrollable row",
-            19 => "19  Scrollable row",
-            20 => "20  Scrollable row",
-            21 => "21  Scrollable row",
-            22 => "22  Scrollable row",
-            23 => "23  Scrollable row",
-            _ => "24  Scrollable row",
-        };
         ui.label(row, label);
         ui.spacer(row);
-        if i == 24 { ui.button(row, "End"); }
     }
 
     let input_row = ui.row(main);
@@ -139,17 +118,16 @@ pub extern "C" fn main() -> i32 {
     });
     ui.label(footer, "Ready");
     ui.spacer(footer);
-    ui.label(footer, "Taffy + Widget trait + Constraints + ScrollView");
+    ui.label(footer, "Taffy + Widget + Constraints + ScrollView");
 
     ui.on_click(home, |_ui| println!("Home clicked"));
     ui.on_click(files, |_ui| println!("Files clicked"));
     ui.on_click(settings, |_ui| println!("Settings clicked"));
     ui.on_click(refresh, |_ui| println!("Refresh clicked"));
-    ui.on_click(clear, |ui| { ui.scroll_to_top(scroll); });
+    ui.on_click(clear, move |ui| { ui.scroll_to_top(scroll); });
     ui.on_click(apply, move |ui| {
         if let Some(text) = ui.text(input) { println!("Name: {}", text); }
     });
 
-    let _ = layout::fill();
     loop { ui.process(&mut win); }
 }
