@@ -101,6 +101,7 @@ impl Widget for Button {
             UiEvent::Up { x, y } if self.down => {
                 let click = self.rect.contains(x, y);
                 self.down = false;
+                self.hot = click;
                 self.dirty = true;
                 if click {
                     EventResult::Clicked
