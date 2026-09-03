@@ -167,7 +167,7 @@ pub mod presets {
     /// Absolute-positioned node style.
     pub fn absolute() -> Style {
         let mut s = Style::default();
-        s.position = Position::ABSOLUTE;
+        s.position = Position::Absolute;
         s
     }
 }

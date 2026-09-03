@@ -9,7 +9,4 @@ test = false
 
 [dependencies]
 libfelix = { path = "../../lib" }
-embedded-graphics-unicodefonts = "0.2.0"
-zune-core = { version = "0.4", default-features = false }
-zune-jpeg = { version = "0.4", default-features = false }
-zune-png = { version = "0.4", default-features = false }
+taffy = { version = "0.14.0", default-features = false, features = ["alloc"] }

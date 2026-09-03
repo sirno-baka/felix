@@ -4,289 +4,282 @@
 extern crate alloc;
 
 use alloc::format;
-use alloc::string::String;
 use alloc::vec::Vec;
-
-use libfelix::async_rt::yield_now;
-use libfelix::embedded_graphics::mono_font::MonoTextStyle;
-use libfelix::embedded_graphics::pixelcolor::Rgb888;
-use libfelix::embedded_graphics::prelude::*;
-use libfelix::embedded_graphics::text::{Baseline, Text};
-use libfelix::fs;
+use taffy::AlignItems;
 use libfelix::prelude::*;
-use libfelix::wm::{rgb, screen_size, Window, EV_CLOSE, EV_KEY_DOWN};
-use embedded_graphics_unicodefonts::mono_9x18_atlas;
-use zune_core::colorspace::ColorSpace;
-use zune_jpeg::JpegDecoder;
-use zune_png::PngDecoder;
-
-const SCAN_ESC: u8 = 0x01;
-const SCAN_Q: u8 = 0x10;
-const BG: u32 = 0x0010_1820;
-const MAX_WIN_W: u32 = 720;
-const MAX_WIN_H: u32 = 520;
-
-struct RgbImage {
-    width: u32,
-    height: u32,
-    pixels: Vec<u8>,
-}
-
-fn usage() {
-    println!("usage: show <file.jpg|file.png>");
-}
-
-fn ext_of(path: &str) -> &str {
-    match path.rsplit_once('.') {
-        Some((_, e)) => e,
-        None => "",
-    }
-}
-
-fn basename(path: &str) -> &str {
-    path.rsplit(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or(path)
-}
-
-fn looks_png(data: &[u8], path: &str) -> bool {
-    data.starts_with(&[0x89, b'P', b'N', b'G']) || ext_of(path).eq_ignore_ascii_case("png")
-}
-
-fn looks_jpeg(data: &[u8], path: &str) -> bool {
-    data.starts_with(&[0xFF, 0xD8])
-        || ext_of(path).eq_ignore_ascii_case("jpg")
-        || ext_of(path).eq_ignore_ascii_case("jpeg")
-}
-
-fn to_rgb8(src: &[u8], w: u32, h: u32, space: ColorSpace) -> Option<RgbImage> {
-    let n = (w as usize).saturating_mul(h as usize);
-    let mut pixels = Vec::with_capacity(n.saturating_mul(3));
-    match space {
-        ColorSpace::RGB => {
-            if src.len() < n * 3 {
-                return None;
-            }
-            pixels.extend_from_slice(&src[..n * 3]);
-        }
-        ColorSpace::RGBA => {
-            if src.len() < n * 4 {
-                return None;
-            }
-            for chunk in src.chunks_exact(4).take(n) {
-                pixels.extend_from_slice(&chunk[..3]);
-            }
-        }
-        ColorSpace::Luma => {
-            if src.len() < n {
-                return None;
-            }
-            for &y in src.iter().take(n) {
-                pixels.push(y);
-                pixels.push(y);
-                pixels.push(y);
-            }
-        }
-        ColorSpace::LumaA => {
-            if src.len() < n * 2 {
-                return None;
-            }
-            for chunk in src.chunks_exact(2).take(n) {
-                pixels.push(chunk[0]);
-                pixels.push(chunk[0]);
-                pixels.push(chunk[0]);
-            }
-        }
-        ColorSpace::BGR => {
-            if src.len() < n * 3 {
-                return None;
-            }
-            for chunk in src.chunks_exact(3).take(n) {
-                pixels.push(chunk[2]);
-                pixels.push(chunk[1]);
-                pixels.push(chunk[0]);
-            }
-        }
-        ColorSpace::BGRA => {
-            if src.len() < n * 4 {
-                return None;
-            }
-            for chunk in src.chunks_exact(4).take(n) {
-                pixels.push(chunk[2]);
-                pixels.push(chunk[1]);
-                pixels.push(chunk[0]);
-            }
-        }
-        _ => return None,
-    }
-    Some(RgbImage {
-        width: w,
-        height: h,
-        pixels,
-    })
-}
-
-fn decode_jpeg(data: &[u8]) -> Result<RgbImage, &'static str> {
-    let mut dec = JpegDecoder::new(data);
-    let raw = dec.decode().map_err(|_| "jpeg decode failed")?;
-    let info = dec.info().ok_or("jpeg has no info")?;
-    let space = dec.get_output_colorspace().unwrap_or(ColorSpace::RGB);
-    to_rgb8(&raw, info.width as u32, info.height as u32, space).ok_or("jpeg colorspace")
-}
-
-fn decode_png(data: &[u8]) -> Result<RgbImage, &'static str> {
-    let mut dec = PngDecoder::new(data);
-    let decoded = dec.decode().map_err(|_| "png decode failed")?;
-    let (w, h) = dec.get_dimensions().ok_or("png has no size")?;
-    let space = dec.get_colorspace().unwrap_or(ColorSpace::RGB);
-    let raw = match decoded {
-        zune_core::result::DecodingResult::U8(v) => v,
-        _ => return Err("png bit depth"),
-    };
-    to_rgb8(&raw, w as u32, h as u32, space).ok_or("png colorspace")
-}
-
-fn decode_image(path: &str, data: &[u8]) -> Result<RgbImage, &'static str> {
-    if looks_png(data, path) {
-        decode_png(data)
-    } else if looks_jpeg(data, path) {
-        decode_jpeg(data)
-    } else {
-        Err("not jpeg/png")
-    }
-}
-
-fn fit_window(img_w: u32, img_h: u32) -> (u32, u32) {
-    let (sw, sh) = screen_size();
-    let max_w = MAX_WIN_W.min(sw.saturating_sub(40)).max(160);
-    let max_h = MAX_WIN_H.min(sh.saturating_sub(60)).max(120);
-    if img_w == 0 || img_h == 0 {
-        return (320, 200);
-    }
-    let mut w = img_w.max(160);
-    let mut h = img_h.max(120);
-    if w > max_w || h > max_h {
-        let sx = (max_w as u64 * 1000) / img_w as u64;
-        let sy = (max_h as u64 * 1000) / img_h as u64;
-        let s = sx.min(sy).max(1);
-        w = ((img_w as u64 * s) / 1000).max(1) as u32;
-        h = ((img_h as u64 * s) / 1000).max(1) as u32;
-    }
-    (w.max(160), h.max(80))
-}
-
-fn blit_fit(win: &mut Window, img: &RgbImage) {
-    win.fill(BG);
-    let cw = win.client_width();
-    let ch = win.client_height();
-    if img.width == 0 || img.height == 0 || cw == 0 || ch == 0 {
-        return;
-    }
-    let sx = (cw as u64 * 1000) / img.width as u64;
-    let sy = (ch as u64 * 1000) / img.height as u64;
-    let s = sx.min(sy).max(1);
-    let dw = ((img.width as u64 * s) / 1000).max(1) as u32;
-    let dh = ((img.height as u64 * s) / 1000).max(1) as u32;
-    let ox = cw.saturating_sub(dw) / 2;
-    let oy = ch.saturating_sub(dh) / 2;
-    for dy in 0..dh {
-        let sy = ((dy as u64 * img.height as u64) / dh as u64) as u32;
-        if sy >= img.height {
-            break;
-        }
-        let src_row = (sy as usize) * (img.width as usize) * 3;
-        for dx in 0..dw {
-            let sx = ((dx as u64 * img.width as u64) / dw as u64) as u32;
-            if sx >= img.width {
-                break;
-            }
-            let i = src_row + (sx as usize) * 3;
-            let r = img.pixels[i];
-            let g = img.pixels[i + 1];
-            let b = img.pixels[i + 2];
-            win.put_pixel(ox + dx, oy + dy, rgb(r, g, b));
-        }
-    }
-}
-
-fn draw_message(win: &mut Window, msg: &str) {
-    win.fill(BG);
-    let atlas = mono_9x18_atlas();
-    let style = MonoTextStyle::new(&atlas, Rgb888::new(0xF0, 0xF0, 0xF0));
-    let _ = Text::with_baseline(msg, Point::new(12, 16), style, Baseline::Top).draw(win);
-    let _ = win.flip();
-}
-
-fn event_loop(win: &mut Window) {
-    let mut events = [libfelix::wm::WmEvent::default(); 32];
-    loop {
-        let n = win.poll_events(&mut events);
-        for ev in events.iter().take(n) {
-            match ev.kind {
-                EV_CLOSE => return,
-                EV_KEY_DOWN => {
-                    let scan = ev.a as u8;
-                    if scan == SCAN_ESC || scan == SCAN_Q {
-                        return;
-                    }
-                },
-                _ => {}
-            }
-        }
-        yield_now();
-    }
-}
+use libfelix::layout::{presets, UiLayoutExt};
+use libfelix::ui::FlexDirection;
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
-    let args = Args::parse();
-    let path = match args.get(0) {
-        Some(p) => p,
-        None => {
-            usage();
-            return 1;
-        }
-    };
+    let mut win = Window::create(1, 1, 900, 600, "layouts").unwrap();
 
-    let data = match fs::read(path) {
-        Ok(d) => d,
-        Err(e) => {
-            println!("show: cannot read {}: {:?}", path, e);
-            return 1;
-        }
-    };
+    let mut ui = Ui::with_size(900, 600);
 
-    let title = {
-        let mut t = String::from("show: ");
-        t.push_str(basename(path));
-        t
-    };
+    // ============================================================
+    // ROOT
+    // ============================================================
 
-    match decode_image(path, &data) {
-        Ok(img) => {
-            println!("show: {}x{} {}", img.width, img.height, path);
-            let (ww, wh) = fit_window(img.width, img.height);
-            let mut win = match Window::create(40, 40, ww, wh, &title) {
-                Some(w) => w,
-                None => {
-                    println!("show: cannot create window");
-                    return 1;
-                }
-            };
-            blit_fit(&mut win, &img);
-            let _ = win.flip();
-            event_loop(&mut win);
+    let root = ui.root_node();
+
+    ui.style(root, |s| {
+        s.flex_direction = FlexDirection::Column;
+        s.gap = taffy::geometry::Size {
+            width: taffy::prelude::LengthPercentage::length(8.0),
+            height: taffy::prelude::LengthPercentage::length(8.0),
+        };
+        s.padding = taffy::geometry::Rect {
+            left: taffy::prelude::LengthPercentage::length(12.0),
+            right: taffy::prelude::LengthPercentage::length(12.0),
+            top: taffy::prelude::LengthPercentage::length(12.0),
+            bottom: taffy::prelude::LengthPercentage::length(12.0),
+        };
+    });
+
+    // ============================================================
+    // HEADER
+    // ============================================================
+
+    let header = ui.row_in(root);
+
+    ui.style(header, |s| {
+        s.min_size.height =
+            taffy::prelude::LengthPercentageAuto::length(52.0);
+
+        s.padding = taffy::geometry::Rect {
+            left: taffy::prelude::LengthPercentage::length(12.0),
+            right: taffy::prelude::LengthPercentage::length(12.0),
+            top: taffy::prelude::LengthPercentage::length(8.0),
+            bottom: taffy::prelude::LengthPercentage::length(8.0),
+        };
+
+        s.align_items = Some(AlignItems::CENTER);
+    });
+
+    let title = ui.label_in(header, "Felix UI");
+    let _ = title;
+
+    let _header_spacer = ui.spacer_in(header);
+
+    let status = ui.label_in(header, "Taffy layout");
+    let _ = status;
+
+    // ============================================================
+    // BODY
+    // ============================================================
+
+    let body = ui.row_in(root);
+
+    ui.style(body, |s| {
+        s.flex_grow = 1.0;
+        s.min_size.height =
+            taffy::prelude::LengthPercentageAuto::length(0.0);
+
+        s.gap = taffy::geometry::Size {
+            width: taffy::prelude::LengthPercentage::length(8.0),
+            height: taffy::prelude::LengthPercentage::length(8.0),
+        };
+    });
+
+    // ============================================================
+    // SIDEBAR
+    // ============================================================
+
+    let sidebar = ui.panel_in(body);
+
+    ui.style(sidebar, |s| {
+        s.size.width =
+            taffy::prelude::Dimension::length(190.0);
+
+        s.padding = taffy::geometry::Rect {
+            left: taffy::prelude::LengthPercentage::length(10.0),
+            right: taffy::prelude::LengthPercentage::length(10.0),
+            top: taffy::prelude::LengthPercentage::length(10.0),
+            bottom: taffy::prelude::LengthPercentage::length(10.0),
+        };
+
+        s.gap = taffy::geometry::Size {
+            width: taffy::prelude::LengthPercentage::length(6.0),
+            height: taffy::prelude::LengthPercentage::length(6.0),
+        };
+    });
+
+    let _sidebar_title = ui.label_in(sidebar, "Navigation");
+
+    let home = ui.button_in(sidebar, "Home");
+    let files = ui.button_in(sidebar, "Files");
+    let settings = ui.button_in(sidebar, "Settings");
+
+    let _sidebar_spacer = ui.spacer_in(sidebar);
+
+    let _version = ui.label_in(sidebar, "Felix OS");
+
+    // ============================================================
+    // MAIN CONTENT
+    // ============================================================
+
+    let content = ui.column_in(body);
+
+    ui.style(content, |s| {
+        s.flex_grow = 1.0;
+        s.min_size.width =
+            taffy::prelude::LengthPercentageAuto::length(0.0);
+        s.min_size.height =
+            taffy::prelude::LengthPercentageAuto::length(0.0);
+
+        s.gap = taffy::geometry::Size {
+            width: taffy::prelude::LengthPercentage::length(8.0),
+            height: taffy::prelude::LengthPercentage::length(8.0),
+        };
+    });
+
+    // ------------------------------------------------------------
+    // CONTENT HEADER
+    // ------------------------------------------------------------
+
+    let content_header = ui.row_in(content);
+
+    ui.style(content_header, |s| {
+        s.min_size.height =
+            taffy::prelude::LengthPercentageAuto::length(40.0);
+
+        s.align_items = Some(AlignItems::CENTER);
+    });
+
+    let page_title = ui.label_in(content_header, "Dashboard");
+
+    let _ = page_title;
+
+    let _ = ui.spacer_in(content_header);
+
+    let refresh = ui.button_in(content_header, "Refresh");
+
+    // ------------------------------------------------------------
+    // INFORMATION PANEL
+    // ------------------------------------------------------------
+
+    let info = ui.panel_in(content);
+
+    ui.style(info, |s| {
+        s.flex_grow = 1.0;
+        s.min_size.height =
+            taffy::prelude::LengthPercentageAuto::length(0.0);
+
+        s.gap = taffy::geometry::Size {
+            width: taffy::prelude::LengthPercentage::length(6.0),
+            height: taffy::prelude::LengthPercentage::length(6.0),
+        };
+    });
+
+    let _info_title = ui.label_in(info, "Layout information");
+
+    let _info1 = ui.label_in(
+        info,
+        "This application demonstrates Taffy flexbox layouts.",
+    );
+
+    let _info2 = ui.label_in(
+        info,
+        "Every widget belongs to an explicit parent node.",
+    );
+
+    let _info3 = ui.label_in(
+        info,
+        "The UI tree is independent from application state.",
+    );
+
+    // ------------------------------------------------------------
+    // INPUT ROW
+    // ------------------------------------------------------------
+
+    let input_row = ui.row_in(content);
+
+    ui.style(input_row, |s| {
+        s.min_size.height =
+            taffy::prelude::LengthPercentageAuto::length(38.0);
+
+        s.gap = taffy::geometry::Size {
+            width: taffy::prelude::LengthPercentage::length(8.0),
+            height: taffy::prelude::LengthPercentage::length(8.0),
+        };
+
+        s.align_items = Some(AlignItems::CENTER);
+    });
+
+    let _input_label = ui.label_in(input_row, "Name:");
+
+    let input = ui.text_input_with_in(input_row, "Felix");
+
+    ui.style(
+        ui.node_of(input).unwrap(),
+        |s| {
+            s.flex_grow = 1.0;
+            s.min_size.width =
+                taffy::prelude::LengthPercentageAuto::length(100.0);
+        },
+    );
+
+    let submit = ui.button_in(input_row, "Apply");
+
+    // ------------------------------------------------------------
+    // FOOTER
+    // ------------------------------------------------------------
+
+    let footer = ui.row_in(root);
+
+    ui.style(footer, |s| {
+        s.min_size.height =
+            taffy::prelude::LengthPercentageAuto::length(34.0);
+
+        s.align_items = Some(AlignItems::CENTER);
+    });
+
+    let footer_text = ui.label_in(
+        footer,
+        "Ready",
+    );
+
+    let _ = footer_text;
+
+    let _ = ui.spacer_in(footer);
+
+    let _footer_status = ui.label_in(
+        footer,
+        "900 x 600",
+    );
+
+    // ============================================================
+    // EVENTS
+    // ============================================================
+
+    ui.on_click(home, |_ui| {
+        println!("Home clicked");
+    });
+
+    ui.on_click(files, |_ui| {
+        println!("Files clicked");
+    });
+
+    ui.on_click(settings, |_ui| {
+        println!("Settings clicked");
+    });
+
+    ui.on_click(refresh, |_ui| {
+        println!("Refresh clicked");
+    });
+
+    ui.on_click(submit, move |ui| {
+        if let Some(text) = ui.text(input) {
+            println!("Name: {}", text);
         }
-        Err(msg) => {
-            println!("show: {}", msg);
-            let mut win = match Window::create(80, 80, 360, 80, "show") {
-                Some(w) => w,
-                None => return 1,
-            };
-            draw_message(&mut win, &format!("error: {}", msg));
-            event_loop(&mut win);
-            return 1;
-        }
+    });
+
+    // ============================================================
+    // MAIN LOOP
+    // ============================================================
+
+    loop {
+        ui.process(&mut win);
     }
-    0
 }
+
