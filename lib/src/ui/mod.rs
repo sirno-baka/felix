@@ -15,12 +15,7 @@ pub mod widgets;
 
 use alloc::{boxed::Box, vec::Vec};
 use embedded_graphics::{pixelcolor::Rgb888, prelude::*, primitives::{PrimitiveStyle, Rectangle}};
-use taffy::{
-    compute_leaf_layout,
-    geometry::Size as TSize,
-    prelude::{AvailableSpace, Dimension, LengthPercentage as LP, LengthPercentageAuto as LPA, Overflow},
-    tree::TaffyTree,
-};
+use taffy::{compute_leaf_layout, geometry::Size as TSize, prelude::{AvailableSpace, Dimension, LengthPercentage as LP, LengthPercentageAuto as LPA, Overflow}, tree::TaffyTree};
 
 use crate::wm::{Window, WmEvent, EV_KEY_DOWN, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_MOVE, EV_MOUSE_UP};
 pub use geometry::{Constraints, Rect};
@@ -31,11 +26,7 @@ pub use taffy::tree::NodeId;
 pub use theme::{BG, BTN_BG, BTN_BG_DOWN, BTN_BG_HOT, BTN_BORDER, INPUT_BG, INPUT_BORDER, INPUT_BORDER_FOCUS, LABEL_FG, PANEL_BG, PANEL_BORDER, SCROLLBAR_BG, SCROLLBAR_THUMB, TEXT};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UiEvent {
-    Down { x: i32, y: i32 }, Move { x: i32, y: i32 }, Up { x: i32, y: i32 },
-    KeyDown { scancode: u8, ch: u8, mods: u8 }, KeyUp { scancode: u8, ch: u8, mods: u8 },
-}
-
+pub enum UiEvent { Down { x: i32, y: i32 }, Move { x: i32, y: i32 }, Up { x: i32, y: i32 }, KeyDown { scancode: u8, ch: u8, mods: u8 }, KeyUp { scancode: u8, ch: u8, mods: u8 } }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WidgetId(usize);
 impl WidgetId { pub const fn index(self) -> usize { self.0 } }
@@ -67,10 +58,7 @@ impl Ui {
     pub fn root(&self) -> NodeId { self.root }
     pub fn root_node(&self) -> NodeId { self.root }
     pub fn root_size(&self) -> (u32, u32) { (self.root_w, self.root_h) }
-    pub fn style(&mut self, node: NodeId, update: impl FnOnce(&mut Style)) -> bool {
-        let Some(mut style) = self.taffy.style(node).ok().cloned() else { return false }; update(&mut style);
-        if self.taffy.set_style(node, style).is_ok() { self.needs_layout = true; true } else { false }
-    }
+    pub fn style(&mut self, node: NodeId, update: impl FnOnce(&mut Style)) -> bool { let Some(mut style) = self.taffy.style(node).ok().cloned() else { return false }; update(&mut style); if self.taffy.set_style(node, style).is_ok() { self.needs_layout = true; true } else { false } }
     pub fn set_style(&mut self, node: NodeId, style: Style) -> bool { if self.taffy.set_style(node, style).is_ok() { self.needs_layout = true; true } else { false } }
     pub fn column(&mut self, parent: NodeId) -> NodeId { self.container(parent, FlexDirection::Column) }
     pub fn row(&mut self, parent: NodeId) -> NodeId { self.container(parent, FlexDirection::Row) }
@@ -78,14 +66,12 @@ impl Ui {
     fn container(&mut self, parent: NodeId, direction: FlexDirection) -> NodeId { let mut s = Style::default(); s.flex_direction = direction; let n = self.taffy.new_leaf(s).expect("taffy: create container"); self.taffy.add_child(parent, n).expect("taffy: add container"); self.needs_layout = true; n }
     pub fn panel(&mut self, parent: NodeId) -> NodeId { let mut s = Style::default(); s.flex_direction = FlexDirection::Column; s.padding = taffy::geometry::Rect { left: LP::length(8.0), right: LP::length(8.0), top: LP::length(8.0), bottom: LP::length(8.0) }; let n = self.taffy.new_leaf_with_context(s, NodeCtx::Panel).expect("taffy: create panel"); self.taffy.add_child(parent, n).expect("taffy: add panel"); self.needs_layout = true; n }
     pub fn spacer(&mut self, parent: NodeId) -> NodeId { let mut s = Style::default(); s.flex_grow = 1.0; let n = self.taffy.new_leaf(s).expect("taffy: create spacer"); self.taffy.add_child(parent, n).expect("taffy: add spacer"); self.needs_layout = true; n }
-
     pub fn scroll_view(&mut self, parent: NodeId) -> ScrollViewId {
         let sid = ScrollViewId(self.scrolls.len()); let mut viewport = Style::default(); viewport.flex_direction = FlexDirection::Column; viewport.min_size.height = LPA::length(0.0); viewport.overflow = taffy::geometry::Point { x: Overflow::Hidden, y: Overflow::Hidden };
         let node = self.taffy.new_leaf_with_context(viewport, NodeCtx::ScrollView(sid)).expect("taffy: create scroll view");
         let mut content = Style::default(); content.flex_direction = FlexDirection::Column; content.flex_shrink = 0.0; content.min_size.height = LPA::length(0.0); content.size.width = Dimension::percent(1.0);
         let content_node = self.taffy.new_leaf_with_context(content, NodeCtx::ScrollContent(sid)).expect("taffy: create scroll content");
-        self.taffy.add_child(node, content_node).expect("taffy: add scroll content"); self.taffy.add_child(parent, node).expect("taffy: add scroll view");
-        self.scrolls.push(ScrollState::default()); self.scroll_nodes.push(node); self.scroll_contents.push(content_node); self.needs_layout = true; sid
+        self.taffy.add_child(node, content_node).expect("taffy: add scroll content"); self.taffy.add_child(parent, node).expect("taffy: add scroll view"); self.scrolls.push(ScrollState::default()); self.scroll_nodes.push(node); self.scroll_contents.push(content_node); self.needs_layout = true; sid
     }
     pub fn scroll_content(&self, scroll: ScrollViewId) -> Option<NodeId> { self.scroll_contents.get(scroll.0).copied() }
     pub fn scroll_offset(&self, scroll: ScrollViewId) -> Option<f32> { self.scrolls.get(scroll.0).map(|s| s.offset_y) }
@@ -94,13 +80,11 @@ impl Ui {
     pub fn scroll_to(&mut self, scroll: ScrollViewId, y: f32) -> bool { let Some(s) = self.scrolls.get_mut(scroll.0) else { return false }; let old = s.offset_y; s.set_offset(y); if old != s.offset_y { self.dirty = true; true } else { false } }
     pub fn scroll_to_top(&mut self, scroll: ScrollViewId) -> bool { self.scroll_to(scroll, 0.0) }
     pub fn scroll_to_bottom(&mut self, scroll: ScrollViewId) -> bool { self.scroll_max_offset(scroll).map(|y| self.scroll_to(scroll, y)).unwrap_or(false) }
-
     pub fn button(&mut self, parent: NodeId, label: &str) -> WidgetId { let mut s = Style::default(); s.justify_content = Some(JustifyContent::CENTER); s.align_items = Some(AlignItems::CENTER); s.padding = taffy::geometry::Rect { left: LP::length(12.0), right: LP::length(12.0), top: LP::length(5.0), bottom: LP::length(5.0) }; self.add_widget(parent, Box::new(Button::new(label)), s) }
     pub fn label(&mut self, parent: NodeId, text: &str) -> WidgetId { self.add_widget(parent, Box::new(Label::new(text)), Style::default()) }
     pub fn text_input(&mut self, parent: NodeId) -> WidgetId { self.text_input_with(parent, "") }
     pub fn text_input_with(&mut self, parent: NodeId, text: &str) -> WidgetId { let mut s = Style::default(); s.align_items = Some(AlignItems::CENTER); s.min_size = TSize { width: LPA::auto(), height: LPA::length(26.0) }; s.padding = taffy::geometry::Rect { left: LP::length(6.0), right: LP::length(6.0), top: LP::length(4.0), bottom: LP::length(4.0) }; self.add_widget(parent, Box::new(TextInput::new(text)), s) }
     fn add_widget(&mut self, parent: NodeId, widget: Box<dyn Widget>, style: Style) -> WidgetId { let id = WidgetId(self.widgets.len()); let node = self.taffy.new_leaf_with_context(style, NodeCtx::Widget(id)).expect("taffy: create widget"); self.taffy.add_child(parent, node).expect("taffy: add widget"); self.widgets.push(widget); self.widget_nodes.push(node); self.clicks.push(None); self.needs_layout = true; id }
-
     pub fn button_mut(&mut self, id: WidgetId) -> Option<&mut Button> { self.widgets.get_mut(id.0)?.as_any_mut().downcast_mut::<Button>() }
     pub fn label_mut(&mut self, id: WidgetId) -> Option<&mut Label> { self.widgets.get_mut(id.0)?.as_any_mut().downcast_mut::<Label>() }
     pub fn text_input_mut(&mut self, id: WidgetId) -> Option<&mut TextInput> { self.widgets.get_mut(id.0)?.as_any_mut().downcast_mut::<TextInput>() }
@@ -124,7 +108,6 @@ impl Ui {
         if self.dirty { self.draw(win); let _ = win.flip(); self.dirty = false; for w in &mut self.widgets { w.clear_dirty(); } }
     }
     pub fn set_root_size(&mut self, w: u32, h: u32) { let w = w.max(1); let h = h.max(1); if w == self.root_w && h == self.root_h { return; } self.root_w = w; self.root_h = h; let _ = self.style(self.root, |s| s.size = TSize { width: Dimension::length(w as f32), height: Dimension::length(h as f32) }); }
-
     fn compute(&mut self) {
         let root = self.root; let rw = self.root_w; let rh = self.root_h; let widgets = &self.widgets; let taffy = &mut self.taffy; let space = TSize { width: AvailableSpace::Definite(rw as f32), height: AvailableSpace::Definite(rh as f32) };
         let _ = taffy.compute_layout_with_measure(root, space, |known, available, _node, ctx, style| { let content = match ctx { Some(NodeCtx::Widget(id)) => widgets[id.0].measure(constraints_from_taffy(known, available)), _ => TSize::ZERO }; compute_leaf_layout(known, style, |_, _| 0.0, |known, _| TSize { width: known.width.unwrap_or(content.width), height: known.height.unwrap_or(content.height) }) });
@@ -132,7 +115,7 @@ impl Ui {
     }
     fn update_scroll_metrics(&mut self) { for i in 0..self.scrolls.len() { let v = self.taffy.layout(self.scroll_nodes[i]).ok().copied(); let c = self.taffy.layout(self.scroll_contents[i]).ok().copied(); if let (Some(v), Some(c)) = (v, c) { self.scrolls[i].viewport_height = v.size.height.max(0.0); self.scrolls[i].content_height = c.size.height.max(0.0); let max = self.scrolls[i].max_offset(); if self.scrolls[i].offset_y > max { self.scrolls[i].offset_y = max; } } } }
     fn apply_layout(&mut self) { self.apply_node(self.root, 0, 0, None); }
-    fn apply_node(&mut self, node: NodeId, ox: i32, oy: i32, clip: Option<Rect>) { let l = match self.taffy.layout(node) { Ok(v) => *v, Err(_) => return }; let x = ox + l.location.x as i32; let y = oy + l.location.y as i32; let ctx = self.taffy.get_node_context(node).ok().flatten().copied(); let mut child_y = y; let mut child_clip = clip; if let Some(NodeCtx::ScrollView(sid)) = ctx { let viewport = Rect::new(x, y, l.size.width.max(0.0) as u32, l.size.height.max(0.0) as u32); child_clip = child_clip.and_then(|c| c.intersect(viewport)).or(Some(viewport)); child_y -= self.scrolls[sid.0].offset_y as i32; } if let Some(NodeCtx::Widget(id)) = ctx { self.widgets[id.0].set_rect(Rect::new(x, y, l.size.width.max(0.0) as u32, l.size.height.max(0.0) as u32)); } if let Ok(children) = self.taffy.children(node) { for child in children { self.apply_node(child, x, child_y, child_clip); } } }
+    fn apply_node(&mut self, node: NodeId, ox: i32, oy: i32, clip: Option<Rect>) { let l = match self.taffy.layout(node) { Ok(v) => *v, Err(_) => return }; let x = ox + l.location.x as i32; let y = oy + l.location.y as i32; let ctx = self.taffy.get_node_context(node).copied(); let mut child_y = y; let mut child_clip = clip; if let Some(NodeCtx::ScrollView(sid)) = ctx { let viewport = Rect::new(x, y, l.size.width.max(0.0) as u32, l.size.height.max(0.0) as u32); child_clip = child_clip.and_then(|c| c.intersect(viewport)).or(Some(viewport)); child_y -= self.scrolls[sid.0].offset_y as i32; } if let Some(NodeCtx::Widget(id)) = ctx { self.widgets[id.0].set_rect(Rect::new(x, y, l.size.width.max(0.0) as u32, l.size.height.max(0.0) as u32)); } if let Ok(children) = self.taffy.children(node) { for child in children { self.apply_node(child, x, child_y, child_clip); } } }
 
     fn dispatch(&mut self, ev: &UiEvent, clicked: &mut Vec<WidgetId>) -> bool {
         let mut changed = false;
@@ -145,14 +128,13 @@ impl Ui {
         changed
     }
     fn scroll_for_widget(&self, id: WidgetId) -> Option<ScrollViewId> { let node = *self.widget_nodes.get(id.0)?; for i in 0..self.scroll_contents.len() { if self.is_descendant(node, self.scroll_contents[i]) { return Some(ScrollViewId(i)); } } None }
-    fn is_descendant(&self, node: NodeId, ancestor: NodeId) -> bool { let mut cur = node; while let Ok(Some(parent)) = self.taffy.parent(cur) { if parent == ancestor { return true; } cur = parent; } false }
+    fn is_descendant(&self, node: NodeId, ancestor: NodeId) -> bool { let mut cur = node; while let Some(parent) = self.taffy.parent(cur) { if parent == ancestor { return true; } cur = parent; } false }
     fn scrollbar_at(&self, x: i32, y: i32) -> Option<ScrollViewId> { for i in (0..self.scrolls.len()).rev() { let l = self.taffy.layout(self.scroll_nodes[i]).ok().copied()?; let r = Rect::new(l.location.x as i32, l.location.y as i32, l.size.width as u32, l.size.height as u32); if self.scrolls[i].content_height > self.scrolls[i].viewport_height && x >= r.x + r.w as i32 - 10 && y >= r.y && y < r.y + r.h as i32 { return Some(ScrollViewId(i)); } } None }
     fn hit_test(&self, x: i32, y: i32) -> Option<WidgetId> { if x < 0 || y < 0 || x >= self.root_w as i32 || y >= self.root_h as i32 { return None; } for i in (0..self.widgets.len()).rev() { let w = &self.widgets[i]; if w.focusable() && w.rect().contains(x, y) && self.point_visible_in_scroll(self.widget_nodes[i], x, y) { return Some(WidgetId(i)); } } None }
-    fn point_visible_in_scroll(&self, node: NodeId, x: i32, y: i32) -> bool { let mut cur = node; while let Ok(Some(parent)) = self.taffy.parent(cur) { if let Ok(Some(NodeCtx::ScrollView(_))) = self.taffy.get_node_context(parent) { let l = match self.taffy.layout(parent) { Ok(v) => *v, Err(_) => return false }; if !Rect::new(l.location.x as i32, l.location.y as i32, l.size.width as u32, l.size.height as u32).contains(x, y) { return false; } } if parent == self.root { break; } cur = parent; } true }
-
+    fn point_visible_in_scroll(&self, node: NodeId, x: i32, y: i32) -> bool { let mut cur = node; while let Some(parent) = self.taffy.parent(cur) { if let Some(NodeCtx::ScrollView(_)) = self.taffy.get_node_context(parent) { let l = match self.taffy.layout(parent) { Ok(v) => *v, Err(_) => return false }; if !Rect::new(l.location.x as i32, l.location.y as i32, l.size.width as u32, l.size.height as u32).contains(x, y) { return false; } } if parent == self.root { break; } cur = parent; } true }
     fn draw(&mut self, win: &mut Window) { let _ = win.clear(BG); self.draw_node(self.root, 0, 0, None, win); self.draw_scrollbars(self.root, 0, 0, win); }
-    fn draw_node(&self, node: NodeId, ox: i32, oy: i32, clip: Option<Rect>, win: &mut Window) { let l = match self.taffy.layout(node) { Ok(v) => *v, Err(_) => return }; let x = ox + l.location.x as i32; let y = oy + l.location.y as i32; let ctx = self.taffy.get_node_context(node).ok().flatten().copied(); let mut child_clip = clip; let mut child_y = y; if let Some(NodeCtx::ScrollView(sid)) = ctx { let viewport = Rect::new(x, y, l.size.width as u32, l.size.height as u32); child_clip = child_clip.and_then(|c| c.intersect(viewport)).or(Some(viewport)); child_y -= self.scrolls[sid.0].offset_y as i32; } if let Some(NodeCtx::Panel) = ctx { draw_rect_clipped(win, Rect::new(x, y, l.size.width as u32, l.size.height as u32), clip, theme::PANEL_BG, true); } if let Some(NodeCtx::Widget(id)) = ctx { if child_clip.map_or(true, |c| self.widgets[id.0].rect().intersect(c).is_some()) { self.widgets[id.0].draw(win); } } if let Ok(children) = self.taffy.children(node) { for child in children { self.draw_node(child, x, child_y, child_clip, win); } } }
-    fn draw_scrollbars(&self, node: NodeId, ox: i32, oy: i32, win: &mut Window) { let l = match self.taffy.layout(node) { Ok(v) => *v, Err(_) => return }; let x = ox + l.location.x as i32; let y = oy + l.location.y as i32; if let Some(NodeCtx::ScrollView(sid)) = self.taffy.get_node_context(node).ok().flatten().copied() { let r = Rect::new(x, y, l.size.width as u32, l.size.height as u32); let state = self.scrolls[sid.0]; if state.content_height > state.viewport_height && r.h > 4 { let bw = 6u32; let bx = r.x + r.w as i32 - bw as i32; let _ = Rectangle::new(Point::new(bx, r.y), Size::new(bw, r.h)).into_styled(PrimitiveStyle::with_fill(theme::SCROLLBAR_BG)).draw(win); let th = (r.h as f32 * r.h as f32 / state.content_height).max(16.0).min(r.h as f32) as u32; let travel = r.h.saturating_sub(th); let ty = r.y + (travel as f32 * state.offset_y / state.max_offset().max(1.0)) as i32; let _ = Rectangle::new(Point::new(bx, ty), Size::new(bw, th)).into_styled(PrimitiveStyle::with_fill(theme::SCROLLBAR_THUMB)).draw(win); } } if let Ok(children) = self.taffy.children(node) { for child in children { self.draw_scrollbars(child, x, y, win); } } }
+    fn draw_node(&self, node: NodeId, ox: i32, oy: i32, clip: Option<Rect>, win: &mut Window) { let l = match self.taffy.layout(node) { Ok(v) => *v, Err(_) => return }; let x = ox + l.location.x as i32; let y = oy + l.location.y as i32; let ctx = self.taffy.get_node_context(node).copied(); let mut child_clip = clip; let mut child_y = y; if let Some(NodeCtx::ScrollView(sid)) = ctx { let viewport = Rect::new(x, y, l.size.width as u32, l.size.height as u32); child_clip = child_clip.and_then(|c| c.intersect(viewport)).or(Some(viewport)); child_y -= self.scrolls[sid.0].offset_y as i32; } if let Some(NodeCtx::Panel) = ctx { draw_rect_clipped(win, Rect::new(x, y, l.size.width as u32, l.size.height as u32), clip, theme::PANEL_BG, true); } if let Some(NodeCtx::Widget(id)) = ctx { if child_clip.map_or(true, |c| self.widgets[id.0].rect().intersect(c).is_some()) { self.widgets[id.0].draw(win); } } if let Ok(children) = self.taffy.children(node) { for child in children { self.draw_node(child, x, child_y, child_clip, win); } } }
+    fn draw_scrollbars(&self, node: NodeId, ox: i32, oy: i32, win: &mut Window) { let l = match self.taffy.layout(node) { Ok(v) => *v, Err(_) => return }; let x = ox + l.location.x as i32; let y = oy + l.location.y as i32; if let Some(NodeCtx::ScrollView(sid)) = self.taffy.get_node_context(node).copied() { let r = Rect::new(x, y, l.size.width as u32, l.size.height as u32); let state = self.scrolls[sid.0]; if state.content_height > state.viewport_height && r.h > 4 { let bw = 6u32; let bx = r.x + r.w as i32 - bw as i32; let _ = Rectangle::new(Point::new(bx, r.y), Size::new(bw, r.h)).into_styled(PrimitiveStyle::with_fill(theme::SCROLLBAR_BG)).draw(win); let th = (r.h as f32 * r.h as f32 / state.content_height).max(16.0).min(r.h as f32) as u32; let travel = r.h.saturating_sub(th); let ty = r.y + (travel as f32 * state.offset_y / state.max_offset().max(1.0)) as i32; let _ = Rectangle::new(Point::new(bx, ty), Size::new(bw, th)).into_styled(PrimitiveStyle::with_fill(theme::SCROLLBAR_THUMB)).draw(win); } } if let Ok(children) = self.taffy.children(node) { for child in children { self.draw_scrollbars(child, x, y, win); } } }
 }
 
 fn constraints_from_taffy(known: taffy::geometry::Size<Option<f32>>, available: taffy::geometry::Size<AvailableSpace>) -> Constraints { fn max(v: AvailableSpace) -> f32 { match v { AvailableSpace::Definite(v) | AvailableSpace::MinContent => v, AvailableSpace::MaxContent => f32::INFINITY } } Constraints { min_width: known.width.unwrap_or(0.0), max_width: max(available.width), min_height: known.height.unwrap_or(0.0), max_height: max(available.height) } }
