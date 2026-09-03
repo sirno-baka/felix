@@ -569,7 +569,7 @@ fn blit_surface_rect(fb: &mut Framebuffer, dx: u32, dy: u32, sx: u32, sy: u32, w
     let dst_pitch = fb.info.pitch as usize; let src_pitch = surf.pitch as usize; let row = w as usize * 4;
     for y in 0..h as usize {
         let src = (sy as usize + y) * src_pitch + sx as usize * 4;
-        let dst = (dy as usize + y) * dst_pitch;
+        let dst = (dy as usize + y) * dst_pitch + dx as usize * 4;
         unsafe { core::ptr::copy_nonoverlapping(surf.pixels.as_ptr().add(src), (fb.virt_base as *mut u8).add(dst), row); }
     }
 }
@@ -1067,7 +1067,6 @@ pub fn on_mouse_down(x: i32, y: i32) {
                     start_drag = true;
                 }
                 if in_client {
-                    println!("kernel mouse {:?}", EV_MOUSE_DOWN);
                     win.events.push(WmEvent {
                         kind: EV_MOUSE_DOWN,
                         a: cx,
