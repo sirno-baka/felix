@@ -463,7 +463,7 @@ impl Ui {
             };
             let mut clicked = None;
             if self.dispatch(&ev, &mut clicked) {
-                self.dirty = true
+                self.dirty = true;
             }
             if let Some(id) = clicked {
                 let mut cb = self.clicks[id.0].take();
@@ -760,6 +760,17 @@ impl Ui {
         let ctx = self.taffy.get_node_context(node).copied();
         if let Some(NodeCtx::Widget(id)) = ctx {
             let r = self.widgets[id.0].rect();
+            // Do not even execute widget drawing code when the widget
+            // cannot contribute pixels to the dirty region.
+            let dirty = Rect::new(
+                base_clip.top_left.x,
+                base_clip.top_left.y,
+                base_clip.size.width,
+                base_clip.size.height,
+            );
+            if r.intersect(dirty).is_none() {
+                return;
+            }
             let visible = self.widget_clips[id.0]
                 .map(|c| r.intersect(c).is_some())
                 .unwrap_or(true)
@@ -776,8 +787,7 @@ impl Ui {
             }
             return;
         }
-        let children: Vec<NodeId> = self.taffy.child_ids(node).collect();
-        for child in children {
+        for child in self.taffy.child_ids(node) {
             self.draw_node(child, win, base_clip)
         }
     }
