@@ -100,6 +100,7 @@ pub struct Ui {
     focus: Option<WidgetId>,
     hovered: Option<WidgetId>,
     dirty: bool,
+    dirty_rect: Option<Rect>,
     needs_layout: bool,
 }
 
@@ -131,6 +132,7 @@ impl Ui {
             focus: None,
             hovered: None,
             dirty: true,
+            dirty_rect: None,
             needs_layout: true,
         }
     }
@@ -238,7 +240,7 @@ impl Ui {
         } else { false };
         if changed {
             self.apply_layout();
-            self.dirty = true;
+            self.mark_dirty_rect(self.scroll_rects[scroll.0]);
         }
         changed
     }
@@ -253,7 +255,7 @@ impl Ui {
             // Scrolling changes screen-space widget rects, but not the Taffy layout.
             // Apply the existing layout immediately; do not trigger a full relayout.
             self.apply_layout();
-            self.dirty = true;
+            self.mark_dirty_rect(self.scroll_rects[scroll.0]);
         }
         changed
     }
@@ -320,7 +322,7 @@ impl Ui {
         if let Some(v) = self.button_mut(id) { v.set_label(text); self.needs_layout = true; }
     }
     pub fn set_text(&mut self, id: WidgetId, text: &str) {
-        if let Some(v) = self.text_input_mut(id) { v.set_text(text); self.needs_layout = true; }
+        if let Some(v) = self.text_input_mut(id) { v.set_text(text); self.mark_dirty_rect(self.widgets[id.0].rect()); }
     }
     pub fn on_click<F: FnMut(&mut Ui) + 'static>(&mut self, id: WidgetId, f: F) {
         if let Some(slot) = self.clicks.get_mut(id.0) { *slot = Some(Box::new(f)); }
@@ -330,51 +332,55 @@ impl Ui {
     pub fn focus(&self) -> Option<WidgetId> { self.focus }
     pub fn set_focus(&mut self, id: Option<WidgetId>) {
         if self.focus == id { return; }
-        if let Some(old) = self.focus { if let Some(w) = self.widgets.get_mut(old.0) { w.set_focused(false); } }
+        let old_focus = self.focus;
+        if let Some(old) = old_focus { if let Some(w) = self.widgets.get_mut(old.0) { w.set_focused(false); } }
         self.focus = id;
         if let Some(new) = id { if let Some(w) = self.widgets.get_mut(new.0) { w.set_focused(true); } }
-        self.dirty = true;
+        if let Some(old) = old_focus { self.mark_dirty_rect(self.widgets[old.0].rect()); }
+        if let Some(new) = id { self.mark_dirty_rect(self.widgets[new.0].rect()); }
     }
-    pub fn request_full_redraw(&mut self) { self.dirty = true; self.needs_layout = true; }
+    pub fn request_full_redraw(&mut self) { self.dirty = true; self.dirty_rect = None; self.needs_layout = true; }
+
+    fn mark_dirty_rect(&mut self, rect: Rect) {
+        self.dirty = true;
+        self.dirty_rect = match self.dirty_rect {
+            None => Some(rect),
+            Some(old) => {
+                let x0 = old.x.min(rect.x); let y0 = old.y.min(rect.y);
+                let x1 = (old.x + old.w as i32).max(rect.x + rect.w as i32);
+                let y1 = (old.y + old.h as i32).max(rect.y + rect.h as i32);
+                Some(Rect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32))
+            }
+        };
+    }
 
     pub fn process(&mut self, win: &mut Window) {
-        let mut buf = [WmEvent::default(); 256];
-        let n = win.poll_events(&mut buf);
-        let mut events = Vec::new();
-        for e in &buf[..n] {
-            match e.kind {
-                EV_MOUSE_DOWN => events.push(UiEvent::Down { x: e.a, y: e.b }),
-                EV_MOUSE_UP => events.push(UiEvent::Up { x: e.a, y: e.b }),
-                EV_MOUSE_MOVE => events.push(UiEvent::Move { x: e.a, y: e.b }),
-                EV_KEY_DOWN => events.push(UiEvent::KeyDown { scancode: e.a as u8, ch: e.b as u8, mods: e.c as u8 }),
-                EV_KEY_UP => events.push(UiEvent::KeyUp { scancode: e.a as u8, ch: e.b as u8, mods: e.c as u8 }),
-                _ => {}
-            }
-        }
-
+        let mut events = [WmEvent::default(); 256];
+        let n = win.poll_events(&mut events);
         self.set_root_size(win.client_width().max(1), win.client_height().max(1));
-        if self.needs_layout {
-            self.compute();
-            self.needs_layout = false;
-        }
+        if self.needs_layout { self.compute(); self.needs_layout = false; self.dirty = true; self.dirty_rect = None; }
 
-        let mut clicked = Vec::new();
-        for ev in &events { if self.dispatch(ev, &mut clicked) { self.dirty = true; } }
-        for id in clicked {
-            let mut cb = self.clicks[id.0].take();
-            if let Some(f) = cb.as_mut() { f(self); }
-            self.clicks[id.0] = cb;
+        // No heap allocation on mouse-move/key-repeat paths. Click handlers are
+        // invoked immediately after their event, with their slot temporarily taken.
+        for raw in &events[..n] {
+            let ev = match raw.kind {
+                EV_MOUSE_DOWN => UiEvent::Down { x: raw.a, y: raw.b }, EV_MOUSE_UP => UiEvent::Up { x: raw.a, y: raw.b },
+                EV_MOUSE_MOVE => UiEvent::Move { x: raw.a, y: raw.b },
+                EV_KEY_DOWN => UiEvent::KeyDown { scancode: raw.a as u8, ch: raw.b as u8, mods: raw.c as u8 },
+                EV_KEY_UP => UiEvent::KeyUp { scancode: raw.a as u8, ch: raw.b as u8, mods: raw.c as u8 }, _ => continue,
+            };
+            let mut clicked = None;
+            if self.dispatch(&ev, &mut clicked) { self.dirty = true; }
+            if let Some(id) = clicked { let mut cb = self.clicks[id.0].take(); if let Some(f) = cb.as_mut() { f(self); } self.clicks[id.0] = cb; }
         }
-
-        if self.needs_layout || self.widgets.iter().any(|w| w.dirty()) {
-            self.compute();
-            self.needs_layout = false;
-            self.dirty = true;
-        }
+        // Widget visual dirtiness never means its intrinsic size changed. Layout
+        // is reserved strictly for structure/style/window-size API mutations.
+        for i in 0..self.widgets.len() { if self.widgets[i].dirty() { self.mark_dirty_rect(self.widgets[i].rect()); } }
         if self.dirty {
-            self.draw(win);
-            let _ = win.flip();
-            self.dirty = false;
+            let rect = self.dirty_rect.unwrap_or(Rect::new(0, 0, self.root_w, self.root_h));
+            self.draw_rect(win, rect);
+            let _ = win.flip_rect(Rectangle::new(Point::new(rect.x, rect.y), Size::new(rect.w, rect.h)));
+            self.dirty = false; self.dirty_rect = None;
             for w in &mut self.widgets { w.clear_dirty(); }
         }
     }
@@ -453,7 +459,7 @@ impl Ui {
         for child in children { self.apply_layout_node(child, x, y, clip); }
     }
 
-    fn dispatch(&mut self, event: &UiEvent, clicked: &mut Vec<WidgetId>) -> bool {
+    fn dispatch(&mut self, event: &UiEvent, clicked: &mut Option<WidgetId>) -> bool {
         match event {
             UiEvent::Down { x, y } => {
                 if let Some((sid, grab)) = self.scrollbar_at(*x, *y) {
@@ -465,7 +471,7 @@ impl Ui {
                 if let Some(id) = target {
                     if self.widgets[id.0].focusable() { self.set_focus(Some(id)); }
                     let r = self.widgets[id.0].event(event, self.focus == Some(id));
-                    if r == EventResult::Clicked { clicked.push(id); }
+                    if r == EventResult::Clicked { *clicked = Some(id); }
                     return r != EventResult::Ignored;
                 }
                 false
@@ -513,7 +519,7 @@ impl Ui {
             UiEvent::KeyDown { .. } | UiEvent::KeyUp { .. } => {
                 if let Some(id) = self.focus {
                     let r = self.widgets[id.0].event(event, true);
-                    if r == EventResult::Submitted && self.clicks.get(id.0).map(|v| v.is_some()).unwrap_or(false) { clicked.push(id); }
+                    if r == EventResult::Submitted && self.clicks.get(id.0).map(|v| v.is_some()).unwrap_or(false) { *clicked = Some(id); }
                     r != EventResult::Ignored
                 } else { false }
             }
@@ -558,25 +564,35 @@ impl Ui {
         None
     }
 
-    fn draw(&self, win: &mut Window) {
-        let _ = Rectangle::new(Point::new(0, 0), Size::new(self.root_w, self.root_h))
+    fn draw_rect(&self, win: &mut Window, dirty: Rect) {
+        let screen = Rect::new(0, 0, self.root_w, self.root_h);
+        let Some(dirty) = dirty.intersect(screen) else { return; };
+        let clip = Rectangle::new(Point::new(dirty.x, dirty.y), Size::new(dirty.w, dirty.h));
+        win.set_clip(Some(clip));
+        let _ = Rectangle::new(Point::new(dirty.x, dirty.y), Size::new(dirty.w, dirty.h))
             .into_styled(PrimitiveStyle::with_fill(BG)).draw(win);
-        self.draw_node(self.root, win);
+        self.draw_node(self.root, win, clip);
         self.draw_scrollbars(win);
+        win.set_clip(None);
     }
 
-    fn draw_node(&self, node: NodeId, win: &mut Window) {
+    fn draw_node(&self, node: NodeId, win: &mut Window, base_clip: Rectangle) {
         let Ok(layout) = self.taffy.layout(node) else { return; };
         let ctx = self.taffy.get_node_context(node).copied();
         if let Some(NodeCtx::Widget(id)) = ctx {
             let r = self.widgets[id.0].rect();
             let visible = self.widget_clips[id.0].map(|c| r.intersect(c).is_some()).unwrap_or(true)
                 && r.intersect(Rect::new(0, 0, self.root_w, self.root_h)).is_some();
-            if visible { self.widgets[id.0].draw(win); }
+            if visible {
+                let clip = self.widget_clips[id.0].and_then(|c| c.intersect(Rect::new(0, 0, self.root_w, self.root_h)));
+                if let Some(c) = clip { win.intersect_clip(Rectangle::new(Point::new(c.x, c.y), Size::new(c.w, c.h))); }
+                self.widgets[id.0].draw(win);
+                win.set_clip(Some(base_clip));
+            }
             return;
         }
         let children: Vec<NodeId> = self.taffy.child_ids(node).collect();
-        for child in children { self.draw_node(child, win); }
+        for child in children { self.draw_node(child, win, base_clip); }
         let _ = layout;
     }
 
