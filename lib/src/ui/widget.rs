@@ -1,7 +1,7 @@
-use core::any::Any;
-use taffy::geometry::Size;
 use crate::ui::{Constraints, Rect, UiEvent};
 use crate::wm::Window;
+use core::any::Any;
+use taffy::geometry::Size;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventResult {
@@ -18,8 +18,12 @@ pub trait Widget {
     fn rect(&self) -> Rect;
     fn draw(&self, win: &mut Window);
     fn event(&mut self, event: &UiEvent, focused: bool) -> EventResult;
-    fn focusable(&self) -> bool { false }
-    fn dirty(&self) -> bool { false }
+    fn focusable(&self) -> bool {
+        false
+    }
+    fn dirty(&self) -> bool {
+        false
+    }
     fn clear_dirty(&mut self) {}
     fn set_focused(&mut self, _focused: bool) {}
     fn as_any(&self) -> &dyn Any;

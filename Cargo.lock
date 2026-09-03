@@ -1024,6 +1024,7 @@ dependencies = [
  "embedded-io-async",
  "embedded-tls",
  "httparse",
+ "micromath",
  "rand_core 0.6.4",
  "taffy",
 ]

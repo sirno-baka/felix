@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+use taffy::prelude::FromLength;
 use libfelix::prelude::*;
 
 #[no_mangle]
