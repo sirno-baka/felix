@@ -11,26 +11,43 @@
 //! `compute_layout` over the tree, walk it, and write each widget's computed rect.
 //!
 //! Building is cursor-based: containers/leaves are attached to the *current container*
-//! (`container`), and style helpers (`grow`, `padding`, …) act on the *last created* node
-//! (`last`).
+//! (`container`). For new code, prefer [`Ui::with_container`] to make that cursor
+//! temporary, and [`Ui::style`] to apply a style to an explicit node. The convenience
+//! style helpers (`grow`, `padding`, …) remain available and act on the *last created*
+//! node (`last`).
 //!
 //! ```ignore
 //! let mut ui = Ui::new();
+//!
+//! use taffy::geometry::{Rect as TRect, Size as TSize};
+//! use taffy::prelude::{JustifyContent, LengthPercentage as LP};
 //!
 //! // A vertical stack. Direct children stretch to the window width.
 //! let root = ui.current_container();
 //!
 //! // Toolbar row.
-//! let _toolbar = ui.row().gap(8).padding(8).justify_space_between();
-//! let _open = ui.button("Open");
-//! let _save = ui.button("Save");
-//! ui.up();
+//! let toolbar = ui.with_container(root, |ui| ui.row());
+//! ui.style(toolbar, |style| {
+//!     style.gap = TSize { width: LP::length(8.0), height: LP::length(8.0) };
+//!     style.padding = TRect {
+//!         left: LP::length(8.0), right: LP::length(8.0),
+//!         top: LP::length(8.0), bottom: LP::length(8.0),
+//!     };
+//!     style.justify_content = Some(JustifyContent::SPACE_BETWEEN);
+//! });
+//! let (open, _save) = ui.with_container(toolbar, |ui| {
+//!     (ui.button("Open"), ui.button("Save"))
+//! });
 //!
 //! // Body.
-//! let _body = ui.column().padding(12);
-//! let _title = ui.label("Hello, Felix");
-//! let _count = ui.label("count: 0");
-//! let _input = ui.text_input();
+//! let body = ui.with_container(root, |ui| ui.column());
+//! let count_label = ui.with_container(body, |ui| {
+//!     ui.padding(12);
+//!     let _title = ui.label("Hello, Felix");
+//!     let count_label = ui.label("count: 0");
+//!     let _input = ui.text_input();
+//!     count_label
+//! });
 //!
 //! let mut count = 0u32;
 //! ui.on_click(open, move |ui| {
@@ -647,6 +664,40 @@ impl Ui {
         (self.root_w, self.root_h)
     }
 
+    /// Run `build` with `node` as the current container, then restore the previous
+    /// build cursor. This makes sibling and nested layout construction independent
+    /// of the order in which containers were created.
+    ///
+    /// The closure's return value is forwarded, so IDs created inside it can be kept:
+    ///
+    /// ```ignore
+    /// let button = ui.with_container(toolbar, |ui| ui.button("Open"));
+    /// ```
+    pub fn with_container<R>(&mut self, node: NodeId, build: impl FnOnce(&mut Self) -> R) -> R {
+        let previous_container = self.container;
+        let previous_last = self.last;
+        self.container = node;
+        self.last = node;
+        let result = build(self);
+        self.container = previous_container;
+        self.last = previous_last;
+        result
+    }
+
+    /// Mutate the Taffy style for an explicit layout node.
+    ///
+    /// Returns `false` when `node` does not belong to this UI. Unlike the legacy
+    /// convenience helpers, this never depends on the current build cursor.
+    pub fn style(&mut self, node: NodeId, update: impl FnOnce(&mut Style)) -> bool {
+        let Ok(mut style) = self.taffy.style(node).cloned() else {
+            return false;
+        };
+        update(&mut style);
+        let _ = self.taffy.set_style(node, style);
+        self.needs_layout = true;
+        true
+    }
+
     // -- containers ----------------------------------------------------------
 
     /// A vertical flex container (children stacked top→bottom).
@@ -784,13 +835,10 @@ impl Ui {
         wid
     }
 
-    // -- style helpers (act on the last created node) ------------------------
+    // -- legacy cursor style helpers (act on the last created node) ----------
 
     fn with_style(&mut self, f: impl FnOnce(&mut Style)) {
-        let mut s = self.taffy.style(self.last).expect("taffy: style").clone();
-        f(&mut s);
-        let _ = self.taffy.set_style(self.last, s);
-        self.needs_layout = true;
+        let _ = self.style(self.last, f);
     }
 
     pub fn grow(&mut self, factor: f32) {
