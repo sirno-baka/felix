@@ -437,7 +437,9 @@ impl Ui {
     pub fn process(&mut self, win: &mut Window) {
         let mut events = [WmEvent::default(); 256];
         let n = win.poll_events(&mut events);
+
         self.set_root_size(win.client_width().max(1), win.client_height().max(1));
+
         if self.needs_layout {
             self.compute();
             self.needs_layout = false;
@@ -462,9 +464,8 @@ impl Ui {
                 _ => continue,
             };
             let mut clicked = None;
-            if self.dispatch(&ev, &mut clicked) {
-                self.dirty = true;
-            }
+            self.dispatch(&ev, &mut clicked);
+
             if let Some(id) = clicked {
                 let mut cb = self.clicks[id.0].take();
                 if let Some(f) = cb.as_mut() {
@@ -473,11 +474,23 @@ impl Ui {
                 self.clicks[id.0] = cb
             }
         }
+
+        // Event callbacks may have changed widget styles/content and therefore
+        // invalidated the Taffy layout. Recompute once after all queued events,
+        // rather than doing layout work for every event.
+        if self.needs_layout {
+            self.compute();
+            self.needs_layout = false;
+            self.dirty = true;
+            self.dirty_rect = None;
+        }
+
         for i in 0..self.widgets.len() {
             if self.widgets[i].dirty() {
                 self.mark_dirty_rect(self.widgets[i].rect())
             }
         }
+
         if self.dirty {
             let rect = self
                 .dirty_rect
@@ -615,10 +628,13 @@ impl Ui {
                         self.set_focus(Some(id))
                     }
                     let r = self.widgets[id.0].event(event, self.focus == Some(id));
+                    if r != EventResult::Ignored {
+                        self.mark_dirty_rect(self.widgets[id.0].rect());
+                    }
                     if r == EventResult::Clicked {
                         *clicked = Some(id)
                     }
-                    return r != EventResult::Ignored;
+                    return false;
                 }
                 false
             }
@@ -647,11 +663,17 @@ impl Ui {
                 if target != self.hovered {
                     if let Some(old) = self.hovered {
                         let r = self.widgets[old.0].event(event, self.focus == Some(old));
-                        changed |= r != EventResult::Ignored || self.widgets[old.0].dirty()
+                        if r != EventResult::Ignored || self.widgets[old.0].dirty() {
+                            self.mark_dirty_rect(self.widgets[old.0].rect());
+                            changed = true;
+                        }
                     }
                     if let Some(new) = target {
                         let r = self.widgets[new.0].event(event, self.focus == Some(new));
-                        changed |= r != EventResult::Ignored || self.widgets[new.0].dirty()
+                        if r != EventResult::Ignored || self.widgets[new.0].dirty() {
+                            self.mark_dirty_rect(self.widgets[new.0].rect());
+                            changed = true;
+                        }
                     }
                     self.hovered = target
                 }
@@ -667,7 +689,10 @@ impl Ui {
                 }
                 if let Some(id) = self.hovered.or_else(|| self.hit_test(*x, *y)) {
                     let r = self.widgets[id.0].event(event, self.focus == Some(id));
-                    changed |= r != EventResult::Ignored || self.widgets[id.0].dirty()
+                    if r != EventResult::Ignored || self.widgets[id.0].dirty() {
+                        self.mark_dirty_rect(self.widgets[id.0].rect());
+                        changed = true;
+                    }
                 }
                 self.hovered = self.hit_test(*x, *y);
                 changed
