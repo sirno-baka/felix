@@ -7,9 +7,7 @@ use embedded_graphics::{
     primitives::{PrimitiveStyle, Rectangle, RoundedRectangle},
     text::{Baseline, Text},
 };
-use embedded_graphics_unicodefonts::mono_9x18_atlas;
 use taffy::geometry::Size as TSize;
-use crate::println;
 
 const FONT_W: f32 = 9.0;
 const FONT_H: f32 = 18.0;
@@ -79,8 +77,7 @@ impl Widget for Button {
         let _ = rr
             .into_styled(PrimitiveStyle::with_stroke(BTN_BORDER, 1))
             .draw(win);
-        let binding = mono_9x18_atlas();
-        let style = MonoTextStyle::new(&binding, TEXT);
+        let style = MonoTextStyle::new(super::font(), TEXT);
         let tw = self.label.chars().count() as i32 * 9;
         let tx = r.x + (r.w as i32 - tw) / 2;
         let ty = r.y + (r.h as i32 - FONT_H as i32) / 2;

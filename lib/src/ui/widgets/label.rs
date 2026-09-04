@@ -7,7 +7,6 @@ use embedded_graphics::{
     prelude::*,
     text::{Baseline, Text},
 };
-use embedded_graphics_unicodefonts::mono_9x18_atlas;
 use taffy::geometry::Size;
 
 const FONT_W: f32 = 9.0;
@@ -60,8 +59,7 @@ impl Widget for Label {
         if r.w == 0 || r.h == 0 {
             return;
         }
-        let binding = mono_9x18_atlas();
-        let style = MonoTextStyle::new(&binding, self.fg);
+        let style = MonoTextStyle::new(super::font(), self.fg);
         let ty = r.y + (r.h as i32 - FONT_H as i32) / 2;
         let _ = Text::with_baseline(
             self.text.as_str(),

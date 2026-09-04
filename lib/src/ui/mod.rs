@@ -100,6 +100,7 @@ pub struct Ui {
     dirty: bool,
     dirty_rect: Option<Rect>,
     needs_layout: bool,
+    needs_apply: bool,
 }
 impl Ui {
     pub fn new() -> Self {
@@ -132,6 +133,7 @@ impl Ui {
             dirty: true,
             dirty_rect: None,
             needs_layout: true,
+            needs_apply: false,
         }
     }
     pub fn root(&self) -> NodeId {
@@ -271,8 +273,7 @@ impl Ui {
             false
         };
         if changed {
-            self.apply_layout();
-            self.mark_dirty_rect(self.scroll_rects[scroll.0]);
+            self.queue_scroll_apply(scroll);
         }
         changed
     }
@@ -285,10 +286,17 @@ impl Ui {
             false
         };
         if changed {
-            self.apply_layout();
-            self.mark_dirty_rect(self.scroll_rects[scroll.0]);
+            self.queue_scroll_apply(scroll);
         }
         changed
+    }
+    fn queue_scroll_apply(&mut self, scroll: ScrollViewId) {
+        self.needs_apply = true;
+        if let Some(r) = self.scroll_rects.get(scroll.0).copied() {
+            if r.w > 0 && r.h > 0 {
+                self.mark_dirty_rect(r);
+            }
+        }
     }
     pub fn scroll_to_top(&mut self, scroll: ScrollViewId) -> bool {
         self.scroll_to(scroll, 0.0)
@@ -460,8 +468,9 @@ impl Ui {
         if self.needs_layout {
             self.compute();
             self.needs_layout = false;
+            self.needs_apply = false;
             self.dirty = true;
-            self.dirty_rect = None
+            self.dirty_rect = None;
         }
         for raw in &events[..n] {
             let ev = match raw.kind {
@@ -492,14 +501,21 @@ impl Ui {
             }
         }
 
-        // Event callbacks may have changed widget styles/content and therefore
-        // invalidated the Taffy layout. Recompute once after all queued events,
-        // rather than doing layout work for every event.
         if self.needs_layout {
             self.compute();
             self.needs_layout = false;
+            self.needs_apply = false;
             self.dirty = true;
             self.dirty_rect = None;
+        } else if self.needs_apply {
+            self.apply_layout();
+            self.needs_apply = false;
+            for i in 0..self.scroll_rects.len() {
+                let r = self.scroll_rects[i];
+                if r.w > 0 && r.h > 0 {
+                    self.mark_dirty_rect(r);
+                }
+            }
         }
 
         for i in 0..self.widgets.len() {
@@ -629,8 +645,11 @@ impl Ui {
         }
         let child_x = rect.x as f32;
         let child_y = rect.y as f32;
-        let children: Vec<NodeId> = self.taffy.child_ids(node).collect();
-        for child in children {
+        let n = self.taffy.child_count(node);
+        for i in 0..n {
+            let Ok(child) = self.taffy.child_at_index(node, i) else {
+                break;
+            };
             self.apply_layout_node(child, child_x, child_y, clip)
         }
     }

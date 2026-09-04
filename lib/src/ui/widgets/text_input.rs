@@ -7,7 +7,6 @@ use embedded_graphics::{
     primitives::{PrimitiveStyle, Rectangle},
     text::{Baseline, Text},
 };
-use embedded_graphics_unicodefonts::mono_9x18_atlas;
 use taffy::geometry::Size as TSize;
 
 const FONT_W: f32 = 9.0;
@@ -80,8 +79,7 @@ impl Widget for TextInput {
         let _ = rect
             .into_styled(PrimitiveStyle::with_stroke(border, 1))
             .draw(win);
-        let binding = mono_9x18_atlas();
-        let style = MonoTextStyle::new(&binding, TEXT);
+        let style = MonoTextStyle::new(super::font(), TEXT);
         let max_chars = (r.w as usize).saturating_sub(8) / FONT_W as usize;
         let shown = if self.text.len() > max_chars {
             &self.text[self.text.len() - max_chars..]
