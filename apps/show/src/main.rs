@@ -8,8 +8,8 @@ use libfelix::prelude::*;
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
-    let mut win = Window::create(1, 1, 900, 600, "Felix UI 2.0 Showcase").unwrap();
-    let mut ui = Ui::with_size(900, 600);
+    let mut win = Window::create(1, 1, 400, 400, "Felix UI 2.0 Showcase").unwrap();
+    let mut ui = Ui::with_size(400, 400);
 
     let root = ui.root();
 

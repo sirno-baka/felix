@@ -156,12 +156,9 @@ impl Ui {
         }
     }
     pub fn set_style(&mut self, node: NodeId, style: Style) -> bool {
-        if self.taffy.set_style(node, style).is_ok() {
-            self.needs_layout = true;
-            true
-        } else {
-            false
-        }
+        // Patch onto the existing style so helpers like fill()/padding()
+        // do not wipe flex_direction, gap, or size.
+        self.style(node, |s| layout::merge_style(s, &style))
     }
     pub fn column(&mut self, parent: NodeId) -> NodeId {
         self.container(parent, FlexDirection::Column)
@@ -175,6 +172,10 @@ impl Ui {
     fn container(&mut self, parent: NodeId, direction: FlexDirection) -> NodeId {
         let mut s = Style::default();
         s.flex_direction = direction;
+        s.min_size = TSize {
+            width: LPA::length(0.0),
+            height: LPA::length(0.0),
+        };
         let n = self.taffy.new_leaf(s).expect("taffy: create container");
         self.taffy
             .add_child(parent, n)
@@ -185,6 +186,11 @@ impl Ui {
     pub fn panel(&mut self, parent: NodeId) -> NodeId {
         let mut s = Style::default();
         s.flex_direction = FlexDirection::Column;
+        s.flex_grow = 1.0;
+        s.min_size = TSize {
+            width: LPA::length(0.0),
+            height: LPA::length(0.0),
+        };
         s.padding = taffy::geometry::Rect {
             left: LP::length(8.0),
             right: LP::length(8.0),
@@ -211,7 +217,12 @@ impl Ui {
         let sid = ScrollViewId(self.scrolls.len());
         let mut viewport = Style::default();
         viewport.flex_direction = FlexDirection::Column;
-        viewport.min_size.height = LPA::length(0.0);
+        viewport.flex_grow = 1.0;
+        viewport.flex_shrink = 1.0;
+        viewport.min_size = TSize {
+            width: LPA::length(0.0),
+            height: LPA::length(0.0),
+        };
         viewport.overflow = taffy::geometry::Point {
             x: Overflow::Hidden,
             y: Overflow::Hidden,
@@ -362,12 +373,18 @@ impl Ui {
             .or_else(|| w.as_any().downcast_ref::<Label>().map(|v| v.text()))
     }
     pub fn set_label(&mut self, id: WidgetId, text: &str) {
+        if let Some(old) = self.rect(id) {
+            self.mark_dirty_rect(old);
+        }
         if let Some(v) = self.label_mut(id) {
             v.set_text(text);
             self.needs_layout = true;
         }
     }
     pub fn set_button_label(&mut self, id: WidgetId, text: &str) {
+        if let Some(old) = self.rect(id) {
+            self.mark_dirty_rect(old);
+        }
         if let Some(v) = self.button_mut(id) {
             v.set_label(text);
             self.needs_layout = true;
@@ -435,7 +452,7 @@ impl Ui {
         }
     }
     pub fn process(&mut self, win: &mut Window) {
-        let mut events = [WmEvent::default(); 256];
+        let mut events = [WmEvent::default(); 16];
         let n = win.poll_events(&mut events);
 
         self.set_root_size(win.client_width().max(1), win.client_height().max(1));
@@ -541,6 +558,12 @@ impl Ui {
                     |known, available| match node_context.as_deref() {
                         Some(NodeCtx::Widget(id)) => {
                             widgets[id.0].measure(constraints_from_taffy(known, available))
+                        }
+                        Some(NodeCtx::Panel | NodeCtx::ScrollView(_) | NodeCtx::ScrollContent(_)) => {
+                            TSize {
+                                width: known.width.unwrap_or(0.0),
+                                height: known.height.unwrap_or(0.0),
+                            }
                         }
                         _ => TSize::ZERO,
                     },

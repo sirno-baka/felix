@@ -48,9 +48,10 @@ impl TextInput {
 }
 impl Widget for TextInput {
     fn measure(&self, c: Constraints) -> TSize<f32> {
+        // Content box only — Taffy adds Style padding (6/4) and min height 26.
         c.clamp(TSize {
-            width: self.text.chars().count().max(8) as f32 * FONT_W + 12.0,
-            height: 26.0,
+            width: self.text.chars().count().max(8) as f32 * FONT_W,
+            height: FONT_H,
         })
     }
     fn set_rect(&mut self, rect: Rect) {

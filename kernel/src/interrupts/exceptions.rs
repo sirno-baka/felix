@@ -280,9 +280,32 @@ pub extern "C" fn page_fault_handler(esp: u32) -> u32 {
     }
 
     if is_user_cs(state.cs) {
+        let slot = unsafe { TASK_MANAGER.get_current_slot() as usize };
+        let (kstack, heap, mmap) = unsafe {
+            TASK_MANAGER.tasks.get(slot).and_then(|t| t.as_ref()).map(|t| {
+                (t.stack_base, t.heap_next, t.mmap_next)
+            }).unwrap_or((0, 0, 0))
+        };
         println!(
-            "PAGE FAULT (user)! CR2={:#x} EIP={:#x} CS={:#x}",
-            cr2, state.eip, state.cs
+            "PAGE FAULT (user)! CR2={:#x} EIP={:#x} CS={:#x} EFLAGS={:#x}",
+            cr2, state.eip, state.cs, state.eflags
+        );
+        println!(
+            "  EAX={:#x} EBX={:#x} ECX={:#x} EDX={:#x}",
+            state.eax, state.ebx, state.ecx, state.edx
+        );
+        println!(
+            "  ESI={:#x} EDI={:#x} EBP={:#x} ESP={:#x} SS={:#x}",
+            state.esi, state.edi, state.ebp, state.esp, state.ss
+        );
+        println!(
+            "  task={} kstack_base={:#x} heap_next={:#x} mmap_next={:#x}",
+            slot, kstack, heap, mmap
+        );
+        println!(
+            "  user_stack~[ESP-64K .. ESP] = [{:#x} .. {:#x}]",
+            state.esp.saturating_sub(64 * 1024),
+            state.esp
         );
         // SIGSEGV → 128+11 = 139
         kill_current_task(esp, "page_fault", 139)

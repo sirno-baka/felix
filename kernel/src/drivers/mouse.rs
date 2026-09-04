@@ -9,6 +9,7 @@ use crate::io::{inb, io_wait, outb};
 use crate::{debugln, println};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use core::arch::{asm, naked_asm};
+use crate::time::jiffies;
 
 /// IRQ12 remapped: 32 + 12 = 44
 pub const MOUSE_INT: u8 = 44;
@@ -26,6 +27,7 @@ static CYCLE: AtomicU8 = AtomicU8::new(0);
 static PACKET: [AtomicU8; 3] = [AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0)];
 
 /// Absolute cursor position (screen pixels).
+static TIME: AtomicU32 = AtomicU32::new(0);
 static POS_X: AtomicU32 = AtomicU32::new(400);
 static POS_Y: AtomicU32 = AtomicU32::new(300);
 /// Bit0=left, bit1=right, bit2=middle
@@ -295,9 +297,11 @@ fn process_packet() {
         crate::drivers::wm::on_mouse_down(x, y);
     } else if (buttons & 1) == 0 && (prev & 1) != 0 {
         crate::drivers::wm::on_mouse_up(x, y);
-    } else if (buttons & 1) != 0 && (dx != 0 || dy != 0) {
+    }
+    if (dx != 0 || dy != 0) {
         crate::drivers::wm::on_mouse_move(x, y);
     }
+
 
     // Redraw cursor (try_lock only — never block in IRQ)
     redraw_cursor();

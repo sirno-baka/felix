@@ -9,6 +9,7 @@ use embedded_graphics::{
 };
 use embedded_graphics_unicodefonts::mono_9x18_atlas;
 use taffy::geometry::Size as TSize;
+use crate::println;
 
 const FONT_W: f32 = 9.0;
 const FONT_H: f32 = 18.0;
@@ -42,9 +43,10 @@ impl Button {
 }
 impl Widget for Button {
     fn measure(&self, c: Constraints) -> TSize<f32> {
+        // Content box only — Taffy adds Style padding (12/5).
         c.clamp(TSize {
-            width: self.label.chars().count() as f32 * FONT_W + 24.0,
-            height: FONT_H + 10.0,
+            width: self.label.chars().count() as f32 * FONT_W,
+            height: FONT_H,
         })
     }
     fn set_rect(&mut self, rect: Rect) {
@@ -114,8 +116,11 @@ impl Widget for Button {
                 if hot != self.hot {
                     self.hot = hot;
                     self.dirty = true;
+                    EventResult::Consumed
+                } else {
+                    EventResult::Ignored
                 }
-                EventResult::Ignored
+
             }
             _ => EventResult::Ignored,
         }

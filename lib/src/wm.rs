@@ -257,8 +257,11 @@ impl Window {
 
         self.info.client_w = client_w;
         self.info.client_h = client_h;
-        self.info.w = client_w;
-        self.info.h = client_h + TITLE_H as u32;
+        self.info.pitch = client_w.saturating_mul(4);
+        // Outer size comes from the kernel (frameless windows have no TITLE_H).
+        let _ = self.refresh_info();
+        self.info.client_w = client_w;
+        self.info.client_h = client_h;
         self.info.pitch = client_w.saturating_mul(4);
         let pitch = self.info.pitch as usize;
         let size = pitch.saturating_mul(client_h as usize);

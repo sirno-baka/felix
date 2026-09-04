@@ -8,6 +8,7 @@ use taffy::{
     tree::NodeId,
     Overflow,
 };
+use taffy::prelude::{TaffyAuto, TaffyZero};
 
 pub trait LayoutApi {
     fn column(&mut self, parent: NodeId) -> NodeId;
@@ -114,4 +115,84 @@ pub fn clipped() -> Style {
         y: Overflow::Hidden,
     };
     s
+}
+
+fn is_default_dimension(d: Dimension) -> bool {
+    matches!(d, Dimension::AUTO)
+}
+
+fn is_default_lpa(v: LPA) -> bool {
+    matches!(v, LPA::AUTO)
+}
+
+fn is_zero_lp(v: LP) -> bool {
+    matches!(v, LP::ZERO)
+}
+
+/// Copy only fields that differ from `Style::default()` onto `dst`.
+pub fn merge_style(dst: &mut Style, src: &Style) {
+    let def = Style::<alloc::string::String>::DEFAULT;
+    if src.flex_direction != def.flex_direction {
+        dst.flex_direction = src.flex_direction;
+    }
+    if src.flex_grow != def.flex_grow {
+        dst.flex_grow = src.flex_grow;
+    }
+    if src.flex_shrink != def.flex_shrink {
+        dst.flex_shrink = src.flex_shrink;
+    }
+    if src.position != def.position {
+        dst.position = src.position;
+    }
+    if src.justify_content != def.justify_content {
+        dst.justify_content = src.justify_content;
+    }
+    if src.align_items != def.align_items {
+        dst.align_items = src.align_items;
+    }
+    if src.align_content != def.align_content {
+        dst.align_content = src.align_content;
+    }
+    if !is_default_dimension(src.size.width) {
+        dst.size.width = src.size.width;
+    }
+    if !is_default_dimension(src.size.height) {
+        dst.size.height = src.size.height;
+    }
+    if !is_default_lpa(src.min_size.width) {
+        dst.min_size.width = src.min_size.width;
+    }
+    if !is_default_lpa(src.min_size.height) {
+        dst.min_size.height = src.min_size.height;
+    }
+    if !is_default_lpa(src.max_size.width) {
+        dst.max_size.width = src.max_size.width;
+    }
+    if !is_default_lpa(src.max_size.height) {
+        dst.max_size.height = src.max_size.height;
+    }
+    if !is_zero_lp(src.padding.left) {
+        dst.padding.left = src.padding.left;
+    }
+    if !is_zero_lp(src.padding.right) {
+        dst.padding.right = src.padding.right;
+    }
+    if !is_zero_lp(src.padding.top) {
+        dst.padding.top = src.padding.top;
+    }
+    if !is_zero_lp(src.padding.bottom) {
+        dst.padding.bottom = src.padding.bottom;
+    }
+    if !is_zero_lp(src.gap.width) {
+        dst.gap.width = src.gap.width;
+    }
+    if !is_zero_lp(src.gap.height) {
+        dst.gap.height = src.gap.height;
+    }
+    if src.overflow != def.overflow {
+        dst.overflow = src.overflow;
+    }
+    if src.inset != def.inset {
+        dst.inset = src.inset;
+    }
 }
