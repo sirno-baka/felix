@@ -254,7 +254,6 @@ struct Window {
     z: u8,
     focused: bool,
     visible: bool,
-    dirty: bool,
     title: [u8; 32],
     flags: WindowFlags,
     surface: Surface,
@@ -288,6 +287,10 @@ impl Window {
         core::str::from_utf8(&self.title[..end]).unwrap_or("")
     }
 
+    fn rect(&self) -> DirtyRect {
+        DirtyRect::new(self.x, self.y, self.w, self.h)
+    }
+
     fn info(&self) -> WindowInfo {
         WindowInfo {
             id: self.id as u32,
@@ -315,6 +318,74 @@ struct DragState {
     orig_h: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DirtyRect {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+}
+
+impl DirtyRect {
+    const fn new(x: i32, y: i32, w: u32, h: u32) -> Self {
+        Self { x, y, w, h }
+    }
+
+    fn is_empty(self) -> bool {
+        self.w == 0 || self.h == 0
+    }
+
+    fn right(self) -> i32 {
+        self.x.saturating_add(self.w as i32)
+    }
+
+    fn bottom(self) -> i32 {
+        self.y.saturating_add(self.h as i32)
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        self.x < other.right()
+            && other.x < self.right()
+            && self.y < other.bottom()
+            && other.y < self.bottom()
+    }
+
+    fn intersection(self, other: Self) -> Option<Self> {
+        if !self.intersects(other) {
+            return None;
+        }
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let right = self.right().min(other.right());
+        let bottom = self.bottom().min(other.bottom());
+        Some(Self::new(
+            x,
+            y,
+            right.saturating_sub(x) as u32,
+            bottom.saturating_sub(y) as u32,
+        ))
+    }
+
+    fn union(self, other: Self) -> Self {
+        if self.is_empty() {
+            return other;
+        }
+        if other.is_empty() {
+            return self;
+        }
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = self.right().max(other.right());
+        let bottom = self.bottom().max(other.bottom());
+        Self::new(
+            x,
+            y,
+            right.saturating_sub(x) as u32,
+            bottom.saturating_sub(y) as u32,
+        )
+    }
+}
+
 pub struct Compositor {
     screen_w: u32,
     screen_h: u32,
@@ -323,6 +394,7 @@ pub struct Compositor {
     next_id: u8,
     next_z: u8,
     drag: Option<DragState>,
+    dirty: Option<DirtyRect>,
 }
 
 impl Compositor {
@@ -335,6 +407,7 @@ impl Compositor {
             next_id: 1,
             next_z: 1,
             drag: None,
+            dirty: None,
         }
     }
 
@@ -398,7 +471,20 @@ impl Compositor {
         ids
     }
 
-    /// Full redraw: clear desktop + all windows (create/destroy/move/focus).
+    fn mark_dirty(&mut self, rect: DirtyRect) {
+        self.dirty = Some(match self.dirty {
+            Some(old) => old.union(rect),
+            None => rect,
+        });
+    }
+
+    fn mark_window_dirty(&mut self, id: u8) {
+        if let Some(w) = self.find(id) {
+            self.mark_dirty(w.rect());
+        }
+    }
+
+    /// Full redraw. Kept for initial framebuffer setup / explicit full invalidate.
     pub fn compose(&self) {
         let mut guard = FRAMEBUFFER.lock();
         let Some(fb) = guard.as_mut() else {
@@ -408,41 +494,75 @@ impl Compositor {
 
         for id in self.sorted_ids().iter().flatten() {
             if let Some(w) = self.find(*id) {
-                self.draw_window(fb, w);
+                self.draw_window_clipped(fb, w, DirtyRect::new(0, 0, self.screen_w, self.screen_h));
             }
         }
         drop(guard);
         crate::drivers::mouse::invalidate_cursor();
     }
 
-    /// Region-aware client update used by partial flips. The changed client
-    /// rectangle is copied directly; only higher windows intersecting that
-    /// screen region are replayed to preserve z-order.
-    pub fn compose_client_rect(&self, id: u8, rx: u32, ry: u32, rw: u32, rh: u32) {
-        let Some(w) = self.find(id) else { return; };
-        if !w.visible || rw == 0 || rh == 0 { return; }
-        let mut guard = FRAMEBUFFER.lock(); let Some(fb) = guard.as_mut() else { return; };
-        let sx = w.x.saturating_add(rx as i32); let sy = w.y.saturating_add(w.title_height() as i32).saturating_add(ry as i32);
-        if sx >= 0 && sy >= 0 { blit_surface_rect(fb, sx as u32, sy as u32, rx, ry, rw, rh, &w.surface); }
-        let my_z = w.z;
-        for oid in self.sorted_ids().iter().flatten() {
-            if *oid == id { continue; }
-            if let Some(ow) = self.find(*oid) {
-                let ox2 = ow.x + ow.w as i32; let oy2 = ow.y + ow.h as i32;
-                if ow.z > my_z && ow.x < sx + rw as i32 && ox2 > sx && ow.y < sy + rh as i32 && oy2 > sy { self.draw_window(fb, ow); }
+    /// Compose one dirty region. The region is first restored from the desktop
+    /// background, then every visible window intersecting it is replayed in Z order.
+    fn compose_region(&self, fb: &mut Framebuffer, dirty: DirtyRect) {
+        if dirty.is_empty() {
+            return;
+        }
+
+        fill_rect_clipped(fb, dirty, 0, 0, self.screen_w, self.screen_h, self.bg);
+
+        for id in self.sorted_ids().iter().flatten() {
+            if let Some(w) = self.find(*id) {
+                if w.rect().intersects(dirty) {
+                    self.draw_window_clipped(fb, w, dirty);
+                }
             }
         }
-        drop(guard); crate::drivers::mouse::invalidate_cursor();
     }
 
-    /// Fast path for flip: only re-blit the dirty window's client surface.
-    /// No full-screen clear → no flicker. Higher-z windows that overlap this
-    /// one are re-drawn after so occlusion stays correct.
-    pub fn compose_window(&self, id: u8) {
-        let Some(w) = self.find(id) else {
+    /// Redraw a region already containing the background/underlying pixels.
+    ///
+    /// The target window is opaque, so its new position can be painted
+    /// directly without clearing the region first. Higher-z windows are
+    /// replayed afterwards for occlusion.
+    fn compose_opaque_region(&self, fb: &mut Framebuffer, id: u8, region: DirtyRect) {
+        if region.is_empty() {
+            return;
+        }
+
+        let Some(target) = self.find(id) else {
             return;
         };
-        if !w.visible {
+        if !target.visible || !target.rect().intersects(region) {
+            return;
+        }
+
+        let target_z = target.z;
+
+        // Paint the moved window first. No background clear here.
+        self.draw_window_clipped(fb, target, region);
+
+        // Restore occlusion from windows above it.
+        for oid in self.sorted_ids().iter().flatten() {
+            if *oid == id {
+                continue;
+            }
+
+            if let Some(w) = self.find(*oid) {
+                if w.z > target_z && w.rect().intersects(region) {
+                    self.draw_window_clipped(fb, w, region);
+                }
+            }
+        }
+    }
+
+    /// Smooth interactive window movement.
+    ///
+    /// Paint the new window position first, then restore only the part of
+    /// the old position that became exposed. This deliberately avoids the
+    /// clear-first path used by compose_region(), which causes visible
+    /// background flashes during mouse dragging.
+    fn compose_move(&self, id: u8, old: DirtyRect, new: DirtyRect) {
+        if old.is_empty() && new.is_empty() {
             return;
         }
 
@@ -451,114 +571,340 @@ impl Compositor {
             return;
         };
 
-        // 1. Blit this window (title + client)
-        self.draw_window(fb, w);
+        // 1. Paint new position first.
+        self.compose_opaque_region(fb, id, new);
 
-        // 2. Re-draw any windows above it that intersect (occlusion)
-        let my_z = w.z;
-        let (wx, wy, ww, wh) = (w.x, w.y, w.w as i32, w.h as i32);
-        for oid in self.sorted_ids().iter().flatten() {
-            if *oid == id {
-                continue;
-            }
-            if let Some(ow) = self.find(*oid) {
-                if ow.z <= my_z {
-                    continue;
+        // 2. Restore old exposed pixels only.
+        if let Some(overlap) = old.intersection(new) {
+            let old_right = old.right();
+            let old_bottom = old.bottom();
+            let overlap_right = overlap.right();
+            let overlap_bottom = overlap.bottom();
+
+            // old - new = at most four rectangles.
+            let strips = [
+                // top
+                DirtyRect::new(
+                    old.x,
+                    old.y,
+                    old.w,
+                    overlap.y.saturating_sub(old.y) as u32,
+                ),
+                // bottom
+                DirtyRect::new(
+                    old.x,
+                    overlap_bottom,
+                    old.w,
+                    old_bottom.saturating_sub(overlap_bottom) as u32,
+                ),
+                // left
+                DirtyRect::new(
+                    old.x,
+                    overlap.y,
+                    overlap.x.saturating_sub(old.x) as u32,
+                    overlap.h,
+                ),
+                // right
+                DirtyRect::new(
+                    overlap_right,
+                    overlap.y,
+                    old_right.saturating_sub(overlap_right) as u32,
+                    overlap.h,
+                ),
+            ];
+
+            for rect in strips {
+                if !rect.is_empty() {
+                    self.compose_region(fb, rect);
                 }
-                // AABB intersect?
-                let ox2 = ow.x + ow.w as i32;
-                let oy2 = ow.y + ow.h as i32;
-                if ow.x < wx + ww && ox2 > wx && ow.y < wy + wh && oy2 > wy {
-                    self.draw_window(fb, ow);
-                }
             }
+        } else {
+            // Completely different position: restore the entire old area.
+            self.compose_region(fb, old);
         }
+
         drop(guard);
         crate::drivers::mouse::invalidate_cursor();
     }
 
-    /// Compose only windows marked dirty.
-    ///
-    /// - single dirty window → `compose_window` (no clear, no flicker)
-    /// - multiple / layout change → full `compose`
-    pub fn compose_dirty(&mut self) {
-        let mut dirty_ids: [Option<u8>; MAX_WINDOWS] = [None; MAX_WINDOWS];
-        let mut n = 0;
-        for w in self.windows.iter().flatten() {
-            if w.dirty && w.visible {
-                dirty_ids[n] = Some(w.id);
-                n += 1;
-            }
-        }
-        if n == 0 {
+    /// Region-aware client update. It is deliberately routed through the same
+    /// dirty-region compositor so exposed pixels and Z-order are always correct.
+    pub fn compose_client_rect(&self, id: u8, rx: u32, ry: u32, rw: u32, rh: u32) {
+        let Some(w) = self.find(id) else { return; };
+        if !w.visible || rw == 0 || rh == 0 {
             return;
         }
-        if n == 1 {
-            if let Some(id) = dirty_ids[0] {
-                self.compose_window(id);
-            }
-        } else {
-            self.compose();
+
+        let rect = DirtyRect::new(
+            w.x.saturating_add(rx as i32),
+            w.y.saturating_add(w.title_height() as i32).saturating_add(ry as i32),
+            rw,
+            rh,
+        );
+
+        let mut guard = FRAMEBUFFER.lock();
+        let Some(fb) = guard.as_mut() else { return; };
+        self.compose_region(fb, rect);
+        drop(guard);
+        crate::drivers::mouse::invalidate_cursor();
+    }
+
+    /// Compatibility wrapper: compose exactly this window's current rectangle.
+    pub fn compose_window(&self, id: u8) {
+        let Some(w) = self.find(id) else { return; };
+        if !w.visible {
+            return;
         }
-        for w in self.windows.iter_mut().flatten() {
-            w.dirty = false;
+
+        let mut guard = FRAMEBUFFER.lock();
+        let Some(fb) = guard.as_mut() else { return; };
+        self.compose_region(fb, w.rect());
+        drop(guard);
+        crate::drivers::mouse::invalidate_cursor();
+    }
+
+    /// Consume the compositor dirty region.
+    ///
+    /// No full-screen clear and no whole-window replay: only the merged dirty
+    /// rectangle is restored and only intersecting windows are redrawn.
+    pub fn compose_dirty(&mut self) {
+        let Some(dirty) = self.dirty.take() else {
+            return;
+        };
+
+        let mut guard = FRAMEBUFFER.lock();
+        let Some(fb) = guard.as_mut() else {
+            self.dirty = Some(dirty);
+            return;
+        };
+
+        self.compose_region(fb, dirty);
+        drop(guard);
+        crate::drivers::mouse::invalidate_cursor();
+    }
+
+    fn draw_window_clipped(&self, fb: &mut Framebuffer, w: &Window, clip: DirtyRect) {
+        let window_rect = w.rect();
+        let Some(_) = window_rect.intersection(clip) else {
+            return;
+        };
+
+        let is_frameless = w.flags.is_enable(WindowFlags::FRAMELESS_WINDOW_HINT);
+        let th = w.title_height();
+
+        if th > 0 {
+            let title_color = if w.focused { 0x003A_7CA5 } else { 0x0040_4850 };
+            fill_rect_clipped(
+                fb,
+                clip,
+                w.x,
+                w.y,
+                w.w,
+                th,
+                title_color,
+            );
+
+            fill_rect_clipped(
+                fb,
+                clip,
+                w.x,
+                w.y + th as i32 - 1,
+                w.w,
+                1,
+                0x0010_1010,
+            );
+
+            draw_title_text_clipped(
+                fb,
+                clip,
+                w.x + 6,
+                w.y + 4,
+                w.title_str(),
+            );
+
+            if w.flags.is_enable(WindowFlags::WINDOW_CLOSE_BUTTON_HINT) {
+                draw_close_button_clipped(fb, clip, w);
+            }
+        }
+
+        let (cx, cy, cw, ch) = w.client_rect();
+        if ch > 0 {
+            if let Some(client_clip) = DirtyRect::new(cx, cy, cw, ch).intersection(clip) {
+                let sx = client_clip.x.saturating_sub(cx) as u32;
+                let sy = client_clip.y.saturating_sub(cy) as u32;
+                blit_surface_rect(
+                    fb,
+                    client_clip.x.max(0) as u32,
+                    client_clip.y.max(0) as u32,
+                    sx,
+                    sy,
+                    client_clip.w,
+                    client_clip.h,
+                    &w.surface,
+                );
+            }
+        }
+
+        if !is_frameless {
+            let wr = window_rect;
+            fill_rect_clipped(fb, clip, wr.x, wr.y, wr.w, 1, 0x0000_0000);
+            if wr.h > 0 {
+                fill_rect_clipped(fb, clip, wr.x, wr.y + wr.h as i32 - 1, wr.w, 1, 0x0000_0000);
+            }
+            fill_rect_clipped(fb, clip, wr.x, wr.y, 1, wr.h, 0x0000_0000);
+            if wr.w > 0 {
+                fill_rect_clipped(fb, clip, wr.x + wr.w as i32 - 1, wr.y, 1, wr.h, 0x0000_0000);
+            }
         }
     }
 
     fn draw_window(&self, fb: &mut Framebuffer, w: &Window) {
-        let x = w.x.max(0) as u32;
-        let y = w.y.max(0) as u32;
-        let sw = self.screen_w;
-        let sh = self.screen_h;
-        if x > sw || y > sh {
-            return;
-        }
+        self.draw_window_clipped(
+            fb,
+            w,
+            DirtyRect::new(0, 0, self.screen_w, self.screen_h),
+        );
+    }
+}
 
-        let win_w = w.w.min(sw - x);
-        let win_h = w.h.min(sh - y);
+fn fill_rect_clipped(
+    fb: &mut Framebuffer,
+    clip: DirtyRect,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    color: u32,
+) {
+    let Some(r) = DirtyRect::new(x, y, w, h).intersection(clip) else {
+        return;
+    };
+    if r.x < 0 || r.y < 0 {
+        // The compositor's dirty region is normally screen-clipped, but keep
+        // this helper safe for windows partially outside the screen.
+        let screen = DirtyRect::new(0, 0, fb.info.width as u32, fb.info.height as u32);
+        let Some(r) = r.intersection(screen) else { return; };
+        fb.fill_rect(r.x as u32, r.y as u32, r.w, r.h, color);
+        return;
+    }
+    fb.fill_rect(r.x as u32, r.y as u32, r.w, r.h, color);
+}
 
-        let is_frameless = w.flags.is_enable(WindowFlags::FRAMELESS_WINDOW_HINT);
-        // 1. Title Bar
-        let th = w.title_height();
-        let title_h_drawn = th.min(win_h);
+struct ClippedFramebuffer<'a> {
+    fb: &'a mut Framebuffer,
+    clip: DirtyRect,
+}
 
-        if title_h_drawn > 0 {
-            let title_color = if w.focused { 0x003A_7CA5 } else { 0x0040_4850 };
-            fb.fill_rect(x, y, win_w, title_h_drawn, title_color);
-            fb.fill_rect(x, y + title_h_drawn.saturating_sub(1), win_w, 1, 0x0010_1010);
-            draw_title_text(fb, x + 6, y + 4, w.title_str());
+impl OriginDimensions for ClippedFramebuffer<'_> {
+    fn size(&self) -> Size {
+        Size::new(self.fb.info.width as u32, self.fb.info.height as u32)
+    }
+}
 
-            if w.flags.is_enable(WindowFlags::WINDOW_CLOSE_BUTTON_HINT) {
-                draw_close_button(fb, w);
+impl DrawTarget for ClippedFramebuffer<'_> {
+    type Color = Rgb888;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(point, color) in pixels {
+            let x = point.x;
+            let y = point.y;
+            if x < self.clip.x
+                || x >= self.clip.right()
+                || y < self.clip.y
+                || y >= self.clip.bottom()
+                || x < 0
+                || y < 0
+                || x >= self.fb.info.width as i32
+                || y >= self.fb.info.height as i32
+            {
+                continue;
             }
 
-            th
-        } else {
-            0 // Если title нет, отступ равен 0
-        };
-
-        // 2. Client Surface
-        let cy = y + title_h_drawn; // cy теперь корректно зависит от реальной высоты title
-        if cy >= y + win_h {
-            return; // Не осталось места для контента
+            let packed = ((color.r() as u32) << 16) | ((color.g() as u32) << 8) | color.b() as u32;
+            self.fb.put_pixel_raw(x as u32, y as u32, packed);
         }
+        Ok(())
+    }
+}
 
-        let ch = (y + win_h).saturating_sub(cy);
-        let cw = win_w.min(w.surface.width);
-        let ch = ch.min(w.surface.height);
-        blit_surface(fb, x, cy, cw, ch, &w.surface);
+fn draw_title_text_clipped(
+    fb: &mut Framebuffer,
+    clip: DirtyRect,
+    x: i32,
+    y: i32,
+    text: &str,
+) {
+    let style = MonoTextStyle::new(&FONT_6X10, Rgb888::new(0xF0, 0xF0, 0xF0));
+    let pos = Point::new(x, y);
+    let mut target = ClippedFramebuffer { fb, clip };
+    without_interrupts(|| {
+        let _ = Text::with_baseline(text, pos, style, Baseline::Top).draw(&mut target);
+    });
+}
 
-        // 3. Border (не рисуем для frameless)
-        if !is_frameless {
-            fb.fill_rect(x, y, win_w, 1, 0x0000_0000);
-            if win_h > 0 {
-                fb.fill_rect(x, y + win_h - 1, win_w, 1, 0x0000_0000);
-            }
-            fb.fill_rect(x, y, 1, win_h, 0x0000_0000);
-            if win_w > 0 {
-                fb.fill_rect(x + win_w - 1, y, 1, win_h, 0x0000_0000);
-            }
+fn draw_close_button_clipped(fb: &mut Framebuffer, clip: DirtyRect, w: &Window) {
+    let (x1, y1, x2, y2) = close_rect(w);
+    if x2 <= x1 || y2 <= y1 {
+        return;
+    }
+
+    fill_rect_clipped(
+        fb,
+        clip,
+        x1,
+        y1,
+        (x2 - x1) as u32,
+        (y2 - y1) as u32,
+        0x00C0_4040,
+    );
+
+    let x0 = x1 + 3;
+    let y0 = y1 + 3;
+    let x1b = x2 - 4;
+    let y1b = y2 - 4;
+
+    let mut px = x0;
+    let mut py = y0;
+    while px <= x1b && py <= y1b {
+        put_pixel_clipped(fb, clip, px, py, 0x00F0_F0_F0);
+        if px + 1 <= x1b {
+            put_pixel_clipped(fb, clip, px + 1, py, 0x00F0_F0_F0);
         }
+        px += 1;
+        py += 1;
+    }
+
+    px = x1b;
+    py = y0;
+    while px >= x0 && py <= y1b {
+        put_pixel_clipped(fb, clip, px, py, 0x00F0_F0_F0);
+        if px > x0 {
+            put_pixel_clipped(fb, clip, px - 1, py, 0x00F0_F0_F0);
+        }
+        if px == i32::MIN {
+            break;
+        }
+        px -= 1;
+        py += 1;
+    }
+}
+
+#[inline]
+fn put_pixel_clipped(fb: &mut Framebuffer, clip: DirtyRect, x: i32, y: i32, color: u32) {
+    if x >= clip.x
+        && x < clip.right()
+        && y >= clip.y
+        && y < clip.bottom()
+        && x >= 0
+        && y >= 0
+        && x < fb.info.width as i32
+        && y < fb.info.height as i32
+    {
+        fb.put_pixel_raw(x as u32, y as u32, color);
     }
 }
 
@@ -744,6 +1090,7 @@ pub fn init() {
         wm.next_id = 1;
         wm.next_z = 1;
         wm.drag = None;
+        wm.dirty = None;
         wm.compose();
     }
 
@@ -782,8 +1129,16 @@ pub fn create_window(x: i32, y: i32, client_w: u32, client_h: u32, title: &str, 
         let z = wm.next_z;
         wm.next_z = wm.next_z.wrapping_add(1);
 
+        let old_focus_rect = wm.windows.iter().flatten()
+            .find(|win| win.focused)
+            .map(|win| win.rect());
+
         for win in wm.windows.iter_mut().flatten() {
             win.focused = false;
+        }
+
+        if let Some(rect) = old_focus_rect {
+            wm.mark_dirty(rect);
         }
 
         wm.windows[slot] = Some(Window {
@@ -795,13 +1150,13 @@ pub fn create_window(x: i32, y: i32, client_w: u32, client_h: u32, title: &str, 
             z,
             focused: true,
             visible: true,
-            dirty: true,
             title: title_buf,
             flags,
             surface,
             owner_slot,
             events: EventQueue::new(),
         });
+        wm.mark_window_dirty(id);
         wm.compose_dirty();
         Some(id as u32)
     })
@@ -813,8 +1168,10 @@ pub fn destroy_window(id: u32) -> bool {
         let id = id as u8;
         for slot in wm.windows.iter_mut() {
             if slot.as_ref().map(|w| w.id) == Some(id) {
+                let rect = slot.as_ref().map(|w| w.rect()).unwrap_or(DirtyRect::new(0, 0, 0, 0));
                 *slot = None;
-                wm.compose();
+                wm.mark_dirty(rect);
+                wm.compose_dirty();
                 return true;
             }
         }
@@ -827,18 +1184,31 @@ pub fn destroy_windows_of(owner_slot: i8) {
     if owner_slot < 0 {
         return;
     }
+
     with_lfb(|| {
         let mut wm = WM.lock();
         let mut any = false;
+        let mut dirty_rects: [Option<DirtyRect>; MAX_WINDOWS] = [None; MAX_WINDOWS];
+        let mut n = 0;
+
         for slot in wm.windows.iter_mut() {
             if slot.as_ref().map(|w| w.owner_slot) == Some(owner_slot) {
+                if let Some(w) = slot.as_ref() {
+                    dirty_rects[n] = Some(w.rect());
+                    n += 1;
+                }
                 *slot = None;
                 any = true;
             }
         }
+
+        for rect in dirty_rects.iter().take(n).flatten() {
+            wm.mark_dirty(*rect);
+        }
+
         if any {
             wm.drag = None;
-            wm.compose();
+            wm.compose_dirty();
         }
     });
 }
@@ -846,11 +1216,18 @@ pub fn destroy_windows_of(owner_slot: i8) {
 pub fn move_window(id: u32, x: i32, y: i32) -> bool {
     with_lfb(|| {
         let mut wm = WM.lock();
-        if let Some(w) = wm.find_mut(id as u8) {
+        let id = id as u8;
+        let old = wm.find(id).map(|w| w.rect());
+        if let Some(w) = wm.find_mut(id) {
             w.x = x;
             w.y = y;
             w.events = EventQueue::new();
-            wm.compose();
+            let new_rect = w.rect();
+            if let Some(old) = old {
+                wm.mark_dirty(old);
+            }
+            wm.mark_dirty(new_rect);
+            wm.compose_dirty();
             true
         } else {
             false
@@ -882,9 +1259,16 @@ pub fn flip(id: u32, user_pixels: *const u8, len: usize) -> bool {
                 } else { w.surface.copy_from_user(user_pixels, len); }
             });
         }
-        w.dirty = partial.is_none();
         drop(wm);
-        with_lfb(|| { let wm = WM.lock(); if let Some((x,y,w,h)) = partial { wm.compose_client_rect(id as u8, x, y, w, h); } else { drop(wm); WM.lock().compose_dirty(); } });
+        with_lfb(|| {
+            if let Some((x, y, w, h)) = partial {
+                WM.lock().compose_client_rect(id as u8, x, y, w, h);
+            } else {
+                let mut wm = WM.lock();
+                wm.mark_window_dirty(id as u8);
+                wm.compose_dirty();
+            }
+        });
         true
     } else { false }
 }
@@ -896,6 +1280,15 @@ pub fn focus_window(id: u32) -> bool {
         if wm.find(id).is_none() {
             return false;
         }
+
+        let mut dirty = None;
+        for w in wm.windows.iter().flatten() {
+            if w.focused && w.id != id {
+                dirty = Some(w.rect());
+                break;
+            }
+        }
+
         let new_z = wm.next_z;
         wm.next_z = wm.next_z.wrapping_add(1);
         for w in wm.windows.iter_mut().flatten() {
@@ -903,8 +1296,15 @@ pub fn focus_window(id: u32) -> bool {
             w.focused = is_target;
             if is_target {
                 w.z = new_z;
-                w.dirty = true;
+                dirty = Some(match dirty {
+                    Some(old) => old.union(w.rect()),
+                    None => w.rect(),
+                });
             }
+        }
+
+        if let Some(rect) = dirty {
+            wm.mark_dirty(rect);
         }
         wm.compose_dirty();
         true
@@ -952,7 +1352,6 @@ fn apply_resize(w: &mut Window, new_w: u32, new_h: u32) {
             w.surface = surf;
         }
     }
-    w.dirty = true;
     w.events.push(WmEvent {
         kind: EV_RESIZE,
         a: w.surface.width as i32,
@@ -990,6 +1389,7 @@ pub fn on_mouse_down(x: i32, y: i32) {
         // frame is already gone. Default signal action reaps the task.
         if hit_close(w, x, y) {
             let mut owner = -1i8;
+            let old_rect = wm.find(target).map(|win| win.rect());
             for slot in wm.windows.iter_mut() {
                 if slot.as_ref().map(|ww| ww.id) == Some(target) {
                     owner = slot.as_ref().map(|ww| ww.owner_slot).unwrap_or(-1);
@@ -997,8 +1397,11 @@ pub fn on_mouse_down(x: i32, y: i32) {
                     break;
                 }
             }
+            if let Some(rect) = old_rect {
+                wm.mark_dirty(rect);
+            }
             wm.drag = None;
-            wm.compose();
+            wm.compose_dirty();
             drop(wm);
             if owner > 0 {
                 // Not a queued signal — mark zombie immediately so ignore/hang
@@ -1011,15 +1414,30 @@ pub fn on_mouse_down(x: i32, y: i32) {
         if hit_resize(w, x, y) {
             let orig_w = w.w;
             let orig_h = w.h;
+            let old_rect = wm.find(target).map(|w| w.rect());
+            let old_focus_rect = wm.windows.iter().flatten()
+                .find(|w| w.focused && w.id != target)
+                .map(|w| w.rect());
+
             let new_z = wm.next_z;
             wm.next_z = wm.next_z.wrapping_add(1);
+            let mut new_rect = None;
             for win in wm.windows.iter_mut().flatten() {
                 let is = win.id == target;
                 win.focused = is;
                 if is {
                     win.z = new_z;
-                    win.dirty = true;
+                    new_rect = Some(win.rect());
                 }
+            }
+            if let Some(r) = old_rect {
+                wm.mark_dirty(r);
+            }
+            if let Some(r) = old_focus_rect {
+                wm.mark_dirty(r);
+            }
+            if let Some(r) = new_rect {
+                wm.mark_dirty(r);
             }
             wm.drag = Some(DragState {
                 id: target,
@@ -1034,58 +1452,93 @@ pub fn on_mouse_down(x: i32, y: i32) {
         }
 
         // Focus + raise + optional client click / title drag
+        let old_target_rect = w.rect();
+        let old_focus_rect = wm.windows.iter().flatten()
+            .find(|win| win.focused && win.id != target)
+            .map(|win| win.rect());
+
+        let target_was_focused = w.focused;
+
         let in_title = hit_title(w, x, y);
         let cx = x - w.x;
         let cy = y - (w.y + w.title_height() as i32);
         let client_h = w.h.saturating_sub(w.title_height()) as i32;
-        let in_client = !in_title && cx >= 0 && cy >= 0 && cx < w.w as i32 && cy < client_h;
+        let in_client =
+            !in_title &&
+                cx >= 0 &&
+                cy >= 0 &&
+                cx < w.w as i32 &&
+                cy < client_h;
 
-        let new_z = wm.next_z;
-        wm.next_z = wm.next_z.wrapping_add(1);
         let mut grab_dx = 0;
         let mut grab_dy = 0;
         let mut start_drag = false;
-        for win in wm.windows.iter_mut().flatten() {
-            let is = win.id == target;
-            let was = win.focused;
-            win.focused = is;
-            if is {
-                win.z = new_z;
-                win.dirty = true;
-                if !was {
+
+        // Only change focus/Z-order when clicking another window.
+        // Clicking the already focused window must not trigger a redraw.
+        if !target_was_focused {
+            let new_z = wm.next_z;
+            wm.next_z = wm.next_z.wrapping_add(1);
+
+            for win in wm.windows.iter_mut().flatten() {
+                let is = win.id == target;
+                let was = win.focused;
+
+                win.focused = is;
+
+                if is {
+                    win.z = new_z;
+
+                    if !was {
+                        win.events.push(WmEvent {
+                            kind: EV_FOCUS_IN,
+                            a: 0,
+                            b: 0,
+                            c: 0,
+                            d: 0,
+                        });
+                    }
+                } else if was {
                     win.events.push(WmEvent {
-                        kind: EV_FOCUS_IN,
+                        kind: EV_FOCUS_OUT,
                         a: 0,
                         b: 0,
                         c: 0,
                         d: 0,
                     });
                 }
-                if in_title && !hit_close(win, x, y) {
-                    grab_dx = x - win.x;
-                    grab_dy = y - win.y;
-                    start_drag = true;
-                }
-                if in_client {
-                    win.events.push(WmEvent {
-                        kind: EV_MOUSE_DOWN,
-                        a: cx,
-                        b: cy,
-                        c: 1,
-                        d: 0,
-                    });
-                }
-            } else if was {
+            }
 
+            wm.mark_dirty(old_target_rect);
+
+            if let Some(rect) = old_focus_rect {
+                wm.mark_dirty(rect);
+            }
+
+            if let Some(rect) = wm.find(target).map(|win| win.rect()) {
+                wm.mark_dirty(rect);
+            }
+        }
+
+        // These events are needed regardless of whether focus changed.
+        if let Some(win) = wm.find_mut(target) {
+            if in_title && !hit_close(win, x, y) {
+                grab_dx = x - win.x;
+                grab_dy = y - win.y;
+                start_drag = true;
+            }
+
+            if in_client {
                 win.events.push(WmEvent {
-                    kind: EV_FOCUS_OUT,
-                    a: 0,
-                    b: 0,
-                    c: 0,
+                    kind: EV_MOUSE_DOWN,
+                    a: cx,
+                    b: cy,
+                    c: 1,
                     d: 0,
                 });
             }
         }
+
         if start_drag {
             wm.drag = Some(DragState {
                 id: target,
@@ -1098,7 +1551,12 @@ pub fn on_mouse_down(x: i32, y: i32) {
         } else {
             wm.drag = None;
         }
-        wm.compose_dirty();
+
+        // Redraw only when focus/Z-order actually changed.
+        if !target_was_focused {
+            wm.compose_dirty();
+        }
+
         return;
     }
     wm.drag = None;
@@ -1117,12 +1575,17 @@ pub fn on_mouse_move(x: i32, y: i32) {
             let dh = y - drag.grab_dy;
             let nw = (drag.orig_w as i32 + dw).clamp(80, wm.screen_w as i32) as u32;
             let nh = (drag.orig_h as i32 + dh).clamp((TITLE_H as i32) + 40, wm.screen_h as i32) as u32;
+            let old_rect = wm.find(id).map(|w| w.rect());
             if let Some(w) = wm.find_mut(id) {
                 if w.w != nw || w.h != nh {
                     w.w = nw;
                     w.h = nh;
-                    w.dirty = true;
-                    wm.compose();
+                    let new_rect = w.rect();
+                    if let Some(old) = old_rect {
+                        wm.mark_dirty(old);
+                    }
+                    wm.mark_dirty(new_rect);
+                    wm.compose_dirty();
                 }
             } else {
                 wm.drag = None;
@@ -1136,12 +1599,21 @@ pub fn on_mouse_move(x: i32, y: i32) {
         let nx = nx.clamp(-((wm.screen_w as i32) / 2), max_x);
         let ny = ny.clamp(0, max_y);
 
+        let old_rect = wm.find(id).map(|w| w.rect());
         if let Some(w) = wm.find_mut(id) {
             if w.x != nx || w.y != ny {
                 w.x = nx;
                 w.y = ny;
                 w.events = EventQueue::new(); // очистить stale events
-                wm.compose();
+                let new_rect = w.rect();
+                if let Some(old) = old_rect {
+                    // Do not use the generic clear-first compositor while
+                    // dragging. It would expose the background for a frame.
+                    wm.compose_move(id, old, new_rect);
+                } else {
+                    wm.mark_dirty(new_rect);
+                    wm.compose_dirty();
+                }
             }
         } else {
             wm.drag = None;
@@ -1185,12 +1657,18 @@ pub fn on_mouse_up(x: i32, y: i32) {
     let finishing = wm.drag.take();
     if let Some(drag) = finishing {
         if drag.kind == 1 {
+            let old_rect = wm.find(drag.id).map(|w| w.rect());
             if let Some(w) = wm.find_mut(drag.id) {
                 let nw = w.w;
                 let nh = w.h;
                 apply_resize(w, nw, nh);
+                let new_rect = w.rect();
+                if let Some(old) = old_rect {
+                    wm.mark_dirty(old);
+                }
+                wm.mark_dirty(new_rect);
             }
-            wm.compose();
+            wm.compose_dirty();
         }
     }
 
