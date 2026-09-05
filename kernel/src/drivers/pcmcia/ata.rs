@@ -4,7 +4,9 @@
 //! primitive can later be reused by the legacy IDE controller by providing
 //! another task-file I/O base.
 
-use crate::io::{inb, inw, outb};
+use crate::disk::interface::BlockDevice;
+use crate::io::{inb, inw, outb, outw};
+use crate::pci::ide::ata::ATA;
 use crate::time::sleep;
 
 const STATUS_ERR: u8 = 0x01;
@@ -13,6 +15,10 @@ const STATUS_DRQ: u8 = 0x08;
 const STATUS_BSY: u8 = 0x80;
 
 const CMD_IDENTIFY: u8 = 0xEC;
+const CMD_READ_SECTORS: u8 = 0x20;
+const CMD_WRITE_SECTORS: u8 = 0x30;
+const STATUS_DRDY: u8 = 0x40;
+const SECTOR_SIZE: u32 = 512;
 
 #[derive(Copy, Clone, Debug)]
 pub struct IdentifyData {
@@ -31,43 +37,27 @@ impl AtaPio {
         Self { base }
     }
 
-    #[inline]
-    fn data(&self) -> u16 { self.base }
-    #[inline]
-    fn error_features(&self) -> u16 { self.base + 1 }
-    #[inline]
-    fn sector_count(&self) -> u16 { self.base + 2 }
-    #[inline]
-    fn lba0(&self) -> u16 { self.base + 3 }
-    #[inline]
-    fn lba1(&self) -> u16 { self.base + 4 }
-    #[inline]
-    fn lba2(&self) -> u16 { self.base + 5 }
-    #[inline]
-    fn device(&self) -> u16 { self.base + 6 }
-    #[inline]
-    fn status_command(&self) -> u16 { self.base + 7 }
+    #[inline] fn data(&self) -> u16 { self.base }
+    #[inline] fn error_features(&self) -> u16 { self.base + 1 }
+    #[inline] fn sector_count(&self) -> u16 { self.base + 2 }
+    #[inline] fn lba0(&self) -> u16 { self.base + 3 }
+    #[inline] fn lba1(&self) -> u16 { self.base + 4 }
+    #[inline] fn lba2(&self) -> u16 { self.base + 5 }
+    #[inline] fn device(&self) -> u16 { self.base + 6 }
+    #[inline] fn status_command(&self) -> u16 { self.base + 7 }
 
     fn wait_not_busy(&self) -> Option<u8> {
         for _ in 0..2000 {
             let status = inb(self.status_command());
-            if status == 0x00 || status == 0xFF {
-                return None;
-            }
-            if (status & STATUS_BSY) == 0 {
-                return Some(status);
-            }
+            if status == 0x00 || status == 0xFF { return None; }
+            if (status & STATUS_BSY) == 0 { return Some(status); }
             sleep(1);
         }
         None
     }
 
     pub fn identify(&self) -> Option<IdentifyData> {
-        crate::println!(
-            "[ATA] IDENTIFY (0xEC) base=0x{:03x}",
-            self.base
-        );
-
+        crate::println!("[ATA] IDENTIFY (0xEC) base=0x{:03x}", self.base);
         outb(self.device(), 0xA0);
         sleep(1);
         outb(self.sector_count(), 0);
@@ -78,26 +68,17 @@ impl AtaPio {
 
         let mut status = match self.wait_not_busy() {
             Some(value) => value,
-            None => {
-                crate::println!("[ATA] no status after IDENTIFY");
-                return None;
-            }
+            None => { crate::println!("[ATA] no status after IDENTIFY"); return None; }
         };
 
         for _ in 0..2000 {
             status = inb(self.status_command());
             if (status & (STATUS_ERR | STATUS_DF)) != 0 {
                 let error = inb(self.error_features());
-                crate::println!(
-                    "[ATA] IDENTIFY failed status={:02x} error={:02x}",
-                    status,
-                    error
-                );
+                crate::println!("[ATA] IDENTIFY failed status={:02x} error={:02x}", status, error);
                 return None;
             }
-            if (status & STATUS_BSY) == 0 && (status & STATUS_DRQ) != 0 {
-                break;
-            }
+            if (status & STATUS_BSY) == 0 && (status & STATUS_DRQ) != 0 { break; }
             sleep(1);
         }
 
@@ -108,9 +89,7 @@ impl AtaPio {
         }
 
         let mut words = [0u16; 256];
-        for word in words.iter_mut() {
-            *word = inw(self.data());
-        }
+        for word in words.iter_mut() { *word = inw(self.data()); }
 
         let mut model = [b' '; 40];
         for (i, word) in words[27..47].iter().enumerate() {
@@ -134,12 +113,83 @@ impl AtaPio {
         crate::println!("");
         crate::println!(
             "[ATA] IDENTIFY ok status={:02x} LBA48={} sectors={} capacity={} MiB",
-            status,
-            has_lba48,
-            sectors,
-            sectors / 2048
+            status, has_lba48, sectors, sectors / 2048
         );
-
         Some(IdentifyData { model, sectors, lba48: has_lba48 })
     }
+
+    fn wait_drq(&self) -> Result<(), u8> {
+        for _ in 0..2000 {
+            let status = inb(self.status_command());
+            if (status & STATUS_BSY) != 0 { sleep(1); continue; }
+            if (status & (STATUS_ERR | STATUS_DF)) != 0 { return Err(inb(self.error_features())); }
+            if (status & STATUS_DRQ) != 0 { return Ok(()); }
+            sleep(1);
+        }
+        Err(0xFF)
+    }
+
+    fn select_lba28(&self, lba: u32) {
+        outb(self.device(), 0xE0 | (((lba >> 24) as u8) & 0x0F));
+        sleep(1);
+    }
+
+
+}
+
+impl BlockDevice for AtaPio {
+    fn read_sectors(&self, numsects: u8, lba: u32, buf: u32) -> Result<(), u8> {
+        if numsects == 0 || buf == 0 || lba > 0x0FFF_FFFF { return Err(1); }
+        self.select_lba28(lba);
+        outb(self.sector_count(), numsects);
+        outb(self.lba0(), lba as u8);
+        outb(self.lba1(), (lba >> 8) as u8);
+        outb(self.lba2(), (lba >> 16) as u8);
+        outb(self.status_command(), CMD_READ_SECTORS);
+
+        let dst = buf as *mut u16;
+        for sector in 0..numsects as usize {
+            self.wait_drq()?;
+            let ptr = unsafe { dst.add(sector * 256) };
+            for i in 0..256usize {
+                let word = inw(self.data());
+                unsafe { core::ptr::write_volatile(ptr.add(i), word); }
+            }
+        }
+        let _ = inb(self.status_command());
+        Ok(())
+    }
+
+    fn write_sectors(&mut self, numsects: u8, lba: u32, buf: u32) -> Result<(), u8> {
+        if numsects == 0 || buf == 0 || lba > 0x0FFF_FFFF { return Err(1); }
+        self.select_lba28(lba);
+        outb(self.sector_count(), numsects);
+        outb(self.lba0(), lba as u8);
+        outb(self.lba1(), (lba >> 8) as u8);
+        outb(self.lba2(), (lba >> 16) as u8);
+        outb(self.status_command(), CMD_WRITE_SECTORS);
+
+        let src = buf as *const u16;
+        for sector in 0..numsects as usize {
+            self.wait_drq()?;
+            let ptr = unsafe { src.add(sector * 256) };
+            for i in 0..256usize {
+                let word = unsafe { core::ptr::read_volatile(ptr.add(i)) };
+                outw(self.data(), word);
+            }
+            let _ = inb(self.status_command());
+        }
+
+        for _ in 0..2000 {
+            let status = inb(self.status_command());
+            if (status & STATUS_BSY) == 0 {
+                if (status & (STATUS_ERR | STATUS_DF)) != 0 { return Err(inb(self.error_features())); }
+                return Ok(());
+            }
+            sleep(1);
+        }
+        Err(0xFF)
+    }
+
+    fn sector_size(&self) -> u32 { SECTOR_SIZE }
 }
