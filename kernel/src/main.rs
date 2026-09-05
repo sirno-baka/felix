@@ -302,6 +302,12 @@ pub extern "C" fn higher_half_entry() -> ! {
         // VESA framebuffer (mode set by bootloader, info at 0x5000).
         // After graphics mode VGA text is gone — software console + mini-WM.
         crate::drivers::framebuffer::init();
+
+        match crate::drivers::ati_m6::init_native_lcd() {
+            Ok(()) => println!("[M6] native LCD mode enabled"),
+            Err(e) => println!("[M6] error: {}", e),
+        }
+
         crate::drivers::wm::init();
         // 4. PIC
         PICS.init();

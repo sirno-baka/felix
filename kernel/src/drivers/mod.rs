@@ -7,5 +7,6 @@ pub mod pic;
 pub mod usb;
 pub mod wm;
 pub(crate) mod wm_flags;
+pub(crate) mod ati_m6;
 // pub mod ramfs;
 // fb_console removed — userspace draws into WM surfaces

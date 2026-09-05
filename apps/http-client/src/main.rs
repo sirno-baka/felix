@@ -36,6 +36,7 @@ fn guess_content_type(data: &str, json_flag: bool) -> ContentType {
     if json_flag {
         return ContentType::ApplicationJson;
     }
+
     let t = data.trim_start();
     if t.starts_with('{') || t.starts_with('[') {
         ContentType::ApplicationJson
@@ -48,11 +49,18 @@ fn usage() {
     println!("usage:");
     println!("  http-client [GET] <url> [-o file]");
     println!("  http-client POST <url> -d|--data <body> [--json] [-o file]");
+    println!("  http-client POST <url> --file <file> [--content-type <type>] [-o file]");
 }
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
-    let args = Args::parse_valued(&["d", "data", "o", "output", "X"]);
+    let args = Args::parse_valued(&[
+        "d", "data",
+        "file", "f",
+        "content-type", "ct",
+        "o", "output",
+        "X",
+    ]);
 
     if args.has("h") || args.has("help") {
         usage();
@@ -61,20 +69,23 @@ pub extern "C" fn main() -> i32 {
 
     let first = args.get(0);
     let method = args.value("X").or_else(|| first.filter(|s| is_method(s)));
+
     let url = if first.map(is_method).unwrap_or(false) {
         args.get(1)
     } else {
         first
     }
-    .unwrap_or("http://10.0.2.2:8899/");
+        .unwrap_or("http://10.0.2.2:8899/");
 
     let data = args.value("data").or_else(|| args.value("d"));
+    let file = args.value("file").or_else(|| args.value("f"));
     let out = args.value("output").or_else(|| args.value("o"));
+    let content_type = args.value("content-type").or_else(|| args.value("ct"));
     let json = args.has("json");
     let do_post = method.map(is_post).unwrap_or(false);
 
-    if do_post && data.is_none() {
-        println!("POST requires -d/--data <body>");
+    if do_post && data.is_none() && file.is_none() {
+        println!("POST requires -d/--data <body> or --file <file>");
         usage();
         return 1;
     }
@@ -87,8 +98,31 @@ pub extern "C" fn main() -> i32 {
 
     block_on(async {
         let response = if do_post {
-            let body = data.unwrap();
-            post(url, body.as_bytes(), guess_content_type(body, json)).await
+            if let Some(filename) = file {
+                match libfelix::fs::read(filename) {
+                    Ok(body) => {
+                        let ct = match content_type {
+                            Some("json") | Some("application/json") =>
+                                ContentType::ApplicationJson,
+                            Some("text") | Some("text/plain") =>
+                                ContentType::TextPlain,
+                            Some("form") | Some("application/x-www-form-urlencoded") =>
+                                ContentType::ApplicationFormUrlEncoded,
+                            _ => ContentType::ApplicationOctetStream,
+                        };
+
+                        println!("Uploading {} ({} bytes)", filename, body.len());
+                        post(url, body.as_slice(), ct).await
+                    }
+                    Err(e) => {
+                        println!("Error read file: {:?}", e);
+                        return;
+                    }
+                }
+            } else {
+                let body = data.unwrap();
+                post(url, body.as_bytes(), guess_content_type(body, json)).await
+            }
         } else {
             get(url).await
         };
@@ -115,6 +149,7 @@ pub extern "C" fn main() -> i32 {
 
         print_response(&response);
     });
+
     println!("Done");
     0
 }

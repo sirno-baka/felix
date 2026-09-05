@@ -604,10 +604,31 @@ impl Ext2 {
         };
 
         let num_blocks = ((data.len() as u32) + self.block_size - 1) / self.block_size;
-        if num_blocks > 12 {
-            println!("[EXT2] File too big (>12 direct blocks)");
+        let ptrs_per_block = self.block_size / 4;
+        let max_blocks = 12 + ptrs_per_block;
+        if num_blocks > max_blocks {
+            println!(
+                "[EXT2] File too big ({} blocks, max {} with single indirect)",
+                num_blocks,
+                max_blocks
+            );
             return false;
         }
+
+        let use_indirect = num_blocks > 12;
+        let indirect_block = if use_indirect {
+            match self.alloc_block() {
+                Some(b) => b,
+                None => {
+                    println!("[EXT2] No free block for single-indirect table");
+                    return false;
+                }
+            }
+        } else {
+            0
+        };
+
+        let mut indirect_buf = [0u8; 4096];
 
         let mut inode = Ext2Inode {
             i_mode: 0x8000 | 0o644, // regular file
@@ -639,14 +660,47 @@ impl Ext2 {
                     return false;
                 }
             };
-            inode.i_block[i] = block;
+
+            if i < 12 {
+                // Первые 12 блоков — прямые
+                inode.i_block[i] = block;
+            } else {
+                // Остальные — через single indirect
+                let ptr = (i - 12) * 4;
+
+                if ptr + 4 > indirect_buf.len() {
+                    println!("[EXT2] Single indirect buffer overflow!");
+                    return false;
+                }
+
+                indirect_buf[ptr..ptr + 4]
+                    .copy_from_slice(&block.to_le_bytes());
+            }
 
             let start = i * self.block_size as usize;
-            let end = core::cmp::min(start + self.block_size as usize, data.len());
+            let end = core::cmp::min(
+                start + self.block_size as usize,
+                data.len(),
+            );
+
             unsafe {
-                self.write_blocks(block, data[start..end].as_ptr(), 1);
+                self.write_blocks(
+                    block,
+                    data[start..end].as_ptr(),
+                    1,
+                );
             }
         }
+
+        if use_indirect {
+            inode.i_block[12] = indirect_block;
+            unsafe {
+                self.write_blocks(indirect_block, indirect_buf.as_ptr(), 1);
+            }
+        }
+
+        inode.i_blocks =
+            (num_blocks + if use_indirect { 1 } else { 0 }) * (self.block_size / 512);
 
         self.write_inode(inode_num, &inode);
 

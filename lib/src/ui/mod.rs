@@ -97,6 +97,7 @@ pub struct Ui {
     root_h: u32,
     focus: Option<WidgetId>,
     hovered: Option<WidgetId>,
+    pressed: Option<WidgetId>,
     dirty: bool,
     dirty_rect: Option<Rect>,
     needs_layout: bool,
@@ -130,6 +131,7 @@ impl Ui {
             root_h: h.max(1),
             focus: None,
             hovered: None,
+            pressed: None,
             dirty: true,
             dirty_rect: None,
             needs_layout: true,
@@ -665,6 +667,7 @@ impl Ui {
                 }
                 let target = self.hit_test(*x, *y);
                 self.hovered = target;
+                self.pressed = target;
                 if let Some(id) = target {
                     if self.widgets[id.0].focusable() {
                         self.set_focus(Some(id))
@@ -676,7 +679,7 @@ impl Ui {
                     if r == EventResult::Clicked {
                         *clicked = Some(id)
                     }
-                    return false;
+                    return true;
                 }
                 false
             }
@@ -729,8 +732,16 @@ impl Ui {
                     }
                     s.dragging = false
                 }
-                if let Some(id) = self.hovered.or_else(|| self.hit_test(*x, *y)) {
+                let id = self
+                    .pressed
+                    .take()
+                    .or(self.hovered)
+                    .or_else(|| self.hit_test(*x, *y));
+                if let Some(id) = id {
                     let r = self.widgets[id.0].event(event, self.focus == Some(id));
+                    if r == EventResult::Clicked {
+                        *clicked = Some(id);
+                    }
                     if r != EventResult::Ignored || self.widgets[id.0].dirty() {
                         self.mark_dirty_rect(self.widgets[id.0].rect());
                         changed = true;

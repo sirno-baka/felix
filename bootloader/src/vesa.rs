@@ -1,104 +1,109 @@
 #![allow(dead_code)]
 
 use core::arch::asm;
-use core::ptr;
 
-/// Информация о фреймбуфере, которую мы передаём ядру
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct FramebufferInfo {
-    pub address: u32, // PhysBasePtr
-    pub pitch: u16,   // bytes per scanline
+    pub address: u32,
+    pub pitch: u16,
     pub width: u16,
     pub height: u16,
-    pub bpp: u8, // bits per pixel
+    pub bpp: u8,
     pub reserved: [u8; 3],
 }
 
-/// Фиксированный адрес, куда кладём структуру (identity-mapped)
 pub const FB_INFO_PHYS: u32 = 0x0000_5000;
 
 #[repr(C, packed)]
 struct VbeInfoBlock {
-    signature: [u8; 4], // "VESA"
+    signature: [u8; 4],
     version: u16,
     oem_string_ptr: u32,
     capabilities: u32,
-    video_mode_ptr: u32, // far ptr
+    video_mode_ptr: u32,
     total_memory: u16,
     reserved: [u8; 512 - 20],
 }
 
 #[repr(C, packed)]
 struct ModeInfoBlock {
-    attributes: u16,             // 0x00
-    win_a: u8,                   // 0x02
-    win_b: u8,                   // 0x03
-    granularity: u16,            // 0x04
-    winsize: u16,                // 0x06
-    segment_a: u16,              // 0x08
-    segment_b: u16,              // 0x0A
-    win_func_ptr: u32,           // 0x0C
-    pitch: u16,                  // 0x10  BytesPerScanLine
-    width: u16,                  // 0x12
-    height: u16,                 // 0x14
-    w_char: u8,                  // 0x16
-    y_char: u8,                  // 0x17
-    planes: u8,                  // 0x18
-    bpp: u8,                     // 0x19  ← BitsPerPixel
-    banks: u8,                   // 0x1A
-    memory_model: u8,            // 0x1B
-    bank_size: u8,               // 0x1C
-    image_pages: u8,             // 0x1D
-    reserved0: u8,               // 0x1E
-    red_mask: u8,                // 0x1F
-    red_position: u8,            // 0x20
-    green_mask: u8,              // 0x21
-    green_position: u8,          // 0x22
-    blue_mask: u8,               // 0x23
-    blue_position: u8,           // 0x24
-    reserved_mask: u8,           // 0x25
-    reserved_position: u8,       // 0x26
-    direct_color_attributes: u8, // 0x27
-    framebuffer: u32,            // 0x28  PhysBasePtr
-    // дальше нам не нужно
-    reserved1: [u8; 212],
+    attributes: u16,
+    win_a: u8,
+    win_b: u8,
+    granularity: u16,
+    winsize: u16,
+    segment_a: u16,
+    segment_b: u16,
+    win_func_ptr: u32,
+    pitch: u16,
+    width: u16,
+    height: u16,
+    w_char: u8,
+    y_char: u8,
+    planes: u8,
+    bpp: u8,
+    banks: u8,
+    memory_model: u8,
+    bank_size: u8,
+    image_pages: u8,
+    reserved0: u8,
+    red_mask: u8,
+    red_position: u8,
+    green_mask: u8,
+    green_position: u8,
+    blue_mask: u8,
+    blue_position: u8,
+    reserved_mask: u8,
+    reserved_position: u8,
+    direct_color_attributes: u8,
+    framebuffer: u32,
+    offscreen_offset: u32,
+    offscreen_size: u16,
+    lin_pitch: u16,
+    reserved1: [u8; 204],
+}
+
+fn min_pitch(w: u16, bpp: u8) -> u16 {
+    w.saturating_mul(((bpp as u16) + 7) / 8)
+}
+
+fn take_pitch(banked: u16, linear: u16, w: u16, bpp: u8) -> u16 {
+    let min = min_pitch(w, bpp);
+    let mut p = banked;
+    if linear >= min {
+        p = p.max(linear);
+    }
+    if p < min {
+        min
+    } else {
+        p
+    }
 }
 
 pub unsafe fn init_vesa() -> bool {
-    let vbe_info = 0x6000 as *mut VbeInfoBlock;
-    let mode_info = 0x6200 as *mut ModeInfoBlock;
+    let vbe = 0x6000 as *mut VbeInfoBlock;
+    let mi = 0x6200 as *mut ModeInfoBlock;
+    core::ptr::write_bytes(vbe as *mut u8, 0, 512);
+    core::ptr::write_bytes(mi as *mut u8, 0, 256);
+    core::ptr::copy_nonoverlapping(b"VBE2".as_ptr(), vbe as *mut u8, 4);
 
-    // Обнуляем буферы
-    core::ptr::write_bytes(vbe_info as *mut u8, 0, 512);
-    core::ptr::write_bytes(mode_info as *mut u8, 0, 256);
-
-    // Для полноценного VBE 2.0+ ставим сигнатуру
-    core::ptr::copy_nonoverlapping(b"VBE2".as_ptr(), vbe_info as *mut u8, 4);
-
-    // --- Get VBE Controller Info (4F00) ---
-    let mut ret: u16;
+    let mut ax: u16;
     asm!(
-    "push es",
-    "mov es, {es:x}",
-    "int 0x10",
-    "pop es",
-    es = in(reg) 0u16,
-    inout("ax") 0x4F00u16 => ret,
-    in("di") vbe_info as u16,
-    options(nostack)
+        "push es",
+        "mov es, {es:x}",
+        "int 0x10",
+        "pop es",
+        es = in(reg) 0u16,
+        inout("ax") 0x4F00u16 => ax,
+        in("di") vbe as u16,
+        options(nostack)
     );
-    if ret != 0x004F {
-        // Даже если VBE Info не получен — пробуем жёсткие режимы
-        return try_hardcoded_modes(mode_info);
-    }
 
-    // --- Перебор режимов ---
-    let mode_list_seg = ((*vbe_info).video_mode_ptr >> 16) as u16;
-    let mut mode_list_off = (*vbe_info).video_mode_ptr as u16;
-
-    let mut best_mode: u16 = 0;
-    let mut best_score: u32 = 0;
+    let mut wide_mode: u16 = 0;
+    let mut wide_score: u32 = 0;
+    let mut safe_mode: u16 = 0;
+    let mut safe_score: u32 = 0;
     let mut best = FramebufferInfo {
         address: 0,
         pitch: 0,
@@ -108,208 +113,164 @@ pub unsafe fn init_vesa() -> bool {
         reserved: [0; 3],
     };
 
-    loop {
-        // Читаем следующий mode number из списка (far pointer)
-        let mode: u16;
-        asm!(
-        "push es",
-        "mov es, {seg:x}",
-        "mov di, {off:x}",
-        "mov ax, es:[di]",
-        "pop es",
-        seg = in(reg) mode_list_seg,
-        off = in(reg) mode_list_off,
-        lateout("ax") mode,
-        options(nostack)
-        );
+    if ax == 0x004F {
+        let seg = ((*vbe).video_mode_ptr >> 16) as u16;
+        let mut off = (*vbe).video_mode_ptr as u16;
+        loop {
+            let mode: u16;
+            asm!(
+                "push es",
+                "mov es, {seg:x}",
+                "mov di, {off:x}",
+                "mov ax, es:[di]",
+                "pop es",
+                seg = in(reg) seg,
+                off = in(reg) off,
+                lateout("ax") mode,
+                options(nostack)
+            );
+            if mode == 0xFFFF {
+                break;
+            }
+            off = off.wrapping_add(2);
 
-        if mode == 0xFFFF {
-            break;
+            let mut st: u16;
+            asm!(
+                "push es",
+                "mov es, {es:x}",
+                "int 0x10",
+                "pop es",
+                es = in(reg) 0u16,
+                inout("ax") 0x4F01u16 => st,
+                in("cx") mode,
+                in("di") mi as u16,
+                options(nostack)
+            );
+            if st != 0x004F {
+                continue;
+            }
+
+            let attr = (*mi).attributes;
+            let w = (*mi).width;
+            let h = (*mi).height;
+            let bpp = (*mi).bpp;
+            let fb = (*mi).framebuffer;
+            if (attr & (1 << 4)) == 0 {
+                continue;
+            }
+            if bpp != 16 && bpp != 24 && bpp != 32 {
+                continue;
+            }
+            if w < 640 || h < 400 || w > 1600 || h > 900 {
+                continue;
+            }
+
+            let mut s = w as u32 * h as u32;
+            match bpp {
+                32 => s += 3_000_000,
+                24 => s += 1_000_000,
+                _ => s += 400_000,
+            }
+            if fb != 0 {
+                s += 10_000;
+            }
+            // Pitch is often 0 until 4F02 on OEM ATI. Still try native-wide modes.
+            let wide = w >= 1280 && h >= 560 && h <= 800;
+            if wide && s > wide_score {
+                wide_score = s;
+                wide_mode = mode;
+            }
+            if w == 800 && h == 600 && s > safe_score {
+                safe_score = s;
+                safe_mode = mode;
+            }
         }
+    }
 
-        // --- Get Mode Info (4F01) ---
-        let mut status: u16;
-        asm!(
+    if wide_mode != 0 && set_mode(wide_mode, mi, &mut best) && best.width >= 1280
+    {
+        core::ptr::write_volatile(FB_INFO_PHYS as *mut FramebufferInfo, best);
+        return true;
+    }
+    if safe_mode != 0 && set_mode(safe_mode, mi, &mut best) && best.width >= 800 {
+        core::ptr::write_volatile(FB_INFO_PHYS as *mut FramebufferInfo, best);
+        return true;
+    }
+
+    let hard: [u16; 4] = [0x115, 0x114, 0x118, 0x112];
+    for m in hard {
+        if set_mode(m, mi, &mut best) {
+            core::ptr::write_volatile(FB_INFO_PHYS as *mut FramebufferInfo, best);
+            return true;
+        }
+    }
+    false
+}
+
+
+unsafe fn set_mode(mode: u16, mi: *mut ModeInfoBlock, out: &mut FramebufferInfo) -> bool {
+    let mut st: u16;
+    asm!(
         "push es",
         "mov es, {es:x}",
         "int 0x10",
         "pop es",
         es = in(reg) 0u16,
-        inout("ax") 0x4F01u16 => status,
+        inout("ax") 0x4F01u16 => st,
         in("cx") mode,
-        in("di") mode_info as u16,
+        in("di") mi as u16,
         options(nostack)
-        );
-
-        if status != 0x004F {
-            mode_list_off = mode_list_off.wrapping_add(2);
-            continue;
-        }
-
-        let attr = (*mode_info).attributes;
-        let width = (*mode_info).width;
-        let height = (*mode_info).height;
-        let bpp = (*mode_info).bpp;
-        let fb = (*mode_info).framebuffer;
-        let pitch = (*mode_info).pitch;
-
-        // Более мягкая проверка (многие карты не ставят все биты)
-        let is_graphics = (attr & (1 << 4)) != 0;
-        let is_color = (attr & (1 << 3)) != 0;
-        // let has_lfb = (attr & (1 << 7)) != 0;
-
-        if !is_graphics || !is_color {
-            mode_list_off = mode_list_off.wrapping_add(2);
-            continue;
-        }
-
-        // // Принимаем даже без LFB-бита, если адрес ненулевой
-        // if fb == 0 || width < 640 || height < 480 || bpp < 16 {
-        //     mode_list_off = mode_list_off.wrapping_add(2);
-        //     continue;
-        // }
-
-        // Prefer 800×600 (target resolution), then higher bpp.
-        let mut score = width as u32 * height as u32;
-        if height > 720 {
-            score = 0;
-        }
-        if bpp >= 32 {
-            score = score.saturating_add(5_000_000);
-        } else if bpp == 24 {
-            score = score.saturating_add(2_000_000);
-        } else if bpp == 16 {
-            score = score.saturating_add(500_000);
-        }
-
-        if score > best_score {
-            best_score = score;
-            best_mode = mode;
-            best = FramebufferInfo {
-                address: fb,
-                pitch,
-                width,
-                height,
-                bpp,
-                reserved: [0; 3],
-            };
-        }
-
-        mode_list_off = mode_list_off.wrapping_add(2);
-    }
-
-    // Если ничего не нашли — пробуем жёсткие режимы
-    if best_mode == 0 || best.address == 0 {
-        return try_hardcoded_modes(mode_info);
-    }
-
-    // --- Устанавливаем найденный режим ---
-    if !set_mode(best_mode, mode_info, &mut best) {
-        return try_hardcoded_modes(mode_info);
-    }
-
-    // Сохраняем
-    core::ptr::write_volatile(FB_INFO_PHYS as *mut FramebufferInfo, best);
-    true
-}
-
-/// Пробует известные рабочие режимы (особенно для QEMU)
-unsafe fn try_hardcoded_modes(mode_info: *mut ModeInfoBlock) -> bool {
-    // Порядок от более предпочтительных к менее
-    // Prefer 800x600; fall back to other common VBE modes.
-    let candidates: [u16; 7] = [
-        0x115, // 800x600x24/32
-        0x114, // 800x600x16
-        0x118, // 1024x768x24/32
-        0x117, // 1024x768x16
-        0x112, // 640x480x24
-        0x11B, // 1280x1024x24
-        0x11A, // 1280x1024x16
-    ];
-
-    for &mode in &candidates {
-        let mut info = FramebufferInfo {
-            address: 0,
-            pitch: 0,
-            width: 0,
-            height: 0,
-            bpp: 0,
-            reserved: [0; 3],
-        };
-
-        if set_mode(mode, mode_info, &mut info) && info.address != 0 {
-            core::ptr::write_volatile(FB_INFO_PHYS as *mut FramebufferInfo, info);
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Устанавливает режим и заполняет info
-unsafe fn set_mode(mode: u16, mode_info: *mut ModeInfoBlock, out: &mut FramebufferInfo) -> bool {
-    // --- Get Mode Info (4F01) ---
-    let mut status: u16;
-    asm!(
-    "push es",
-    "mov es, {es:x}",
-    "int 0x10",
-    "pop es",
-    es = in(reg) 0u16,
-    inout("ax") 0x4F01u16 => status,
-    in("cx") mode,
-    in("di") mode_info as u16,
-    options(nostack)
     );
-
-    if status != 0x004F {
+    if st != 0x004F {
         return false;
     }
 
-    // Всегда пробуем с LFB-битом
-    let mode_lfb = mode | 0x4000;
-
-    // --- Set Mode (4F02) ---
+    // Same as the working tree: always request LFB, ignore AH.
+    let bx = mode | 0x4000;
     asm!(
-    "int 0x10",
-    inout("ax") 0x4F02u16 => status,
-    in("bx") mode_lfb,
-    options(nostack)
+        "int 0x10",
+        inout("ax") 0x4F02u16 => st,
+        in("bx") bx,
+        options(nostack)
     );
 
-    // if status != 0x004F {
-    //     // Если с LFB не получилось — пробуем без него
-    //     asm!(
-    //         "int 0x10",
-    //         inout("ax") 0x4F02u16 => status,
-    //         in("bx") mode,
-    //         options(nostack)
-    //     );
-    // }
-
-    // Ещё раз читаем info после установки (на всякий случай)
     asm!(
-    "push es",
-    "mov es, {es:x}",
-    "int 0x10",
-    "pop es",
-    es = in(reg) 0u16,
-    inout("ax") 0x4F01u16 => status,
-    in("cx") mode,
-    in("di") mode_info as u16,
-    options(nostack)
+        "push es",
+        "mov es, {es:x}",
+        "int 0x10",
+        "pop es",
+        es = in(reg) 0u16,
+        inout("ax") 0x4F01u16 => st,
+        in("cx") mode,
+        in("di") mi as u16,
+        options(nostack)
     );
 
-    out.address = (*mode_info).framebuffer;
-    out.pitch = (*mode_info).pitch;
-    out.width = (*mode_info).width;
-    out.height = (*mode_info).height;
-    out.bpp = (*mode_info).bpp;
-
-    // Иногда pitch = 0, тогда считаем сами
-    if out.pitch == 0 && out.width != 0 && out.bpp != 0 {
-        out.pitch = out.width * ((out.bpp as u16 + 7) / 8);
+    let w = (*mi).width;
+    let h = (*mi).height;
+    let bpp = (*mi).bpp;
+    let fb = (*mi).framebuffer;
+    let p = take_pitch((*mi).pitch, (*mi).lin_pitch, w, bpp);
+    if w == 0 || h == 0 {
+        return false;
     }
-
-    out.address != 0 && out.width != 0
+    if fb == 0 || w == 0 || h == 0 {
+        return false;
+    }
+    // Reject only an explicitly too-small nonzero pitch (stripes).
+    // Zero pitch is filled by take_pitch() as width*bpp.
+    let reported = if (*mi).lin_pitch != 0 {
+        (*mi).lin_pitch
+    } else {
+        (*mi).pitch
+    };
+    if w >= 1280 && reported != 0 && reported < min_pitch(w, bpp) {
+        return false;
+    }
+    out.address = fb;
+    out.pitch = p;
+    out.width = w;
+    out.height = h;
+    out.bpp = bpp;
+    true
 }
