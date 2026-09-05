@@ -3,7 +3,7 @@
 use super::bar::Bar;
 use super::config;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct PciDevice {
     pub bus: u8,
     pub device: u8,

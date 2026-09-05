@@ -8,8 +8,8 @@ use core::arch::asm;
 use core::fmt;
 use core::fmt::Write;
 
-pub const LOG_LINES: usize = 50;
-pub const LOG_WIDTH: usize = 96;
+pub const LOG_LINES: usize = 70;
+pub const LOG_WIDTH: usize = 150;
 
 // ---------------------------------------------------------------------------
 // klog — independent of PRINTER lock

@@ -303,7 +303,7 @@ pub fn init_rtl8139() {
 }
 
 fn bring_up(device: AnyNic) {
-    crate::net::init_logger();
+    // crate::net::init_logger();
     let stack = NetStack::new(device);
     *NET_STACK.lock() = Some(stack);
     log::debug!("stack up (no address — ifconfig static|dhcp)");
