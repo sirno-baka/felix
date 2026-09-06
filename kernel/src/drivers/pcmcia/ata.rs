@@ -6,7 +6,6 @@
 
 use crate::disk::interface::BlockDevice;
 use crate::io::{inb, inw, outb, outw};
-use crate::pci::ide::ata::ATA;
 use crate::time::sleep;
 
 const STATUS_ERR: u8 = 0x01;
@@ -17,6 +16,10 @@ const STATUS_BSY: u8 = 0x80;
 const CMD_IDENTIFY: u8 = 0xEC;
 const CMD_READ_SECTORS: u8 = 0x20;
 const CMD_WRITE_SECTORS: u8 = 0x30;
+const CMD_SET_FEATURES: u8 = 0xEF;
+const FEAT_DISABLE_8BIT: u8 = 0x81;
+const FEAT_SET_XFER: u8 = 0x03;
+const XFER_PIO_MODE0: u8 = 0x08;
 const STATUS_DRDY: u8 = 0x40;
 const SECTOR_SIZE: u32 = 512;
 
@@ -46,20 +49,32 @@ impl AtaPio {
     #[inline] fn device(&self) -> u16 { self.base + 6 }
     #[inline] fn status_command(&self) -> u16 { self.base + 7 }
 
+    #[inline]
+    fn io_pause(&self) {
+        outb(0x80, 0);
+    }
+
     fn wait_not_busy(&self) -> Option<u8> {
-        for _ in 0..2000 {
+        let mut float_hits = 0u32;
+        for _ in 0..200_000 {
             let status = inb(self.status_command());
-            if status == 0x00 || status == 0xFF { return None; }
+            if status == 0x00 || status == 0xFF {
+                float_hits += 1;
+                if float_hits > 64 { return None; }
+                self.io_pause();
+                continue;
+            }
+            float_hits = 0;
             if (status & STATUS_BSY) == 0 { return Some(status); }
-            sleep(1);
+            self.io_pause();
         }
         None
     }
 
     pub fn identify(&self) -> Option<IdentifyData> {
-        crate::println!("[ATA] IDENTIFY (0xEC) base=0x{:03x}", self.base);
+        // crate::println!("[ATA] IDENTIFY (0xEC) base=0x{:03x}", self.base);
         outb(self.device(), 0xA0);
-        sleep(1);
+        self.io_pause();
         outb(self.sector_count(), 0);
         outb(self.lba0(), 0);
         outb(self.lba1(), 0);
@@ -68,18 +83,19 @@ impl AtaPio {
 
         let mut status = match self.wait_not_busy() {
             Some(value) => value,
-            None => { crate::println!("[ATA] no status after IDENTIFY"); return None; }
+            None => {
+                // crate::println!("[ATA] no status after IDENTIFY");
+                return None;
+            }
         };
 
-        for _ in 0..2000 {
+        for _ in 0..200_000 {
             status = inb(self.status_command());
             if (status & (STATUS_ERR | STATUS_DF)) != 0 {
-                let error = inb(self.error_features());
-                crate::println!("[ATA] IDENTIFY failed status={:02x} error={:02x}", status, error);
                 return None;
             }
             if (status & STATUS_BSY) == 0 && (status & STATUS_DRQ) != 0 { break; }
-            sleep(1);
+            self.io_pause();
         }
 
         status = inb(self.status_command());
@@ -115,23 +131,40 @@ impl AtaPio {
             "[ATA] IDENTIFY ok status={:02x} LBA48={} sectors={} capacity={} MiB",
             status, has_lba48, sectors, sectors / 2048
         );
+
         Some(IdentifyData { model, sectors, lba48: has_lba48 })
     }
 
     fn wait_drq(&self) -> Result<(), u8> {
-        for _ in 0..2000 {
+        let mut float_hits = 0u32;
+        for _ in 0..200_000 {
             let status = inb(self.status_command());
-            if (status & STATUS_BSY) != 0 { sleep(1); continue; }
+            if status == 0x00 || status == 0xFF {
+                float_hits += 1;
+                if float_hits > 64 { return Err(0xFF); }
+                self.io_pause();
+                continue;
+            }
+            float_hits = 0;
+            if (status & STATUS_BSY) != 0 { self.io_pause(); continue; }
             if (status & (STATUS_ERR | STATUS_DF)) != 0 { return Err(inb(self.error_features())); }
             if (status & STATUS_DRQ) != 0 { return Ok(()); }
-            sleep(1);
+            self.io_pause();
         }
+        let status = inb(self.status_command());
+        let error = inb(self.error_features());
+        crate::println!("[ATA] wait_drq timeout status={:02x} error={:02x}", status, error);
         Err(0xFF)
     }
 
-    fn select_lba28(&self, lba: u32) {
+    fn select_lba28(&self, lba: u32) -> Option<u8> {
+        let st = inb(self.status_command());
+        if st == 0x00 || st == 0xFF {
+            super::rearm_io();
+        }
         outb(self.device(), 0xE0 | (((lba >> 24) as u8) & 0x0F));
-        sleep(1);
+        self.io_pause();
+        self.wait_not_busy()
     }
 
 
@@ -140,7 +173,10 @@ impl AtaPio {
 impl BlockDevice for AtaPio {
     fn read_sectors(&self, numsects: u8, lba: u32, buf: u32) -> Result<(), u8> {
         if numsects == 0 || buf == 0 || lba > 0x0FFF_FFFF { return Err(1); }
-        self.select_lba28(lba);
+        if self.select_lba28(lba).is_none() {
+            crate::println!("[ATA] select fail LBA={} st={:02x}", lba, inb(self.status_command()));
+            return Err(33);
+        }
         outb(self.sector_count(), numsects);
         outb(self.lba0(), lba as u8);
         outb(self.lba1(), (lba >> 8) as u8);
@@ -162,7 +198,7 @@ impl BlockDevice for AtaPio {
 
     fn write_sectors(&mut self, numsects: u8, lba: u32, buf: u32) -> Result<(), u8> {
         if numsects == 0 || buf == 0 || lba > 0x0FFF_FFFF { return Err(1); }
-        self.select_lba28(lba);
+        self.select_lba28(lba).ok_or(33)?;
         outb(self.sector_count(), numsects);
         outb(self.lba0(), lba as u8);
         outb(self.lba1(), (lba >> 8) as u8);
@@ -180,13 +216,13 @@ impl BlockDevice for AtaPio {
             let _ = inb(self.status_command());
         }
 
-        for _ in 0..2000 {
+        for _ in 0..200_000 {
             let status = inb(self.status_command());
             if (status & STATUS_BSY) == 0 {
                 if (status & (STATUS_ERR | STATUS_DF)) != 0 { return Err(inb(self.error_features())); }
                 return Ok(());
             }
-            sleep(1);
+            self.io_pause();
         }
         Err(0xFF)
     }

@@ -47,12 +47,12 @@ pub fn read_cis() -> Option<CardInfo> {
     let mut have_cftable_1 = false;
     let mut func_id = None;
 
-    crate::println!("[PCMCIA] reading CF attribute memory / CIS...");
+    // crate::println!("[PCMCIA] reading CF attribute memory / CIS...");
 
     while pos < 0x400 {
         let code = unsafe { attr_read8(pos) };
         if code == TUPLE_END {
-            crate::println!("[PCMCIA] CIS END at +0x{:03x}", pos);
+            // crate::println!("[PCMCIA] CIS END at +0x{:03x}", pos);
             break;
         }
         if code == 0x00 {
@@ -61,46 +61,46 @@ pub fn read_cis() -> Option<CardInfo> {
         }
 
         let len = unsafe { attr_read8(pos + 2) };
-        crate::println!(
-            "[PCMCIA] CIS tuple @0x{:03x}: code={:02x} len={}",
-            pos, code, len
-        );
+        // crate::println!(
+        //     "[PCMCIA] CIS tuple @0x{:03x}: code={:02x} len={}",
+        //     pos, code, len
+        // );
 
-        let dump_len = core::cmp::min(len as u32, 24);
-        if dump_len != 0 {
-            crate::print!("[PCMCIA]   data:");
-            for i in 0..dump_len {
-                crate::print!(" {:02x}", unsafe { attr_read8(pos + 4 + i * 2) });
-            }
-            crate::println!("");
-        }
+        // let dump_len = core::cmp::min(len as u32, 24);
+        // if dump_len != 0 {
+        //     crate::print!("[PCMCIA]   data:");
+        //     for i in 0..dump_len {
+        //         crate::print!(" {:02x}", unsafe { attr_read8(pos + 4 + i * 2) });
+        //     }
+        //     crate::println!("");
+        // }
 
         match code {
             TUPLE_VERS1 => {
-                crate::print!("[PCMCIA]   version/product: ");
-                let mut p = pos + 4;
-                let end = p + len as u32 * 2;
-                while p < end {
-                    let b = unsafe { attr_read8(p) };
-                    if b == 0xff { break; }
-                    if b >= 0x20 && b < 0x7f { crate::print!("{}", b as char); }
-                    else if b == 0 { crate::print!(" "); }
-                    p += 2;
-                }
-                crate::println!("");
+                // crate::print!("[PCMCIA]   version/product: ");
+                // let mut p = pos + 4;
+                // let end = p + len as u32 * 2;
+                // while p < end {
+                //     let b = unsafe { attr_read8(p) };
+                //     if b == 0xff { break; }
+                //     if b >= 0x20 && b < 0x7f { crate::print!("{}", b as char); }
+                //     else if b == 0 { crate::print!(" "); }
+                //     p += 2;
+                // }
+                // crate::println!("");
             }
             TUPLE_FUNCID if len >= 1 => {
                 let id = unsafe { attr_read8(pos + 4) } & 0x7f;
                 func_id = Some(id);
-                crate::println!("[PCMCIA]   FUNCID={:02x}", id);
+                // crate::println!("[PCMCIA]   FUNCID={:02x}", id);
             }
             TUPLE_FUNCE if len >= 2 => {
-                let subtype = unsafe { attr_read8(pos + 4) };
-                let iface = unsafe { attr_read8(pos + 6) };
-                crate::println!(
-                    "[PCMCIA]   FUNCE subtype={:02x} iface={:02x}",
-                    subtype, iface
-                );
+                // let subtype = unsafe { attr_read8(pos + 4) };
+                // let iface = unsafe { attr_read8(pos + 6) };
+                // crate::println!(
+                //     "[PCMCIA]   FUNCE subtype={:02x} iface={:02x}",
+                //     subtype, iface
+                // );
             }
             TUPLE_CONFIG if len >= 4 => {
                 let size = unsafe { attr_read8(pos + 4) };
@@ -112,11 +112,11 @@ pub fn read_cis() -> Option<CardInfo> {
                         base |= b << (i * 8);
                     }
                     config_base = Some(base);
-                    crate::println!(
-                        "[PCMCIA]   CONFIG base=0x{:08x} rasz={}",
-                        base,
-                        rasz + 1
-                    );
+                    // crate::println!(
+                    //     "[PCMCIA]   CONFIG base=0x{:08x} rasz={}",
+                    //     base,
+                    //     rasz + 1
+                    // );
                 }
             }
             TUPLE_CFTABLE_ENTRY if len >= 1 => {
@@ -129,11 +129,11 @@ pub fn read_cis() -> Option<CardInfo> {
                 if is_default && first_default.is_none() {
                     first_default = Some(idx);
                 }
-                crate::println!(
-                    "[PCMCIA]   CFTABLE index={}{}",
-                    idx,
-                    if (raw & 0x40) != 0 { " default" } else { "" }
-                );
+                // crate::println!(
+                //     "[PCMCIA]   CFTABLE index={}{}",
+                //     idx,
+                //     if (raw & 0x40) != 0 { " default" } else { "" }
+                // );
             }
             _ => {}
         }
@@ -161,26 +161,27 @@ pub fn read_cis() -> Option<CardInfo> {
 
 pub fn configure_card(pc16: &Pc16, config_base: u32, config_index: u8) -> bool {
     if config_base >= CF_MEM_SIZE {
-        crate::println!(
-            "[PCMCIA] card: CONFIG base 0x{:x} outside mapped attribute window",
-            config_base
-        );
+        // crate::println!(
+        //     "[PCMCIA] card: CONFIG base 0x{:x} outside mapped attribute window",
+        //     config_base
+        // );
         return false;
     }
 
     // CF/ATA configuration: select the CIS entry and enable I/O + function.
     // The 0x40 function-enable bit is specific to memory/IO function cards;
     // this path is called only after CardType::FixedDisk selection.
+    super::store_card_cor(config_base, config_index);
     let cor_value = 0x40 | (config_index & 0x3f);
-    crate::println!(
-        "[PCMCIA] card: writing COR @0x{:x} = 0x{:02x} (CFTABLE={})",
-        config_base, cor_value, config_index
-    );
+    // crate::println!(
+    //     "[PCMCIA] card: writing COR @0x{:x} = 0x{:02x} (CFTABLE={})",
+    //     config_base, cor_value, config_index
+    // );
     unsafe { attr_write8(config_base, cor_value); }
     sleep(20);
 
     let cor = unsafe { attr_read8(config_base) };
-    crate::println!("[PCMCIA] card: COR readback={:02x}", cor);
+    // crate::println!("[PCMCIA] card: COR readback={:02x}", cor);
     if cor == 0xff { return false; }
 
     unsafe {
@@ -190,10 +191,10 @@ pub fn configure_card(pc16: &Pc16, config_base: u32, config_index: u8) -> bool {
         pc16.write_reg8(super::pc16::reg::AWINEN, awinen);
     }
 
-    crate::println!(
-        "[PCMCIA] fixed-disk configured: IO=0x{:03x}-0x{:03x} AWINEN={:02x} IOCTRL={:02x}",
-        super::CF_IO_BASE, super::CF_IO_END,
-        unsafe { pc16.awinen() }, unsafe { pc16.ioctrl() }
-    );
+    // crate::println!(
+    //     "[PCMCIA] fixed-disk configured: IO=0x{:03x}-0x{:03x} AWINEN={:02x} IOCTRL={:02x}",
+    //     super::CF_IO_BASE, super::CF_IO_END,
+    //     unsafe { pc16.awinen() }, unsafe { pc16.ioctrl() }
+    // );
     true
 }

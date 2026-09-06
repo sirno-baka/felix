@@ -3,10 +3,14 @@
 // klog is a lock-free (cli-only) ring of recent lines so fb_panic / exceptions
 // can dump history even when PRINTER's Mutex is held by the faulting context.
 
+use alloc::fmt::format;
+use alloc::format;
+use alloc::string::String;
 use crate::sync::mutex::Mutex;
 use core::arch::asm;
 use core::fmt;
 use core::fmt::Write;
+use crate::time::get_timestamp;
 
 pub const LOG_LINES: usize = 70;
 pub const LOG_WIDTH: usize = 150;
@@ -304,10 +308,10 @@ macro_rules! print {
 #[macro_export]
 macro_rules! println {
     () => {
-        $crate::print::print!("\n");
+        $crate::print::print!("{} | \n", $crate::time::get_timestamp().as_f64());
     };
     ($($arg:tt)*) => {{
-        $crate::print!("{}\n", format_args!($($arg)*));
+        $crate::print!("{} | {}\n", $crate::time::get_timestamp().as_f64(), format_args!($($arg)*));
     }};
 }
 

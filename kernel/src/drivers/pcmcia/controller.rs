@@ -93,7 +93,7 @@ fn probe_bar_size(dev: &pci::device::PciDevice, offset: u8, original: u32) -> u3
     let mask = dev.read_u32(offset);
     dev.write_u32(offset, original);
     dev.write_u16(PCI_COMMAND, old_command);
-    crate::println!("[PCMCIA] BAR sizing: original={:08x} mask={:08x}", original, mask);
+    // crate::println!("[PCMCIA] BAR sizing: original={:08x} mask={:08x}", original, mask);
     if mask == 0 || mask == 0xFFFF_FFFF { return 0; }
     let size_mask = if (mask & 1) != 0 { mask & 0xFFFF_FFFC } else { mask & 0xFFFF_FFF0 };
     if size_mask == 0 { 0 } else { (!size_mask).wrapping_add(1) }
@@ -101,7 +101,7 @@ fn probe_bar_size(dev: &pci::device::PciDevice, offset: u8, original: u32) -> u3
 
 fn map_bar0(phys: u32, size: u32) {
     let map_size = ((size as usize) + 0xFFF) & !0xFFF;
-    crate::println!("[PCMCIA] mapping MMIO phys=0x{:08x} size=0x{:x} -> virt=0x{:08x}", phys, map_size, BAR0_VIRT);
+    // crate::println!("[PCMCIA] mapping MMIO phys=0x{:08x} size=0x{:x} -> virt=0x{:08x}", phys, map_size, BAR0_VIRT);
     let flags = PTEFlags::new().present().writable();
     let mut paging = unsafe { PAGING.lock() };
     let _ = paging.map_physical_range(phys, map_size as u32, BAR0_VIRT, flags);
@@ -120,7 +120,7 @@ pub fn setup(dev: pci::device::PciDevice) -> Option<RicohR5c475> {
     let mut bar0_phys = original_bar0 & 0xFFFF_FFF0;
     if bar0_phys == 0 {
         bar0_phys = BAR0_PHYS_FALLBACK;
-        crate::println!("[PCMCIA] BAR0 unassigned -> 0x{:08x}", bar0_phys);
+        // crate::println!("[PCMCIA] BAR0 unassigned -> 0x{:08x}", bar0_phys);
         dev.write_u32(PCI_BAR0, bar0_phys);
     }
     bar0_phys = dev.read_u32(PCI_BAR0) & 0xFFFF_FFF0;
@@ -129,31 +129,35 @@ pub fn setup(dev: pci::device::PciDevice) -> Option<RicohR5c475> {
         return None;
     }
 
-    dev.write_u16(PCI_COMMAND, old_command | 0x0002);
+    // IO + Memory + Bus Master — ExCA I/O windows need IOSE.
+    dev.write_u16(PCI_COMMAND, old_command | 0x0007);
     dev.write_u16(PCI_RICOH_MISC_CONTROL, 0x00a0);
+    // 0x80: IO0 16-bit address mode (RL5C4XX_CONFIG_IO_0_MODE)
+    let cfg80 = dev.read_u16(0x80);
+    dev.write_u16(0x80, cfg80 | 0x0100);
     dev.write_u16(PCI_BRIDGE_CONTROL, 0x0780);
 
     map_bar0(bar0_phys, size);
     let controller = RicohR5c475::new(dev, bar0_phys, BAR0_VIRT, size);
 
-    unsafe {
-        crate::println!(
-            "[PCMCIA] MMIO verify: +00={:08x} +04={:08x} +08={:08x}",
-            controller.mmio_read32(0),
-            controller.mmio_read32(4),
-            controller.mmio_read32(CB_SOCKET_STATE)
-        );
-        let pc16 = controller.pc16();
-        crate::println!("[PCMCIA] PC16 verify: IDREV={:02x} IFSTAT={:02x}", pc16.idrev(), pc16.ifstat());
-    }
+    // unsafe {
+    //     crate::println!(
+    //         "[PCMCIA] MMIO verify: +00={:08x} +04={:08x} +08={:08x}",
+    //         controller.mmio_read32(0),
+    //         controller.mmio_read32(4),
+    //         controller.mmio_read32(CB_SOCKET_STATE)
+    //     );
+    //     let pc16 = controller.pc16();
+    //     crate::println!("[PCMCIA] PC16 verify: IDREV={:02x} IFSTAT={:02x}", pc16.idrev(), pc16.ifstat());
+    // }
 
     dev.write_u32(PCI_CB_MEMORY_BASE_0, super::CF_MEM_PHYS & 0xfffffff0);
     dev.write_u32(PCI_CB_MEMORY_LIMIT_0, (super::CF_MEM_PHYS + super::CF_MEM_SIZE - 1) | 0x0f);
     dev.write_u32(PCI_CB_IO_BASE_0, (super::CF_IO_BASE as u32) & 0xffff_fffc);
     dev.write_u32(PCI_CB_IO_LIMIT_0, (super::CF_IO_END as u32) | 0x3);
 
-    crate::println!("[PCMCIA] CardBus MEM0: {:08x}-{:08x}", dev.read_u32(PCI_CB_MEMORY_BASE_0), dev.read_u32(PCI_CB_MEMORY_LIMIT_0));
-    crate::println!("[PCMCIA] CardBus IO0:  {:08x}-{:08x}", dev.read_u32(PCI_CB_IO_BASE_0), dev.read_u32(PCI_CB_IO_LIMIT_0));
+    // crate::println!("[PCMCIA] CardBus MEM0: {:08x}-{:08x}", dev.read_u32(PCI_CB_MEMORY_BASE_0), dev.read_u32(PCI_CB_MEMORY_LIMIT_0));
+    // crate::println!("[PCMCIA] CardBus IO0:  {:08x}-{:08x}", dev.read_u32(PCI_CB_IO_BASE_0), dev.read_u32(PCI_CB_IO_LIMIT_0));
 
     Some(controller)
 }

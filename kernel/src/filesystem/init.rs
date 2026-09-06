@@ -9,6 +9,8 @@ use alloc::vec::Vec;
 use crate::device::char::{NullDevice, ZeroDevice};
 use crate::disk::interface::BlockDevice;
 use crate::disk::ramdisk::RamDisk;
+use crate::drivers::pcmcia;
+use crate::drivers::pcmcia::PcmciaDevice;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::ext2::Ext2;
 use crate::filesystem::fat32::FatFs;
@@ -86,6 +88,33 @@ pub fn init_rootfs() -> bool {
                     println!("[init] Try mount IDE disks");
                     register_ide_disks(&devfs, true);
 
+                    match pcmcia::init() {
+                        None => {}
+                        Some(PcmciaDevice::CompactFlash(cf)) => {
+                            let name = "cf0";
+                            devfs.register_block(
+                                &name,
+                                Mutex::new(Box::new(cf.clone()) as Box<dyn BlockDevice>),
+                            );
+                            println!(
+                                "[init] /dev/cf0  size={} sectors (~{} MiB)",
+                                cf.sectors(),
+                                (cf.sectors() * 512) / (1024 * 1024)
+                            );
+
+                            let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(cf));
+                            match try_mount(arc, &name) {
+                                Some(p) => {
+                                    let mp = format!("/mnt/{}", name);
+                                    println!("[VFS] mount {} ({}) at {}", name, p.kind, mp);
+                                    VFS.get().mount(&mp, p.fs);
+                                }
+                                None => println!("[init] {} → no supported filesystem", name),
+                            }
+                        }
+                        _ => {}
+                    }
+
                     VFS.get().mount("/dev", devfs);
                     return true;
                 }
@@ -103,6 +132,33 @@ pub fn init_rootfs() -> bool {
     if disks.is_empty() {
         println!("[init] no ATA disks and no BootInfo ramdisk");
         return false;
+    }
+
+    match pcmcia::init() {
+        None => {}
+        Some(PcmciaDevice::CompactFlash(cf)) => {
+            let name = "cf0";
+            devfs.register_block(
+                &name,
+                Mutex::new(Box::new(cf.clone()) as Box<dyn BlockDevice>),
+            );
+            println!(
+                "[init] /dev/cf0  size={} sectors (~{} MiB)",
+                cf.sectors(),
+                (cf.sectors() * 512) / (1024 * 1024)
+            );
+
+            let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(cf));
+            match try_mount(arc, &name) {
+                Some(p) => {
+                    let mp = format!("/mnt/{}", name);
+                    println!("[VFS] mount {} ({}) at {}", name, p.kind, mp);
+                    VFS.get().mount(&mp, p.fs);
+                }
+                None => println!("[init] {} → no supported filesystem", name),
+            }
+        }
+        _ => {}
     }
 
     for (i, dev) in disks.iter().enumerate() {
@@ -223,6 +279,7 @@ fn collect_ata_disks() -> Vec<IDEDevice> {
     }
     out
 }
+
 
 fn try_mount(disk: Arc<spin::Mutex<dyn BlockDevice>>, name: &str) -> Option<ProbedFs> {
     {

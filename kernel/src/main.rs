@@ -34,7 +34,6 @@ mod utils;
 mod wrappers;
 mod pit;
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -68,6 +67,8 @@ use crate::pci::print_devices;
 use crate::sync::mutex::Mutex;
 use crate::utils::queue::Queue;
 use multitasking::task::TASK_MANAGER;
+use crate::drivers::pcmcia;
+use crate::drivers::pcmcia::PcmciaDevice;
 use crate::pit::init;
 
 static mut TEST_WRITE: [u32; 128] = [0; 128];

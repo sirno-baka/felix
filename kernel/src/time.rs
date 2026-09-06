@@ -22,13 +22,28 @@ impl Time {
     }
 }
 
+fn read_tsc_asm() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        asm!(
+        "rdtsc",
+        out("eax") low,
+        out("edx") high,
+        options(nomem, nostack)
+        );
+    }
+    ((high as u64) << 32) | (low as u64)
+}
+
+
 /// Construct a Time structure using the JIFFIES and SYSTEM_FRACTION to calculate time elapsed
 /// since boot
 #[inline(always)]
 pub fn get_timestamp() -> Time {
     // SYSTEM_FRACTION shouldn't be change after boot and should so be safe
     unsafe {
-        let total_ms = (JIFFIES.load(Ordering::Relaxed) as f64 * SYSTEM_FRACTION) as usize;
+        let total_ms = (read_tsc_asm() / 100_000_000) as usize;
         Time {
             second: total_ms / 1000,
             millisecond: total_ms - (total_ms / 1000),

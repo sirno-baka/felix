@@ -176,12 +176,17 @@ impl Pc16 {
         self.write8(reg::AWINEN, awinen);
         self.write16(reg::IOWIN0_START, CF_IO_BASE);
         self.write16(reg::IOWIN0_END, CF_IO_END);
-        self.write16(reg::IOWIN0_OFFSET, 0);
+        // 0xC000 + 0x41E0 = 0x01E0 on the card (16-bit wrap)
+        self.write16(reg::IOWIN0_OFFSET, 0x41E0);
+        self.write16(reg::IO_OFFSET0, 0x41E0);
         let mut ioctl = self.read8(reg::IOCTRL);
         ioctl &= !0xFF;
-        ioctl |= ioctrl::IO0_IOCS16 | ioctrl::IO1_IOCS16;
+        ioctl |= ioctrl::IO0_16BIT | ioctrl::IO0_IOCS16 | ioctrl::IO0_WAIT
+            | ioctrl::IO1_16BIT | ioctrl::IO1_IOCS16 | ioctrl::IO1_WAIT;
         self.write8(reg::IOCTRL, ioctl);
-        self.write8(reg::AWINEN, awinen | addrwin::MEM0 | addrwin::IO0 | addrwin::IO1);
+        // Ricoh 16-bit ATA timing mode (RF5C_MODE_ATA).
+        self.write8(reg::ATCTRL, 0x01);
+        self.write8(reg::AWINEN, awinen | addrwin::MEM0 | addrwin::IO0);
     }
 
     pub unsafe fn configure_cf_attribute_window(&self) {

@@ -13,11 +13,56 @@ pub use ata::{AtaPio, IdentifyData};
 pub use pc16::SocketStatus;
 pub use controller::RicohR5c475;
 
-pub const CF_IO_BASE: u16 = 0x01E0;
-pub const CF_IO_END: u16 = 0x01EF;
+pub const CF_IO_BASE: u16 = 0xC000;
+pub const CF_IO_END: u16 = 0xC00F;
 pub const CF_MEM_PHYS: u32 = 0xF000_1000;
 pub const CF_MEM_VIRT: u32 = 0xE000_1000;
 pub const CF_MEM_SIZE: u32 = 0x1000;
+
+static mut SOCKET: Option<controller::RicohR5c475> = None;
+static mut CARD_COR: Option<(u32, u8)> = None;
+
+pub(crate) fn store_card_cor(base: u32, index: u8) {
+    unsafe { CARD_COR = Some((base, index)); }
+}
+
+/// Re-enable PCI I/O + ExCA windows if the task-file port floated (0xFF).
+pub fn rearm_io() {
+    unsafe {
+        let Some(c) = SOCKET else {
+            crate::println!("[PCMCIA] rearm: no socket");
+            return;
+        };
+        let cmd0 = c.pci.read_u16(0x04);
+        c.pci.write_u16(0x04, cmd0 | 0x0007);
+        c.pci.write_u32(0x10, c.bar0_phys);
+        c.pci.write_u32(0x2C, (CF_IO_BASE as u32) & 0xffff_fffc);
+        c.pci.write_u32(0x30, (CF_IO_END as u32) | 0x3);
+        let pc16 = c.pc16();
+        pc16.write_reg8(pc16::reg::PWCTRL, 0xb0);
+        // pulse RESET then IOCARD+IRQ like initial bring-up
+        pc16.write_reg8(pc16::reg::IGCTRL, 0x69);
+        crate::time::sleep(2);
+        pc16.write_reg8(pc16::reg::IGCTRL, 0x29);
+        pc16.set_io_card_mode(true);
+        pc16.configure_cf_attribute_window();
+        pc16.configure_cf_io();
+        if let Some((base, idx)) = CARD_COR {
+            let _ = cis::configure_card(&pc16, base, idx);
+        }
+        let st = crate::io::inb(CF_IO_BASE + 7);
+        crate::println!(
+            "[PCMCIA] rearm cmd {:04x}->{:04x} PWCTRL={:02x} IGCTRL={:02x} AWINEN={:02x} IOCTRL={:02x} tf={:02x}",
+            cmd0,
+            c.pci.read_u16(0x04),
+            pc16.pwctrl(),
+            pc16.igctrl(),
+            pc16.awinen(),
+            pc16.ioctrl(),
+            st
+        );
+    }
+}
 
 const PCI_CLASS_BRIDGE: u8 = 0x06;
 const PCI_SUBCLASS_CARD_BUS: u8 = 0x07;
@@ -100,6 +145,30 @@ impl CompactFlash {
     pub fn model(&self) -> &[u8; 40] { &self.identify.model }
 }
 
+impl crate::disk::interface::BlockDevice for CompactFlash {
+    fn read_sectors(
+        &self,
+        numsects: u8,
+        lba: u32,
+        buf: u32,
+    ) -> Result<(), u8> {
+        self.ata.read_sectors(numsects, lba, buf)
+    }
+
+    fn write_sectors(
+        &mut self,
+        numsects: u8,
+        lba: u32,
+        buf: u32,
+    ) -> Result<(), u8> {
+        self.ata.write_sectors(numsects, lba, buf)
+    }
+
+    fn sector_size(&self) -> u32 {
+        self.ata.sector_size()
+    }
+}
+
 fn print_socket_status(status: &SocketStatus) {
     crate::println!("[PCMCIA] socket:");
     crate::println!(
@@ -161,9 +230,10 @@ fn prepare_socket(controller: &controller::RicohR5c475) -> bool {
         pc16.configure_cf_attribute_window();
         pc16.configure_cf_io();
         pc16.write_reg8(pc16::reg::PWCTRL, 0xb0);
-
         crate::time::sleep(100);
-        pc16.write_reg8(pc16::reg::IGCTRL, 0x69);
+        pc16.write_reg8(pc16::reg::IGCTRL, 0x69); // IOCARD + RESET + IRQ9
+        crate::time::sleep(50);
+        pc16.write_reg8(pc16::reg::IGCTRL, 0x29); // RESET off
         crate::time::sleep(100);
     }
 
@@ -260,20 +330,21 @@ pub fn init() -> Option<PcmciaDevice> {
     );
 
     let controller = setup_controller(kind, dev)?;
-    unsafe {
-        crate::println!(
-            "[PCMCIA] PC16: phys=0x{:08x} virt=0x{:08x}",
-            controller.bar0_phys + 0x800,
-            controller.bar0_virt + 0x800
-        );
-        crate::println!(
-            "[PCMCIA] PC16 initial: IDREV={:02x} IFSTAT={:02x} PWCTRL={:02x} IGCTRL={:02x} AWINEN={:02x}",
-            controller.pc16().idrev(), controller.pc16().ifstat(),
-            controller.pc16().pwctrl(), controller.pc16().igctrl(), controller.pc16().awinen()
-        );
-        print_socket_status(&controller.pc16().status());
-    }
-
+    unsafe { SOCKET = Some(controller); }
+    // unsafe {
+    //     crate::println!(
+    //         "[PCMCIA] PC16: phys=0x{:08x} virt=0x{:08x}",
+    //         controller.bar0_phys + 0x800,
+    //         controller.bar0_virt + 0x800
+    //     );
+    //     crate::println!(
+    //         "[PCMCIA] PC16 initial: IDREV={:02x} IFSTAT={:02x} PWCTRL={:02x} IGCTRL={:02x} AWINEN={:02x}",
+    //         controller.pc16().idrev(), controller.pc16().ifstat(),
+    //         controller.pc16().pwctrl(), controller.pc16().igctrl(), controller.pc16().awinen()
+    //     );
+    //     print_socket_status(&controller.pc16().status());
+    // }
+    unsafe { print_socket_status(&controller.pc16().status()); }
     if !prepare_socket(&controller) {
         return None;
     }
