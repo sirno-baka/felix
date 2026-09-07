@@ -231,8 +231,13 @@ fn collect_ata_disks() -> Vec<IDEDevice> {
 }
 
 
-const CF_NAME: &str = "cf0";
-const CF_MNT: &str = "/mnt/cf0";
+const PCMCIA_NAME: &str = "pcmcia0";
+const PCMCIA_MOUNT_PREFIX: &str = "pcmcia";
+
+/// Mountpoint owned by the currently inserted PCMCIA card. There is one
+/// socket today, so the filesystem layer can keep the exact path instead of
+/// guessing which numbered mount should be removed.
+static PCMCIA_MOUNT: Mutex<Option<String>> = Mutex::new(None);
 
 fn attach_pcmcia(devfs: &DevFS, dev: Option<PcmciaDevice>) {
     mount_pcmcia_device(dev, Some(devfs));
@@ -243,26 +248,23 @@ fn mount_pcmcia_device(dev: Option<PcmciaDevice>, devfs: Option<&DevFS>) {
         Some(PcmciaDevice::CompactFlash(cf)) => {
             if let Some(devfs) = devfs {
                 devfs.register_block(
-                    CF_NAME,
+                    PCMCIA_NAME,
                     Mutex::new(Box::new(cf.clone()) as Box<dyn BlockDevice>),
                 );
             }
             println!(
                 "[init] /dev/{}  size={} sectors (~{} MiB)",
-                CF_NAME,
+                PCMCIA_NAME,
                 cf.sectors(),
                 (cf.sectors() * 512) / (1024 * 1024)
             );
             let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(cf));
-            match try_mount(arc, CF_NAME) {
-                Some(p) => {
-                    if VFS.get().is_mounted_at(CF_MNT) {
-                        VFS.get().unmount(CF_MNT);
-                    }
-                    println!("[VFS] mount {} ({}) at {}", CF_NAME, p.kind, CF_MNT);
-                    VFS.get().mount(CF_MNT, p.fs);
+            match mount_removable(arc, PCMCIA_MOUNT_PREFIX) {
+                Some(path) => {
+                    println!("[PCMCIA] mounted at {}", path);
+                    *PCMCIA_MOUNT.lock() = Some(path);
                 }
-                None => println!("[init] {} → no supported filesystem", CF_NAME),
+                None => println!("[init] {} → no supported filesystem", PCMCIA_NAME),
             }
         }
         Some(other) => {
@@ -272,16 +274,46 @@ fn mount_pcmcia_device(dev: Option<PcmciaDevice>, devfs: Option<&DevFS>) {
     }
 }
 
-/// Called from PCMCIA hotplug (timer context after debounce).
-pub fn pcmcia_hotplug(present: bool) {
-    if present {
-        mount_pcmcia_device(pcmcia::bind_card(), None);
-    } else if VFS.get().is_mounted_at(CF_MNT) {
-        VFS.get().unmount(CF_MNT);
+/// Attach an already-probed PCMCIA device to the generic removable-storage
+/// filesystem layer. The PCMCIA core is responsible for driver probing; this
+/// function only publishes the resulting BlockDevice through `try_mount()`.
+pub fn pcmcia_hotplug_device(dev: PcmciaDevice) {
+    match dev {
+        PcmciaDevice::CompactFlash(cf) => {
+            let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(cf));
+            match mount_removable(arc, PCMCIA_MOUNT_PREFIX) {
+                Some(path) => {
+                    println!("[PCMCIA] mounted at {}", path);
+                    *PCMCIA_MOUNT.lock() = Some(path);
+                }
+                None => println!("[PCMCIA] card has no supported filesystem"),
+            }
+        }
+        PcmciaDevice::Unsupported(info) => {
+            println!("[PCMCIA] card {:?} — no block driver", info.card_type);
+        }
     }
 }
 
-fn try_mount(disk: Arc<spin::Mutex<dyn BlockDevice>>, name: &str) -> Option<ProbedFs> {
+/// Compatibility entry point for code that only reports presence changes.
+/// New hotplug code should pass the already-probed device to
+/// `pcmcia_hotplug_device()` so probing happens exactly once in PCMCIA core.
+pub fn pcmcia_hotplug(present: bool) {
+    if present {
+        if let Some(device) = pcmcia::bind_card() {
+            pcmcia_hotplug_device(device);
+        }
+        return;
+    }
+
+    let path = PCMCIA_MOUNT.lock().take();
+    if let Some(path) = path {
+        VFS.get().unmount(&path);
+        println!("[PCMCIA] unmounted {}", path);
+    }
+}
+
+pub fn try_mount(disk: Arc<spin::Mutex<dyn BlockDevice>>, name: &str) -> Option<ProbedFs> {
     {
         let mut ext2 = Ext2::new_with_auto_partition(disk.clone());
         ext2.mount(None);
@@ -307,6 +339,30 @@ fn try_mount(disk: Arc<spin::Mutex<dyn BlockDevice>>, name: &str) -> Option<Prob
             })
         }
         Err(()) => None,
+    }
+}
+
+/// Mount a removable block device under `/mnt/<prefix>N`, using the same
+/// filesystem probing as the rest of the system. The caller only supplies a
+/// namespace prefix; filesystem type selection stays here in `try_mount()`.
+pub fn mount_removable(
+    disk: Arc<spin::Mutex<dyn BlockDevice>>,
+    prefix: &str,
+) -> Option<String> {
+    let mut index = 0usize;
+    loop {
+        let mount_point = format!("/mnt/{}{}", prefix, index);
+        if !VFS.get().is_mounted_at(&mount_point) {
+            let name = format!("{}{}", prefix, index);
+            let probed = try_mount(disk, &name)?;
+            println!(
+                "[VFS] mount {} ({}) at {}",
+                name, probed.kind, mount_point
+            );
+            VFS.get().mount(&mount_point, probed.fs);
+            return Some(mount_point);
+        }
+        index = index.saturating_add(1);
     }
 }
 

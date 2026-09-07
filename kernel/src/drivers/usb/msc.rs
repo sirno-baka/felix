@@ -1,10 +1,12 @@
 //! USB Mass Storage — Bulk-Only Transport + SCSI (flash drives).
 
 use super::desc::{self, Interface};
+use super::driver::UsbMatch;
 use super::ohci::{self, Ohci};
 use crate::disk::interface::BlockDevice;
 use crate::println;
 use crate::sync::mutex::Mutex;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -13,12 +15,36 @@ const CSW_SIG: u32 = 0x5342_5355;
 
 static DEVICES: Mutex<Vec<UsbMsc>> = Mutex::new(Vec::new());
 
+pub static DRIVER: super::driver::UsbDriver = super::driver::UsbDriver {
+    name: "usb-storage",
+    matches: &[
+        UsbMatch::InterfaceClass {
+            class: desc::CLASS_MSC,
+            subclass: None,
+            protocol: Some(PROTO_BBB),
+        },
+        UsbMatch::InterfaceClass {
+            class: desc::CLASS_MSC,
+            subclass: None,
+            protocol: Some(PROTO_CBI),
+        },
+        UsbMatch::InterfaceClass {
+            class: desc::CLASS_MSC,
+            subclass: None,
+            protocol: Some(PROTO_CB),
+        },
+    ],
+    probe: probe,
+    disconnect: disconnect,
+};
+
 const PROTO_CBI: u8 = 0x00;
 const PROTO_CB: u8 = 0x01;
 const PROTO_BBB: u8 = 0x50;
 
 #[derive(Clone)]
 pub struct UsbMsc {
+    hc: Ohci,
     mmio: usize,
     addr: u8,
     ep_out: u8,
@@ -29,6 +55,7 @@ pub struct UsbMsc {
     mps: u16,
     pub block_size: u32,
     pub blocks: u32,
+    mount_point: Option<String>,
 }
 
 impl UsbMsc {
@@ -116,16 +143,9 @@ impl BlockDevice for UsbMsc {
         cdb[0] = 0x28;
         cdb[2..6].copy_from_slice(&lba.to_be_bytes());
         cdb[8] = numsects;
-        let hc = {
-            let g = ohci::CONTROLLERS.lock();
-            g.iter()
-                .find(|h| h.mmio == self.mmio)
-                .map(|h| h as *const Ohci)
-                .ok_or(1u8)?
-        };
         unsafe {
             let data = core::slice::from_raw_parts_mut(dest, bytes);
-            self.bot(&*hc, &cdb, data, true).map_err(|_| 2u8)?;
+            self.bot(&self.hc, &cdb, data, true).map_err(|_| 2u8)?;
         }
         Ok(())
     }
@@ -141,14 +161,7 @@ impl BlockDevice for UsbMsc {
         cdb[0] = 0x2A;
         cdb[2..6].copy_from_slice(&lba.to_be_bytes());
         cdb[8] = numsects;
-        let hc = {
-            let g = ohci::CONTROLLERS.lock();
-            g.iter()
-                .find(|h| h.mmio == self.mmio)
-                .map(|h| h as *const Ohci)
-                .ok_or(1u8)?
-        };
-        unsafe { self.bot(&*hc, &cdb, &mut tmp[..bytes], false).map_err(|_| 2u8) }
+        self.bot(&self.hc, &cdb, &mut tmp[..bytes], false).map_err(|_| 2u8)
     }
 
     fn sector_size(&self) -> u32 {
@@ -202,6 +215,7 @@ pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {
     );
 
     let mut dev = UsbMsc {
+        hc: *hc,
         mmio: hc.mmio,
         addr,
         ep_out,
@@ -212,6 +226,7 @@ pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {
         mps,
         block_size: 512,
         blocks: 0,
+        mount_point: None,
     };
     match dev.inquiry(hc) {
         Ok(inq) => {
@@ -230,6 +245,54 @@ pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {
         Err(e) => println!("[usb-msc] READ_CAPACITY: {}", e),
     }
     DEVICES.lock().push(dev);
+}
+
+fn probe(hc: &Ohci, addr: u8, _device: &crate::drivers::usb::device::UsbDevice, iface: Option<&Interface>) -> Result<(), &'static str> {
+    let Some(iface) = iface else { return Err("MSC: no interface"); };
+    bind(hc, addr, iface);
+
+    let dev = DEVICES
+        .lock()
+        .iter()
+        .position(|d| d.mmio == hc.mmio && d.addr == addr && d.iface == iface.number)
+        .ok_or("MSC: probe failed")?;
+
+    let mount_point = {
+        let device = DEVICES.lock()[dev].clone();
+        if device.blocks == 0 {
+            println!("[usb-msc] no media, skip mount");
+            None
+        } else {
+            use alloc::sync::Arc;
+            use crate::filesystem::init::mount_removable;
+            use crate::spin;
+
+            let arc: Arc<spin::Mutex<dyn BlockDevice>> =
+                Arc::new(spin::Mutex::new(device));
+            mount_removable(arc, "usb")
+        }
+    };
+
+    if let Some(path) = mount_point {
+        DEVICES.lock()[dev].mount_point = Some(path);
+    }
+    Ok(())
+}
+
+fn disconnect(hc: &Ohci, addr: u8, iface: u8) {
+    let mount_point = {
+        let mut devices = DEVICES.lock();
+        let pos = devices
+            .iter()
+            .position(|d| d.mmio == hc.mmio && d.addr == addr && d.iface == iface);
+        pos.and_then(|i| devices.remove(i).mount_point)
+    };
+
+    if let Some(path) = mount_point {
+        use crate::filesystem::vfs::VFS;
+        VFS.get().unmount(&path);
+    }
+    println!("[usb-msc] disconnect addr={} iface={}", addr, iface);
 }
 
 pub fn devices() -> usize {

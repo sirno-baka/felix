@@ -48,7 +48,7 @@ endif
 .PHONY: build
 build:
 	@export RUSTFLAGS='--cfg getrandom_backend=\"custom\"'
-	@export RUSTFLAGS=-Awarningsls
+	@export RUSTFLAGS="-Awarnings"
 
 	@echo "Building Felix..."
 	@echo "  native apps: $(NATIVE_APPS)"

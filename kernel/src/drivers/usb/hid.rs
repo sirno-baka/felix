@@ -1,6 +1,7 @@
 //! HID class — boot keyboard and boot mouse (USB 1.1).
 
 use super::desc::{self, Interface};
+use super::driver::UsbMatch;
 use super::ohci::Ohci;
 use crate::println;
 
@@ -8,6 +9,24 @@ const SET_IDLE: u8 = 0x0A;
 const SET_PROTOCOL: u8 = 0x0B;
 const GET_REPORT: u8 = 0x01;
 const PROTOCOL_BOOT: u16 = 0;
+
+pub static DRIVER: super::driver::UsbDriver = super::driver::UsbDriver {
+    name: "usbhid",
+    matches: &[
+        UsbMatch::InterfaceClass {
+            class: desc::CLASS_HID,
+            subclass: Some(desc::HID_BOOT),
+            protocol: Some(desc::HID_BOOT_KEYBOARD),
+        },
+        UsbMatch::InterfaceClass {
+            class: desc::CLASS_HID,
+            subclass: Some(desc::HID_BOOT),
+            protocol: Some(desc::HID_BOOT_MOUSE),
+        },
+    ],
+    probe,
+    disconnect,
+};
 
 pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {
     match iface.protocol {
@@ -39,6 +58,14 @@ fn boot_setup(hc: &Ohci, addr: u8, iface: u8) {
     let _ = hc.control(addr, &desc::setup(0x21, SET_PROTOCOL, PROTOCOL_BOOT, iface as u16, 0), &mut empty, false);
     let _ = hc.control(addr, &desc::setup(0x21, SET_IDLE, 0, iface as u16, 0), &mut empty, false);
 }
+
+fn probe(hc: &Ohci, addr: u8, _device: &crate::drivers::usb::device::UsbDevice, iface: Option<&Interface>) -> Result<(), &'static str> {
+    let Some(iface) = iface else { return Err("HID: no interface"); };
+    bind(hc, addr, iface);
+    Ok(())
+}
+
+fn disconnect(_hc: &Ohci, _addr: u8, _iface: u8) {}
 
 fn get_report(hc: &Ohci, addr: u8, iface: u8, buf: &mut [u8]) -> Result<usize, &'static str> {
     let setup = desc::setup(0xA1, GET_REPORT, 0x0100, iface as u16, buf.len() as u16);

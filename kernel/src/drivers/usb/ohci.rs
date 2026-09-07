@@ -17,6 +17,7 @@ use core::arch::naked_asm;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 // ——— PCI ———
 const PROG_IF_OHCI: u8 = 0x10;
@@ -270,6 +271,7 @@ fn spin_ms(ms: u32) {
     }
 }
 
+#[derive(Copy, Clone)]
 pub struct Ohci {
     pub(crate) mmio: usize,
     irq: u8,
@@ -287,6 +289,11 @@ unsafe impl Sync for Ohci {}
 
 pub(crate) static CONTROLLERS: Mutex<Vec<Ohci>> = Mutex::new(Vec::new());
 static MMIO_SLOT: Mutex<u32> = Mutex::new(0);
+
+// IRQ context only sets bits; enumeration and driver callbacks happen from
+// poll_hotplug() outside the interrupt handler.
+static HOTPLUG_PENDING: AtomicU32 = AtomicU32::new(0);
+static KNOWN_MMIO: AtomicU32 = AtomicU32::new(0);
 
 impl Ohci {
     fn r32(&self, off: usize) -> u32 {
@@ -883,26 +890,59 @@ impl Ohci {
     /// Reset every connected port and bind a class driver.
     pub fn enumerate_ports(&self) {
         for p in 0..self.nports {
-            println!("[ohci] stage=port{}-reset-start", p + 1);
-            match self.reset_port(p) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(e) => {
-                    println!("[ohci] port {} reset: {}", p + 1, e);
-                    continue;
-                }
+            self.enumerate_port(p);
+        }
+    }
+
+    /// Enumerate one root-hub port. This is intentionally outside IRQ context.
+    pub fn enumerate_port(&self, port: u8) {
+        println!("[ohci] stage=port{}-reset-start", port + 1);
+        match self.reset_port(port) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                println!("[ohci] port {} reset: {}", port + 1, e);
+                return;
             }
-            println!("[ohci] stage=port{}-reset-done", p + 1);
-            let ls = self.port_low_speed(p);
-            match self.address_and_bind(ls) {
-                Ok(addr) => println!("[ohci] port {} addr={}{}", p + 1, addr, if ls { " LS" } else { " FS" }),
-                Err(e) => println!("[ohci] port {}: {}", p + 1, e),
+        }
+        println!("[ohci] stage=port{}-reset-done", port + 1);
+        let ls = self.port_low_speed(port);
+        match self.address_and_bind_on_port(port, ls) {
+            Ok(addr) => println!("[ohci] port {} addr={}{}", port + 1, addr, if ls { " LS" } else { " FS" }),
+            Err(e) => println!("[ohci] port {}: {}", port + 1, e),
+        }
+    }
+
+    /// Scan root-hub connection state after an RHSC interrupt.
+    pub fn poll_root_hub(&self) {
+        for p in 0..self.nports {
+            let status = self.port_status(p);
+            let connected = status & PS_CCS != 0;
+            let known = crate::drivers::usb::device::find(self.mmio, p).is_some();
+
+            if connected && !known {
+                println!("[ohci] hotplug: port {} connected", p + 1);
+                self.enumerate_port(p);
+            } else if !connected && known {
+                println!("[ohci] hotplug: port {} disconnected", p + 1);
+                crate::drivers::usb::device::disconnect_port(self, p);
+            }
+
+            // RHSC is level-triggered by port-change bits. Acknowledge all
+            // change bits after sampling CCS so the next physical transition
+            // can raise RHSC again.
+            if status & 0xFFFF_0000 != 0 {
+                self.write_port(p, status & 0xFFFF_0000);
             }
         }
     }
 
     /// Default-state device on the wire → SET_ADDRESS → class bind.
     pub fn address_and_bind(&self, ls: bool) -> Result<u8, &'static str> {
+        self.address_and_bind_on_port(0xFF, ls)
+    }
+
+    fn address_and_bind_on_port(&self, port: u8, ls: bool) -> Result<u8, &'static str> {
         let mps8 = if ls { 8 } else { 8 };
         let mut hdr = [0u8; 8];
         self.control_ex(0, &[0x80, 6, 0x00, 0x01, 0, 0, 8, 0], &mut hdr, true, mps8, ls)?;
@@ -923,7 +963,7 @@ impl Ohci {
         let mut empty: [u8; 0] = [];
         self.control_ex(0, &[0x00, 5, addr, 0, 0, 0, 0, 0], &mut empty, false, mps, ls)?;
         spin_ms(2);
-        crate::drivers::usb::device::bind(self, addr, &desc);
+        crate::drivers::usb::device::bind_with_port(self, port, addr, &desc);
         Ok(addr)
     }
 }
@@ -934,14 +974,54 @@ fn silence_mmio(mmio: usize) {
         if st != 0 {
             write_volatile((mmio + HC_INTSTATUS) as *mut u32, st);
         }
-        write_volatile((mmio + HC_INTDIS) as *mut u32, 0x8000_003F);
     }
 }
 
 extern "C" fn irq9_ack() {
-    silence_mmio(OHCI_MMIO_BASE as usize);
-    silence_mmio((OHCI_MMIO_BASE + OHCI_MMIO_STRIDE) as usize);
+    let mask = KNOWN_MMIO.load(Ordering::Relaxed);
+    for slot in 0..32u32 {
+        if mask & (1 << slot) == 0 {
+            continue;
+        }
+        let mmio = (OHCI_MMIO_BASE + slot * OHCI_MMIO_STRIDE) as usize;
+        unsafe {
+            let st = read_volatile((mmio + HC_INTSTATUS) as *const u32);
+            if st == 0 {
+                continue;
+            }
+            if st & INTR_RHSC != 0 {
+                HOTPLUG_PENDING.fetch_or(1 << slot, Ordering::Release);
+            }
+            // Acknowledge only the bits that actually fired. Do not disable
+            // RHSC here: otherwise the first hotplug event would be the last.
+            write_volatile((mmio + HC_INTSTATUS) as *mut u32, st);
+        }
+    }
     PICS.end_interrupt(32 + 9);
+}
+
+pub fn poll_hotplug() {
+    let pending = HOTPLUG_PENDING.swap(0, Ordering::Acquire);
+    if pending == 0 {
+        return;
+    }
+
+    let mmios: Vec<usize> = {
+        let controllers = CONTROLLERS.lock();
+        controllers.iter().map(|hc| hc.mmio).collect()
+    };
+    for mmio in mmios {
+        let slot = ((mmio as u32).saturating_sub(OHCI_MMIO_BASE) / OHCI_MMIO_STRIDE) as u32;
+        if slot < 32 && pending & (1 << slot) != 0 {
+            let controller = {
+                let controllers = CONTROLLERS.lock();
+                controllers.iter().find(|hc| hc.mmio == mmio).copied()
+            };
+            if let Some(hc) = controller {
+                hc.poll_root_hub();
+            }
+        }
+    }
 }
 
 #[unsafe(naked)]
@@ -981,14 +1061,22 @@ pub fn init_all() {
                     continue;
                 }
                 println!("[ohci] pci {:02x}:{:02x}.{} start-done", dev.bus, dev.device, dev.function);
+                let mmio_slot = ((hc.mmio as u32).saturating_sub(OHCI_MMIO_BASE) / OHCI_MMIO_STRIDE) as u32;
+                hc.w32(HC_INTSTATUS, 0x8000_003F);
+                hc.w32(HC_INTEN, INTR_RHSC | INTR_MIE);
+                KNOWN_MMIO.fetch_or(1 << mmio_slot, Ordering::Release);
+                let mmio = hc.mmio;
                 CONTROLLERS.lock().push(hc);
-                let idx = CONTROLLERS.lock().len() - 1;
                 println!("[ohci] pci {:02x}:{:02x}.{} enumerate", dev.bus, dev.device, dev.function);
-                if let Some(hc) = CONTROLLERS.lock().get(idx) {
+                let controller = {
+                    let controllers = CONTROLLERS.lock();
+                    controllers.iter().find(|hc| hc.mmio == mmio).copied()
+                };
+                if let Some(hc) = controller {
                     hc.enumerate_ports();
                 }
                 println!("[ohci] pci {:02x}:{:02x}.{} enumerate-done", dev.bus, dev.device, dev.function);
-                silence_mmio(CONTROLLERS.lock().last().map(|h| h.mmio).unwrap_or(0));
+                silence_mmio(mmio);
                 n += 1;
             }
             Err(e) => println!("[ohci] probe {:02x}:{:02x}.{}: {}", dev.bus, dev.device, dev.function, e),

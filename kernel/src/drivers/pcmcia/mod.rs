@@ -7,6 +7,7 @@
 mod ata;
 mod cis;
 mod controller;
+mod driver;
 mod pc16;
 
 pub use ata::{AtaPio, IdentifyData};
@@ -21,6 +22,15 @@ pub const CF_MEM_SIZE: u32 = 0x1000;
 
 static mut SOCKET: Option<alloc::boxed::Box<dyn controller::SocketController>> = None;
 static mut CARD_COR: Option<(u32, u8)> = None;
+
+/// Card currently owned by the PCMCIA core. Keeping the selected driver and
+/// CIS identity here makes insert/remove symmetric and avoids probing a new
+/// card on removal just to discover what used to be attached.
+static ACTIVE_CARD: Mutex<Option<(CardInfo, &'static str)>> = Mutex::new(None);
+
+pub fn active_card() -> Option<CardInfo> {
+    ACTIVE_CARD.lock().as_ref().map(|(info, _)| *info)
+}
 
 pub(crate) fn store_card_cor(base: u32, index: u8) {
     unsafe { CARD_COR = Some((base, index)); }
@@ -60,6 +70,7 @@ pub fn rearm_io() {
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use crate::drivers::pic::PICS;
+use crate::sync::mutex::Mutex;
 use crate::interrupts::idt::IDT;
 
 static IRQ_LINE: AtomicU8 = AtomicU8::new(0xFF);
@@ -161,12 +172,14 @@ pub fn poll_hotplug() {
             crate::println!("[PCMCIA] card removed");
             CARD_LIVE.store(false, Ordering::Relaxed);
             c.enable_csc(irq);
-            crate::filesystem::init::pcmcia_hotplug(false);
+            disconnect_card(c.as_ref());
         } else if present && !live {
             crate::println!("[PCMCIA] card inserted");
-            CARD_LIVE.store(true, Ordering::Relaxed);
             c.enable_csc(irq);
-            crate::filesystem::init::pcmcia_hotplug(true);
+            if let Some(device) = bind_card() {
+                CARD_LIVE.store(true, Ordering::Relaxed);
+                crate::filesystem::init::pcmcia_hotplug_device(device);
+            }
         }
     }
 }
@@ -365,26 +378,13 @@ fn init_fixed_disk(controller: &dyn controller::SocketController, info: CardInfo
     Some(PcmciaDevice::CompactFlash(CompactFlash { ata, identify }))
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum ControllerKind {
-    RicohR5c475,
-}
-
-impl ControllerKind {
-    fn name(self) -> &'static str {
-        match self {
-            Self::RicohR5c475 => "Ricoh R5C475/R5C475II",
-        }
-    }
-}
-
 fn attach_controller(
     dev: crate::pci::device::PciDevice,
 ) -> Option<alloc::boxed::Box<dyn controller::SocketController>> {
-    if controller::matches(&dev) {
-        return controller::attach(dev);
-    }
-    None
+    driver::controllers()
+        .iter()
+        .find(|d| (d.matches)(&dev))
+        .and_then(|d| (d.attach)(dev))
 }
 
 fn find_controller() -> Option<alloc::boxed::Box<dyn controller::SocketController>> {
@@ -445,13 +445,36 @@ pub fn init() -> Option<PcmciaDevice> {
 }
 
 fn bind_by_cis(controller: &dyn controller::SocketController, info: CardInfo) -> Option<PcmciaDevice> {
-    match info.card_type {
-        CardType::FixedDisk => init_fixed_disk(controller, info),
-        _ => {
-            crate::println!("[PCMCIA] no card driver for type {:?}", info.card_type);
-            Some(PcmciaDevice::Unsupported(info))
+    for driver in driver::card_drivers().iter() {
+        if !(driver.matches)(&info) {
+            continue;
         }
+        crate::println!("[PCMCIA] matched card driver: {}", driver.name);
+        let device = (driver.probe)(controller, info)?;
+        *ACTIVE_CARD.lock() = Some((info, driver.name));
+        return Some(device);
     }
+
+    crate::println!("[PCMCIA] no card driver for type {:?}", info.card_type);
+    Some(PcmciaDevice::Unsupported(info))
+}
+
+fn disconnect_card(controller: &dyn controller::SocketController) {
+    let active = ACTIVE_CARD.lock().take();
+    let Some((info, driver_name)) = active else {
+        crate::println!("[PCMCIA] remove with no active card");
+        return;
+    };
+
+    if let Some(driver) = driver::card_drivers()
+        .iter()
+        .find(|d| d.name == driver_name)
+    {
+        crate::println!("[PCMCIA] disconnect card driver: {}", driver.name);
+        (driver.disconnect)(controller, info);
+    }
+
+    crate::filesystem::init::pcmcia_hotplug(false);
 }
 
 /// Re-probe CIS and pick a card driver. Socket must already be up.

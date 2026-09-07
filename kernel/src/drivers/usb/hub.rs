@@ -1,8 +1,27 @@
 //! USB hub class (root hubs are handled inside OHCI; this is for external hubs).
 
 use super::desc;
+use super::driver::UsbMatch;
 use super::ohci::Ohci;
 use crate::println;
+
+pub static DRIVER: super::driver::UsbDriver = super::driver::UsbDriver {
+    name: "hub",
+    matches: &[
+        UsbMatch::DeviceClass {
+            class: desc::CLASS_HUB,
+            subclass: None,
+            protocol: None,
+        },
+        UsbMatch::InterfaceClass {
+            class: desc::CLASS_HUB,
+            subclass: None,
+            protocol: None,
+        },
+    ],
+    probe,
+    disconnect,
+};
 
 pub fn bind(hc: &Ohci, addr: u8) {
     let setup = desc::setup(0xA0, 6, (desc::DT_HUB as u16) << 8, 0, 9);
@@ -16,6 +35,13 @@ pub fn bind(hc: &Ohci, addr: u8) {
         Err(e) => println!("[usb-hub] GET_HUB_DESCRIPTOR: {}", e),
     }
 }
+
+fn probe(hc: &Ohci, addr: u8, _device: &crate::drivers::usb::device::UsbDevice, _iface: Option<&super::desc::Interface>) -> Result<(), &'static str> {
+    bind(hc, addr);
+    Ok(())
+}
+
+fn disconnect(_hc: &Ohci, _addr: u8, _iface: u8) {}
 
 const GET_STATUS: u8 = 0;
 const SET_FEATURE: u8 = 3;

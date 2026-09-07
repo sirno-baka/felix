@@ -490,13 +490,10 @@ impl TaskManager {
 }
 
 fn idle() {
-    let mut a = 0;
     loop {
-        a += 1;
-        for _ in 0..1000000000 {}
-        if a % 10000000 == 0 {
-            a += 1;
-        }
+        // USB RHSC IRQs only enqueue an atomic event. Enumeration and driver
+        // probe/disconnect are intentionally performed here, outside IRQ context.
+        crate::drivers::usb::poll_events();
         unsafe {
             asm!("hlt");
         }
