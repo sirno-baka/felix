@@ -77,5 +77,4 @@ pub fn init_net() {
     }
 
     ifconfig_dhcp();
-    crate::drivers::usb::init();
 }

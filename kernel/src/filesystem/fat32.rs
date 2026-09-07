@@ -124,6 +124,10 @@ pub struct FatDisk {
     start_lba: u64,
     pos: u64,
     size: u64,
+    // FAT performs many small reads from the same 512-byte sector.
+    // Keep the last sector here so those reads do not hit USB repeatedly.
+    cached_lba: Option<u32>,
+    cached_sector: [u8; 512],
 }
 
 impl FatDisk {
@@ -133,6 +137,8 @@ impl FatDisk {
             start_lba,
             pos: 0,
             size: size_bytes,
+            cached_lba: None,
+            cached_sector: [0u8; 512],
         }
     }
 
@@ -156,17 +162,18 @@ impl Read for FatDisk {
         }
 
         let mut done = 0usize;
-        let mut sector = [0u8; 512];
 
         while done < buf.len() {
             if self.size != 0 && self.pos + done as u64 >= self.size {
                 break;
             }
             let (lba, off) = self.abs_lba(self.pos + done as u64);
-            {
+            // println!("[FAT] read pos={} len={} -> LBA={} off={}", self.pos + done as u64, buf.len(), lba, off);
+            if self.cached_lba != Some(lba) {
                 let disk = self.disk.lock();
-                disk.read_sectors(1, lba, sector.as_mut_ptr() as u32)
+                disk.read_sectors(1, lba, self.cached_sector.as_mut_ptr() as u32)
                     .map_err(|_| ())?;
+                self.cached_lba = Some(lba);
             }
             let room = 512 - off;
             let mut n = cmp::min(room, buf.len() - done);
@@ -174,7 +181,7 @@ impl Read for FatDisk {
                 let left = (self.size - self.pos - done as u64) as usize;
                 n = cmp::min(n, left);
             }
-            buf[done..done + n].copy_from_slice(&sector[off..off + n]);
+            buf[done..done + n].copy_from_slice(&self.cached_sector[off..off + n]);
             done += n;
         }
 
@@ -190,24 +197,30 @@ impl Write for FatDisk {
         }
 
         let mut done = 0usize;
-        let mut sector = [0u8; 512];
 
         while done < buf.len() {
             let (lba, off) = self.abs_lba(self.pos + done as u64);
+            let mut sector = [0u8; 512];
             let room = 512 - off;
             let n = cmp::min(room, buf.len() - done);
 
             {
                 let mut disk = self.disk.lock();
                 if off != 0 || n != 512 {
-                    disk.read_sectors(1, lba, sector.as_mut_ptr() as u32)
-                        .map_err(|_| ())?;
+                    if self.cached_lba == Some(lba) {
+                        sector.copy_from_slice(&self.cached_sector);
+                    } else {
+                        disk.read_sectors(1, lba, sector.as_mut_ptr() as u32)
+                            .map_err(|_| ())?;
+                    }
                 }
                 sector[off..off + n].copy_from_slice(&buf[done..done + n]);
                 disk.write_sectors(1, lba, sector.as_ptr() as u32)
                     .map_err(|_| ())?;
             }
 
+            self.cached_sector.copy_from_slice(&sector);
+            self.cached_lba = Some(lba);
             done += n;
         }
 

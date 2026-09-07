@@ -9,8 +9,11 @@ use crate::memory::paging::{KERNEL_OFFSET, PAGING, PTEFlags};
 use crate::pci::class::{class, subclass};
 use crate::pci::device::PciDevice;
 use crate::pci::{self};
+use crate::drivers::pic::PICS;
+use crate::interrupts::idt::IDT;
 use crate::println;
 use crate::sync::mutex::Mutex;
+use core::arch::naked_asm;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
@@ -38,6 +41,7 @@ const HC_BULKHEADED: usize = 0x28;
 const HC_BULKCURRENTED: usize = 0x2C;
 const HC_DONEHEAD: usize = 0x30;
 const HC_FMINTERVAL: usize = 0x34;
+const HC_FMREMAINING: usize = 0x38;
 const HC_PERIODICSTART: usize = 0x40;
 const HC_RHDESCA: usize = 0x48;
 const HC_RHSTATUS: usize = 0x50;
@@ -88,6 +92,57 @@ const TD_DI_NONE: u32 = 7 << 21;
 const TD_R: u32 = 1 << 18;
 
 const ED_SKIP: u32 = 1 << 14;
+const ED_LOWSPEED: u32 = 1 << 13;
+
+fn ed_flags(addr: u8, ep: u8, mps: u16, ls: bool) -> u32 {
+    (addr as u32)
+        | ((ep as u32) << 7)
+        | ((mps as u32) << 16)
+        | if ls { ED_LOWSPEED } else { 0 }
+}
+
+fn td_toggle(data1: bool) -> u32 {
+    if data1 { TD_T_DATA1 } else { TD_T_DATA0 }
+}
+
+/// DATA0/1 per (addr, ep). Bulk/interrupt only — control toggle is fixed by spec.
+static TOGGLE: Mutex<[u8; 128]> = Mutex::new([0; 128]);
+
+fn toggle_of(addr: u8, ep: u8) -> bool {
+    let i = ((addr as usize) & 0x7F);
+    TOGGLE.lock()[i] & (1 << (ep & 7)) != 0
+}
+
+fn set_toggle(addr: u8, ep: u8, data1: bool) {
+    let i = ((addr as usize) & 0x7F);
+    let bit = 1u8 << (ep & 7);
+    let mut g = TOGGLE.lock();
+    if data1 {
+        g[i] |= bit;
+    } else {
+        g[i] &= !bit;
+    }
+}
+
+static NEXT_ADDR: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+
+pub fn alloc_addr() -> u8 {
+    NEXT_ADDR.fetch_add(1, core::sync::atomic::Ordering::Relaxed).max(1)
+}
+
+static EP0_MPS: Mutex<[u16; 128]> = Mutex::new([8; 128]);
+static EP0_LS: Mutex<[u8; 128]> = Mutex::new([0; 128]);
+
+fn ep0_mps(addr: u8) -> u16 {
+    EP0_MPS.lock()[addr as usize].max(8)
+}
+fn ep0_ls(addr: u8) -> bool {
+    EP0_LS.lock()[addr as usize] != 0
+}
+fn set_ep0(addr: u8, mps: u16, ls: bool) {
+    EP0_MPS.lock()[addr as usize] = mps.max(8);
+    EP0_LS.lock()[addr as usize] = if ls { 1 } else { 0 };
+}
 
 #[repr(C, align(256))]
 struct Hcca {
@@ -131,6 +186,82 @@ fn virt_to_phys(ptr: *const u8) -> u32 {
     }
 }
 
+/// HCCA must be 256-aligned; ED/TD 16-aligned. Heap Box does not guarantee that.
+#[repr(C, align(4096))]
+struct DmaPage {
+    hcca: Hcca,
+    ed: Ed,
+    dummy: Td,
+    setup_td: Td,
+    data_td: Td,
+    status_td: Td,
+    setup: [u8; 8],
+    data: [u8; 512],
+}
+
+const fn empty_td() -> Td {
+    Td { flags: 0, cbp: 0, next_td: 0, be: 0 }
+}
+const fn empty_ed() -> Ed {
+    Ed { flags: 0, tail_td: 0, head_td: 0, next_ed: 0 }
+}
+const fn empty_hcca() -> Hcca {
+    Hcca {
+        int_table: [0; 32],
+        frame_number: 0,
+        pad: 0,
+        done_head: 0,
+        reserved: [0; 120],
+    }
+}
+
+static DMA: Mutex<[DmaPage; 2]> = Mutex::new([
+    DmaPage {
+        hcca: empty_hcca(),
+        ed: empty_ed(),
+        dummy: empty_td(),
+        setup_td: empty_td(),
+        data_td: empty_td(),
+        status_td: empty_td(),
+        setup: [0; 8],
+        data: [0; 512],
+    },
+    DmaPage {
+        hcca: empty_hcca(),
+        ed: empty_ed(),
+        dummy: empty_td(),
+        setup_td: empty_td(),
+        data_td: empty_td(),
+        status_td: empty_td(),
+        setup: [0; 8],
+        data: [0; 512],
+    },
+]);
+static DMA_SLOT: Mutex<usize> = Mutex::new(0);
+
+/// Persistent bulk endpoint state. OHCI expects bulk EDs to remain scheduled;
+/// individual TDs are queued behind the endpoint's dummy tail.
+struct BulkEp {
+    mmio: usize,
+    addr: u8,
+    ep: u8,
+    mps: u16,
+    ed: *mut Ed,
+    ed_phys: u32,
+    dummy: *mut Td,
+    dummy_phys: u32,
+    next_data1: bool,
+}
+
+unsafe impl Send for BulkEp {}
+unsafe impl Sync for BulkEp {}
+
+static BULK_EPS: Mutex<Vec<BulkEp>> = Mutex::new(Vec::new());
+
+const FI_DEFAULT: u32 = 0x2EDF;
+const FSMPS_DEFAULT: u32 = 0x2778;
+const PERIODIC_START: u32 = 0x2A2F;
+
 fn spin_ms(ms: u32) {
     for _ in 0..ms {
         for _ in 0..30_000 {
@@ -146,6 +277,7 @@ pub struct Ohci {
     device: u16,
     skip_fminterval: bool,
     nports: u8,
+    port_ls: u16,
     hcca: *mut Hcca,
     hcca_phys: u32,
 }
@@ -198,14 +330,17 @@ impl Ohci {
 
         let skip_fminterval = dev.vendor_id == ALI_VENDOR && dev.device_id == ALI_M5237;
 
-        let hcca = Box::leak(Box::new(Hcca {
-            int_table: [0; 32],
-            frame_number: 0,
-            pad: 0,
-            done_head: 0,
-            reserved: [0; 120],
-        }));
-        let hcca_phys = virt_to_phys(hcca as *mut Hcca as *const u8);
+        let hcca = {
+            let mut slot = DMA_SLOT.lock();
+            let i = *slot;
+            *slot = i + 1;
+            drop(slot);
+            let g = DMA.lock();
+            let i = i.min(1);
+            &g[i].hcca as *const Hcca as *mut Hcca
+        };
+        let hcca_phys = virt_to_phys(hcca as *const u8);
+        println!("[ohci] HCCA virt={:p} phys=0x{:08x}", hcca, hcca_phys);
 
         Ok(Self {
             mmio,
@@ -214,6 +349,7 @@ impl Ohci {
             device: dev.device_id,
             skip_fminterval,
             nports: 0,
+            port_ls: 0,
             hcca,
             hcca_phys,
         })
@@ -236,8 +372,10 @@ impl Ohci {
             }
         );
 
+        println!("[ohci] stage=control-read");
         // Drop SMM ownership (IR) if the BIOS left the controller in IRQ routing mode.
         let mut ctrl = self.r32(HC_CONTROL);
+        println!("[ohci] stage=control-read-done ctrl={:08x}", ctrl);
         if ctrl & CTRL_IR != 0 {
             self.w32(HC_CONTROL, ctrl | CTRL_RWC);
             spin_ms(10);
@@ -245,10 +383,22 @@ impl Ohci {
             self.w32(HC_CONTROL, ctrl & !CTRL_IR);
         }
 
+        println!("[ohci] stage=interrupt-clear");
         self.w32(HC_INTDIS, 0x8000_003F);
         self.w32(HC_INTSTATUS, 0x8000_003F);
+        println!("[ohci] stage=interrupt-clear-done");
 
-        self.w32(HC_CMDSTATUS, CMD_HCR);
+        println!("[ohci] stage=hcfs-read");
+        let already_op = (self.r32(HC_CONTROL) & CTRL_HCFS_MASK) == CTRL_HCFS_OPERATIONAL;
+        println!("[ohci] stage=hcfs-read-done already_op={}", already_op);
+        if already_op {
+            println!("[ohci] already operational, skip HCR");
+        } else {
+        if self.skip_fminterval {
+            println!("[ohci] ALi: skip HCR");
+            } else {
+            println!("[ohci] stage=hcr-write");
+            self.w32(HC_CMDSTATUS, CMD_HCR);
         for _ in 0..1000 {
             if self.r32(HC_CMDSTATUS) & CMD_HCR == 0 {
                 break;
@@ -258,31 +408,53 @@ impl Ohci {
         if self.r32(HC_CMDSTATUS) & CMD_HCR != 0 {
             return Err("OHCI: HCR stuck");
         }
+        println!("[ohci] stage=hcr-done");
+            } // ALi skip HCR
+        } // HCR
 
-        if !self.skip_fminterval {
-            // Default interval 0x2EDF, FSMPS in the upper half; periodic start ~90%.
+        // Linux: 10b9:5237 hard-locks the southbridge on any FmInterval access.
+        if !self.skip_fminterval && !already_op {
+            println!("[ohci] stage=fminterval-read");
             let fi = self.r32(HC_FMINTERVAL);
-            self.w32(HC_FMINTERVAL, fi);
-            self.w32(HC_PERIODICSTART, 0x2A2F);
+            println!("[ohci] stage=fminterval-read-done fi={:08x}", fi);
+            let mut interval = fi & 0x3FFF;
+            let mut fsmps = (fi >> 16) & 0x7FFF;
+            if interval < 0x1000 {
+                interval = FI_DEFAULT;
+            }
+            if fsmps < 0x1000 {
+                fsmps = FSMPS_DEFAULT;
+            }
+            println!("[ohci] stage=fminterval-write");
+            self.w32(HC_FMINTERVAL, interval | (fsmps << 16) | (1 << 31));
+            println!("[ohci] stage=periodicstart-write");
+            self.w32(HC_PERIODICSTART, PERIODIC_START);
+            println!("[ohci] stage=fminterval-config-done");
         }
 
+        println!("[ohci] stage=hcca-write");
         self.w32(HC_HCCA, self.hcca_phys);
         self.w32(HC_CONTROLHEADED, 0);
         self.w32(HC_CONTROLCURRENTED, 0);
         self.w32(HC_BULKHEADED, 0);
         self.w32(HC_BULKCURRENTED, 0);
 
-        // USBOPERATIONAL + control + bulk lists.
+        // USBOPERATIONAL + control + bulk + periodic.
+        println!("[ohci] stage=operational-write");
         self.w32(
             HC_CONTROL,
             CTRL_HCFS_OPERATIONAL | CTRL_CLE | CTRL_BLE | CTRL_RWC,
         );
         spin_ms(10);
+        println!("[ohci] stage=operational-done ctrl={:08x}", self.r32(HC_CONTROL));
 
         // Global power on root-hub ports.
+        println!("[ohci] stage=root-power-write");
         self.w32(HC_RHSTATUS, RHS_LPSC);
         spin_ms(20);
+        println!("[ohci] stage=root-power-done");
 
+        println!("[ohci] stage=port-count-read");
         let desca = self.r32(HC_RHDESCA);
         self.nports = (desca & 0xFF) as u8;
         if self.nports == 0 || self.nports > 15 {
@@ -290,9 +462,13 @@ impl Ohci {
         }
         println!("[ohci] ports={}", self.nports);
 
-        // Acknowledge leftover port-change bits.
+        // Power + ack leftover port-change bits.
         for p in 0..self.nports {
+            println!("[ohci] stage=port{}-power-write", p + 1);
+            self.write_port(p, PS_PPS);
+            println!("[ohci] stage=port{}-status-read", p + 1);
             let s = self.port_status(p);
+            println!("[ohci] stage=port{}-status-read-done status={:08x}", p + 1, s);
             self.write_port(p, s & 0xFFFF_0000);
             if s & PS_CCS != 0 {
                 println!(
@@ -329,6 +505,10 @@ impl Ohci {
         Ok(s & PS_PES != 0 && s & PS_CCS != 0)
     }
 
+    pub fn port_low_speed(&self, port: u8) -> bool {
+        self.port_status(port) & PS_LSDA != 0
+    }
+
     /// Control transfer on ep0 of `addr` (0 during default state).
     pub fn control(
         &self,
@@ -337,6 +517,21 @@ impl Ohci {
         data: &mut [u8],
         in_dir: bool,
     ) -> Result<usize, &'static str> {
+        self.control_ex(addr, setup, data, in_dir, ep0_mps(addr), ep0_ls(addr))
+    }
+
+    pub fn control_ex(
+        &self,
+        addr: u8,
+        setup: &[u8; 8],
+        data: &mut [u8],
+        in_dir: bool,
+        mps: u16,
+        ls: bool,
+    ) -> Result<usize, &'static str> {
+        if data.len() > 256 {
+            return Err("OHCI: control data > 256");
+        }
         let dummy = Box::leak(Box::new(Td {
             flags: TD_CC_NOT_ACCESSED << TD_CC_SHIFT,
             cbp: 0,
@@ -393,9 +588,8 @@ impl Ohci {
             let _ = data_td;
         }
 
-        let mps = 8u32;
         let ed = Box::leak(Box::new(Ed {
-            flags: (addr as u32) | (mps << 16),
+            flags: ed_flags(addr, 0, mps.max(8), ls),
             tail_td: dummy_phys,
             head_td: first_phys,
             next_ed: 0,
@@ -423,6 +617,14 @@ impl Ohci {
         self.w32(HC_CONTROLCURRENTED, 0);
 
         if !ok {
+            println!(
+                "[ohci] ctrl timeout ctrl={:08x} cmd={:08x} done={:08x} setup_cc={} stat_cc={}",
+                self.r32(HC_CONTROL),
+                self.r32(HC_CMDSTATUS),
+                self.r32(HC_DONEHEAD),
+                setup_td.cc(),
+                status_td.cc()
+            );
             return Err("OHCI: control timeout");
         }
         if setup_td.cc() != 0 {
@@ -442,6 +644,10 @@ impl Ohci {
     }
 
     /// Bulk IN or OUT on `ep` (endpoint number, no direction bit).
+    ///
+    /// This follows the Linux OHCI queue model: one persistent ED per endpoint,
+    /// a permanent dummy tail TD, and real TDs appended before that dummy. Bulk
+    /// TDs use TD_T_TOGGLE so the controller carries DATA0/DATA1 in ED.HeadP.C.
     pub fn bulk(
         &self,
         addr: u8,
@@ -449,6 +655,167 @@ impl Ohci {
         mps: u16,
         data: &mut [u8],
         in_dir: bool,
+    ) -> Result<usize, &'static str> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let n = data.len();
+        // The transfer buffer itself is DMA-visible. Linux's OHCI HCD maps the
+        // URB buffer and puts that DMA address directly in TD.hwCBP/hwBE.
+        // Do the same here instead of bouncing every bulk transfer through one
+        // shared DMA[0].data buffer. The latter is especially wrong with two
+        // OHCI controllers and also adds an unnecessary copy on every IN.
+        let data_phys = virt_to_phys(data.as_mut_ptr());
+        let last = data_phys + (n as u32) - 1;
+
+        let (ed, ed_phys, dummy, dummy_phys, first) = {
+            let mut eps = BULK_EPS.lock();
+            let pos = eps.iter().position(|e| e.mmio == self.mmio && e.addr == addr && e.ep == ep);
+            let idx = match pos {
+                Some(i) => i,
+                None => {
+                    let dummy = Box::leak(Box::new(Td {
+                        flags: TD_CC_NOT_ACCESSED << TD_CC_SHIFT,
+                        cbp: 0,
+                        next_td: 0,
+                        be: 0,
+                    }));
+                    let dummy_phys = virt_to_phys(dummy as *mut Td as *const u8);
+                    let ed = Box::leak(Box::new(Ed {
+                        flags: (addr as u32) | ((ep as u32) << 7) | ((mps as u32) << 16),
+                        tail_td: dummy_phys,
+                        head_td: dummy_phys,
+                        next_ed: 0,
+                    }));
+                    let ed_phys = virt_to_phys(ed as *mut Ed as *const u8);
+                    // BulkHeadED is the head of a linked ED list, not a single
+                    // endpoint register. Keep all persistent bulk EDs chained.
+                    if let Some(prev) = eps.iter().rev().find(|e| e.mmio == self.mmio) {
+                        unsafe { (*prev.ed).next_ed = ed_phys; }
+                        // println!("[ohci] bulk link ed=0x{:08x} -> ed=0x{:08x}", prev.ed_phys, ed_phys);
+                    }
+                    eps.push(BulkEp {
+                        mmio: self.mmio,
+                        addr,
+                        ep,
+                        mps,
+                        ed,
+                        ed_phys,
+                        dummy,
+                        dummy_phys,
+                        next_data1: false,
+                    });
+                    eps.len() - 1
+                }
+            };
+            let state = &mut eps[idx];
+            let dummy = state.dummy;
+            let dummy_phys = state.dummy_phys;
+
+            // OHCI's queue is advanced by converting the current dummy TD into
+            // the real TD, then installing a fresh dummy tail. This is the same
+            // queue invariant used by Linux's OHCI HCD.
+            let new_dummy = Box::leak(Box::new(Td {
+                flags: TD_CC_NOT_ACCESSED << TD_CC_SHIFT,
+                cbp: 0,
+                next_td: 0,
+                be: 0,
+            }));
+            let new_dummy_phys = virt_to_phys(new_dummy as *mut Td as *const u8);
+            unsafe {
+                (*dummy).flags = (TD_CC_NOT_ACCESSED << TD_CC_SHIFT)
+                    | if in_dir { TD_DP_IN } else { TD_DP_OUT }
+                    | TD_DI_NONE
+                    | TD_R;
+                (*dummy).cbp = data_phys;
+                (*dummy).next_td = new_dummy_phys;
+                (*dummy).be = last;
+                (*state.ed).tail_td = new_dummy_phys;
+            }
+            state.dummy = new_dummy;
+            state.dummy_phys = new_dummy_phys;
+            (state.ed, state.ed_phys, dummy, dummy_phys, dummy_phys)
+        };
+
+        // println!(
+        //     "[ohci] bulk begin addr={} ep={} {} len={} mps={} ed=0x{:08x} td=0x{:08x} buf=0x{:08x} head=0x{:08x}",
+        //     addr, ep, if in_dir { "IN" } else { "OUT" }, n, mps, ed_phys, first, data_phys,
+        //     unsafe { read_volatile(&(*ed).head_td) }
+        // );
+
+        // Schedule the persistent ED if it is not already the bulk-list head.
+        let head = self.r32(HC_BULKHEADED) & !0xF;
+        if head == 0 {
+            self.w32(HC_BULKHEADED, ed_phys);
+            self.w32(HC_BULKCURRENTED, 0);
+            // println!("[ohci] bulk list head=0x{:08x}", ed_phys);
+        } else {
+            // println!("[ohci] bulk list existing head=0x{:08x}, ED=0x{:08x} already linked", head, ed_phys);
+        }
+        let ctrl = self.r32(HC_CONTROL);
+        self.w32(
+            HC_CONTROL,
+            (ctrl & !CTRL_HCFS_MASK) | CTRL_HCFS_OPERATIONAL | CTRL_CLE | CTRL_BLE,
+        );
+        // Linux kicks the bulk list after the TD has been linked and memory is visible.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.w32(HC_CMDSTATUS, CMD_BLF);
+        // println!(
+        //     "[ohci] bulk kick head=0x{:08x} current=0x{:08x} ctrl={:08x} cmd={:08x} ed_head=0x{:08x} ed_tail=0x{:08x}",
+        //     self.r32(HC_BULKHEADED), self.r32(HC_BULKCURRENTED), self.r32(HC_CONTROL),
+        //     self.r32(HC_CMDSTATUS), unsafe { read_volatile(&(*ed).head_td) },
+        //     unsafe { read_volatile(&(*ed).tail_td) }
+        // );
+
+        let mut ok = false;
+        for _ in 0..2000 {
+            if unsafe { read_volatile(&(*dummy).flags) } >> TD_CC_SHIFT != TD_CC_NOT_ACCESSED {
+                ok = true;
+                break;
+            }
+            spin_ms(1);
+        }
+
+        if !ok {
+            println!(
+                "[ohci] bulk TIMEOUT cc={} ctrl={:08x} cmd={:08x} int={:08x} done={:08x} head=0x{:08x} current=0x{:08x} ed_head=0x{:08x} ed_tail=0x{:08x}",
+                unsafe { read_volatile(&(*dummy).flags) } >> TD_CC_SHIFT,
+                self.r32(HC_CONTROL), self.r32(HC_CMDSTATUS), self.r32(HC_INTSTATUS),
+                self.r32(HC_DONEHEAD), self.r32(HC_BULKHEADED), self.r32(HC_BULKCURRENTED),
+                unsafe { read_volatile(&(*ed).head_td) }, unsafe { read_volatile(&(*ed).tail_td) }
+            );
+            return Err("OHCI: bulk timeout");
+        }
+
+        let cc = unsafe { read_volatile(&(*dummy).flags) } >> TD_CC_SHIFT;
+        // println!(
+        //     // "[ohci] bulk done cc={} td_flags={:08x} cbp=0x{:08x} be=0x{:08x} ed_head=0x{:08x} ed_tail=0x{:08x}",
+        //     cc,
+        //     unsafe { read_volatile(&(*dummy).flags) },
+        //     unsafe { read_volatile(&(*dummy).cbp) },
+        //     unsafe { read_volatile(&(*dummy).be) },
+        //     unsafe { read_volatile(&(*ed).head_td) },
+        //     unsafe { read_volatile(&(*ed).tail_td) }
+        // );
+        if cc != 0 && cc != 9 {
+            println!("[ohci] bulk cc={}", cc);
+            return Err("OHCI: bulk failed");
+        }
+
+        // println!("[ohci] bulk return n={}", n);
+        let _ = dummy_phys;
+        Ok(n)
+    }
+
+    /// Interrupt IN/OUT on the periodic list (HID boot reports).
+    pub fn interrupt(
+        &self,
+        addr: u8,
+        ep: u8,
+        mps: u16,
+        data: &mut [u8],
+        in_dir: bool,
+        ls: bool,
     ) -> Result<usize, &'static str> {
         if data.is_empty() {
             return Ok(0);
@@ -462,10 +829,11 @@ impl Ohci {
         let dummy_phys = virt_to_phys(dummy as *mut Td as *const u8);
         let data_phys = virt_to_phys(data.as_mut_ptr());
         let last = data_phys + (data.len() as u32) - 1;
+        let data1 = toggle_of(addr, ep);
         let td = Box::leak(Box::new(Td {
             flags: (TD_CC_NOT_ACCESSED << TD_CC_SHIFT)
                 | if in_dir { TD_DP_IN } else { TD_DP_OUT }
-                | TD_T_DATA0
+                | td_toggle(data1)
                 | TD_DI_NONE
                 | TD_R,
             cbp: data_phys,
@@ -474,24 +842,23 @@ impl Ohci {
         }));
         let td_phys = virt_to_phys(td as *mut Td as *const u8);
         let ed = Box::leak(Box::new(Ed {
-            flags: (addr as u32) | ((ep as u32) << 7) | ((mps as u32) << 16),
+            flags: ed_flags(addr, ep, mps.max(8), ls),
             tail_td: dummy_phys,
             head_td: td_phys,
             next_ed: 0,
         }));
         let ed_phys = virt_to_phys(ed as *mut Ed as *const u8);
-
-        self.w32(HC_BULKHEADED, ed_phys);
-        self.w32(HC_BULKCURRENTED, 0);
+        unsafe {
+            let hcca = &mut *self.hcca;
+            for slot in hcca.int_table.iter_mut() {
+                *slot = ed_phys;
+            }
+        }
         let ctrl = self.r32(HC_CONTROL);
-        self.w32(
-            HC_CONTROL,
-            (ctrl & !CTRL_HCFS_MASK) | CTRL_HCFS_OPERATIONAL | CTRL_CLE | CTRL_BLE,
-        );
-        self.w32(HC_CMDSTATUS, CMD_BLF);
+        self.w32(HC_CONTROL, ctrl | CTRL_PLE | CTRL_HCFS_OPERATIONAL);
 
         let mut ok = false;
-        for _ in 0..2000 {
+        for _ in 0..200 {
             if td.cc() != TD_CC_NOT_ACCESSED {
                 ok = true;
                 break;
@@ -499,23 +866,24 @@ impl Ohci {
             spin_ms(1);
         }
         ed.flags |= ED_SKIP;
-        self.w32(HC_BULKHEADED, 0);
-        self.w32(HC_BULKCURRENTED, 0);
+        unsafe {
+            (*self.hcca).int_table = [0; 32];
+        }
         if !ok {
-            return Err("OHCI: bulk timeout");
+            return Err("OHCI: interrupt timeout");
         }
         if td.cc() != 0 && td.cc() != 9 {
-            println!("[ohci] bulk cc={}", td.cc());
-            return Err("OHCI: bulk failed");
+            return Err("OHCI: interrupt failed");
         }
+        set_toggle(addr, ep, (ed.head_td & 2) != 0);
         let _ = dummy;
         Ok(data.len())
     }
 
     /// Reset every connected port and bind a class driver.
     pub fn enumerate_ports(&self) {
-        let mut next_addr = 1u8;
         for p in 0..self.nports {
+            println!("[ohci] stage=port{}-reset-start", p + 1);
             match self.reset_port(p) {
                 Ok(true) => {}
                 Ok(false) => continue,
@@ -524,44 +892,74 @@ impl Ohci {
                     continue;
                 }
             }
-
-            let setup_get = [0x80u8, 6, 0x00, 0x01, 0, 0, 18, 0];
-            let mut desc = [0u8; 18];
-            match self.control(0, &setup_get, &mut desc, true) {
-                Ok(_) => {
-                    let vid = u16::from_le_bytes([desc[8], desc[9]]);
-                    let pid = u16::from_le_bytes([desc[10], desc[11]]);
-                    println!(
-                        "[ohci] port {} device desc len={} vid={:04x} pid={:04x}",
-                        p + 1,
-                        desc[0],
-                        vid,
-                        pid
-                    );
-                }
-                Err(e) => {
-                    println!("[ohci] port {} GET_DESCRIPTOR: {}", p + 1, e);
-                    continue;
-                }
-            }
-
-            let addr = next_addr;
-            next_addr = next_addr.saturating_add(1);
-            let setup_addr = [0x00u8, 5, addr, 0, 0, 0, 0, 0];
-            let mut empty: [u8; 0] = [];
-            match self.control(0, &setup_addr, &mut empty, false) {
-                Ok(_) => {
-                    println!("[ohci] port {} SET_ADDRESS {}", p + 1, addr);
-                    spin_ms(2);
-                    crate::drivers::usb::device::bind(self, addr, &desc);
-                }
-                Err(e) => println!("[ohci] port {} SET_ADDRESS: {}", p + 1, e),
+            println!("[ohci] stage=port{}-reset-done", p + 1);
+            let ls = self.port_low_speed(p);
+            match self.address_and_bind(ls) {
+                Ok(addr) => println!("[ohci] port {} addr={}{}", p + 1, addr, if ls { " LS" } else { " FS" }),
+                Err(e) => println!("[ohci] port {}: {}", p + 1, e),
             }
         }
     }
+
+    /// Default-state device on the wire → SET_ADDRESS → class bind.
+    pub fn address_and_bind(&self, ls: bool) -> Result<u8, &'static str> {
+        let mps8 = if ls { 8 } else { 8 };
+        let mut hdr = [0u8; 8];
+        self.control_ex(0, &[0x80, 6, 0x00, 0x01, 0, 0, 8, 0], &mut hdr, true, mps8, ls)?;
+        let mps = if hdr[7] == 8 || hdr[7] == 16 || hdr[7] == 32 || hdr[7] == 64 {
+            hdr[7] as u16
+        } else {
+            8
+        };
+        let mut desc = [0u8; 18];
+        self.control_ex(0, &[0x80, 6, 0x00, 0x01, 0, 0, 18, 0], &mut desc, true, mps, ls)?;
+        let vid = u16::from_le_bytes([desc[8], desc[9]]);
+        let pid = u16::from_le_bytes([desc[10], desc[11]]);
+        println!("[ohci] device {:04x}:{:04x} mps0={}", vid, pid, mps);
+
+        let addr = alloc_addr();
+        set_ep0(0, mps, ls);
+        set_ep0(addr, mps, ls);
+        let mut empty: [u8; 0] = [];
+        self.control_ex(0, &[0x00, 5, addr, 0, 0, 0, 0, 0], &mut empty, false, mps, ls)?;
+        spin_ms(2);
+        crate::drivers::usb::device::bind(self, addr, &desc);
+        Ok(addr)
+    }
+}
+
+fn silence_mmio(mmio: usize) {
+    unsafe {
+        let st = read_volatile((mmio + HC_INTSTATUS) as *const u32);
+        if st != 0 {
+            write_volatile((mmio + HC_INTSTATUS) as *mut u32, st);
+        }
+        write_volatile((mmio + HC_INTDIS) as *mut u32, 0x8000_003F);
+    }
+}
+
+extern "C" fn irq9_ack() {
+    silence_mmio(OHCI_MMIO_BASE as usize);
+    silence_mmio((OHCI_MMIO_BASE + OHCI_MMIO_STRIDE) as usize);
+    PICS.end_interrupt(32 + 9);
+}
+
+#[unsafe(naked)]
+extern "C" fn irq9_stub() {
+    naked_asm!(
+        "pushad",
+        "call {h}",
+        "popad",
+        "iretd",
+        h = sym irq9_ack,
+    );
 }
 
 pub fn init_all() {
+    unsafe {
+        IDT.add(32 + 9, irq9_stub as u32);
+    }
+    PICS.unmask_irq(9);
     let devices = pci::enumerate();
     let mut n = 0u32;
     for dev in devices.iter() {
@@ -571,17 +969,26 @@ pub fn init_all() {
         {
             continue;
         }
+        if dev.vendor_id == ALI_VENDOR && dev.device_id == ALI_M5237 && dev.device == 0x0f {
+            println!("[ohci] skip {:02x}:{:02x}.{} (internal MS HC)", dev.bus, dev.device, dev.function);
+            continue;
+        }
         match Ohci::probe(dev) {
             Ok(mut hc) => {
+                println!("[ohci] pci {:02x}:{:02x}.{} start", dev.bus, dev.device, dev.function);
                 if let Err(e) = hc.start() {
                     println!("[ohci] start failed: {}", e);
                     continue;
                 }
+                println!("[ohci] pci {:02x}:{:02x}.{} start-done", dev.bus, dev.device, dev.function);
                 CONTROLLERS.lock().push(hc);
                 let idx = CONTROLLERS.lock().len() - 1;
+                println!("[ohci] pci {:02x}:{:02x}.{} enumerate", dev.bus, dev.device, dev.function);
                 if let Some(hc) = CONTROLLERS.lock().get(idx) {
                     hc.enumerate_ports();
                 }
+                println!("[ohci] pci {:02x}:{:02x}.{} enumerate-done", dev.bus, dev.device, dev.function);
+                silence_mmio(CONTROLLERS.lock().last().map(|h| h.mmio).unwrap_or(0));
                 n += 1;
             }
             Err(e) => println!("[ohci] probe {:02x}:{:02x}.{}: {}", dev.bus, dev.device, dev.function, e),

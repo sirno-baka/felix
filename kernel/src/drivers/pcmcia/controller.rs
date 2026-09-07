@@ -5,10 +5,29 @@ use core::ptr::{read_volatile, write_volatile};
 use crate::memory::paging::{PAGING, PTEFlags};
 use crate::pci;
 
+use super::{CF_IO_BASE, CF_IO_END};
 use super::pc16::Pc16;
 
 pub const VENDOR_ID: u16 = 0x1180;
 pub const DEVICE_ID: u16 = 0x0475;
+
+/// Host-side PCMCIA/CardBus bridge. One impl per chip (Ricoh, TI, Toshiba…).
+pub trait SocketController: Send {
+    fn name(&self) -> &'static str;
+    fn irq_line(&self) -> u8;
+    fn restore_host_decode(&self);
+    fn pc16(&self) -> Pc16;
+    unsafe fn enable_csc(&self, irq: u8);
+    unsafe fn ack_csc(&self) -> (u8, u32, bool);
+}
+
+pub fn matches(dev: &pci::device::PciDevice) -> bool {
+    dev.vendor_id == VENDOR_ID && dev.device_id == DEVICE_ID
+}
+
+pub fn attach(dev: pci::device::PciDevice) -> Option<alloc::boxed::Box<dyn SocketController>> {
+    Some(alloc::boxed::Box::new(setup(dev)?))
+}
 
 const PCI_COMMAND: u8 = 0x04;
 const PCI_BAR0: u8 = 0x10;
@@ -55,6 +74,33 @@ impl RicohR5c475 {
         read_volatile((self.bar0_virt + offset) as *const u32)
     }
 
+    #[inline]
+    unsafe fn mmio_write32(&self, offset: u32, value: u32) {
+        write_volatile((self.bar0_virt + offset) as *mut u32, value);
+    }
+
+    pub unsafe fn enable_csc(&self, irq: u8) {
+        // Yenta: CSTSCHG | CCD1 | CCD2
+        const MASK_CD: u32 = 0x0000_0007;
+        let ev = self.mmio_read32(CB_SOCKET_EVENT);
+        self.mmio_write32(CB_SOCKET_EVENT, ev);
+        self.mmio_write32(CB_SOCKET_MASK, MASK_CD);
+        let pc16 = self.pc16();
+        pc16.write_reg8(super::pc16::reg::CSCHG, 0xff);
+        let irq = irq & 0x0f;
+        pc16.write_reg8(super::pc16::reg::CSCINT, 0x08 | (irq << 4));
+        self.pci.write_u8(PCI_INTERRUPT_LINE, irq);
+    }
+
+    pub unsafe fn ack_csc(&self) -> (u8, u32, bool) {
+        let pc16 = self.pc16();
+        let cschg = pc16.cschg();
+        pc16.write_reg8(super::pc16::reg::CSCHG, cschg);
+        let ev = self.mmio_read32(CB_SOCKET_EVENT);
+        self.mmio_write32(CB_SOCKET_EVENT, ev);
+        (cschg, ev, pc16.status().card_present())
+    }
+
     pub unsafe fn dump_cardbus_socket(&self) {
         unsafe {
             crate::println!("[PCMCIA] CardBus socket registers:");
@@ -84,6 +130,27 @@ impl RicohR5c475 {
         unsafe { self.dump_cardbus_socket(); }
         unsafe { self.pc16().dump(); }
     }
+}
+
+impl SocketController for RicohR5c475 {
+    fn name(&self) -> &'static str { "Ricoh R5C475/R5C475II" }
+
+    fn irq_line(&self) -> u8 {
+        let irq = self.pci.read_u8(PCI_INTERRUPT_LINE);
+        if irq == 0 || irq == 0xFF { 11 } else { irq }
+    }
+
+    fn restore_host_decode(&self) {
+        let cmd = (self.pci.read_u16(PCI_COMMAND) | 0x0007) & !0x0400;
+        self.pci.write_u16(PCI_COMMAND, cmd);
+        self.pci.write_u32(PCI_BAR0, self.bar0_phys);
+        self.pci.write_u32(PCI_CB_IO_BASE_0, (CF_IO_BASE as u32) & 0xffff_fffc);
+        self.pci.write_u32(PCI_CB_IO_LIMIT_0, (CF_IO_END as u32) | 0x3);
+    }
+
+    fn pc16(&self) -> Pc16 { RicohR5c475::pc16(self) }
+    unsafe fn enable_csc(&self, irq: u8) { RicohR5c475::enable_csc(self, irq); }
+    unsafe fn ack_csc(&self) -> (u8, u32, bool) { RicohR5c475::ack_csc(self) }
 }
 
 fn probe_bar_size(dev: &pci::device::PciDevice, offset: u8, original: u32) -> u32 {

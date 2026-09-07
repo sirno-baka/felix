@@ -16,7 +16,7 @@ pub mod ohci;
 /// Probe every PCI OHCI controller and bind class drivers.
 pub fn init() {
     ohci::init_all();
-    try_mount_fat();
+    // try_mount_fat();
 }
 
 /// If an MSC stick answered, mount FAT at `/mnt/usb`.
@@ -30,6 +30,10 @@ fn try_mount_fat() {
     let Some(dev) = msc::first() else {
         return;
     };
+    if dev.blocks == 0 {
+        crate::println!("[usb-msc] no media, skip mount");
+        return;
+    }
     let mut probe = [0u8; 512];
     match dev.read_sectors(1, 0, probe.as_mut_ptr() as u32) {
         Ok(()) => crate::println!(

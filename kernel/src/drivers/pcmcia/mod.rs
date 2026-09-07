@@ -11,7 +11,7 @@ mod pc16;
 
 pub use ata::{AtaPio, IdentifyData};
 pub use pc16::SocketStatus;
-pub use controller::RicohR5c475;
+pub use controller::{RicohR5c475, SocketController};
 
 pub const CF_IO_BASE: u16 = 0xC000;
 pub const CF_IO_END: u16 = 0xC00F;
@@ -19,7 +19,7 @@ pub const CF_MEM_PHYS: u32 = 0xF000_1000;
 pub const CF_MEM_VIRT: u32 = 0xE000_1000;
 pub const CF_MEM_SIZE: u32 = 0x1000;
 
-static mut SOCKET: Option<controller::RicohR5c475> = None;
+static mut SOCKET: Option<alloc::boxed::Box<dyn controller::SocketController>> = None;
 static mut CARD_COR: Option<(u32, u8)> = None;
 
 pub(crate) fn store_card_cor(base: u32, index: u8) {
@@ -29,15 +29,11 @@ pub(crate) fn store_card_cor(base: u32, index: u8) {
 /// Re-enable PCI I/O + ExCA windows if the task-file port floated (0xFF).
 pub fn rearm_io() {
     unsafe {
-        let Some(c) = SOCKET else {
+        let Some(c) = SOCKET.as_ref() else {
             crate::println!("[PCMCIA] rearm: no socket");
             return;
         };
-        let cmd0 = c.pci.read_u16(0x04);
-        c.pci.write_u16(0x04, cmd0 | 0x0007);
-        c.pci.write_u32(0x10, c.bar0_phys);
-        c.pci.write_u32(0x2C, (CF_IO_BASE as u32) & 0xffff_fffc);
-        c.pci.write_u32(0x30, (CF_IO_END as u32) | 0x3);
+        c.restore_host_decode();
         let pc16 = c.pc16();
         pc16.write_reg8(pc16::reg::PWCTRL, 0xb0);
         // pulse RESET then IOCARD+IRQ like initial bring-up
@@ -52,15 +48,126 @@ pub fn rearm_io() {
         }
         let st = crate::io::inb(CF_IO_BASE + 7);
         crate::println!(
-            "[PCMCIA] rearm cmd {:04x}->{:04x} PWCTRL={:02x} IGCTRL={:02x} AWINEN={:02x} IOCTRL={:02x} tf={:02x}",
-            cmd0,
-            c.pci.read_u16(0x04),
+            "[PCMCIA] rearm PWCTRL={:02x} IGCTRL={:02x} AWINEN={:02x} IOCTRL={:02x} tf={:02x}",
             pc16.pwctrl(),
             pc16.igctrl(),
             pc16.awinen(),
             pc16.ioctrl(),
             st
         );
+    }
+}
+
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use crate::drivers::pic::PICS;
+use crate::interrupts::idt::IDT;
+
+static IRQ_LINE: AtomicU8 = AtomicU8::new(0xFF);
+static PENDING: AtomicU8 = AtomicU8::new(0); // 1=insert 2=remove
+static CARD_LIVE: AtomicBool = AtomicBool::new(false);
+static DEBOUNCE: AtomicU8 = AtomicU8::new(0);
+
+const EVT_NONE: u8 = 0;
+const EVT_INSERT: u8 = 1;
+const EVT_REMOVE: u8 = 2;
+
+pub fn card_live() -> bool {
+    CARD_LIVE.load(Ordering::Relaxed)
+}
+
+pub fn set_card_live(v: bool) {
+    CARD_LIVE.store(v, Ordering::Relaxed);
+}
+
+#[unsafe(naked)]
+pub extern "C" fn pcmcia_irq_stub() {
+    unsafe {
+        core::arch::naked_asm!(
+            "cli",
+            "pusha",
+            "call {handler}",
+            "popa",
+            "iretd",
+            handler = sym pcmcia_irq_handler,
+        );
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn pcmcia_irq_handler() {
+    unsafe {
+        if let Some(c) = SOCKET.as_ref() {
+            let (cschg, ev, present) = c.ack_csc();
+            let evt = if present { EVT_INSERT } else { EVT_REMOVE };
+            PENDING.store(evt, Ordering::Relaxed);
+            DEBOUNCE.store(20, Ordering::Relaxed); // ~20 timer ticks
+            crate::println!(
+                "[PCMCIA] CSC irq cschg={:02x} ev={:08x} present={}",
+                cschg, ev, present
+            );
+        }
+        let irq = IRQ_LINE.load(Ordering::Relaxed);
+        if irq < 16 {
+            PICS.end_interrupt(32 + irq);
+        }
+    }
+}
+
+/// Enable Card Detect IRQ. Call once after socket init.
+pub fn enable_hotplug() {
+    unsafe {
+        let Some(c) = SOCKET.as_ref() else { return };
+        let irq = c.irq_line();
+        IRQ_LINE.store(irq, Ordering::Relaxed);
+        c.restore_host_decode();
+        c.enable_csc(irq);
+        let vec = 32u8.wrapping_add(irq);
+        IDT.add(vec as usize, pcmcia_irq_stub as u32);
+        PICS.unmask_irq(irq);
+        CARD_LIVE.store(c.pc16().status().card_present(), Ordering::Relaxed);
+        crate::println!("[PCMCIA] hotplug IRQ{} vec={} CSCINT={:02x}", irq, vec, c.pc16().cscint());
+    }
+}
+
+/// Deferred insert/remove. Safe to call from timer.
+pub fn poll_hotplug() {
+    unsafe {
+        let Some(c) = SOCKET.as_ref() else { return };
+        let present = c.pc16().status().card_present();
+        let live = CARD_LIVE.load(Ordering::Relaxed);
+        let irq_evt = PENDING.load(Ordering::Relaxed) != EVT_NONE;
+
+        let mut left = DEBOUNCE.load(Ordering::Relaxed);
+        if irq_evt || present != live {
+            if left == 0 {
+                DEBOUNCE.store(20, Ordering::Relaxed);
+                return;
+            }
+            left = left.saturating_sub(1);
+            DEBOUNCE.store(left, Ordering::Relaxed);
+            if left != 0 {
+                return;
+            }
+        } else {
+            if left != 0 {
+                DEBOUNCE.store(0, Ordering::Relaxed);
+            }
+            return;
+        }
+
+        PENDING.store(EVT_NONE, Ordering::Relaxed);
+        let irq = IRQ_LINE.load(Ordering::Relaxed);
+        if !present && live {
+            crate::println!("[PCMCIA] card removed");
+            CARD_LIVE.store(false, Ordering::Relaxed);
+            c.enable_csc(irq);
+            crate::filesystem::init::pcmcia_hotplug(false);
+        } else if present && !live {
+            crate::println!("[PCMCIA] card inserted");
+            CARD_LIVE.store(true, Ordering::Relaxed);
+            c.enable_csc(irq);
+            crate::filesystem::init::pcmcia_hotplug(true);
+        }
     }
 }
 
@@ -185,7 +292,7 @@ fn print_socket_status(status: &SocketStatus) {
     );
 }
 
-fn prepare_socket(controller: &controller::RicohR5c475) -> bool {
+fn prepare_socket(controller: &dyn controller::SocketController) -> bool {
     let pc16 = controller.pc16();
 
     unsafe {
@@ -240,7 +347,7 @@ fn prepare_socket(controller: &controller::RicohR5c475) -> bool {
     true
 }
 
-fn init_fixed_disk(controller: &controller::RicohR5c475, info: CardInfo) -> Option<PcmciaDevice> {
+fn init_fixed_disk(controller: &dyn controller::SocketController, info: CardInfo) -> Option<PcmciaDevice> {
     let Some(cfg) = info.config_base.zip(info.config_index) else {
         crate::println!("[PCMCIA] fixed-disk card has no CONFIG tuple");
         return None;
@@ -271,50 +378,31 @@ impl ControllerKind {
     }
 }
 
-fn match_controller(dev: &crate::pci::device::PciDevice) -> Option<ControllerKind> {
-    // Keep controller matching in the PCMCIA front-end. Individual drivers
-    // only describe which PCI IDs they support and how to initialize them.
-    match (dev.vendor_id, dev.device_id) {
-        (controller::VENDOR_ID, controller::DEVICE_ID)
-        if dev.class_code == PCI_CLASS_BRIDGE
-            && dev.subclass == PCI_SUBCLASS_CARD_BUS =>
-            {
-                Some(ControllerKind::RicohR5c475)
-            }
-        _ => None,
-    }
-}
-
-fn setup_controller(
-    kind: ControllerKind,
+fn attach_controller(
     dev: crate::pci::device::PciDevice,
-) -> Option<controller::RicohR5c475> {
-    match kind {
-        ControllerKind::RicohR5c475 => controller::setup(dev),
+) -> Option<alloc::boxed::Box<dyn controller::SocketController>> {
+    if controller::matches(&dev) {
+        return controller::attach(dev);
     }
+    None
 }
 
-fn find_controller() -> Option<(ControllerKind, crate::pci::device::PciDevice)> {
+fn find_controller() -> Option<alloc::boxed::Box<dyn controller::SocketController>> {
     for dev in crate::pci::enumerate().into_iter() {
-        // PCMCIA/CardBus controllers are PCI class 06:07. Only those devices
-        // are offered to our controller-driver table.
         if dev.class_code != PCI_CLASS_BRIDGE || dev.subclass != PCI_SUBCLASS_CARD_BUS {
             continue;
         }
-
         crate::println!(
             "[PCMCIA] controller candidate {:02x}:{:02x}.{} [{:04x}:{:04x}] class={:02x}:{:02x}:{:02x}",
             dev.bus, dev.device, dev.function,
             dev.vendor_id, dev.device_id,
             dev.class_code, dev.subclass, dev.prog_if
         );
-
-        if let Some(kind) = match_controller(&dev) {
-            crate::println!("[PCMCIA] matched controller driver: {}", kind.name());
-            return Some((kind, dev));
+        if let Some(ctrl) = attach_controller(dev) {
+            crate::println!("[PCMCIA] matched controller driver: {}", ctrl.name());
+            return Some(ctrl);
         }
     }
-
     crate::println!("[PCMCIA] no supported PCMCIA/CardBus controller found");
     None
 }
@@ -322,15 +410,10 @@ fn find_controller() -> Option<(ControllerKind, crate::pci::device::PciDevice)> 
 /// Initialize PCMCIA/CardBus by first discovering a supported PCI controller,
 /// then inspecting the card CIS and dispatching to a card driver.
 pub fn init() -> Option<PcmciaDevice> {
-    let (kind, dev) = find_controller()?;
-
-    crate::println!(
-        "[PCMCIA] using {} at {:02x}:{:02x}.{}",
-        kind.name(), dev.bus, dev.device, dev.function
-    );
-
-    let controller = setup_controller(kind, dev)?;
+    let controller = find_controller()?;
+    crate::println!("[PCMCIA] using {}", controller.name());
     unsafe { SOCKET = Some(controller); }
+    enable_hotplug();
     // unsafe {
     //     crate::println!(
     //         "[PCMCIA] PC16: phys=0x{:08x} virt=0x{:08x}",
@@ -344,8 +427,9 @@ pub fn init() -> Option<PcmciaDevice> {
     //     );
     //     print_socket_status(&controller.pc16().status());
     // }
+    let controller = unsafe { SOCKET.as_ref().unwrap().as_ref() };
     unsafe { print_socket_status(&controller.pc16().status()); }
-    if !prepare_socket(&controller) {
+    if !prepare_socket(controller) {
         return None;
     }
 
@@ -357,12 +441,34 @@ pub fn init() -> Option<PcmciaDevice> {
         info.card_type, info.func_id, info.config_base, info.config_index
     );
 
+    bind_by_cis(controller, info)
+}
+
+fn bind_by_cis(controller: &dyn controller::SocketController, info: CardInfo) -> Option<PcmciaDevice> {
     match info.card_type {
-        CardType::FixedDisk => init_fixed_disk(&controller, info),
+        CardType::FixedDisk => init_fixed_disk(controller, info),
         _ => {
             crate::println!("[PCMCIA] no card driver for type {:?}", info.card_type);
             Some(PcmciaDevice::Unsupported(info))
         }
+    }
+}
+
+/// Re-probe CIS and pick a card driver. Socket must already be up.
+pub fn bind_card() -> Option<PcmciaDevice> {
+    unsafe {
+        let Some(controller) = SOCKET.as_ref() else { return None };
+        if !controller.pc16().status().card_present() {
+            return None;
+        }
+        rearm_io();
+        cis::map_attribute_memory();
+        let info = cis::read_cis()?;
+        crate::println!(
+            "[PCMCIA] bind CIS type={:?} FUNCID={:?} CFTABLE={:?}",
+            info.card_type, info.func_id, info.config_index
+        );
+        bind_by_cis(controller.as_ref(), info)
     }
 }
 

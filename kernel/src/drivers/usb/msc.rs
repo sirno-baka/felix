@@ -13,12 +13,19 @@ const CSW_SIG: u32 = 0x5342_5355;
 
 static DEVICES: Mutex<Vec<UsbMsc>> = Mutex::new(Vec::new());
 
+const PROTO_CBI: u8 = 0x00;
+const PROTO_CB: u8 = 0x01;
+const PROTO_BBB: u8 = 0x50;
+
 #[derive(Clone)]
 pub struct UsbMsc {
     mmio: usize,
     addr: u8,
     ep_out: u8,
     ep_in: u8,
+    ep_intr: u8,
+    iface: u8,
+    proto: u8,
     mps: u16,
     pub block_size: u32,
     pub blocks: u32,
@@ -26,6 +33,9 @@ pub struct UsbMsc {
 
 impl UsbMsc {
     fn bot(&self, hc: &Ohci, cdb: &[u8], data: &mut [u8], din: bool) -> Result<(), &'static str> {
+        if self.proto != PROTO_BBB {
+            return self.cbi(hc, cdb, data, din);
+        }
         let mut cbw = [0u8; 31];
         cbw[0..4].copy_from_slice(&CBW_SIG.to_le_bytes());
         cbw[4..8].copy_from_slice(&1u32.to_le_bytes());
@@ -37,7 +47,11 @@ impl UsbMsc {
 
         hc.bulk(self.addr, self.ep_out, self.mps, &mut cbw, false)?;
         if !data.is_empty() {
-            hc.bulk(self.addr, if din { self.ep_in } else { self.ep_out }, self.mps, data, din)?;
+            let ep = if din { self.ep_in } else { self.ep_out };
+            let n = hc.bulk(self.addr, ep, self.mps, data, din)?;
+            if din && n != data.len() {
+                return Err("MSC: short DATA IN");
+            }
         }
         let mut csw = [0u8; 13];
         hc.bulk(self.addr, self.ep_in, self.mps, &mut csw, true)?;
@@ -51,8 +65,30 @@ impl UsbMsc {
         Ok(())
     }
 
+    fn cbi(&self, hc: &Ohci, cdb: &[u8], data: &mut [u8], din: bool) -> Result<(), &'static str> {
+        let mut cmd = [0u8; 12];
+        let n = cdb.len().min(12);
+        cmd[..n].copy_from_slice(&cdb[..n]);
+        hc.control(
+            self.addr,
+            &desc::setup(0x21, 0x00, 0, self.iface as u16, 12),
+            &mut cmd,
+            false,
+        )?;
+        if !data.is_empty() {
+            hc.bulk(
+                self.addr,
+                if din { self.ep_in } else { self.ep_out },
+                self.mps,
+                data,
+                din,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn inquiry(&self, hc: &Ohci) -> Result<[u8; 36], &'static str> {
-        let cdb = [0x12u8, 0, 0, 0, 36, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let cdb = [0x12u8, 0, 0, 0, 36, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let mut buf = [0u8; 36];
         self.bot(hc, &cdb[..6], &mut buf, true)?;
         Ok(buf)
@@ -71,20 +107,25 @@ impl UsbMsc {
 impl BlockDevice for UsbMsc {
     fn read_sectors(&self, numsects: u8, lba: u32, buf: u32) -> Result<(), u8> {
         let n = numsects as usize;
+        if n == 0 || buf == 0 || self.block_size == 0 {
+            return Err(1u8);
+        }
         let bytes = n * self.block_size as usize;
         let dest = buf as *mut u8;
-        let mut tmp = vec![0u8; bytes.max(512)];
         let mut cdb = [0u8; 10];
         cdb[0] = 0x28;
         cdb[2..6].copy_from_slice(&lba.to_be_bytes());
         cdb[8] = numsects;
-        {
+        let hc = {
             let g = ohci::CONTROLLERS.lock();
-            let hc = g.iter().find(|h| h.mmio == self.mmio).ok_or(1u8)?;
-            self.bot(hc, &cdb, &mut tmp[..bytes], true).map_err(|_| 2u8)?;
-        }
+            g.iter()
+                .find(|h| h.mmio == self.mmio)
+                .map(|h| h as *const Ohci)
+                .ok_or(1u8)?
+        };
         unsafe {
-            core::ptr::copy_nonoverlapping(tmp.as_ptr(), dest, bytes);
+            let data = core::slice::from_raw_parts_mut(dest, bytes);
+            self.bot(&*hc, &cdb, data, true).map_err(|_| 2u8)?;
         }
         Ok(())
     }
@@ -100,9 +141,14 @@ impl BlockDevice for UsbMsc {
         cdb[0] = 0x2A;
         cdb[2..6].copy_from_slice(&lba.to_be_bytes());
         cdb[8] = numsects;
-        let g = ohci::CONTROLLERS.lock();
-        let hc = g.iter().find(|h| h.mmio == self.mmio).ok_or(1u8)?;
-        self.bot(hc, &cdb, &mut tmp[..bytes], false).map_err(|_| 2u8)
+        let hc = {
+            let g = ohci::CONTROLLERS.lock();
+            g.iter()
+                .find(|h| h.mmio == self.mmio)
+                .map(|h| h as *const Ohci)
+                .ok_or(1u8)?
+        };
+        unsafe { self.bot(&*hc, &cdb, &mut tmp[..bytes], false).map_err(|_| 2u8) }
     }
 
     fn sector_size(&self) -> u32 {
@@ -111,17 +157,20 @@ impl BlockDevice for UsbMsc {
 }
 
 pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {
-    if iface.subclass != desc::MSC_SCSI || iface.protocol != desc::MSC_BBB {
-        println!(
-            "[usb-msc] unsupported subclass=0x{:02x} proto=0x{:02x}",
-            iface.subclass, iface.protocol
-        );
+    let proto = iface.protocol;
+    if proto != PROTO_BBB && proto != PROTO_CBI && proto != PROTO_CB {
+        println!("[usb-msc] unsupported subclass=0x{:02x} proto=0x{:02x}", iface.subclass, iface.protocol);
         return;
     }
     let mut ep_in = None;
     let mut ep_out = None;
+    let mut ep_intr = 0u8;
     let mut mps = 64u16;
     for ep in iface.endpoints.iter() {
+        if ep.is_interrupt() && ep.dir_in() {
+            ep_intr = ep.number();
+            continue;
+        }
         if !ep.is_bulk() {
             continue;
         }
@@ -137,14 +186,29 @@ pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {
         return;
     };
 
-    let mut empty: [u8; 0] = [];
-    let _ = hc.control(addr, &desc::setup(0x21, 0xFF, 0, iface.number as u16, 0), &mut empty, false); // Bulk-Only reset
+    if proto == PROTO_BBB {
+        let mut empty: [u8; 0] = [];
+        let _ = hc.control(addr, &desc::setup(0x21, 0xFF, 0, iface.number as u16, 0), &mut empty, false);
+    }
+
+    println!(
+        "[usb-msc] addr={} proto={} bulk {}/{} irq={} mps={}",
+        addr,
+        if proto == PROTO_BBB { "BBB" } else { "CBI" },
+        ep_out,
+        ep_in,
+        ep_intr,
+        mps
+    );
 
     let mut dev = UsbMsc {
         mmio: hc.mmio,
         addr,
         ep_out,
         ep_in,
+        ep_intr,
+        iface: iface.number,
+        proto,
         mps,
         block_size: 512,
         blocks: 0,
@@ -172,7 +236,6 @@ pub fn devices() -> usize {
     DEVICES.lock().len()
 }
 
-/// Clone of the first enumerated flash drive, if any.
 pub fn first() -> Option<UsbMsc> {
     DEVICES.lock().first().cloned()
 }

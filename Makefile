@@ -47,14 +47,17 @@ endif
 
 .PHONY: build
 build:
+	@export RUSTFLAGS='--cfg getrandom_backend=\"custom\"'
+	@export RUSTFLAGS=-Awarningsls
+
 	@echo "Building Felix..."
 	@echo "  native apps: $(NATIVE_APPS)"
 	@echo "  wasm apps:   $(WASM_APPS)"
 	@cargo build --target=x86_16-felix.json --package=felix-boot --release -Z json-target-spec
 	@cargo build --target=x86_16-felix.json --package=felix-bootloader -Z json-target-spec
-	@cargo build --target=x86_16-felix.json --package=felix-bootloader --release -Z json-target-spec
+	@#cargo build --target=x86_16-felix.json --package=felix-bootloader --release -Z json-target-spec
 	@cargo build --target=x86_32-felix.json --package=felix-kernel -Z json-target-spec
-	@cargo build --target=x86_32-felix.json --package=felix-kernel --release -Z json-target-spec
+	@#cargo build --target=x86_32-felix.json --package=felix-kernel --release -Z json-target-spec
 	@for p in $(NATIVE_APPS); do \
 		echo "  cargo build $$p"; \
 		cargo build --target=x86_32-felix.json --package=$$p --release -Z json-target-spec; \
@@ -218,6 +221,6 @@ debug: all usb-image
                  -device rtl8139,netdev=net0,mac=52:54:00:12:34:56 \
                  -object filter-dump,id=f1,netdev=net0,file=guest.pcap \
                  -device pci-ohci,id=ohci \
-                 -drive if=none,id=usbstick,format=raw,file=build/usb.img \
+                 -drive if=none,id=usbstick,format=raw,file=/media/sirno/b68c5baf-cda7-4901-a031-5acf01621548/Torrent/win98drvXP.img \
                  -device usb-storage,bus=ohci.0,drive=usbstick \
 		-m 128M -s -S &

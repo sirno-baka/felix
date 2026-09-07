@@ -66,6 +66,7 @@ pub extern "C" fn timer_handler(esp: u32) -> u32 {
         if NET_POLL_COUNTER >= NET_POLL_EVERY {
             NET_POLL_COUNTER = 0;
             poll_network();
+            crate::drivers::pcmcia::poll_hotplug();
         }
 
         // === 2. Планировщик ===

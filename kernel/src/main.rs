@@ -69,7 +69,9 @@ use crate::utils::queue::Queue;
 use multitasking::task::TASK_MANAGER;
 use crate::drivers::pcmcia;
 use crate::drivers::pcmcia::PcmciaDevice;
+use crate::filesystem::init::init_usb;
 use crate::pit::init;
+use crate::wrappers::_cli;
 
 static mut TEST_WRITE: [u32; 128] = [0; 128];
 static mut TEST_READ: [u32; 128] = [0; 128];
@@ -326,7 +328,7 @@ pub extern "C" fn higher_half_entry() -> ! {
             println!("[!] init_rootfs failed — no mountable disk");
             halt();
         }
-
+        init_usb();
         print_info();
         print_devices();
         drivers::net::init_net();
@@ -370,6 +372,7 @@ pub extern "C" fn higher_half_entry() -> ! {
         PICS.unmask_irq(0);
         PICS.unmask_irq(1);
         PICS.unmask_irq(12);
+        PICS.unmask_irq(11);
 
         println!(
             "[!] Higher-half kernel running at 0x{:08x}",
@@ -380,7 +383,6 @@ pub extern "C" fn higher_half_entry() -> ! {
         // Enable interrupts. The next timer tick will first_switch into the
         // idle task; subsequent ticks round-robin to the shell.
         asm!("sti");
-        init(1000);
         loop {
             asm!("hlt");
         }

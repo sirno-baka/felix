@@ -53,13 +53,30 @@ impl Vfs {
     }
 
     pub fn mount(&self, mount_point: &str, fs: Box<dyn Filesystem>) {
+        println!("[VFS] mount request: {}", mount_point);
         if !mount_point.starts_with('/') {
             println!("[VFS] Mount point must start with /");
             return;
         }
         let mut inner = self.inner.lock();
         inner.mounts.push((mount_point.to_string(), fs));
-        println!("[VFS] Mounted at {}", mount_point);
+        println!("[VFS] Mounted at {} (mounts={})", mount_point, inner.mounts.len());
+    }
+
+    pub fn unmount(&self, mount_point: &str) -> bool {
+        let mut inner = self.inner.lock();
+        let before = inner.mounts.len();
+        inner.mounts.retain(|(mp, _)| mp != mount_point);
+        let ok = inner.mounts.len() < before;
+        if ok {
+            println!("[VFS] Unmounted {}", mount_point);
+        }
+        ok
+    }
+
+    pub fn is_mounted_at(&self, mount_point: &str) -> bool {
+        let inner = self.inner.lock();
+        inner.mounts.iter().any(|(mp, _)| mp == mount_point)
     }
 
     // ====================== PUBLIC API ======================
@@ -101,8 +118,11 @@ impl Vfs {
     }
 
     pub fn list_directory_entries(&self, path: &str) -> Option<Vec<DirEntry>> {
+        println!("[VFS] ls request path={}", path);
         let inner = self.inner.lock();
+        println!("[VFS] ls acquired lock: mounts={} root_fs={}", inner.mounts.len(), inner.root_fs.is_some());
         let path = if path.is_empty() { "/" } else { path };
+        println!("[VFS] ls effective path={}", path);
 
         // Специальная обработка для корневой директории
         if path == "/" {
@@ -130,8 +150,16 @@ impl Vfs {
         }
 
         // Для всех остальных путей используем механизм разрешения
-        let (fs, rel_path, _fs_id) = resolve(&inner, path);
-        fs.list_directory_entries(&rel_path)
+        println!("[VFS] ls resolving path={}", path);
+        let (fs, rel_path, fs_id) = resolve(&inner, path);
+        println!("[VFS] ls resolved fs_id={} rel_path={}", fs_id, rel_path);
+        println!("[VFS] ls calling filesystem...");
+        let result = fs.list_directory_entries(&rel_path);
+        println!("[VFS] ls filesystem returned: {}", if result.is_some() { "Some" } else { "None" });
+        if let Some(ref entries) = result {
+            println!("[VFS] ls entries={}", entries.len());
+        }
+        result
     }
 
     pub fn resolve_path(&self, path: &str) -> Option<u32> {
@@ -186,6 +214,7 @@ fn is_mount_prefix(path: &str, mp: &str) -> bool {
 
 fn resolve<'a>(inner: &'a VfsInner, path: &'a str) -> (&'a dyn Filesystem, String, u8) {
     let path = if path.is_empty() { "/" } else { path };
+    println!("[VFS] resolve start path={} mounts={}", path, inner.mounts.len());
     let mut best_fs: &dyn Filesystem = inner
         .root_fs
         .as_ref()
@@ -195,10 +224,12 @@ fn resolve<'a>(inner: &'a VfsInner, path: &'a str) -> (&'a dyn Filesystem, Strin
     let mut best_id: u8 = 0; // 0 = root_fs
 
     for (idx, (mp, fs_box)) in inner.mounts.iter().enumerate() {
+        println!("[VFS] resolve check mount[{}]={}", idx, mp);
         if is_mount_prefix(path, mp) && mp.len() > best_prefix.len() {
             best_fs = fs_box.as_ref();
             best_prefix = mp;
             best_id = (idx + 1) as u8; // 1-based ID для точек монтирования
+            println!("[VFS] resolve selected mount={} fs_id={}", best_prefix, best_id);
         }
     }
 
@@ -210,6 +241,7 @@ fn resolve<'a>(inner: &'a VfsInner, path: &'a str) -> (&'a dyn Filesystem, Strin
         path
     };
 
+    println!("[VFS] resolve done mount={} rel={} fs_id={}", best_prefix, relative, best_id);
     (best_fs, relative.to_string(), best_id)
 }
 
