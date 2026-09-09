@@ -124,19 +124,27 @@ extern "C" fn pcmcia_irq_handler() {
     }
 }
 
-/// Enable Card Detect IRQ. Call once after socket init.
+/// Enable Card Detect monitoring.
+///
+/// Felix currently has one IDT handler per legacy PIC vector and no shared-INTx
+/// dispatcher.  On the Sony C1M platform ToPIC100 and both ALi M5237 OHCI
+/// controllers share IRQ9.  Driving CardBus CSC through IRQ9 therefore lets a
+/// level/shared PCI interrupt starve IRQ0 immediately after STI.  The timer
+/// already calls poll_hotplug() every tick, so use socket-status polling until a
+/// real shared-IRQ dispatcher exists.
 pub fn enable_hotplug() {
     unsafe {
         let Some(c) = SOCKET.as_ref() else { return };
         let irq = c.irq_line();
         IRQ_LINE.store(irq, Ordering::Relaxed);
         c.restore_host_decode();
-        c.enable_csc(irq);
-        let vec = 32u8.wrapping_add(irq);
-        IDT.add(vec as usize, pcmcia_irq_stub as u32);
-        PICS.unmask_irq(irq);
+
+        // Do not enable CSC interrupt routing, do not install an IDT gate and do
+        // not unmask the shared PCI line. Presence changes are detected below by
+        // comparing the live socket status on each timer tick.
+        PICS.mask_irq(irq);
         CARD_LIVE.store(c.pc16().status().card_present(), Ordering::Relaxed);
-        crate::println!("[PCMCIA] hotplug IRQ{} vec={} CSCINT={:02x}", irq, vec, c.pc16().cscint());
+        crate::println!("[PCMCIA] hotplug polling IRQ{} masked", irq);
     }
 }
 
@@ -167,15 +175,12 @@ pub fn poll_hotplug() {
         }
 
         PENDING.store(EVT_NONE, Ordering::Relaxed);
-        let irq = IRQ_LINE.load(Ordering::Relaxed);
         if !present && live {
             crate::println!("[PCMCIA] card removed");
             CARD_LIVE.store(false, Ordering::Relaxed);
-            c.enable_csc(irq);
             disconnect_card(c.as_ref());
         } else if present && !live {
             crate::println!("[PCMCIA] card inserted");
-            c.enable_csc(irq);
             if let Some(device) = bind_card() {
                 CARD_LIVE.store(true, Ordering::Relaxed);
                 crate::filesystem::init::pcmcia_hotplug_device(device);

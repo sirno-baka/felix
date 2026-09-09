@@ -105,13 +105,19 @@ impl PciDevice {
 /// Probe the size of a BAR
 fn probe_bar_size(bus: u8, device: u8, function: u8, offset: u8, is_io: bool) -> u32 {
     let original = config::read_u32(bus, device, function, offset);
+    let old_command = config::read_u16(bus, device, function, 0x04);
 
-    // Write all 1s
+    // BAR sizing temporarily writes all ones. Do not leave I/O or memory
+    // decoding enabled while doing that: on real legacy PCI hardware the
+    // transient BAR value can otherwise decode live bus transactions. This is
+    // especially important because USB/PCMCIA rescan PCI after devices are up.
+    config::write_u16(bus, device, function, 0x04, old_command & !0x0003);
     config::write_u32(bus, device, function, offset, 0xFFFF_FFFF);
     let mut size = config::read_u32(bus, device, function, offset);
 
-    // Restore
+    // Restore BAR first, then restore the device's original decode state.
     config::write_u32(bus, device, function, offset, original);
+    config::write_u16(bus, device, function, 0x04, old_command);
 
     if is_io {
         size &= 0xFFFF_FFFC; // mask out the type bits

@@ -329,9 +329,7 @@ pub extern "C" fn higher_half_entry() -> ! {
             halt();
         }
         init_usb();
-        print_info();
-        print_devices();
-        drivers::net::init_net();
+        // drivers::net::init_net();
         // ---------------------------------------------------------------
         // Launch shell WHILE TIMER IS STILL MASKED and IF=0.
         // First IRQ0 does first_switch → abandons this boot context forever.
@@ -367,19 +365,25 @@ pub extern "C" fn higher_half_entry() -> ! {
         }
         println!("[!] Shell spawned as pid={}", shell_pid);
 
-        // Now safe to enable scheduling + keyboard + mouse:
-        //   IRQ0 = timer, IRQ1 = keyboard, IRQ12 = mouse
-        PICS.unmask_irq(0);
-        PICS.unmask_irq(1);
-        PICS.unmask_irq(12);
-        PICS.unmask_irq(11);
+        // Enable only the IRQs with real handlers here:
+        //   master IRQ0 = PIT, IRQ1 = keyboard, IRQ2 = slave cascade
+        //   slave  IRQ12 = PS/2 mouse (slave line 4)
+        // Keep shared PCI IRQ9 masked: OHCI + ToPIC hotplug are polling-only
+        // until the kernel has a shared legacy-INTx dispatcher. IRQ11 also
+        // stays masked because there is no active owner/handler for it here.
+        PICS.set_masks(0xF8, 0xEF);
+        println!(
+            "[IRQ] PIC masks={:#04x}/{:#04x}",
+            PICS.master_mask(),
+            PICS.slave_mask(),
+        );
 
         println!(
             "[!] Higher-half kernel running at 0x{:08x}",
             higher_half_entry as u32
         );
         println!("[!] Enabling interrupts — entering idle");
-
+        init(200);
         // Enable interrupts. The next timer tick will first_switch into the
         // idle task; subsequent ticks round-robin to the shell.
         asm!("sti");

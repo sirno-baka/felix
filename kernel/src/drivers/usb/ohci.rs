@@ -5,15 +5,12 @@
 //!
 //! ALi/ULi M5237 quirk: never touch HcFmInterval — the chip hard-locks.
 
-use crate::memory::paging::{KERNEL_OFFSET, PAGING, PTEFlags};
+use crate::memory::paging::{phys_to_virt, KERNEL_OFFSET, PAGING, PTEFlags};
 use crate::pci::class::{class, subclass};
 use crate::pci::device::PciDevice;
 use crate::pci::{self};
-use crate::drivers::pic::PICS;
-use crate::interrupts::idt::IDT;
 use crate::println;
 use crate::sync::mutex::Mutex;
-use core::arch::naked_asm;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
@@ -43,12 +40,15 @@ const HC_BULKCURRENTED: usize = 0x2C;
 const HC_DONEHEAD: usize = 0x30;
 const HC_FMINTERVAL: usize = 0x34;
 const HC_FMREMAINING: usize = 0x38;
+const HC_FMNUMBER: usize = 0x3C;
 const HC_PERIODICSTART: usize = 0x40;
+const HC_LSTHRESH: usize = 0x44;
 const HC_RHDESCA: usize = 0x48;
 const HC_RHSTATUS: usize = 0x50;
 const HC_RHPORTSTATUS: usize = 0x54;
 
 // HcControl
+const CTRL_CBSR: u32 = 3 << 0;
 const CTRL_PLE: u32 = 1 << 2;
 const CTRL_CLE: u32 = 1 << 4;
 const CTRL_BLE: u32 = 1 << 5;
@@ -62,10 +62,12 @@ const CTRL_RWC: u32 = 1 << 9;
 const CMD_HCR: u32 = 1 << 0;
 const CMD_CLF: u32 = 1 << 1;
 const CMD_BLF: u32 = 1 << 2;
+const CMD_OCR: u32 = 1 << 3;
 
 // HcInterruptStatus / Enable
 const INTR_WDH: u32 = 1 << 1;
 const INTR_RHSC: u32 = 1 << 6;
+const INTR_OC: u32 = 1 << 30;
 const INTR_MIE: u32 = 1 << 31;
 
 // Root hub port
@@ -83,7 +85,9 @@ const RHS_LPSC: u32 = 1 << 16;
 
 // TD condition / direction
 const TD_CC_SHIFT: u32 = 28;
-const TD_CC_NOT_ACCESSED: u32 = 14;
+// OHCI CC=0xF means "Not Accessed". 0xE is reserved for HCD use and
+// must not be used as the hardware-owned initial TD condition code.
+const TD_CC_NOT_ACCESSED: u32 = 15;
 const TD_DP_SETUP: u32 = 0 << 19;
 const TD_DP_OUT: u32 = 1 << 19;
 const TD_DP_IN: u32 = 2 << 19;
@@ -290,10 +294,16 @@ unsafe impl Sync for Ohci {}
 pub(crate) static CONTROLLERS: Mutex<Vec<Ohci>> = Mutex::new(Vec::new());
 static MMIO_SLOT: Mutex<u32> = Mutex::new(0);
 
-// IRQ context only sets bits; enumeration and driver callbacks happen from
-// poll_hotplug() outside the interrupt handler.
-static HOTPLUG_PENDING: AtomicU32 = AtomicU32::new(0);
-static KNOWN_MMIO: AtomicU32 = AtomicU32::new(0);
+// USB transfers in this HCD are already completion-polled. On the C1M
+// generation IRQ9 is a heavily shared legacy PCI INTx line (CardBus, USB,
+// audio, etc.), while this kernel currently has one IDT handler per vector.
+// Root-hub state is therefore polled from idle. Keep the divider small: at
+// 200 Hz PIT this is roughly 20 root-hub polls/sec when idle runs every tick.
+static ROOT_HUB_POLL_DIV: AtomicU32 = AtomicU32::new(0);
+// One bit per root-hub port (16 bits reserved per controller). A failed
+// enumeration is latched until the device is physically disconnected, so a
+// fast PIT cannot hammer a broken/slow real controller with repeated resets.
+static ENUM_FAIL_MASK: AtomicU32 = AtomicU32::new(0);
 
 impl Ohci {
     fn r32(&self, off: usize) -> u32 {
@@ -304,12 +314,42 @@ impl Ohci {
         unsafe { write_volatile((self.mmio + off) as *mut u32, val) }
     }
 
+    /// OHCI frame number advances once per USB frame (~1 ms) while HCFS is
+    /// OPERATIONAL. Use it for USB protocol timing instead of CPU-speed based
+    /// spin loops; this stays correct on both QEMU and the slow C1M Crusoe and
+    /// does not depend on the PIT frequency.
+    #[inline]
+    fn frame_number(&self) -> u16 {
+        (self.r32(HC_FMNUMBER) & 0xffff) as u16
+    }
+
+    #[inline]
+    fn frames_since(&self, start: u16) -> u16 {
+        self.frame_number().wrapping_sub(start)
+    }
+
+    fn wait_frames(&self, frames: u16) {
+        if frames == 0 {
+            return;
+        }
+        let start = self.frame_number();
+        while self.frames_since(start) < frames {
+            core::hint::spin_loop();
+        }
+    }
+
     fn port_status(&self, port: u8) -> u32 {
         self.r32(HC_RHPORTSTATUS + (port as usize) * 4)
     }
 
     fn write_port(&self, port: u8, val: u32) {
         self.w32(HC_RHPORTSTATUS + (port as usize) * 4, val);
+    }
+
+    #[inline]
+    fn enum_fail_bit(&self, port: u8) -> u32 {
+        let slot = ((self.mmio as u32).wrapping_sub(OHCI_MMIO_BASE) / OHCI_MMIO_STRIDE).min(1);
+        1u32 << (slot * 16 + (port as u32 & 0x0f))
     }
 
     fn map_bar(phys: u32, size: u32) -> Result<usize, &'static str> {
@@ -332,7 +372,10 @@ impl Ohci {
             .and_then(|b| b.address())
             .ok_or("OHCI: no MMIO BAR")?;
 
-        dev.enable_bus_mastering();
+        // OHCI uses MMIO + DMA; it does not need PCI I/O-space decoding.
+        // Keep firmware's other command bits and enable only Memory + BusMaster.
+        let cmd_before = dev.read_u16(0x04);
+        dev.write_u16(0x04, cmd_before | 0x0006);
         let mmio = Self::map_bar(bar, dev.bars.iter().find(|b| b.is_memory()).map(|b| b.size()).unwrap_or(0x1000))?;
 
         let skip_fminterval = dev.vendor_id == ALI_VENDOR && dev.device_id == ALI_M5237;
@@ -347,7 +390,6 @@ impl Ohci {
             &g[i].hcca as *const Hcca as *mut Hcca
         };
         let hcca_phys = virt_to_phys(hcca as *const u8);
-        println!("[ohci] HCCA virt={:p} phys=0x{:08x}", hcca, hcca_phys);
 
         Ok(Self {
             mmio,
@@ -379,51 +421,88 @@ impl Ohci {
             }
         );
 
-        println!("[ohci] stage=control-read");
-        // Drop SMM ownership (IR) if the BIOS left the controller in IRQ routing mode.
         let mut ctrl = self.r32(HC_CONTROL);
-        println!("[ohci] stage=control-read-done ctrl={:08x}", ctrl);
+
+        // OHCI ownership handoff.  IR means interrupts are routed to SMM/BIOS;
+        // software must request ownership through HcCommandStatus.OCR and wait
+        // for firmware to clear IR.  Clearing IR directly in HcControl is not
+        // the OHCI handoff protocol and is particularly unsafe on old ALi parts.
         if ctrl & CTRL_IR != 0 {
-            self.w32(HC_CONTROL, ctrl | CTRL_RWC);
-            spin_ms(10);
-            ctrl = self.r32(HC_CONTROL);
-            self.w32(HC_CONTROL, ctrl & !CTRL_IR);
-        }
+            self.w32(HC_INTDIS, 0xFFFF_FFFF);
+            self.w32(HC_INTEN, INTR_OC);
+            self.w32(HC_CMDSTATUS, CMD_OCR);
 
-        println!("[ohci] stage=interrupt-clear");
-        self.w32(HC_INTDIS, 0x8000_003F);
-        self.w32(HC_INTSTATUS, 0x8000_003F);
-        println!("[ohci] stage=interrupt-clear-done");
-
-        println!("[ohci] stage=hcfs-read");
-        let already_op = (self.r32(HC_CONTROL) & CTRL_HCFS_MASK) == CTRL_HCFS_OPERATIONAL;
-        println!("[ohci] stage=hcfs-read-done already_op={}", already_op);
-        if already_op {
-            println!("[ohci] already operational, skip HCR");
-        } else {
-        if self.skip_fminterval {
-            println!("[ohci] ALi: skip HCR");
-            } else {
-            println!("[ohci] stage=hcr-write");
-            self.w32(HC_CMDSTATUS, CMD_HCR);
-        for _ in 0..1000 {
-            if self.r32(HC_CMDSTATUS) & CMD_HCR == 0 {
-                break;
+            let mut released = false;
+            for _ in 0..500 {
+                ctrl = self.r32(HC_CONTROL);
+                if ctrl & CTRL_IR == 0 {
+                    released = true;
+                    break;
+                }
+                spin_ms(10);
             }
-            spin_ms(1);
+            self.w32(HC_INTDIS, INTR_OC | INTR_MIE);
+            if !released {
+                // FreeBSD/NetBSD-style recovery: old firmware can ignore OCR.
+                // Continue with a controller reset instead of leaving IR/SMM
+                // routing active when the kernel later executes STI.
+                println!("[ohci] SMM did not release HC; forcing reset path");
+            }
         }
-        if self.r32(HC_CMDSTATUS) & CMD_HCR != 0 {
-            return Err("OHCI: HCR stuck");
-        }
-        println!("[ohci] stage=hcr-done");
-            } // ALi skip HCR
-        } // HCR
 
-        // Linux: 10b9:5237 hard-locks the southbridge on any FmInterval access.
-        if !self.skip_fminterval && !already_op {
-            println!("[ohci] stage=fminterval-read");
+        // Keep all HC interrupt sources disabled during reset and initial port
+        // enumeration.  This prevents a stale RHSC from becoming the very first
+        // interrupt immediately after the kernel executes STI.
+        self.w32(HC_INTDIS, 0xFFFF_FFFF);
+        self.w32(HC_INTSTATUS, 0xFFFF_FFFF);
+
+        ctrl = self.r32(HC_CONTROL);
+        let rwc = ctrl & CTRL_RWC;
+        let old_hcfs = ctrl & CTRL_HCFS_MASK;
+
+        // ALi/ULi M5237 is special in two independent ways:
+        //   1) touching HcFmInterval can wedge the whole machine;
+        //   2) rev03 parts are historically fragile around HCR itself.
+        //
+        // More importantly for this Sony, HCR would force us to reconstruct
+        // frame-scheduler state that we are forbidden to read back safely.
+        // Preserve firmware's FmInterval/FSMPS/PeriodicStart/LSThreshold and do
+        // only a USB bus reset. This keeps the BIOS-programmed non-periodic
+        // budget intact while still returning devices to the default state.
+        if self.skip_fminterval {
+            self.w32(HC_CONTROL, rwc | CTRL_HCFS_RESET);
+            let _ = self.r32(HC_CONTROL); // flush RESET write
+            spin_ms(50);
+
+            unsafe {
+                core::ptr::write_bytes(self.hcca as *mut u8, 0, core::mem::size_of::<Hcca>());
+            }
+            self.w32(HC_CONTROLHEADED, 0);
+            self.w32(HC_CONTROLCURRENTED, 0);
+            self.w32(HC_BULKHEADED, 0);
+            self.w32(HC_BULKCURRENTED, 0);
+            self.w32(HC_HCCA, self.hcca_phys);
+            core::sync::atomic::fence(Ordering::SeqCst);
+            self.w32(HC_CONTROL, CTRL_HCFS_OPERATIONAL | CTRL_CBSR | rwc);
+            let _ = self.r32(HC_CONTROL);
+        } else {
+            if old_hcfs != CTRL_HCFS_RESET {
+                self.w32(HC_CONTROL, rwc | CTRL_HCFS_RESET);
+                let _ = self.r32(HC_CONTROL);
+                spin_ms(50);
+            }
+
+            self.w32(HC_CMDSTATUS, CMD_HCR);
+            for _ in 0..1000 {
+                if self.r32(HC_CMDSTATUS) & CMD_HCR == 0 {
+                    break;
+                }
+                spin_ms(1);
+            }
+            if self.r32(HC_CMDSTATUS) & CMD_HCR != 0 {
+                return Err("OHCI: HCR stuck");
+            }
             let fi = self.r32(HC_FMINTERVAL);
-            println!("[ohci] stage=fminterval-read-done fi={:08x}", fi);
             let mut interval = fi & 0x3FFF;
             let mut fsmps = (fi >> 16) & 0x7FFF;
             if interval < 0x1000 {
@@ -432,50 +511,40 @@ impl Ohci {
             if fsmps < 0x1000 {
                 fsmps = FSMPS_DEFAULT;
             }
-            println!("[ohci] stage=fminterval-write");
             self.w32(HC_FMINTERVAL, interval | (fsmps << 16) | (1 << 31));
-            println!("[ohci] stage=periodicstart-write");
+
             self.w32(HC_PERIODICSTART, PERIODIC_START);
-            println!("[ohci] stage=fminterval-config-done");
+            self.w32(HC_LSTHRESH, 0x0628);
+
+            self.w32(HC_HCCA, self.hcca_phys);
+            self.w32(HC_CONTROLHEADED, 0);
+            self.w32(HC_CONTROLCURRENTED, 0);
+            self.w32(HC_BULKHEADED, 0);
+            self.w32(HC_BULKCURRENTED, 0);
+
+            self.w32(HC_CONTROL, CTRL_HCFS_OPERATIONAL | CTRL_CBSR | rwc);
+            spin_ms(10);
         }
 
-        println!("[ohci] stage=hcca-write");
-        self.w32(HC_HCCA, self.hcca_phys);
-        self.w32(HC_CONTROLHEADED, 0);
-        self.w32(HC_CONTROLCURRENTED, 0);
-        self.w32(HC_BULKHEADED, 0);
-        self.w32(HC_BULKCURRENTED, 0);
-
-        // USBOPERATIONAL + control + bulk + periodic.
-        println!("[ohci] stage=operational-write");
-        self.w32(
-            HC_CONTROL,
-            CTRL_HCFS_OPERATIONAL | CTRL_CLE | CTRL_BLE | CTRL_RWC,
-        );
-        spin_ms(10);
-        println!("[ohci] stage=operational-done ctrl={:08x}", self.r32(HC_CONTROL));
-
-        // Global power on root-hub ports.
-        println!("[ohci] stage=root-power-write");
+        // Global power on root-hub ports. HcRhDescriptorA.POTPGT tells the
+        // HCD how long a newly powered port needs before it may be accessed;
+        // the field is in 2 ms units. Real southbridges can need much longer
+        // than QEMU, so do not hard-code one short delay for every controller.
         self.w32(HC_RHSTATUS, RHS_LPSC);
-        spin_ms(20);
-        println!("[ohci] stage=root-power-done");
-
-        println!("[ohci] stage=port-count-read");
+        let _ = self.r32(HC_RHSTATUS); // flush posted PCI write
         let desca = self.r32(HC_RHDESCA);
+        let potpgt_ms = ((desca >> 24) & 0xFF) * 2;
+        spin_ms(potpgt_ms.max(20));
+
         self.nports = (desca & 0xFF) as u8;
         if self.nports == 0 || self.nports > 15 {
             self.nports = 2;
         }
-        println!("[ohci] ports={}", self.nports);
 
         // Power + ack leftover port-change bits.
         for p in 0..self.nports {
-            println!("[ohci] stage=port{}-power-write", p + 1);
             self.write_port(p, PS_PPS);
-            println!("[ohci] stage=port{}-status-read", p + 1);
             let s = self.port_status(p);
-            println!("[ohci] stage=port{}-status-read-done status={:08x}", p + 1, s);
             self.write_port(p, s & 0xFFFF_0000);
             if s & PS_CCS != 0 {
                 println!(
@@ -498,15 +567,23 @@ impl Ohci {
         }
 
         self.write_port(port, PS_PRS);
-        for _ in 0..200 {
+        let reset_start = self.frame_number();
+        let mut reset_done = false;
+        while self.frames_since(reset_start) < 100 {
             if self.port_status(port) & PS_PRSC != 0 {
+                reset_done = true;
                 break;
             }
-            spin_ms(1);
+            core::hint::spin_loop();
         }
+        if !reset_done {
+            return Err("OHCI: port reset timeout");
+        }
+
         self.write_port(port, PS_PRSC | PS_CSC | PS_PESC);
         self.write_port(port, PS_PES);
-        spin_ms(10);
+        // USB requires recovery time after reset before address-0 traffic.
+        self.wait_frames(10);
 
         let s = self.port_status(port);
         Ok(s & PS_PES != 0 && s & PS_CCS != 0)
@@ -539,31 +616,37 @@ impl Ohci {
         if data.len() > 256 {
             return Err("OHCI: control data > 256");
         }
-        let dummy = Box::leak(Box::new(Td {
+        // Use the controller's permanently allocated, physically contiguous
+        // DMA page for EP0. This avoids handing real OHCI hardware a mixture of
+        // heap objects and an idle-task stack buffer. QEMU tolerates that model,
+        // but old PCI OHCI parts are much happier when the complete control
+        // transaction lives in one stable DMA page.
+        let dma = unsafe { &mut *(self.hcca as *mut DmaPage) };
+
+        dma.setup.copy_from_slice(setup);
+        if data.is_empty() {
+            dma.data[..1].fill(0);
+        } else if in_dir {
+            dma.data[..data.len()].fill(0);
+        } else {
+            dma.data[..data.len()].copy_from_slice(data);
+        }
+
+        let ed_phys = virt_to_phys((&dma.ed as *const Ed).cast::<u8>());
+        let dummy_phys = virt_to_phys((&dma.dummy as *const Td).cast::<u8>());
+        let setup_td_phys = virt_to_phys((&dma.setup_td as *const Td).cast::<u8>());
+        let data_td_phys = virt_to_phys((&dma.data_td as *const Td).cast::<u8>());
+        let status_td_phys = virt_to_phys((&dma.status_td as *const Td).cast::<u8>());
+        let setup_phys = virt_to_phys(dma.setup.as_ptr());
+        let data_phys = virt_to_phys(dma.data.as_ptr());
+
+        dma.dummy = Td {
             flags: TD_CC_NOT_ACCESSED << TD_CC_SHIFT,
             cbp: 0,
             next_td: 0,
             be: 0,
-        }));
-        let dummy_phys = virt_to_phys(dummy as *mut Td as *const u8);
-
-        let setup_buf = Box::leak(Box::new(*setup));
-        let setup_phys = virt_to_phys(setup_buf.as_ptr());
-
-        let data_phys = if !data.is_empty() {
-            virt_to_phys(data.as_mut_ptr())
-        } else {
-            0
         };
-
-        let setup_td = Box::leak(Box::new(Td {
-            flags: (TD_CC_NOT_ACCESSED << TD_CC_SHIFT) | TD_DP_SETUP | TD_T_DATA0 | TD_DI_NONE,
-            cbp: setup_phys,
-            next_td: 0,
-            be: setup_phys + 7,
-        }));
-
-        let status_td = Box::leak(Box::new(Td {
+        dma.status_td = Td {
             flags: (TD_CC_NOT_ACCESSED << TD_CC_SHIFT)
                 | if in_dir { TD_DP_OUT } else { TD_DP_IN }
                 | TD_T_DATA1
@@ -571,82 +654,121 @@ impl Ohci {
             cbp: 0,
             next_td: dummy_phys,
             be: 0,
-        }));
-        let status_phys = virt_to_phys(status_td as *mut Td as *const u8);
-
-        let first_phys;
-        if data.is_empty() {
-            setup_td.next_td = status_phys;
-            first_phys = virt_to_phys(setup_td as *mut Td as *const u8);
-        } else {
-            let last = data_phys + (data.len() as u32) - 1;
-            let data_td = Box::leak(Box::new(Td {
-                flags: (TD_CC_NOT_ACCESSED << TD_CC_SHIFT)
-                    | if in_dir { TD_DP_IN } else { TD_DP_OUT }
-                    | TD_T_DATA1
-                    | TD_DI_NONE
-                    | TD_R,
-                cbp: data_phys,
-                next_td: status_phys,
-                be: last,
-            }));
-            setup_td.next_td = virt_to_phys(data_td as *mut Td as *const u8);
-            first_phys = virt_to_phys(setup_td as *mut Td as *const u8);
-            let _ = data_td;
-        }
-
-        let ed = Box::leak(Box::new(Ed {
+        };
+        dma.data_td = Td {
+            flags: (TD_CC_NOT_ACCESSED << TD_CC_SHIFT)
+                | if in_dir { TD_DP_IN } else { TD_DP_OUT }
+                | TD_T_DATA1
+                | TD_DI_NONE
+                | TD_R,
+            cbp: if data.is_empty() { 0 } else { data_phys },
+            next_td: status_td_phys,
+            be: if data.is_empty() {
+                0
+            } else {
+                data_phys + data.len() as u32 - 1
+            },
+        };
+        dma.setup_td = Td {
+            flags: (TD_CC_NOT_ACCESSED << TD_CC_SHIFT) | TD_DP_SETUP | TD_T_DATA0 | TD_DI_NONE,
+            cbp: setup_phys,
+            next_td: if data.is_empty() { status_td_phys } else { data_td_phys },
+            be: setup_phys + 7,
+        };
+        dma.ed = Ed {
             flags: ed_flags(addr, 0, mps.max(8), ls),
             tail_td: dummy_phys,
-            head_td: first_phys,
+            head_td: setup_td_phys,
             next_ed: 0,
-        }));
-        let ed_phys = virt_to_phys(ed as *mut Ed as *const u8);
+        };
 
+        // Make descriptor writes globally visible before the controller can DMA.
+        core::sync::atomic::fence(Ordering::SeqCst);
+
+        // Stop non-periodic schedules while replacing ControlHeadED. Linux
+        // starts with CBSR=3 and enables CLE/BLE on demand; mirror that model
+        // instead of leaving an empty bulk schedule enabled on ALi M5237.
+        let ctrl = self.r32(HC_CONTROL);
+        self.w32(HC_CONTROL, ctrl & !(CTRL_CLE | CTRL_BLE));
+        let _ = self.r32(HC_CONTROL); // flush posted PCI write
         self.w32(HC_CONTROLHEADED, ed_phys);
         self.w32(HC_CONTROLCURRENTED, 0);
-        let ctrl = self.r32(HC_CONTROL);
-        self.w32(HC_CONTROL, (ctrl & !CTRL_HCFS_MASK) | CTRL_HCFS_OPERATIONAL | CTRL_CLE);
+        core::sync::atomic::fence(Ordering::SeqCst);
+        self.w32(
+            HC_CONTROL,
+            (ctrl & !(CTRL_HCFS_MASK | CTRL_CLE | CTRL_BLE | CTRL_CBSR))
+                | CTRL_HCFS_OPERATIONAL
+                | CTRL_CBSR
+                | CTRL_CLE,
+        );
+        let _ = self.r32(HC_CONTROL); // flush posted writes
         self.w32(HC_CMDSTATUS, CMD_CLF);
+        let _ = self.r32(HC_CMDSTATUS); // force posted write onto PCI
 
         let mut ok = false;
-        for _ in 0..500 {
-            if setup_td.cc() != TD_CC_NOT_ACCESSED && status_td.cc() != TD_CC_NOT_ACCESSED {
+        let wait_start = self.frame_number();
+        while self.frames_since(wait_start) < 500 {
+            let setup_cc = dma.setup_td.cc();
+            let status_cc = dma.status_td.cc();
+            if setup_cc != TD_CC_NOT_ACCESSED && status_cc != TD_CC_NOT_ACCESSED {
                 ok = true;
                 break;
             }
-            spin_ms(1);
+            core::hint::spin_loop();
         }
 
-        // Unlink ED so the HC stops walking it.
-        ed.flags |= ED_SKIP;
+        // Stop HC access to the descriptor before reusing this DMA page. Also
+        // switch CLE off: after a failed transfer in particular, leaving an
+        // empty control schedule enabled with CLF latched can poison the next
+        // hotplug enumeration on old M5237 hardware.
+        dma.ed.flags |= ED_SKIP;
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let ctrl_after = self.r32(HC_CONTROL);
+        self.w32(HC_CONTROL, ctrl_after & !CTRL_CLE);
+        let _ = self.r32(HC_CONTROL);
         self.w32(HC_CONTROLHEADED, 0);
         self.w32(HC_CONTROLCURRENTED, 0);
+        let _ = self.r32(HC_CONTROLHEADED);
 
         if !ok {
             println!(
-                "[ohci] ctrl timeout ctrl={:08x} cmd={:08x} done={:08x} setup_cc={} stat_cc={}",
+                "[ohci] ctrl timeout mmio={:#x} ctrl={:08x} cmd={:08x} int={:08x} done={:08x} head={:08x} cur={:08x} frame={} hcca_frame={} rem={:08x} periodic={:08x} setup_cc={} data_cc={} stat_cc={}",
+                self.mmio,
                 self.r32(HC_CONTROL),
                 self.r32(HC_CMDSTATUS),
+                self.r32(HC_INTSTATUS),
                 self.r32(HC_DONEHEAD),
-                setup_td.cc(),
-                status_td.cc()
+                self.r32(HC_CONTROLHEADED),
+                self.r32(HC_CONTROLCURRENTED),
+                self.r32(HC_FMNUMBER) & 0xffff,
+                unsafe { read_volatile(&(*self.hcca).frame_number) as u32 },
+                self.r32(HC_FMREMAINING),
+                self.r32(HC_PERIODICSTART),
+                dma.setup_td.cc(),
+                dma.data_td.cc(),
+                dma.status_td.cc(),
             );
             return Err("OHCI: control timeout");
         }
-        if setup_td.cc() != 0 {
-            println!("[ohci] SETUP cc={}", setup_td.cc());
+        if dma.setup_td.cc() != 0 {
+            println!("[ohci] SETUP cc={}", dma.setup_td.cc());
             return Err("OHCI: SETUP failed");
         }
-        if status_td.cc() != 0 && status_td.cc() != 9 {
-            // 9 = data underrun / short packet — acceptable on IN
-            println!("[ohci] STATUS cc={}", status_td.cc());
+        if !data.is_empty() {
+            let data_cc = dma.data_td.cc();
+            if data_cc != 0 && data_cc != 9 {
+                println!("[ohci] DATA cc={}", data_cc);
+                return Err("OHCI: DATA failed");
+            }
+        }
+        if dma.status_td.cc() != 0 && dma.status_td.cc() != 9 {
+            println!("[ohci] STATUS cc={}", dma.status_td.cc());
             return Err("OHCI: STATUS failed");
         }
 
-        let _ = dummy;
-        let _ = setup_buf;
-        let _ = addr_of_mut!(*ed);
+        if in_dir && !data.is_empty() {
+            data.copy_from_slice(&dma.data[..data.len()]);
+        }
         Ok(data.len())
     }
 
@@ -775,12 +897,13 @@ impl Ohci {
         // );
 
         let mut ok = false;
-        for _ in 0..2000 {
+        let wait_start = self.frame_number();
+        while self.frames_since(wait_start) < 2000 {
             if unsafe { read_volatile(&(*dummy).flags) } >> TD_CC_SHIFT != TD_CC_NOT_ACCESSED {
                 ok = true;
                 break;
             }
-            spin_ms(1);
+            core::hint::spin_loop();
         }
 
         if !ok {
@@ -849,7 +972,10 @@ impl Ohci {
         }));
         let td_phys = virt_to_phys(td as *mut Td as *const u8);
         let ed = Box::leak(Box::new(Ed {
-            flags: ed_flags(addr, ep, mps.max(8), ls),
+            // Interrupt endpoints may legitimately have very small packets
+            // (CBI command-completion is two bytes). Use the descriptor's
+            // wMaxPacketSize; the >=8 rule applies to EP0, not periodic EDs.
+            flags: ed_flags(addr, ep, mps.max(1), ls),
             tail_td: dummy_phys,
             head_td: td_phys,
             next_ed: 0,
@@ -865,12 +991,13 @@ impl Ohci {
         self.w32(HC_CONTROL, ctrl | CTRL_PLE | CTRL_HCFS_OPERATIONAL);
 
         let mut ok = false;
-        for _ in 0..200 {
+        let wait_start = self.frame_number();
+        while self.frames_since(wait_start) < 200 {
             if td.cc() != TD_CC_NOT_ACCESSED {
                 ok = true;
                 break;
             }
-            spin_ms(1);
+            core::hint::spin_loop();
         }
         ed.flags |= ED_SKIP;
         unsafe {
@@ -887,6 +1014,58 @@ impl Ohci {
         Ok(data.len())
     }
 
+    /// Drop host-controller endpoint state belonging to a physically removed
+    /// USB address. Device/class/VFS state is removed by usb::device first;
+    /// this removes the stale OHCI bulk EDs that otherwise remain linked in
+    /// HcBulkHeadED across a disconnect/reconnect cycle.
+    pub(crate) fn disconnect_address(&self, addr: u8) {
+        let ctrl = self.r32(HC_CONTROL);
+        self.w32(HC_CONTROL, ctrl & !(CTRL_CLE | CTRL_BLE));
+        let _ = self.r32(HC_CONTROL); // flush before editing the ED chain
+        self.w32(HC_CONTROLHEADED, 0);
+        self.w32(HC_CONTROLCURRENTED, 0);
+
+        let first_phys = {
+            let mut eps = BULK_EPS.lock();
+            eps.retain(|e| !(e.mmio == self.mmio && e.addr == addr));
+
+            let indices: Vec<usize> = eps
+                .iter()
+                .enumerate()
+                .filter_map(|(i, e)| if e.mmio == self.mmio { Some(i) } else { None })
+                .collect();
+
+            for (n, &idx) in indices.iter().enumerate() {
+                let next = indices
+                    .get(n + 1)
+                    .map(|&next_idx| eps[next_idx].ed_phys)
+                    .unwrap_or(0);
+                unsafe {
+                    (*eps[idx].ed).next_ed = next;
+                }
+            }
+
+            indices.first().map(|&i| eps[i].ed_phys).unwrap_or(0)
+        };
+
+        self.w32(HC_BULKHEADED, first_phys);
+        self.w32(HC_BULKCURRENTED, 0);
+        core::sync::atomic::fence(Ordering::SeqCst);
+
+        // Restore the bulk schedule only if this controller still owns at
+        // least one bulk endpoint. Otherwise leave BLE off with an empty head.
+        if first_phys != 0 {
+            self.w32(HC_CONTROL, ctrl & !CTRL_CLE);
+        } else {
+            self.w32(HC_CONTROL, ctrl & !(CTRL_CLE | CTRL_BLE));
+        }
+        let _ = self.r32(HC_CONTROL);
+
+        TOGGLE.lock()[addr as usize & 0x7f] = 0;
+        EP0_MPS.lock()[addr as usize & 0x7f] = 8;
+        EP0_LS.lock()[addr as usize & 0x7f] = 0;
+    }
+
     /// Reset every connected port and bind a class driver.
     pub fn enumerate_ports(&self) {
         for p in 0..self.nports {
@@ -896,7 +1075,6 @@ impl Ohci {
 
     /// Enumerate one root-hub port. This is intentionally outside IRQ context.
     pub fn enumerate_port(&self, port: u8) {
-        println!("[ohci] stage=port{}-reset-start", port + 1);
         match self.reset_port(port) {
             Ok(true) => {}
             Ok(false) => return,
@@ -905,36 +1083,96 @@ impl Ohci {
                 return;
             }
         }
-        println!("[ohci] stage=port{}-reset-done", port + 1);
-        let ls = self.port_low_speed(port);
+        let port_status = self.port_status(port);
+        let ls = port_status & PS_LSDA != 0;
         match self.address_and_bind_on_port(port, ls) {
-            Ok(addr) => println!("[ohci] port {} addr={}{}", port + 1, addr, if ls { " LS" } else { " FS" }),
-            Err(e) => println!("[ohci] port {}: {}", port + 1, e),
+            Ok(addr) => {
+                ENUM_FAIL_MASK.fetch_and(!self.enum_fail_bit(port), Ordering::Relaxed);
+                println!("[ohci] port {} addr={}{}", port + 1, addr, if ls { " LS" } else { " FS" });
+            }
+            Err(e) => {
+                ENUM_FAIL_MASK.fetch_or(self.enum_fail_bit(port), Ordering::Relaxed);
+                println!("[ohci] port {}: {} (retry latched until disconnect)", port + 1, e);
+            }
         }
+    }
+
+    /// Clear all root-hub change latches and the top-level RHSC bit.
+    /// Keep this separate from enumeration so init can drain stale BIOS/reset
+    /// events before the PIC line is ever unmasked.
+    fn ack_root_hub_changes(&self) {
+        for p in 0..self.nports {
+            let status = self.port_status(p);
+            let changes = status & 0xFFFF_0000;
+            if changes != 0 {
+                self.write_port(p, changes);
+            }
+        }
+        self.w32(HC_INTSTATUS, INTR_RHSC);
+        let _ = self.r32(HC_INTSTATUS); // flush posted write
     }
 
     /// Scan root-hub connection state after an RHSC interrupt.
     pub fn poll_root_hub(&self) {
         for p in 0..self.nports {
+            // Do not infer power state from PPS here. Old ALi root hubs can
+            // report surprising PPS values while disconnected, and repeatedly
+            // writing SetPortPower on every poll prevents normal edge handling.
+            // Initial root-hub power is established once in start().
             let status = self.port_status(p);
             let connected = status & PS_CCS != 0;
             let known = crate::drivers::usb::device::find(self.mmio, p).is_some();
 
-            if connected && !known {
-                println!("[ohci] hotplug: port {} connected", p + 1);
-                self.enumerate_port(p);
-            } else if !connected && known {
-                println!("[ohci] hotplug: port {} disconnected", p + 1);
-                crate::drivers::usb::device::disconnect_port(self, p);
+            let fail_bit = self.enum_fail_bit(p);
+            let failed = ENUM_FAIL_MASK.load(Ordering::Relaxed) & fail_bit != 0;
+
+            if connected && !known && !failed {
+                println!(
+                    "[ohci] hotplug: mmio={:#x} port {} connected status={:08x}",
+                    self.mmio,
+                    p + 1,
+                    status,
+                );
+                // Debounce against the controller's own 1 kHz USB frame clock,
+                // not an uncalibrated CPU spin. Leave IRQs enabled while the
+                // connector settles; only reset/enumeration is atomic against
+                // the PIT scheduler on this old M5237.
+                let debounce_start = self.frame_number();
+                while self.frames_since(debounce_start) < 100 {
+                    if self.port_status(p) & PS_CCS == 0 {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                if self.port_status(p) & PS_CCS != 0 {
+                    interrupt_sync::without_interrupts(|| self.enumerate_port(p));
+                }
+            } else if !connected {
+                // Physical disconnect arms a fresh enumeration attempt. A
+                // failed enumeration never enters DEVICES, so log that case too
+                // instead of making subsequent unplug look like "no event".
+                ENUM_FAIL_MASK.fetch_and(!fail_bit, Ordering::Relaxed);
+                if known {
+                    println!("[ohci] hotplug: port {} disconnected", p + 1);
+                    crate::drivers::usb::device::disconnect_port(self, p);
+                } else if failed {
+                    println!("[ohci] hotplug: port {} disconnected; retry rearmed", p + 1);
+                }
             }
 
-            // RHSC is level-triggered by port-change bits. Acknowledge all
-            // change bits after sampling CCS so the next physical transition
-            // can raise RHSC again.
-            if status & 0xFFFF_0000 != 0 {
-                self.write_port(p, status & 0xFFFF_0000);
+            // Port change bits are W1C and are the real source behind RHSC on
+            // controllers that implement RHSC as a level interrupt.
+            let changes = status & 0xFFFF_0000;
+            if changes != 0 {
+                self.write_port(p, changes);
             }
         }
+
+        // Keep the top-level RHSC latch drained.  Hardware RHSC interrupts are
+        // deliberately disabled for now: legacy IRQ9 is shared on the target
+        // C1M platform and the kernel does not yet have a shared IRQ dispatcher.
+        self.w32(HC_INTSTATUS, INTR_RHSC);
+        let _ = self.r32(HC_INTSTATUS); // flush posted write
     }
 
     /// Default-state device on the wire → SET_ADDRESS → class bind.
@@ -943,7 +1181,7 @@ impl Ohci {
     }
 
     fn address_and_bind_on_port(&self, port: u8, ls: bool) -> Result<u8, &'static str> {
-        let mps8 = if ls { 8 } else { 8 };
+        let mps8 = 8;
         let mut hdr = [0u8; 8];
         self.control_ex(0, &[0x80, 6, 0x00, 0x01, 0, 0, 8, 0], &mut hdr, true, mps8, ls)?;
         let mps = if hdr[7] == 8 || hdr[7] == 16 || hdr[7] == 32 || hdr[7] == 64 {
@@ -962,84 +1200,34 @@ impl Ohci {
         set_ep0(addr, mps, ls);
         let mut empty: [u8; 0] = [];
         self.control_ex(0, &[0x00, 5, addr, 0, 0, 0, 0, 0], &mut empty, false, mps, ls)?;
-        spin_ms(2);
+        self.wait_frames(2);
         crate::drivers::usb::device::bind_with_port(self, port, addr, &desc);
         Ok(addr)
     }
 }
 
-fn silence_mmio(mmio: usize) {
-    unsafe {
-        let st = read_volatile((mmio + HC_INTSTATUS) as *const u32);
-        if st != 0 {
-            write_volatile((mmio + HC_INTSTATUS) as *mut u32, st);
-        }
-    }
-}
-
-extern "C" fn irq9_ack() {
-    let mask = KNOWN_MMIO.load(Ordering::Relaxed);
-    for slot in 0..32u32 {
-        if mask & (1 << slot) == 0 {
-            continue;
-        }
-        let mmio = (OHCI_MMIO_BASE + slot * OHCI_MMIO_STRIDE) as usize;
-        unsafe {
-            let st = read_volatile((mmio + HC_INTSTATUS) as *const u32);
-            if st == 0 {
-                continue;
-            }
-            if st & INTR_RHSC != 0 {
-                HOTPLUG_PENDING.fetch_or(1 << slot, Ordering::Release);
-            }
-            // Acknowledge only the bits that actually fired. Do not disable
-            // RHSC here: otherwise the first hotplug event would be the last.
-            write_volatile((mmio + HC_INTSTATUS) as *mut u32, st);
-        }
-    }
-    PICS.end_interrupt(32 + 9);
-}
-
 pub fn poll_hotplug() {
-    let pending = HOTPLUG_PENDING.swap(0, Ordering::Acquire);
-    if pending == 0 {
+    // Keep polling cheap on the Crusoe but responsive at the current 200 Hz PIT.
+    // Unlike the old /100 divider, /10 does not turn hotplug into multi-second
+    // latency once other runnable tasks reduce the amount of idle CPU time.
+    if ROOT_HUB_POLL_DIV.fetch_add(1, Ordering::Relaxed) % 10 != 0 {
         return;
     }
-
-    let mmios: Vec<usize> = {
+    let controllers: Vec<Ohci> = {
         let controllers = CONTROLLERS.lock();
-        controllers.iter().map(|hc| hc.mmio).collect()
+        controllers.iter().copied().collect()
     };
-    for mmio in mmios {
-        let slot = ((mmio as u32).saturating_sub(OHCI_MMIO_BASE) / OHCI_MMIO_STRIDE) as u32;
-        if slot < 32 && pending & (1 << slot) != 0 {
-            let controller = {
-                let controllers = CONTROLLERS.lock();
-                controllers.iter().find(|hc| hc.mmio == mmio).copied()
-            };
-            if let Some(hc) = controller {
-                hc.poll_root_hub();
-            }
-        }
+    for hc in controllers {
+        hc.poll_root_hub();
     }
-}
-
-#[unsafe(naked)]
-extern "C" fn irq9_stub() {
-    naked_asm!(
-        "pushad",
-        "call {h}",
-        "popad",
-        "iretd",
-        h = sym irq9_ack,
-    );
 }
 
 pub fn init_all() {
-    unsafe {
-        IDT.add(32 + 9, irq9_stub as u32);
-    }
-    PICS.unmask_irq(9);
+    // Do NOT install a USB-specific IRQ9 gate here.  On the target Sony C1M
+    // generation PCI INTx/IRQ9 is shared with CardBus and several other devices,
+    // and PCMCIA may already own vector 41 by the time USB is initialized.
+    // This HCD uses polling for transfer completion anyway, so root-hub hotplug
+    // is polled from idle until the kernel gains a shared IRQ dispatcher.
     let devices = pci::enumerate();
     let mut n = 0u32;
     for dev in devices.iter() {
@@ -1049,34 +1237,37 @@ pub fn init_all() {
         {
             continue;
         }
-        if dev.vendor_id == ALI_VENDOR && dev.device_id == ALI_M5237 && dev.device == 0x0f {
-            println!("[ohci] skip {:02x}:{:02x}.{} (internal MS HC)", dev.bus, dev.device, dev.function);
-            continue;
-        }
+        // Do not skip an M5237 merely because firmware left Memory/BusMaster
+        // decode disabled.  On the PCG-C1MHP (same C1MW platform as C1MAH),
+        // 00:0f.0 starts as command 0x0010 and Linux deliberately enables it;
+        // that controller owns the built-in Sony Memory Stick reader.  Probe()
+        // enables only PCI Memory + BusMaster before touching OHCI registers.
         match Ohci::probe(dev) {
             Ok(mut hc) => {
-                println!("[ohci] pci {:02x}:{:02x}.{} start", dev.bus, dev.device, dev.function);
                 if let Err(e) = hc.start() {
                     println!("[ohci] start failed: {}", e);
                     continue;
                 }
-                println!("[ohci] pci {:02x}:{:02x}.{} start-done", dev.bus, dev.device, dev.function);
-                let mmio_slot = ((hc.mmio as u32).saturating_sub(OHCI_MMIO_BASE) / OHCI_MMIO_STRIDE) as u32;
-                hc.w32(HC_INTSTATUS, 0x8000_003F);
-                hc.w32(HC_INTEN, INTR_RHSC | INTR_MIE);
-                KNOWN_MMIO.fetch_or(1 << mmio_slot, Ordering::Release);
                 let mmio = hc.mmio;
+
+                // The HC interrupt block is still fully disabled here. Initial
+                // port resets/enumeration themselves generate RHSC changes, so
+                // doing this before enabling RHSC avoids a pending IRQ at STI.
                 CONTROLLERS.lock().push(hc);
-                println!("[ohci] pci {:02x}:{:02x}.{} enumerate", dev.bus, dev.device, dev.function);
                 let controller = {
                     let controllers = CONTROLLERS.lock();
                     controllers.iter().find(|hc| hc.mmio == mmio).copied()
                 };
                 if let Some(hc) = controller {
                     hc.enumerate_ports();
+                    hc.ack_root_hub_changes();
+
+                    // Never assert PCI INTx from OHCI in polling mode.  In
+                    // particular, do not overwrite/unmask shared IRQ9 after the
+                    // ToPIC/CardBus driver has already installed its handler.
+                    hc.w32(HC_INTDIS, 0xFFFF_FFFF);
+                    hc.w32(HC_INTSTATUS, 0xFFFF_FFFF);
                 }
-                println!("[ohci] pci {:02x}:{:02x}.{} enumerate-done", dev.bus, dev.device, dev.function);
-                silence_mmio(mmio);
                 n += 1;
             }
             Err(e) => println!("[ohci] probe {:02x}:{:02x}.{}: {}", dev.bus, dev.device, dev.function, e),

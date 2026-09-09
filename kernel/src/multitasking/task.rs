@@ -289,24 +289,13 @@ impl TaskManager {
             if next != 0 {
                 self.current_task = next;
             }
-            // Make sure timer/kbd/cascade/mouse are unmasked after sti.
-            crate::drivers::pic::PICS.unmask_irq(0);
-            crate::drivers::pic::PICS.unmask_irq(1);
-            crate::drivers::pic::PICS.unmask_irq(2);
-            crate::drivers::pic::PICS.unmask_irq(12);
-            let master = crate::drivers::pic::PICS.master_mask();
-            let slave = crate::drivers::pic::PICS.slave_mask();
-            let eflags = unsafe {
-                let t = self.tasks[self.current_task as usize].as_ref().unwrap();
-                (*(t.cpu_state_ptr as *const CPUState)).eflags
-            };
-            println!(
-                "[TASK] first switch -> {} eflags={:#x} pic={:#x}/{:#x}",
-                self.current_task, eflags, master, slave
-            );
-
+            // PIC policy belongs to boot/device code, not the scheduler. In
+            // particular, do not overwrite main.rs masks here: IRQ9 must remain
+            // masked while OHCI/ToPIC share the legacy line and use polling.
             let task = unsafe { self.tasks[self.current_task as usize].as_ref().unwrap() };
             let new_cpustate = task.cpu_state_ptr as *mut CPUState;
+            println!("[TASK] first switch -> {}", self.current_task);
+
             unsafe {
                 gdt::TSS.esp0 = task.kernel_stack;
                 task.switch_address_space();
@@ -490,12 +479,15 @@ impl TaskManager {
 }
 
 fn idle() {
+    println!("[TASK] idle");
     loop {
-        // USB RHSC IRQs only enqueue an atomic event. Enumeration and driver
-        // probe/disconnect are intentionally performed here, outside IRQ context.
-        crate::drivers::usb::poll_events();
         unsafe {
             asm!("hlt");
         }
+        // USB + PCMCIA hotplug are intentionally polled from task context.
+        // OHCI transfers themselves run with interrupts temporarily disabled on
+        // the Sony C1M so the PIT scheduler cannot preempt old M5237 hardware.
+        crate::drivers::usb::poll_events();
+        crate::drivers::pcmcia::poll_hotplug();
     }
 }

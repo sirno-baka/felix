@@ -17,14 +17,14 @@ pub mod ohci;
 /// Probe every PCI OHCI controller and bind class drivers.
 pub fn init() {
     // init_all() both starts every OHCI controller and enumerates ports that
-    // are already connected. Later insert/remove events arrive through RHSC
-    // and are drained by poll_events().
+    // are already connected. Root-hub insert/remove is polled from idle on
+    // legacy shared-IRQ targets until the kernel has a shared INTx dispatcher.
     ohci::init_all();
 }
 
-/// Drain controller hotplug events from process/task context. The IRQ handler
-/// only acknowledges RHSC and sets an atomic bit; all USB control transfers and
-/// driver probe/disconnect callbacks happen here.
+/// Poll/drain controller hotplug events from process/task context. All USB
+/// control transfers and driver probe/disconnect callbacks happen here, never
+/// from hard IRQ context.
 pub fn poll_events() {
     ohci::poll_hotplug();
 }

@@ -12,7 +12,7 @@ pub const TIMER_INT: u8 = 32;
 
 // Как часто поллить сеть (в тиках таймера)
 // При SYSTEM_FRACTION ≈ 1.0 (1 мс) → каждые 10 мс
-const NET_POLL_EVERY: usize = 1;
+const NET_POLL_EVERY: usize = 10;
 
 static mut NET_POLL_COUNTER: usize = 0;
 
@@ -66,7 +66,6 @@ pub extern "C" fn timer_handler(esp: u32) -> u32 {
         if NET_POLL_COUNTER >= NET_POLL_EVERY {
             NET_POLL_COUNTER = 0;
             poll_network();
-            crate::drivers::pcmcia::poll_hotplug();
         }
 
         // === 2. Планировщик ===
@@ -77,7 +76,6 @@ pub extern "C" fn timer_handler(esp: u32) -> u32 {
 
         // === 4. EOI ===
         PICS.end_interrupt(TIMER_INT);
-
         new_esp
     }
 }

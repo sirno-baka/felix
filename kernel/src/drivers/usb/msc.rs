@@ -50,7 +50,9 @@ pub struct UsbMsc {
     ep_out: u8,
     ep_in: u8,
     ep_intr: u8,
+    ep_intr_mps: u16,
     iface: u8,
+    subclass: u8,
     proto: u8,
     mps: u16,
     pub block_size: u32,
@@ -110,6 +112,47 @@ impl UsbMsc {
                 data,
                 din,
             )?;
+        }
+
+        // Protocol 00h is Control/Bulk/Interrupt (CBI): every command has a
+        // two-byte Command Completion Interrupt on the interrupt-IN endpoint.
+        // Protocol 01h is plain Control/Bulk and deliberately has no CCI.
+        if self.proto == PROTO_CBI {
+            if self.ep_intr == 0 || self.ep_intr_mps == 0 {
+                return Err("MSC: CBI missing interrupt endpoint");
+            }
+            let mut cci = [0u8; 2];
+            hc.interrupt(
+                self.addr,
+                self.ep_intr,
+                self.ep_intr_mps,
+                &mut cci,
+                true,
+                false,
+            )?;
+
+            // UFI (subclass 04h) returns ASC/ASCQ rather than the common
+            // bType/bValue block. INQUIRY and REQUEST SENSE are special-cased
+            // by established CBI implementations; otherwise non-zero ASC/ASCQ
+            // means the command needs error handling.
+            if self.subclass == 0x04 {
+                let op = cdb.first().copied().unwrap_or(0);
+                if op != 0x12 && op != 0x03 && (cci[0] != 0 || cci[1] != 0) {
+                    println!("[usb-msc] CBI UFI ASC={:02x} ASCQ={:02x}", cci[0], cci[1]);
+                    return Err("MSC: CBI UFI status");
+                }
+            } else {
+                if cci[0] != 0 {
+                    println!("[usb-msc] CBI bad type={:02x} value={:02x}", cci[0], cci[1]);
+                    return Err("MSC: bad CBI CCI");
+                }
+                match cci[1] & 0x03 {
+                    0 => {}
+                    1 => return Err("MSC: CBI command failed"),
+                    2 => return Err("MSC: CBI phase error"),
+                    _ => return Err("MSC: CBI persistent failure"),
+                }
+            }
         }
         Ok(())
     }
@@ -178,10 +221,12 @@ pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {
     let mut ep_in = None;
     let mut ep_out = None;
     let mut ep_intr = 0u8;
+    let mut ep_intr_mps = 0u16;
     let mut mps = 64u16;
     for ep in iface.endpoints.iter() {
         if ep.is_interrupt() && ep.dir_in() {
             ep_intr = ep.number();
+            ep_intr_mps = ep.max_packet.max(1);
             continue;
         }
         if !ep.is_bulk() {
@@ -198,6 +243,10 @@ pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {
         println!("[usb-msc] need bulk IN+OUT");
         return;
     };
+    if proto == PROTO_CBI && ep_intr == 0 {
+        println!("[usb-msc] CBI requires interrupt-IN endpoint");
+        return;
+    }
 
     if proto == PROTO_BBB {
         let mut empty: [u8; 0] = [];
@@ -205,12 +254,14 @@ pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {
     }
 
     println!(
-        "[usb-msc] addr={} proto={} bulk {}/{} irq={} mps={}",
+        "[usb-msc] addr={} proto={} sub=0x{:02x} bulk {}/{} irq={}/{} mps={}",
         addr,
-        if proto == PROTO_BBB { "BBB" } else { "CBI" },
+        if proto == PROTO_BBB { "BBB" } else if proto == PROTO_CBI { "CBI" } else { "CB" },
+        iface.subclass,
         ep_out,
         ep_in,
         ep_intr,
+        ep_intr_mps,
         mps
     );
 
@@ -221,7 +272,9 @@ pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {
         ep_out,
         ep_in,
         ep_intr,
+        ep_intr_mps,
         iface: iface.number,
+        subclass: iface.subclass,
         proto,
         mps,
         block_size: 512,

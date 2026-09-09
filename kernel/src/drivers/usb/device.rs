@@ -186,6 +186,11 @@ pub fn disconnect_port(hc: &Ohci, port: u8) -> bool {
         }
     }
 
+    // Class/VFS state is gone; now remove the old address from the HCD's
+    // persistent endpoint lists as well. Otherwise a reconnected device gets a
+    // new USB address while stale bulk EDs for the old address remain linked.
+    hc.disconnect_address(dev.address);
+
     println!(
         "[usb] disconnected addr={} {:04x}:{:04x} port={}",
         dev.address, dev.descriptor.vid, dev.descriptor.pid, port
