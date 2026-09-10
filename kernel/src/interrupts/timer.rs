@@ -22,7 +22,6 @@ pub extern "C" fn timer() {
     unsafe {
         naked_asm!(
             "cli",
-            "call jiffies_inc",
             "push ebp",
             "push edi",
             "push esi",
@@ -30,10 +29,35 @@ pub extern "C" fn timer() {
             "push ecx",
             "push ebx",
             "push eax",
+            // All interrupted GPRs are now safe on the stack, so AX can be
+            // used to establish the kernel data selectors for Rust code.
+            "cld",
+            "mov ax, 0x10",
+            "mov ds, ax",
+            "mov es, ax",
+            // jiffies_inc is a normal Rust function and may clobber caller-saved
+            // registers; call it only after the interrupted context is saved.
+            "call jiffies_inc",
             "push esp",
             "call timer_handler",
             "add esp, 4",
             "mov esp, eax",
+
+            // CPUState layout at the selected task's ESP:
+            // eax,ebx,ecx,edx,esi,edi,ebp,eip,cs,eflags,esp,ss.
+            // Pick DS/ES BEFORE restoring EAX/ECX; the previous code changed
+            // CX after pop and silently corrupted userspace on every tick.
+            "mov ax, [esp + 32]",
+            "and ax, 3",
+            "cmp ax, 3",
+            "jne 1f",
+            "mov ax, 0x23",
+            "jmp 2f",
+            "1:",
+            "mov ax, 0x10",
+            "2:",
+            "mov ds, ax",
+            "mov es, ax",
             "pop eax",
             "pop ebx",
             "pop ecx",
@@ -41,18 +65,6 @@ pub extern "C" fn timer() {
             "pop esi",
             "pop edi",
             "pop ebp",
-            // На стеке: EIP, CS, EFLAGS, [ESP, SS]
-            // ВАЖНО: не трогать EAX — там return value syscall
-            // (если IRQ0 пришёл между sti и iretd в syscall path).
-            // Раньше mov ax, 0x23 превращал ret=0 в ret=35.
-            "mov cx, [esp + 4]", // CS
-            "and cx, 3",
-            "cmp cx, 3",
-            "jne 2f",
-            "mov cx, 0x23",
-            "mov ds, cx",
-            "mov es, cx",
-            "2:",
             "iretd"
         );
     }

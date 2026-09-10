@@ -12,14 +12,61 @@ pub const SYS_MKDIR: u32 = 7;
 pub const SYS_RMDIR: u32 = 8;
 pub const SYS_UNLINK: u32 = 10;
 pub const SYS_EXECVE: u32 = 11;
+pub const SYS_CHDIR: u32 = 12;
 pub const SYS_EXECVE_WASM: u32 = 1000;
 
 pub const SYS_LSEEK: u32 = 19;
+pub const SYS_GETPID: u32 = 20;
+pub const SYS_MOUNT: u32 = 21;
+pub const SYS_DUP: u32 = 41;
+pub const SYS_UMOUNT2: u32 = 52;
+pub const SYS_SETPGID: u32 = 57;
+pub const SYS_GETPPID: u32 = 64;
+pub const SYS_GETPGRP: u32 = 65;
+pub const SYS_SETSID: u32 = 66;
+pub const SYS_GETTIMEOFDAY: u32 = 78;
+pub const SYS_GETPGID: u32 = 132;
+pub const SYS_GETSID: u32 = 147;
+pub const SYS_NANOSLEEP: u32 = 162;
+pub const SYS_GETCWD: u32 = 183;
+pub const SYS_CLOCK_GETTIME: u32 = 265;
 pub const SYS_BRK: u32 = 45;
 pub const SYS_MMAP: u32 = 90;
 pub const SYS_MUNMAP: u32 = 91;
 pub const SYS_MMAP2: u32 = 192;
 pub const SYS_IOCTL: u32 = 54;
+
+pub const TCGETS: u32 = 0x5401;
+pub const TCSETS: u32 = 0x5402;
+pub const TIOCGPGRP: u32 = 0x540F;
+pub const TIOCSPGRP: u32 = 0x5410;
+pub const LFLAG_ISIG: u32 = 0x0001;
+pub const LFLAG_ICANON: u32 = 0x0002;
+pub const LFLAG_ECHO: u32 = 0x0008;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Termios {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_line: u8,
+    pub c_cc: [u8; 19],
+}
+
+impl Default for Termios {
+    fn default() -> Self {
+        Self {
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cflag: 0,
+            c_lflag: LFLAG_ISIG | LFLAG_ECHO,
+            c_line: 0,
+            c_cc: [0; 19],
+        }
+    }
+}
 
 pub const PROT_READ: u32 = 1;
 pub const PROT_WRITE: u32 = 2;
@@ -63,6 +110,11 @@ pub const SIGINT: u32 = 2;
 pub const SIGQUIT: u32 = 3;
 pub const SIGKILL: u32 = 9;
 pub const SIGTERM: u32 = 15;
+pub const SIGCONT: u32 = 18;
+pub const SIGSTOP: u32 = 19;
+pub const SIGTSTP: u32 = 20;
+pub const SIGTTIN: u32 = 21;
+pub const SIGTTOU: u32 = 22;
 
 pub const SIG_DFL: u32 = 0;
 pub const SIG_IGN: u32 = 1;
@@ -98,9 +150,18 @@ pub const SYS_LS: u32 = 302;
 
 pub unsafe fn exit() -> ! {
     asm!("int 0x80", in("eax") SYS_EXIT, options(noreturn));
-    loop {
+    loop {}
+}
 
-    }
+/// Exit with an explicit status code. The kernel stores it for waitpid/$?.
+pub unsafe fn exit_status(status: i32) -> ! {
+    asm!(
+        "int 0x80",
+        in("eax") SYS_EXIT_GROUP,
+        in("ebx") status,
+        options(noreturn)
+    );
+    loop {}
 }
 
 pub unsafe fn write(fd: u32, buf: *const u8, len: usize) -> usize {
@@ -185,6 +246,224 @@ pub unsafe fn unlink(path: *const u8) -> usize {
     ret
 }
 
+pub unsafe fn chdir(path: *const u8) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_CHDIR => ret,
+        in("ebx") path,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn getcwd(buf: *mut u8, size: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_GETCWD => ret,
+        in("ebx") buf,
+        in("ecx") size,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn getpid() -> i32 {
+    let ret: usize;
+    asm!("int 0x80", inlateout("eax") SYS_GETPID => ret, options(nostack, preserves_flags));
+    ret as i32
+}
+
+pub unsafe fn getppid() -> i32 {
+    let ret: usize;
+    asm!("int 0x80", inlateout("eax") SYS_GETPPID => ret, options(nostack, preserves_flags));
+    ret as i32
+}
+
+pub unsafe fn getpgrp() -> i32 {
+    let ret: usize;
+    asm!("int 0x80", inlateout("eax") SYS_GETPGRP => ret, options(nostack, preserves_flags));
+    ret as i32
+}
+
+pub unsafe fn getpgid(pid: i32) -> i32 {
+    let ret: usize;
+    asm!("int 0x80", inlateout("eax") SYS_GETPGID => ret, in("ebx") pid, options(nostack, preserves_flags));
+    ret as i32
+}
+
+pub unsafe fn getsid(pid: i32) -> i32 {
+    let ret: usize;
+    asm!("int 0x80", inlateout("eax") SYS_GETSID => ret, in("ebx") pid, options(nostack, preserves_flags));
+    ret as i32
+}
+
+pub unsafe fn setpgid(pid: i32, pgid: i32) -> usize {
+    let ret: usize;
+    asm!("int 0x80", inlateout("eax") SYS_SETPGID => ret, in("ebx") pid, in("ecx") pgid, options(nostack, preserves_flags));
+    ret
+}
+
+pub unsafe fn setsid() -> i32 {
+    let ret: usize;
+    asm!("int 0x80", inlateout("eax") SYS_SETSID => ret, options(nostack, preserves_flags));
+    ret as i32
+}
+
+pub unsafe fn dup(oldfd: u32) -> usize {
+    let ret: usize;
+    asm!("int 0x80", inlateout("eax") SYS_DUP => ret, in("ebx") oldfd, options(nostack, preserves_flags));
+    ret
+}
+
+pub unsafe fn ioctl(fd: u32, request: u32, arg: u32) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_IOCTL => ret,
+        in("ebx") fd,
+        in("ecx") request,
+        in("edx") arg,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn tcgetattr(fd: u32, termios: *mut Termios) -> usize {
+    ioctl(fd, TCGETS, termios as u32)
+}
+
+pub unsafe fn tcsetattr(fd: u32, termios: *const Termios) -> usize {
+    ioctl(fd, TCSETS, termios as u32)
+}
+
+pub unsafe fn tcgetpgrp(fd: u32) -> i32 {
+    let mut pgid = -1i32;
+    let ret = ioctl(fd, TIOCGPGRP, (&mut pgid as *mut i32) as u32);
+    if ret == 0 { pgid } else { -1 }
+}
+
+pub unsafe fn tcsetpgrp(fd: u32, pgid: i32) -> usize {
+    ioctl(fd, TIOCSPGRP, (&pgid as *const i32) as u32)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimeVal {
+    pub tv_sec: i32,
+    pub tv_usec: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimeSpec {
+    pub tv_sec: i32,
+    pub tv_nsec: i32,
+}
+
+pub unsafe fn gettimeofday(tv: *mut TimeVal) -> usize {
+    let ret: usize;
+    asm!("int 0x80", inlateout("eax") SYS_GETTIMEOFDAY => ret, in("ebx") tv, options(nostack, preserves_flags));
+    ret
+}
+
+pub unsafe fn clock_gettime(clock_id: i32, tp: *mut TimeSpec) -> usize {
+    let ret: usize;
+    asm!("int 0x80", inlateout("eax") SYS_CLOCK_GETTIME => ret, in("ebx") clock_id, in("ecx") tp, options(nostack, preserves_flags));
+    ret
+}
+
+pub unsafe fn nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> usize {
+    let ret: usize;
+    asm!("int 0x80", inlateout("eax") SYS_NANOSLEEP => ret, in("ebx") req, in("ecx") rem, options(nostack, preserves_flags));
+    ret
+}
+
+pub unsafe fn tty_setfg(pgid: i32) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_TTY_SETFG => ret,
+        in("ebx") pgid,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn tty_getfg() -> i32 {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_TTY_GETFG => ret,
+        options(nostack, preserves_flags)
+    );
+    ret as i32
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MountInfo {
+    pub path: [u8; 96],
+}
+
+impl Default for MountInfo {
+    fn default() -> Self { Self { path: [0; 96] } }
+}
+
+pub unsafe fn mount_list(out: *mut MountInfo, max: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_MOUNT_LIST => ret,
+        in("ebx") out,
+        in("ecx") max,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+#[repr(C)]
+struct MountArgs {
+    fstype: *const u8,
+    flags: u32,
+    data: *const u8,
+}
+
+pub unsafe fn mount(
+    source: *const u8,
+    target: *const u8,
+    fstype: *const u8,
+    flags: u32,
+    data: *const u8,
+) -> usize {
+    // Keep the i386 syscall ABI to eax/ebx/ecx/edx. LLVM reserves ESI on
+    // this target, so the less common mount arguments travel in one struct.
+    let args = MountArgs { fstype, flags, data };
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_MOUNT => ret,
+        in("ebx") source,
+        in("ecx") target,
+        in("edx") &args as *const MountArgs,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn umount2(path: *const u8, flags: u32) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_UMOUNT2 => ret,
+        in("ebx") path,
+        in("ecx") flags,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
 /// Parameters for `execve` (passed via edx).
 #[repr(C)]
 pub struct ExecParams {
@@ -194,6 +473,15 @@ pub struct ExecParams {
     pub argc: u32,
     /// Array of `argc` pointers to C strings in the caller's address space.
     pub argv: *const *const u8,
+    pub envc: u32,
+    /// Array of `envc` pointers to `KEY=VALUE\0` strings.
+    pub envp: *const *const u8,
+    /// -1 = inherit parent's PGID, 0 = create group with child PID,
+    /// >0 = atomically join that existing process group.
+    pub pgid: i32,
+    /// Non-zero asks the kernel to hand the controlling TTY to this PGID
+    /// before the new task becomes observable to the scheduler.
+    pub foreground: u32,
 }
 
 /// Spawn a new task from an in-memory ELF image.
@@ -215,6 +503,10 @@ pub unsafe fn execve(
         stderr: stderr_fd,
         argc: argv.len() as u32,
         argv: argv.as_ptr(),
+        envc: 0,
+        envp: core::ptr::null(),
+        pgid: -1,
+        foreground: 0,
     };
     let ret: usize;
     asm!(
@@ -242,6 +534,10 @@ pub unsafe fn execve_wasm(
         stderr: stderr_fd,
         argc: argv.len() as u32,
         argv: argv.as_ptr(),
+        envc: 0,
+        envp: core::ptr::null(),
+        pgid: -1,
+        foreground: 0,
     };
     let ret: usize;
     asm!(
@@ -255,6 +551,142 @@ pub unsafe fn execve_wasm(
     ret
 }
 
+/// ELF exec with an explicit exported environment (`KEY=VALUE\0` strings).
+pub unsafe fn execve_env(
+    buf: *const u8,
+    buf_size: usize,
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
+    argv: &[*const u8],
+    envp: &[*const u8],
+) -> usize {
+    let params = ExecParams {
+        stdin: stdin_fd,
+        stdout: stdout_fd,
+        stderr: stderr_fd,
+        argc: argv.len() as u32,
+        argv: argv.as_ptr(),
+        envc: envp.len() as u32,
+        envp: envp.as_ptr(),
+        pgid: -1,
+        foreground: 0,
+    };
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_EXECVE => ret,
+        in("ebx") buf,
+        in("ecx") buf_size,
+        in("edx") &params as *const ExecParams,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+/// ELF exec with environment and atomic process-group placement.
+pub unsafe fn execve_env_pgid(
+    buf: *const u8,
+    buf_size: usize,
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
+    argv: &[*const u8],
+    envp: &[*const u8],
+    pgid: i32,
+    foreground: bool,
+) -> usize {
+    let params = ExecParams {
+        stdin: stdin_fd,
+        stdout: stdout_fd,
+        stderr: stderr_fd,
+        argc: argv.len() as u32,
+        argv: argv.as_ptr(),
+        envc: envp.len() as u32,
+        envp: envp.as_ptr(),
+        pgid,
+        foreground: foreground as u32,
+    };
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_EXECVE => ret,
+        in("ebx") buf,
+        in("ecx") buf_size,
+        in("edx") &params as *const ExecParams,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+/// WASM exec with an explicit exported environment.
+pub unsafe fn execve_wasm_env(
+    buf: *const u8,
+    buf_size: usize,
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
+    argv: &[*const u8],
+    envp: &[*const u8],
+) -> usize {
+    let params = ExecParams {
+        stdin: stdin_fd,
+        stdout: stdout_fd,
+        stderr: stderr_fd,
+        argc: argv.len() as u32,
+        argv: argv.as_ptr(),
+        envc: envp.len() as u32,
+        envp: envp.as_ptr(),
+        pgid: -1,
+        foreground: 0,
+    };
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_EXECVE_WASM => ret,
+        in("ebx") buf,
+        in("ecx") buf_size,
+        in("edx") &params as *const ExecParams,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+/// WASM exec with environment and atomic process-group placement.
+pub unsafe fn execve_wasm_env_pgid(
+    buf: *const u8,
+    buf_size: usize,
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
+    argv: &[*const u8],
+    envp: &[*const u8],
+    pgid: i32,
+    foreground: bool,
+) -> usize {
+    let params = ExecParams {
+        stdin: stdin_fd,
+        stdout: stdout_fd,
+        stderr: stderr_fd,
+        argc: argv.len() as u32,
+        argv: argv.as_ptr(),
+        envc: envp.len() as u32,
+        envp: envp.as_ptr(),
+        pgid,
+        foreground: foreground as u32,
+    };
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_EXECVE_WASM => ret,
+        in("ebx") buf,
+        in("ecx") buf_size,
+        in("edx") &params as *const ExecParams,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
 pub unsafe fn pipe(pipefd: *mut u32) -> usize {
     let ret: usize;
     asm!(
@@ -262,6 +694,19 @@ pub unsafe fn pipe(pipefd: *mut u32) -> usize {
     inlateout("eax") SYS_PIPE => ret,
     in("ebx") pipefd,
     options(nostack, preserves_flags)
+    );
+    ret
+}
+
+/// Create a pseudo terminal pair. Writes [master_fd, slave_fd] to `fds` and
+/// returns the PTY id, or usize::MAX on error.
+pub unsafe fn openpty(fds: *mut u32) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_OPENPTY => ret,
+        in("ebx") fds,
+        options(nostack, preserves_flags)
     );
     ret
 }
@@ -293,6 +738,20 @@ pub unsafe fn wait_options(pid: i32, options: u32) -> usize {
     in("ebx") pid,
     in("ecx") options,
     options(nostack, preserves_flags)
+    );
+    ret
+}
+
+/// Wait for a child and receive its actual exit status.
+pub unsafe fn waitpid_status(pid: i32, status: *mut i32, options: u32) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_WAITPID_STATUS => ret,
+        in("ebx") pid,
+        in("ecx") status,
+        in("edx") options,
+        options(nostack, preserves_flags)
     );
     ret
 }
@@ -402,6 +861,62 @@ pub const SYS_PCI_LIST: u32 = 410;
 pub const SYS_IFCONFIG: u32 = 411;
 pub const SYS_FB_INFO: u32 = 412;
 pub const SYS_FB_BLIT: u32 = 413;
+pub const SYS_WAITPID_STATUS: u32 = 414;
+pub const SYS_TASK_LIST: u32 = 415;
+pub const SYS_OPENPTY: u32 = 416;
+pub const SYS_TTY_SETFG: u32 = 417;
+pub const SYS_TTY_GETFG: u32 = 418;
+pub const SYS_MOUNT_LIST: u32 = 419;
+
+pub const TASK_RUNNING: u8 = 0;
+pub const TASK_STOPPED: u8 = 1;
+pub const TASK_ZOMBIE: u8 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TaskInfo {
+    pub pid: i32,
+    pub ppid: i32,
+    pub pgid: i32,
+    pub sid: i32,
+    pub state: u8,
+    pub _pad: [u8; 3],
+    pub exit_code: i32,
+    pub tty_id: i16,
+    pub _pad2: [u8; 2],
+    pub name: [u8; 32],
+    pub cwd: [u8; 128],
+}
+
+impl Default for TaskInfo {
+    fn default() -> Self {
+        Self {
+            pid: 0,
+            ppid: 0,
+            pgid: 0,
+            sid: 0,
+            state: 0,
+            _pad: [0; 3],
+            exit_code: 0,
+            tty_id: -1,
+            _pad2: [0; 2],
+            name: [0; 32],
+            cwd: [0; 128],
+        }
+    }
+}
+
+pub unsafe fn task_list(out: *mut TaskInfo, max: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_TASK_LIST => ret,
+        in("ebx") out,
+        in("ecx") max,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
 
 pub const IFCFG_GET: u32 = 0;
 pub const IFCFG_STATIC: u32 = 1;
@@ -844,15 +1359,9 @@ pub unsafe fn shutdown(sockfd: u32, how: u32) -> usize {
 
 
 pub unsafe fn sys_sleep(ms: u32) {
-    // Используем poll с timeout как простой сон
-    let ret: usize;
-    asm!(
-    "int 0x80",
-    inlateout("eax") SYS_POLL => ret,
-    in("ebx") 0usize,   // fds = null
-    in("ecx") 0usize,   // nfds = 0
-    in("edx") ms as i32,
-    options(nostack, preserves_flags)
-    );
-    let _ = ret;
+    let req = TimeSpec {
+        tv_sec: (ms / 1000) as i32,
+        tv_nsec: ((ms % 1000) * 1_000_000) as i32,
+    };
+    let _ = nanosleep(&req as *const TimeSpec, core::ptr::null_mut());
 }

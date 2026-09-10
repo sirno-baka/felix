@@ -7,6 +7,7 @@ use crate::memory::paging::{
     alloc_task_page_dir, copy_kernel_mappings,
 };
 use crate::{gdt, init_network_stack, print, println};
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::u32::MAX;
@@ -14,7 +15,10 @@ use core::u32::MAX;
 pub const STACK_SIZE: usize = 64 * 1024;
 /// Space above the saved CPUState for the hardware interrupt frame (~few dozen bytes).
 pub const HEADROOM: usize = 256;
-const MAX_TASKS: i8 = 8;
+/// Fixed scheduler slots. PID is deliberately independent from this index.
+/// 32 keeps the scheduler simple on i386 while removing the old 8-process limit.
+pub const MAX_TASKS: i8 = 32;
+pub const USER_HEAP_BASE: u32 = 0x4000_0000;
 
 /// Отслеживает сколько выделений памяти используют каждую страницу.
 /// Страница размапливается только когда счётчик достигает 0.
@@ -76,9 +80,22 @@ pub struct Task {
     /// Next free VA for anonymous mmap (grows up).
     pub mmap_next: u32,
     pub page_refcounts: PageRefcounts,
+    /// Stable process identity. Scheduler slot is an implementation detail.
+    pub pid: i32,
+    pub ppid: i32,
+    pub pgid: i32,
+    pub sid: i32,
+    /// Internal scheduler parent slot, retained only for fd inheritance/debugging.
     pub parent: i8,
+    /// Per-process working directory inherited across spawn.
+    pub cwd: String,
+    /// Controlling PTY id, -1 when none is attached.
+    pub tty_id: i16,
     pub zombie: bool,
+    pub stopped: bool,
     pub exit_code: i32,
+    /// Short process name used by ps/task_list. NUL padded UTF-8/ASCII.
+    pub name: [u8; 32],
     pub pending_signals: u32,
     /// Per-signal handlers: 0=SIG_DFL, 1=SIG_IGN, else userspace addr.
     pub signal_handlers: [u32; 32],
@@ -126,9 +143,17 @@ impl Task {
             heap_next: 0,
             mmap_next: 0x6000_0000,
             page_refcounts: PageRefcounts::new(),
+            pid: -1,
+            ppid: -1,
+            pgid: -1,
+            sid: -1,
             parent: -1,
+            cwd: "/".to_string(),
+            tty_id: -1,
             zombie: false,
+            stopped: false,
             exit_code: 0,
+            name: [0; 32],
             pending_signals: 0,
             signal_handlers: [0; 32],
         }
@@ -185,6 +210,7 @@ pub struct TaskManager {
     pub(crate) task_count: i8,
     pub(crate) current_task: i8,
     first_switch: bool,
+    next_pid: i32,
 }
 
 pub static mut TASK_MANAGER: TaskManager = TaskManager {
@@ -192,6 +218,7 @@ pub static mut TASK_MANAGER: TaskManager = TaskManager {
     task_count: 0,
     current_task: -1,
     first_switch: true,
+    next_pid: 1,
 };
 
 const fn init_tasks_array() -> [Option<Task>; MAX_TASKS as usize] {
@@ -227,7 +254,14 @@ impl TaskManager {
             task.cpu_state_ptr = state_ptr as u32;
             task.kernel_stack = stack_top;
             task.running = true;
+            task.pid = 0;
+            task.ppid = -1;
+            task.pgid = 0;
+            task.sid = 0;
             task.parent = -1;
+            task.cwd = "/".to_string();
+            task.stopped = false;
+            task.name[..4].copy_from_slice(b"idle");
 
             gdt::TSS.esp0 = task.kernel_stack;
             gdt::TSS.ss0 = 0x10;
@@ -236,6 +270,7 @@ impl TaskManager {
         self.task_count = 1;
         self.current_task = 0;
         self.first_switch = true;
+        self.next_pid = 1;
 
         println!(
             "[TASK] Idle | kstack={:#x} cpu_state={:#x} pd_phys={:#x} Task={}",
@@ -253,16 +288,46 @@ impl TaskManager {
             println!("[TASK] No free slot!");
             return;
         }
+        let pid = self.alloc_pid();
         let mut task = Task::new_task();
         task.init(entry_point, user_stack_top, heap_start);
+        task.pid = pid;
+        task.ppid = 0;
+        task.pgid = pid;
+        task.sid = pid;
+        task.parent = 0;
+        task.cwd = "/".to_string();
+        task.tty_id = -1;
         self.tasks[free_slot as usize] = Some(task);
         self.task_count += 1;
     }
 
+    pub(crate) fn reparent_children_of(&mut self, dead_pid: i32) {
+        if dead_pid <= 0 { return; }
+        let init_slot = if dead_pid != 1 {
+            self.slot_by_pid(1).filter(|slot| {
+                self.tasks[*slot].as_ref().map_or(false, |t| !t.zombie)
+            })
+        } else {
+            None
+        };
+        for task in self.tasks.iter_mut().flatten() {
+            if task.ppid != dead_pid { continue; }
+            if let Some(slot) = init_slot {
+                task.ppid = 1;
+                task.parent = slot as i8;
+            } else {
+                task.ppid = 0;
+                task.parent = 0;
+            }
+        }
+    }
+
     //remove task
     pub fn remove_task(&mut self, id: usize) {
-        if id != 0 {
-            if self.tasks[id].is_some() {
+        if id != 0 && id < self.tasks.len() {
+            if let Some(pid) = self.tasks[id].as_ref().map(|t| t.pid) {
+                self.reparent_children_of(pid);
                 self.tasks[id] = None;
                 self.task_count -= 1;
             }
@@ -378,6 +443,46 @@ impl TaskManager {
         0
     }
 
+    pub fn alloc_pid(&mut self) -> i32 {
+        // PID 0 is reserved for idle/kernel. Monotonic reuse is intentionally
+        // avoided until i32 wrap, which is effectively unreachable here.
+        let pid = self.next_pid.max(1);
+        self.next_pid = self.next_pid.wrapping_add(1);
+        if self.next_pid <= 0 {
+            self.next_pid = 1;
+        }
+        pid
+    }
+
+    pub fn slot_by_pid(&self, pid: i32) -> Option<usize> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .find_map(|(slot, task)| task.as_ref().filter(|t| t.pid == pid).map(|_| slot))
+    }
+
+    pub fn current_pid(&self) -> i32 {
+        if self.current_task < 0 {
+            return -1;
+        }
+        self.tasks[self.current_task as usize]
+            .as_ref()
+            .map(|t| t.pid)
+            .unwrap_or(-1)
+    }
+
+    pub fn slots_in_pgid(&self, pgid: i32) -> Vec<usize> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, task)| {
+                task.as_ref()
+                    .filter(|t| t.pgid == pgid && !t.zombie)
+                    .map(|_| slot)
+            })
+            .collect()
+    }
+
     pub fn get_free_slot(&mut self) -> i8 {
         self.reap_orphans();
         for i in 0..MAX_TASKS {
@@ -385,47 +490,39 @@ impl TaskManager {
                 return i as i8;
             }
         }
-        // Last resort: steal any zombie so exec is not stuck at 8 slots.
-        for i in 1..MAX_TASKS {
-            if let Some(ref t) = self.tasks[i as usize] {
-                if t.zombie {
-                    let id = i as usize;
-                    let _ = self.reap(id);
-                    return i;
-                }
-            }
-        }
+        // Do not steal a zombie that still belongs to a live parent: doing so
+        // destroys waitpid semantics. PID 1 is responsible for orphan reaping.
         -1
     }
 
-    fn parent_gone(&self, parent: i8) -> bool {
-        if parent <= 0 {
-            return true;
-        }
-        match self.tasks.get(parent as usize) {
-            Some(Some(t)) => t.zombie,
-            _ => true,
-        }
+    fn parent_gone(&self, ppid: i32) -> bool {
+        ppid <= 0 || self.slot_by_pid(ppid).is_none()
     }
 
-    /// Free zombie tasks whose parent is dead / idle / missing.
+    /// Repair any stale parent references. Normal parent death is handled by
+    /// reap(), which reparents children to PID 1. This path mainly covers old
+    /// tasks created before that parent was tracked or forced slot removal.
     pub fn reap_orphans(&mut self) {
-        loop {
-            let mut victim = None;
-            for i in 1..MAX_TASKS as usize {
-                if let Some(ref t) = self.tasks[i] {
-                    if t.zombie && self.parent_gone(t.parent) {
-                        victim = Some(i);
-                        break;
-                    }
+        let init_slot = self.slot_by_pid(1).filter(|slot| {
+            self.tasks[*slot].as_ref().map_or(false, |t| !t.zombie)
+        });
+        let mut unreapable_zombies = Vec::new();
+        for i in 1..MAX_TASKS as usize {
+            let missing_parent = self.tasks[i]
+                .as_ref()
+                .map_or(false, |t| t.pid != 1 && self.parent_gone(t.ppid));
+            if !missing_parent { continue; }
+            if let Some(slot) = init_slot {
+                if let Some(ref mut task) = self.tasks[i] {
+                    task.ppid = 1;
+                    task.parent = slot as i8;
                 }
+            } else if self.tasks[i].as_ref().map_or(false, |t| t.zombie) {
+                unreapable_zombies.push(i);
             }
-            match victim {
-                Some(id) => {
-                    let _ = self.reap(id);
-                }
-                None => break,
-            }
+        }
+        for id in unreapable_zombies {
+            let _ = self.reap(id);
         }
     }
 
@@ -433,14 +530,14 @@ impl TaskManager {
         self.current_task
     }
 
-    /// Find a zombie child of `parent` matching `want_pid` (-1 = any).
-    /// Returns (slot, exit_code) without removing the task.
-    pub fn find_zombie_child(&self, parent: i8, want_pid: i32) -> Option<(usize, i32)> {
+    /// Find a zombie child by stable PID. `want_pid == -1` means any child.
+    /// Returns (slot, child_pid, exit_code) without removing the task.
+    pub fn find_zombie_child(&self, parent_pid: i32, want_pid: i32) -> Option<(usize, i32, i32)> {
         for i in 0..MAX_TASKS as usize {
             if let Some(ref t) = self.tasks[i] {
-                if t.zombie && t.parent == parent {
-                    if want_pid < 0 || want_pid == i as i32 {
-                        return Some((i, t.exit_code));
+                if t.zombie && t.ppid == parent_pid {
+                    if want_pid < 0 || want_pid == t.pid {
+                        return Some((i, t.pid, t.exit_code));
                     }
                 }
             }
@@ -453,13 +550,15 @@ impl TaskManager {
         if id == 0 {
             return false;
         }
-        if let Some(ref t) = self.tasks[id] {
+        let dead_pid = if let Some(ref t) = self.tasks[id] {
             if !t.zombie {
                 return false;
             }
+            t.pid
         } else {
             return false;
-        }
+        };
+        self.reparent_children_of(dead_pid);
         self.tasks[id] = None;
         self.task_count -= 1;
         true

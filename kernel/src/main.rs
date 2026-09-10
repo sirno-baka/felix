@@ -29,6 +29,7 @@ mod spin;
 mod sync;
 mod syscalls;
 mod time;
+mod tty;
 mod tss;
 mod utils;
 mod wrappers;
@@ -103,6 +104,9 @@ macro_rules! run {
                 -1,
                 -1,
                 &[],
+                &[],
+                -1,
+                false,
             );
         }
     };
@@ -331,39 +335,40 @@ pub extern "C" fn higher_half_entry() -> ! {
         init_usb();
         // drivers::net::init_net();
         // ---------------------------------------------------------------
-        // Launch shell WHILE TIMER IS STILL MASKED and IF=0.
-        // First IRQ0 does first_switch → abandons this boot context forever.
-        // If that fires mid-execve, the system hangs intermittently.
+        // Launch userspace init while TIMER is still masked and IF=0.
+        // PID 0 remains the kernel idle task; the first userspace PID is 1.
+        // init owns service lifecycle and is responsible for spawning shell.
         // ---------------------------------------------------------------
-        // Keep nested cli for the entire critical section.
         crate::wrappers::_cli();
-        // // 7. Task Manager (после IDT!)
         TASK_MANAGER.init();
 
-        let data = match VFS.get().read_file("/shell") {
+        let data = match VFS.get().read_file("/init") {
             Some(d) => d,
             None => {
-                println!("[!] /shell not found on root fs");
+                println!("[!] /init not found on root fs");
                 halt();
             }
         };
-        let shell_argv = [b"/shell\0".to_vec()];
-        let shell_pid = crate::syscalls::handler::sys_execve(
+        let init_argv = [b"/init\0".to_vec()];
+        let init_pid = crate::syscalls::handler::sys_execve(
             0,
             data.as_ptr(),
             data.len(),
             -1,
             -1,
             -1,
-            &shell_argv,
+            &init_argv,
+            &[],
+            -1,
+            false,
         );
-        if shell_pid == usize::MAX {
-            println!("[!] Failed to exec /shell");
+        if init_pid == usize::MAX {
+            println!("[!] Failed to exec /init");
             loop {
                 asm!("hlt");
             }
         }
-        println!("[!] Shell spawned as pid={}", shell_pid);
+        println!("[!] init spawned as pid={}", init_pid);
 
         // Enable only the IRQs with real handlers here:
         //   master IRQ0 = PIT, IRQ1 = keyboard, IRQ2 = slave cascade
@@ -384,8 +389,10 @@ pub extern "C" fn higher_half_entry() -> ! {
         );
         println!("[!] Enabling interrupts — entering idle");
         init(200);
-        // Enable interrupts. The next timer tick will first_switch into the
-        // idle task; subsequent ticks round-robin to the shell.
+        // Enable interrupts. Boot used nested wrappers::_cli() above, while
+        // this point intentionally releases *all* boot-time interrupt guards.
+        // Keep the software nesting counter synchronized with the real IF.
+        crate::wrappers::_rst();
         asm!("sti");
         loop {
             asm!("hlt");

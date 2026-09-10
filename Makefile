@@ -1,5 +1,9 @@
 UNAME := $(shell uname)
 
+# Every cargo invocation needs both the custom getrandom backend selected by
+# Felix and warning suppression. Recipe-local `export` commands do not persist
+# between Makefile lines, so keep this as an exported make variable.
+
 #MacOS tools
 ifeq ($(UNAME), Darwin)
 	SFDISK := $(shell brew --prefix util-linux)/sbin/sfdisk
@@ -47,8 +51,7 @@ endif
 
 .PHONY: build
 build:
-	@export RUSTFLAGS='--cfg getrandom_backend=\"custom\"'
-	@export RUSTFLAGS="-Awarnings"
+	@export RUSTFLAGS='--cfg test_disabled --cfg getrandom_backend=\"custom\" -Awarnings'docker
 
 	@echo "Building Felix..."
 	@echo "  native apps: $(NATIVE_APPS)"
@@ -208,6 +211,42 @@ run: all usb-image
 		-device usb-storage,bus=ohci.0,drive=usbstick \
 		-no-reboot -no-shutdown -vga std -m 128M \
 		-debugcon file:debug.log -serial stdio
+
+.PHONY: smoke
+smoke: all usb-image
+	@echo "Running Felix smoke test..."
+	@rm -f build/smoke.log
+	@set +e; \
+		timeout 15s qemu-system-i386 \
+			-drive file=build/disk.img,index=0,media=disk,format=raw,if=ide \
+			-boot order=c \
+			-netdev user,id=net0 \
+			-device rtl8139,netdev=net0,mac=52:54:00:12:34:56 \
+			-device pci-ohci,id=ohci \
+			-drive if=none,id=usbstick,format=raw,file=build/usb.img \
+			-device usb-storage,bus=ohci.0,drive=usbstick \
+			-no-reboot -no-shutdown -vga std -m 128M \
+			-display none -serial none -monitor none \
+			-debugcon file:build/smoke.log; \
+		rc=$$?; \
+		set -e; \
+		if [ $$rc -ne 0 ] && [ $$rc -ne 124 ]; then \
+			echo "smoke: QEMU failed with status $$rc"; \
+			cat build/smoke.log; \
+			exit $$rc; \
+		fi
+	@if grep -q "=== KERNEL PANIC ===" build/smoke.log; then \
+		echo "smoke: kernel panic"; \
+		cat build/smoke.log; \
+		exit 1; \
+	fi
+	@grep -q '\[!\] init spawned as pid=1' build/smoke.log || { echo "smoke: PID 1 was not spawned"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'Felix init: service manager pid=1' build/smoke.log || { echo "smoke: userspace init did not run as PID 1"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'selftest: PASS' build/smoke.log || { echo "smoke: userspace selftest failed"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'init: boot selftest pid=.* status=0' build/smoke.log || { echo "smoke: PID 1 did not reap selftest cleanly"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'init: started pid=.* /shell' build/smoke.log || { echo "smoke: shell was not spawned"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'shell: userspace main started pid=' build/smoke.log || { echo "smoke: shell did not reach main"; tail -n 160 build/smoke.log; exit 1; }
+	@echo "smoke: PASS"
 
 .PHONY: debug
 debug: all usb-image

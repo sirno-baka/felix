@@ -57,21 +57,34 @@ pub extern "C" fn keyboard() {
     unsafe {
         core::arch::naked_asm!(
             "cli",
+            // Save every GPR before using AX as a segment-selector scratch.
+            // PUSHAD layout at this point:
+            //   +0 edi, +4 esi, +8 ebp, +12 saved_esp,
+            //   +16 ebx, +20 edx, +24 ecx, +28 eax,
+            //   +32 eip, +36 cs, +40 eflags, [+44 user_esp, +48 user_ss]
             "pusha",
+            "cld",
             "mov ax, 0x10",
             "mov ds, ax",
             "mov es, ax",
             "call keyboard_handler",
-            "popa",
-            // Restore user DS/ES if we return to ring 3 (iretd does not load them).
-            "mov cx, [esp + 4]",
-            "and cx, 3",
-            "cmp cx, 3",
-            "jne 2f",
-            "mov cx, 0x23",
-            "mov ds, cx",
-            "mov es, cx",
+
+            // Restore the proper data selectors BEFORE popa.  AX is safe to
+            // use here because the interrupted EAX is still saved at [esp+28].
+            // The old code did this after popa with CX and therefore corrupted
+            // userspace ECX on every key press.
+            "mov ax, [esp + 36]",
+            "and ax, 3",
+            "cmp ax, 3",
+            "jne 1f",
+            "mov ax, 0x23",
+            "jmp 2f",
+            "1:",
+            "mov ax, 0x10",
             "2:",
+            "mov ds, ax",
+            "mov es, ax",
+            "popa",
             "iretd",
         );
     }
@@ -159,12 +172,15 @@ pub extern "C" fn keyboard_handler() {
 
     // Ctrl+C → ETX to focused window (shell kills its own children).
     if code == 0x2e && unsafe { KEYBOARD.ctrl } && !released {
-        match &mut *KEYBOARD_BUFFER.lock() {
-            Some(buffer) => buffer.push(0x03),
-            None => {}
+        if let Some(mut guard) = KEYBOARD_BUFFER.try_lock() {
+            if let Some(buffer) = guard.as_mut() {
+                buffer.push(0x03);
+            }
         }
         let mods = 2u8;
-        crate::drivers::wm::push_key(true, code, 0x03, mods);
+        if crate::drivers::wm::is_ready() {
+            crate::drivers::wm::push_key(true, code, 0x03, mods);
+        }
         PICS.end_interrupt(KEYBOARD_INT);
         return;
     }
@@ -177,9 +193,13 @@ pub extern "C" fn keyboard_handler() {
 
     // Suppress ordinary characters while Ctrl is held (except handled above)
     if key_byte != 0 && !unsafe { KEYBOARD.ctrl } {
-        match &mut *KEYBOARD_BUFFER.lock() {
-            Some(buffer) => buffer.push(key_byte),
-            None => {}
+        // IRQ handlers must never spin waiting for a lock. If a future code
+        // path keeps the input queue busy, dropping one byte is safer than
+        // deadlocking IRQ1 with IF=0.
+        if let Some(mut guard) = KEYBOARD_BUFFER.try_lock() {
+            if let Some(buffer) = guard.as_mut() {
+                buffer.push(key_byte);
+            }
         }
     }
 
@@ -196,7 +216,9 @@ pub extern "C" fn keyboard_handler() {
             } else {
                 key_byte
             };
-            crate::drivers::wm::push_key(!released, code, ch, mods);
+            if crate::drivers::wm::is_ready() {
+                crate::drivers::wm::push_key(!released, code, ch, mods);
+            }
         }
     }
 

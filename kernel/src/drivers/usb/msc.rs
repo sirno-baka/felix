@@ -58,6 +58,7 @@ pub struct UsbMsc {
     pub block_size: u32,
     pub blocks: u32,
     mount_point: Option<String>,
+    dev_node: Option<String>,
 }
 
 impl UsbMsc {
@@ -280,6 +281,7 @@ pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {
         block_size: 512,
         blocks: 0,
         mount_point: None,
+        dev_node: None,
     };
     match dev.inquiry(hc) {
         Ok(inq) => {
@@ -310,40 +312,53 @@ fn probe(hc: &Ohci, addr: u8, _device: &crate::drivers::usb::device::UsbDevice, 
         .position(|d| d.mmio == hc.mmio && d.addr == addr && d.iface == iface.number)
         .ok_or("MSC: probe failed")?;
 
-    let mount_point = {
+    let (mount_point, dev_node) = {
         let device = DEVICES.lock()[dev].clone();
         if device.blocks == 0 {
-            println!("[usb-msc] no media, skip mount");
-            None
+            println!("[usb-msc] no media, skip mount/devfs");
+            (None, None)
         } else {
             use alloc::sync::Arc;
-            use crate::filesystem::init::mount_removable;
+            use crate::filesystem::devfs::DevFS;
+            use crate::filesystem::init::mount_removable_named;
             use crate::spin;
 
+            let node_name = alloc::format!("usb{}-{}", addr, iface.number);
             let arc: Arc<spin::Mutex<dyn BlockDevice>> =
                 Arc::new(spin::Mutex::new(device));
-            mount_removable(arc, "usb")
+            let _ = DevFS::unregister(&node_name);
+            DevFS::register_block_global(&node_name, arc.clone());
+            println!("[usb-msc] /dev/{}", node_name);
+
+            (mount_removable_named(arc, "usb", &node_name), Some(node_name))
         }
     };
 
-    if let Some(path) = mount_point {
-        DEVICES.lock()[dev].mount_point = Some(path);
-    }
+    let mut devices = DEVICES.lock();
+    devices[dev].mount_point = mount_point;
+    devices[dev].dev_node = dev_node;
     Ok(())
 }
 
 fn disconnect(hc: &Ohci, addr: u8, iface: u8) {
-    let mount_point = {
+    let removed = {
         let mut devices = DEVICES.lock();
         let pos = devices
             .iter()
             .position(|d| d.mmio == hc.mmio && d.addr == addr && d.iface == iface);
-        pos.and_then(|i| devices.remove(i).mount_point)
+        pos.map(|i| devices.remove(i))
     };
 
-    if let Some(path) = mount_point {
-        use crate::filesystem::vfs::VFS;
-        VFS.get().unmount(&path);
+    if let Some(dev) = removed {
+        if let Some(name) = dev.dev_node {
+            crate::filesystem::init::unmount_device_mounts(&name);
+            let _ = crate::filesystem::devfs::DevFS::unregister(&name);
+            println!("[usb-msc] removed /dev/{}", name);
+        } else if let Some(path) = dev.mount_point {
+            // Fallback for media probed before a dev node could be published.
+            use crate::filesystem::vfs::VFS;
+            let _ = VFS.get().unmount(&path);
+        }
     }
     println!("[usb-msc] disconnect addr={} iface={}", addr, iface);
 }

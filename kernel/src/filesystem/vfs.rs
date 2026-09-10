@@ -32,9 +32,24 @@ pub struct Vfs {
     inner: Mutex<VfsInner>,
 }
 
+fn new_mount_registry() -> Mutex<Vec<String>> {
+    Mutex::new(Vec::new())
+}
+
+/// Kept separately from VfsInner so synthetic filesystems such as /proc can
+/// inspect the mount table while VFS is already dispatching a read to them.
+pub static MOUNT_REGISTRY: MutexLazy<Mutex<Vec<String>>> = MutexLazy::new(new_mount_registry);
+
+struct Mount {
+    point: String,
+    fs_id: u8,
+    fs: Box<dyn Filesystem>,
+}
+
 struct VfsInner {
     root_fs: Option<Box<dyn Filesystem>>,
-    mounts: Vec<(String, Box<dyn Filesystem>)>,
+    mounts: Vec<Mount>,
+    next_fs_id: u8,
 }
 
 impl Vfs {
@@ -43,6 +58,7 @@ impl Vfs {
             inner: Mutex::new(VfsInner {
                 root_fs: None,
                 mounts: Vec::new(),
+                next_fs_id: 1,
             }),
         }
     }
@@ -50,6 +66,11 @@ impl Vfs {
     pub fn set_root(&self, fs: Box<dyn Filesystem>) {
         let mut inner = self.inner.lock();
         inner.root_fs = Some(fs);
+        drop(inner);
+        let mut mounts = MOUNT_REGISTRY.get().lock();
+        if !mounts.iter().any(|m| m == "/") {
+            mounts.push("/".to_string());
+        }
     }
 
     pub fn mount(&self, mount_point: &str, fs: Box<dyn Filesystem>) {
@@ -59,16 +80,32 @@ impl Vfs {
             return;
         }
         let mut inner = self.inner.lock();
-        inner.mounts.push((mount_point.to_string(), fs));
-        println!("[VFS] Mounted at {} (mounts={})", mount_point, inner.mounts.len());
+        if inner.mounts.iter().any(|m| m.point == mount_point) {
+            println!("[VFS] Already mounted at {}", mount_point);
+            return;
+        }
+        let Some(fs_id) = alloc_mount_id(&mut inner) else {
+            println!("[VFS] No free filesystem id for {}", mount_point);
+            return;
+        };
+        inner.mounts.push(Mount { point: mount_point.to_string(), fs_id, fs });
+        let count = inner.mounts.len();
+        drop(inner);
+        let mut mounts = MOUNT_REGISTRY.get().lock();
+        if !mounts.iter().any(|m| m == mount_point) {
+            mounts.push(mount_point.to_string());
+        }
+        println!("[VFS] Mounted at {} (mounts={})", mount_point, count);
     }
 
     pub fn unmount(&self, mount_point: &str) -> bool {
         let mut inner = self.inner.lock();
         let before = inner.mounts.len();
-        inner.mounts.retain(|(mp, _)| mp != mount_point);
+        inner.mounts.retain(|m| m.point != mount_point);
         let ok = inner.mounts.len() < before;
         if ok {
+            drop(inner);
+            MOUNT_REGISTRY.get().lock().retain(|mp| mp != mount_point);
             println!("[VFS] Unmounted {}", mount_point);
         }
         ok
@@ -76,7 +113,12 @@ impl Vfs {
 
     pub fn is_mounted_at(&self, mount_point: &str) -> bool {
         let inner = self.inner.lock();
-        inner.mounts.iter().any(|(mp, _)| mp == mount_point)
+        inner.mounts.iter().any(|m| m.point == mount_point)
+    }
+
+    /// Snapshot mount points for /proc/mounts and userspace diagnostics.
+    pub fn mount_points(&self) -> Vec<String> {
+        MOUNT_REGISTRY.get().lock().clone()
     }
 
     // ====================== PUBLIC API ======================
@@ -118,48 +160,23 @@ impl Vfs {
     }
 
     pub fn list_directory_entries(&self, path: &str) -> Option<Vec<DirEntry>> {
-        // println!("[VFS] ls request path={}", path);
         let inner = self.inner.lock();
-        // println!("[VFS] ls acquired lock: mounts={} root_fs={}", inner.mounts.len(), inner.root_fs.is_some());
-        let path = if path.is_empty() { "/" } else { path };
-        // println!("[VFS] ls effective path={}", path);
+        let path = normalize_dir_path(path);
 
-        // Специальная обработка для корневой директории
-        if path == "/" {
-            let mut entries = inner
-                .root_fs
-                .as_ref()
-                .and_then(|fs| fs.list_directory_entries("/"))
-                .unwrap_or_default();
+        // Ask the backing filesystem first. A synthetic parent such as /mnt
+        // may not physically exist on rootfs, so None is not final until mount
+        // descendants have been considered.
+        let (fs, rel_path, _fs_id) = resolve(&inner, &path);
+        let backing = fs.list_directory_entries(&rel_path);
+        let backing_exists = backing.is_some();
+        let mut entries = backing.unwrap_or_default();
+        let synthetic = add_mount_children(&inner, &path, &mut entries);
 
-            // Добавляем точки монтирования как синтетические директории
-            for (mount_point, _fs) in &inner.mounts {
-                let name = mount_point.trim_start_matches('/');
-                if !name.is_empty() {
-                    if !entries.iter().any(|e| e.name == name) {
-                        entries.push(DirEntry {
-                            inode: 0,
-                            name: name.to_string(),
-                            file_type: 2, // 2 = Directory (S_IFDIR)
-                            size: 0,
-                        });
-                    }
-                }
-            }
-            return Some(entries);
+        if backing_exists || synthetic {
+            Some(entries)
+        } else {
+            None
         }
-
-        // Для всех остальных путей используем механизм разрешения
-        // println!("[VFS] ls resolving path={}", path);
-        let (fs, rel_path, fs_id) = resolve(&inner, path);
-        // println!("[VFS] ls resolved fs_id={} rel_path={}", fs_id, rel_path);
-        // println!("[VFS] ls calling filesystem...");
-        let result = fs.list_directory_entries(&rel_path);
-        // println!("[VFS] ls filesystem returned: {}", if result.is_some() { "Some" } else { "None" });
-        // if let Some(ref entries) = result {
-        //     println!("[VFS] ls entries={}", entries.len());
-        // }
-        result
     }
 
     pub fn resolve_path(&self, path: &str) -> Option<u32> {
@@ -180,8 +197,8 @@ impl Vfs {
             if let Some(fs) = &inner.root_fs {
                 return fs.read_at(local_inode, offset, buf);
             }
-        } else if fs_id > 0 && fs_id <= inner.mounts.len() {
-            return inner.mounts[fs_id - 1].1.read_at(local_inode, offset, buf);
+        } else if let Some(mount) = inner.mounts.iter().find(|m| m.fs_id as usize == fs_id) {
+            return mount.fs.read_at(local_inode, offset, buf);
         }
         0
     }
@@ -195,14 +212,67 @@ impl Vfs {
             if let Some(fs) = &mut inner.root_fs {
                 return fs.write_at(local_inode, offset, buf);
             }
-        } else if fs_id > 0 && fs_id <= inner.mounts.len() {
-            return inner.mounts[fs_id - 1].1.write_at(local_inode, offset, buf);
+        } else if let Some(mount) = inner.mounts.iter_mut().find(|m| m.fs_id as usize == fs_id) {
+            return mount.fs.write_at(local_inode, offset, buf);
         }
         0
     }
 }
 
 // ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
+
+fn normalize_dir_path(path: &str) -> String {
+    if path.is_empty() || path == "/" {
+        return "/".to_string();
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() }
+}
+
+/// Add the immediate directory components implied by deeper mountpoints.
+/// Example: /mnt/usb0 and /mnt/cf0 make `ls /` show `mnt/`, while `ls /mnt`
+/// shows `usb0/` and `cf0/` even if the root filesystem has no /mnt inode.
+fn add_mount_children(inner: &VfsInner, path: &str, entries: &mut Vec<DirEntry>) -> bool {
+    let mut added = false;
+    for mount in &inner.mounts {
+        if mount.point == path {
+            continue;
+        }
+        let rest = if path == "/" {
+            mount.point.strip_prefix('/').unwrap_or(mount.point.as_str())
+        } else {
+            let Some(rest) = mount.point.strip_prefix(path) else { continue; };
+            let Some(rest) = rest.strip_prefix('/') else { continue; };
+            rest
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        let child = rest.split('/').next().unwrap_or(rest);
+        if child.is_empty() || entries.iter().any(|e| e.name.trim_end_matches('/') == child) {
+            continue;
+        }
+        entries.push(DirEntry {
+            inode: 0,
+            name: child.to_string(),
+            file_type: 2,
+            size: 0,
+        });
+        added = true;
+    }
+    added
+}
+
+fn alloc_mount_id(inner: &mut VfsInner) -> Option<u8> {
+    for _ in 0..255 {
+        let id = if inner.next_fs_id == 0 { 1 } else { inner.next_fs_id };
+        inner.next_fs_id = id.wrapping_add(1);
+        if !inner.mounts.iter().any(|m| m.fs_id == id) {
+            return Some(id);
+        }
+    }
+    None
+}
 
 /// `/dev` matches `/dev` and `/dev/sda`, but not `/devfoo`.
 fn is_mount_prefix(path: &str, mp: &str) -> bool {
@@ -223,13 +293,11 @@ fn resolve<'a>(inner: &'a VfsInner, path: &'a str) -> (&'a dyn Filesystem, Strin
     let mut best_prefix = "/";
     let mut best_id: u8 = 0; // 0 = root_fs
 
-    for (idx, (mp, fs_box)) in inner.mounts.iter().enumerate() {
-        // println!("[VFS] resolve check mount[{}]={}", idx, mp);
-        if is_mount_prefix(path, mp) && mp.len() > best_prefix.len() {
-            best_fs = fs_box.as_ref();
-            best_prefix = mp;
-            best_id = (idx + 1) as u8; // 1-based ID для точек монтирования
-            // println!("[VFS] resolve selected mount={} fs_id={}", best_prefix, best_id);
+    for mount in inner.mounts.iter() {
+        if is_mount_prefix(path, &mount.point) && mount.point.len() > best_prefix.len() {
+            best_fs = mount.fs.as_ref();
+            best_prefix = &mount.point;
+            best_id = mount.fs_id;
         }
     }
 
@@ -255,11 +323,11 @@ fn resolve_mut<'a>(inner: &'a mut VfsInner, path: &'a str) -> (&'a mut dyn Files
     let mut best_prefix = "/";
     let mut best_id: u8 = 0;
 
-    for (idx, (mp, fs_box)) in inner.mounts.iter_mut().enumerate() {
-        if is_mount_prefix(path, mp.as_str()) && mp.len() > best_prefix.len() {
-            best_fs = fs_box.as_mut();
-            best_prefix = mp;
-            best_id = (idx + 1) as u8;
+    for mount in inner.mounts.iter_mut() {
+        if is_mount_prefix(path, mount.point.as_str()) && mount.point.len() > best_prefix.len() {
+            best_fs = mount.fs.as_mut();
+            best_prefix = &mount.point;
+            best_id = mount.fs_id;
         }
     }
 

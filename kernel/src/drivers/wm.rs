@@ -627,8 +627,10 @@ impl Compositor {
         crate::drivers::mouse::invalidate_cursor();
     }
 
-    /// Region-aware client update. It is deliberately routed through the same
-    /// dirty-region compositor so exposed pixels and Z-order are always correct.
+    /// Region-aware client update. The client surface is opaque, so paint the
+    /// updated pixels directly and replay only higher-Z windows. Do not clear
+    /// the region to the desktop first: that clear was visible as a flash on
+    /// every terminal keystroke.
     pub fn compose_client_rect(&self, id: u8, rx: u32, ry: u32, rw: u32, rh: u32) {
         let Some(w) = self.find(id) else { return; };
         if !w.visible || rw == 0 || rh == 0 {
@@ -644,7 +646,7 @@ impl Compositor {
 
         let mut guard = FRAMEBUFFER.lock();
         let Some(fb) = guard.as_mut() else { return; };
-        self.compose_region(fb, rect);
+        self.compose_opaque_region(fb, id, rect);
         drop(guard);
         crate::drivers::mouse::invalidate_cursor();
     }
@@ -1241,7 +1243,7 @@ pub fn window_info(id: u32) -> Option<WindowInfo> {
 }
 
 /// Copy pixels from user buffer into surface (full client, BGRX 32bpp),
-/// mark dirty and compose.
+/// then compose only the client area. Client flips never invalidate title/border.
 ///
 /// User buffer is only valid under the *current* task CR3. A timer tick
 /// mid-copy would switch page directories and page-fault (e.g. CR2=0x40e000).
@@ -1264,9 +1266,13 @@ pub fn flip(id: u32, user_pixels: *const u8, len: usize) -> bool {
             if let Some((x, y, w, h)) = partial {
                 WM.lock().compose_client_rect(id as u8, x, y, w, h);
             } else {
-                let mut wm = WM.lock();
-                wm.mark_window_dirty(id as u8);
-                wm.compose_dirty();
+                // A full userspace flip updates only the client surface. The WM
+                // decorations are kernel-owned and must stay untouched; marking
+                // the whole window dirty caused the title bar/border to flash.
+                let wm = WM.lock();
+                if let Some(win) = wm.find(id as u8) {
+                    wm.compose_client_rect(id as u8, 0, 0, win.surface.width, win.surface.height);
+                }
             }
         });
         true

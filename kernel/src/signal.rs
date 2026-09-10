@@ -8,7 +8,7 @@
 //! Signal numbers intentionally mirror Linux where practical.
 
 use crate::filesystem::file::{FileDescriptor, PipeEnd};
-use crate::multitasking::task::{CPUState, TASK_MANAGER};
+use crate::multitasking::task::{CPUState, TASK_MANAGER, MAX_TASKS};
 use crate::net::SocketState;
 use crate::println;
 
@@ -19,6 +19,14 @@ pub const SIGINT: u32 = 2;
 pub const SIGQUIT: u32 = 3;
 pub const SIGKILL: u32 = 9;
 pub const SIGTERM: u32 = 15;
+pub const SIGCONT: u32 = 18;
+pub const SIGSTOP: u32 = 19;
+pub const SIGTSTP: u32 = 20;
+pub const SIGTTIN: u32 = 21;
+pub const SIGTTOU: u32 = 22;
+
+pub const SIG_DFL: u32 = 0;
+pub const SIG_IGN: u32 = 1;
 
 /// Bit for signal number `sig` (1..=31).
 #[inline]
@@ -36,17 +44,62 @@ const DEFAULT_TERMINATE: u32 =
 
 // ====================== Send ======================
 
-/// Queue `sig` for task `slot`. Returns false if slot invalid / idle / zombie.
+/// Queue `sig` for a live task. A stopped task may accumulate pending signals;
+/// they are delivered after SIGCONT makes it runnable again. Stop/continue/kill
+/// themselves are handled synchronously by sys_kill.
 pub fn send_signal(slot: i8, sig: u32) -> bool {
     if slot <= 0 || sig == 0 || sig > 31 {
         return false;
     }
     unsafe {
         if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
-            if t.zombie || !t.running {
+            if t.zombie {
                 return false;
             }
             t.pending_signals |= sigbit(sig);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Stop a task without turning it into a zombie. Its CPU state and FDs remain
+/// intact so the shell can later resume it with SIGCONT/`bg`/`fg`.
+pub fn stop_task(slot: i8) -> bool {
+    if slot <= 0 {
+        return false;
+    }
+    unsafe {
+        if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
+            if t.zombie || t.stopped {
+                return false;
+            }
+            t.running = false;
+            t.stopped = true;
+            t.pending_signals &= !sigbit(SIGSTOP);
+            println!("[signal] task {} stopped", slot);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Resume a previously stopped task.
+pub fn continue_task(slot: i8) -> bool {
+    if slot <= 0 {
+        return false;
+    }
+    unsafe {
+        if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
+            if t.zombie {
+                return false;
+            }
+            t.stopped = false;
+            t.running = true;
+            t.pending_signals &= !sigbit(SIGCONT);
+            println!("[signal] task {} continued", slot);
             true
         } else {
             false
@@ -59,20 +112,25 @@ pub fn force_kill(slot: i8, sig: u32) -> bool {
     if slot <= 0 {
         return false;
     }
-    unsafe {
+    let dead_pid = unsafe {
         if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
             if t.zombie {
                 return false;
             }
+            let pid = t.pid;
             t.pending_signals = 0;
             t.running = false;
+            t.stopped = false;
             t.zombie = true;
             t.exit_code = 128 + (if sig == 0 { SIGKILL } else { sig }) as i32;
+            pid
         } else {
             return false;
         }
-    }
+    };
+    unsafe { TASK_MANAGER.reparent_children_of(dead_pid); }
     close_task_fds(slot);
+    crate::syscalls::wasm::clear_task_state(slot as usize);
     crate::drivers::wm::destroy_windows_of(slot);
     unsafe {
         TASK_MANAGER.reap_orphans();
@@ -105,6 +163,9 @@ fn close_task_fds(slot: i8) {
                 if let Some(sock) = table.get_mut(socket_id) {
                     sock.state = SocketState::Closed;
                 }
+            }
+            FileDescriptor::Pty { pty_id, side } => {
+                crate::tty::close_ref(pty_id, side);
             }
             _ => {}
         }
@@ -171,12 +232,18 @@ pub fn deliver_pending(esp: u32) -> u32 {
 
                 // Default action
                 if (DEFAULT_TERMINATE & sigbit(sig)) != 0 {
+                    let mut dead_pid = -1;
                     if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
+                        dead_pid = t.pid;
                         t.pending_signals &= !sigbit(sig);
                         t.running = false;
+                        t.stopped = false;
                         t.zombie = true;
                         t.exit_code = 128 + sig as i32;
                     }
+                    TASK_MANAGER.reparent_children_of(dead_pid);
+                    close_task_fds(slot);
+                    crate::syscalls::wasm::clear_task_state(slot as usize);
                     crate::drivers::wm::destroy_windows_of(slot);
                     println!("[signal] task {} killed by signal {}", slot, sig);
                     let new_esp = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
@@ -212,9 +279,11 @@ fn deliver_pending_after_switch(esp: u32) -> u32 {
             if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
                 t.pending_signals &= !fatal;
                 t.running = false;
+                t.stopped = false;
                 t.zombie = true;
                 t.exit_code = 128 + sig as i32;
             }
+            close_task_fds(slot);
             crate::drivers::wm::destroy_windows_of(slot);
             return TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
         }
@@ -229,7 +298,7 @@ fn esp_or_current(esp: u32) -> u32 {
     esp
 }
 
-const MAX_TASKS_GUARD: usize = 8;
+const MAX_TASKS_GUARD: usize = MAX_TASKS as usize;
 
 fn lowest_sig(mask: u32) -> Option<u32> {
     if mask == 0 {

@@ -2,7 +2,9 @@
 
 use crate::syscall::{self, SigAction, SIG_DFL, SIG_IGN};
 
-pub use crate::syscall::{SIGHUP, SIGINT, SIGKILL, SIGQUIT, SIGTERM};
+pub use crate::syscall::{
+    SIGHUP, SIGCONT, SIGINT, SIGKILL, SIGQUIT, SIGSTOP, SIGTERM, SIGTSTP, SIGTTIN, SIGTTOU,
+};
 
 /// Handler type: called with the signal number.
 pub type Handler = extern "C" fn(sig: u32);

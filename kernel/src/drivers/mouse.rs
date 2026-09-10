@@ -195,19 +195,25 @@ pub extern "C" fn mouse_irq() {
         naked_asm!(
             "cli",
             "pusha",
+            "cld",
             "mov ax, 0x10",
             "mov ds, ax",
             "mov es, ax",
             "call mouse_handler",
-            "popa",
-            "mov cx, [esp + 4]",
-            "and cx, 3",
-            "cmp cx, 3",
-            "jne 2f",
-            "mov cx, 0x23",
-            "mov ds, cx",
-            "mov es, cx",
+            // Inspect the interrupted CS while all GPRs are still saved.
+            // Never use CX after popa: that corrupts the interrupted context.
+            "mov ax, [esp + 36]",
+            "and ax, 3",
+            "cmp ax, 3",
+            "jne 1f",
+            "mov ax, 0x23",
+            "jmp 2f",
+            "1:",
+            "mov ax, 0x10",
             "2:",
+            "mov ds, ax",
+            "mov es, ax",
+            "popa",
             "iretd",
         );
     }
@@ -292,19 +298,22 @@ fn process_packet() {
     POS_X.store(x as u32, Ordering::Relaxed);
     POS_Y.store(y as u32, Ordering::Relaxed);
 
-    // Left button edges + drag move → WM (close / title drag / focus)
-    if (buttons & 1) != 0 && (prev & 1) == 0 {
-        crate::drivers::wm::on_mouse_down(x, y);
-    } else if (buttons & 1) == 0 && (prev & 1) != 0 {
-        crate::drivers::wm::on_mouse_up(x, y);
-    }
-    if (dx != 0 || dy != 0) {
-        crate::drivers::wm::on_mouse_move(x, y);
-    }
+    // Left button edges + drag move → WM only after the compositor is live.
+    // This also keeps the raw PS/2 path safe when WM is intentionally disabled
+    // for real-hardware diagnostics.
+    if crate::drivers::wm::is_ready() {
+        if (buttons & 1) != 0 && (prev & 1) == 0 {
+            crate::drivers::wm::on_mouse_down(x, y);
+        } else if (buttons & 1) == 0 && (prev & 1) != 0 {
+            crate::drivers::wm::on_mouse_up(x, y);
+        }
+        if dx != 0 || dy != 0 {
+            crate::drivers::wm::on_mouse_move(x, y);
+        }
 
-
-    // Redraw cursor (try_lock only — never block in IRQ)
-    redraw_cursor();
+        // Redraw cursor (try_lock only — never block in IRQ)
+        redraw_cursor();
+    }
 }
 
 fn screen_size() -> (i32, i32) {

@@ -2,12 +2,13 @@ pub const SYS_EXECVE_WASM: u32 = 1000;
 
 use crate::filesystem::file::{FileDescriptor, FileDescriptorTable};
 use crate::memory::paging::{PDEFlags, copy_kernel_mappings};
-use crate::multitasking::task::{CPUState, TASK_MANAGER, Task};
+use crate::multitasking::task::{CPUState, TASK_MANAGER, Task, MAX_TASKS};
 use crate::print::klog_write_str;
 use crate::syscalls::handler::*;
 use crate::wrappers::{cli, hlt, sti};
 use crate::{print, println};
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::str::Utf8Error;
 use interrupt_sync::without_interrupts;
 use wasmi::core::HostError;
@@ -28,12 +29,13 @@ fn register_wasi_functions(
     linker.func_wrap(
         "wasi_snapshot_preview1",
         "proc_exit",
-        |_code: i32| -> Result<(), wasmi::core::Trap> {
+        |code: i32| -> Result<(), wasmi::core::Trap> {
             without_interrupts(|| {
                 unsafe {
                     let slot = TASK_MANAGER.get_current_slot() as usize;
-                    println!("proc exit {}", slot);
-                    sys_exit(slot, 0);
+                    println!("proc exit {} status={}", slot, code);
+                    WASM_LAUNCH[slot] = None;
+                    sys_exit(slot, 0, code);
                 }
                 Err(wasmi::core::Trap::new("proc_exit called"))
             })
@@ -367,8 +369,7 @@ fn register_wasi_functions(
         },
     )?;
 
-    // === ДОБАВЛЕНЫ ЗАГЛУШКИ ДЛЯ WASI ===
-    // environ_sizes_get
+    // WASI environment inherited from the Felix shell.
     linker.func_wrap(
         "wasi_snapshot_preview1",
         "environ_sizes_get",
@@ -376,22 +377,25 @@ fn register_wasi_functions(
          count_ptr: i32,
          buf_size_ptr: i32|
          -> Result<i32, wasmi::core::Trap> {
+            let (count, size) = unsafe {
+                let slot = TASK_MANAGER.get_current_slot() as usize;
+                WASM_LAUNCH[slot]
+                    .as_ref()
+                    .map(|ctx| (ctx.envp.len() as u32, ctx.envp.iter().map(|s| s.len()).sum::<usize>() as u32))
+                    .unwrap_or((0, 0))
+            };
             let memory = caller
                 .get_export("memory")
                 .and_then(|e| e.into_memory())
                 .ok_or_else(|| wasmi::core::Trap::new("no mem"))?;
-            // 1 var, size of "RUST_BACKTRACE=1\0"
-            memory
-                .write(&mut caller, count_ptr as usize, &1u32.to_le_bytes())
+            memory.write(&mut caller, count_ptr as usize, &count.to_le_bytes())
                 .map_err(|_| wasmi::core::Trap::new("write"))?;
-            memory
-                .write(&mut caller, buf_size_ptr as usize, &17u32.to_le_bytes())
+            memory.write(&mut caller, buf_size_ptr as usize, &size.to_le_bytes())
                 .map_err(|_| wasmi::core::Trap::new("write"))?;
             Ok(0)
         },
     )?;
 
-    // environ_get
     linker.func_wrap(
         "wasi_snapshot_preview1",
         "environ_get",
@@ -399,26 +403,26 @@ fn register_wasi_functions(
          environ_ptrs: i32,
          environ_buf: i32|
          -> Result<i32, wasmi::core::Trap> {
+            let entries = unsafe {
+                let slot = TASK_MANAGER.get_current_slot() as usize;
+                WASM_LAUNCH[slot].as_ref().map(|ctx| ctx.envp.clone()).unwrap_or_default()
+            };
             let memory = caller
                 .get_export("memory")
                 .and_then(|e| e.into_memory())
                 .ok_or_else(|| wasmi::core::Trap::new("no mem"))?;
-            let s = b"RUST_BACKTRACE=1\0";
-            memory
-                .write(&mut caller, environ_buf as usize, s)
-                .map_err(|_| wasmi::core::Trap::new("write"))?;
-            memory
-                .write(
-                    &mut caller,
-                    environ_ptrs as usize,
-                    &(environ_buf as u32).to_le_bytes(),
-                )
-                .map_err(|_| wasmi::core::Trap::new("write"))?;
+            let mut off = environ_buf as usize;
+            for (i, entry) in entries.iter().enumerate() {
+                memory.write(&mut caller, environ_ptrs as usize + i * 4, &(off as u32).to_le_bytes())
+                    .map_err(|_| wasmi::core::Trap::new("write env ptr"))?;
+                memory.write(&mut caller, off, entry)
+                    .map_err(|_| wasmi::core::Trap::new("write env"))?;
+                off += entry.len();
+            }
             Ok(0)
         },
     )?;
 
-    // args_sizes_get
     linker.func_wrap(
         "wasi_snapshot_preview1",
         "args_sizes_get",
@@ -426,22 +430,25 @@ fn register_wasi_functions(
          argc_ptr: i32,
          argv_buf_size_ptr: i32|
          -> Result<i32, wasmi::core::Trap> {
+            let (argc, size) = unsafe {
+                let slot = TASK_MANAGER.get_current_slot() as usize;
+                WASM_LAUNCH[slot]
+                    .as_ref()
+                    .map(|ctx| (ctx.argv.len() as u32, ctx.argv.iter().map(|s| s.len()).sum::<usize>() as u32))
+                    .unwrap_or((0, 0))
+            };
             let memory = caller
                 .get_export("memory")
                 .and_then(|e| e.into_memory())
                 .ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
-            // 1 arg, size of "http-client\0"
-            memory
-                .write(&mut caller, argc_ptr as usize, &1u32.to_le_bytes())
+            memory.write(&mut caller, argc_ptr as usize, &argc.to_le_bytes())
                 .map_err(|_| wasmi::core::Trap::new("write argc failed"))?;
-            memory
-                .write(&mut caller, argv_buf_size_ptr as usize, &6u32.to_le_bytes())
+            memory.write(&mut caller, argv_buf_size_ptr as usize, &size.to_le_bytes())
                 .map_err(|_| wasmi::core::Trap::new("write size failed"))?;
             Ok(0)
         },
     )?;
 
-    // args_get
     linker.func_wrap(
         "wasi_snapshot_preview1",
         "args_get",
@@ -449,22 +456,22 @@ fn register_wasi_functions(
          argv_ptrs_ptr: i32,
          argv_buf_ptr: i32|
          -> Result<i32, wasmi::core::Trap> {
+            let entries = unsafe {
+                let slot = TASK_MANAGER.get_current_slot() as usize;
+                WASM_LAUNCH[slot].as_ref().map(|ctx| ctx.argv.clone()).unwrap_or_default()
+            };
             let memory = caller
                 .get_export("memory")
                 .and_then(|e| e.into_memory())
                 .ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
-            let buf = b"http-client\0";
-
-            memory
-                .write(&mut caller, argv_buf_ptr as usize, buf)
-                .map_err(|_| wasmi::core::Trap::new("write argc failed"))?;
-            memory
-                .write(
-                    &mut caller,
-                    argv_ptrs_ptr as usize,
-                    &(argv_buf_ptr as u32).to_le_bytes(),
-                )
-                .map_err(|_| wasmi::core::Trap::new("write argc failed"))?;
+            let mut off = argv_buf_ptr as usize;
+            for (i, entry) in entries.iter().enumerate() {
+                memory.write(&mut caller, argv_ptrs_ptr as usize + i * 4, &(off as u32).to_le_bytes())
+                    .map_err(|_| wasmi::core::Trap::new("write argv ptr"))?;
+                memory.write(&mut caller, off, entry)
+                    .map_err(|_| wasmi::core::Trap::new("write argv"))?;
+                off += entry.len();
+            }
             Ok(0)
         },
     )?;
@@ -672,10 +679,21 @@ fn register_wasi_functions(
     Ok(())
 }
 
-/// Контекст для WASI
+/// Контекст регистрации WASI.
 struct WasmTaskContext {
     slot: usize,
 }
+
+/// argv/envp belonging to one running WASM task. WASI host functions execute
+/// in kernel context, so they can resolve the current task slot and read this
+/// launch data without changing every `Store<()>` callback signature.
+struct WasmLaunchInfo {
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+}
+
+static mut WASM_LAUNCH: [Option<WasmLaunchInfo>; MAX_TASKS as usize] =
+    [const { None }; MAX_TASKS as usize];
 
 /// Структура для хранения состояния WASM-машины задачи
 struct WasmExec {
@@ -684,10 +702,19 @@ struct WasmExec {
 }
 
 // Глобальное хранилище (в идеале должно быть полем в Task)
-static mut WASM_EXEC: [Option<Box<WasmExec>>; 8] = {
-    const NONE: Option<Box<WasmExec>> = None;
-    [NONE; 8]
-};
+static mut WASM_EXEC: [Option<Box<WasmExec>>; MAX_TASKS as usize] =
+    [const { None }; MAX_TASKS as usize];
+
+/// Release per-slot WASM metadata/runtime when a task exits through a generic
+/// kernel path (signal kill, forced cleanup, native-style SYS_EXIT). Safe for
+/// non-WASM tasks because both entries are simply None.
+pub(crate) fn clear_task_state(slot: usize) {
+    if slot >= MAX_TASKS as usize { return; }
+    unsafe {
+        WASM_LAUNCH[slot] = None;
+        WASM_EXEC[slot] = None;
+    }
+}
 
 /// Реализация sys_execve_wasm
 pub(crate) fn sys_execve_wasm(
@@ -707,6 +734,32 @@ pub(crate) fn sys_execve_wasm(
         return usize::MAX;
     }
     let slot = slot_i8 as usize;
+    let pid = unsafe { TASK_MANAGER.alloc_pid() };
+    let (ppid, inherited_pgid, inherited_sid, inherited_cwd, inherited_tty) = unsafe {
+        TASK_MANAGER.tasks
+            .get(parent_slot)
+            .and_then(|t| t.as_ref())
+            .map(|p| (p.pid, p.pgid, p.sid, p.cwd.clone(), p.tty_id))
+            .unwrap_or((0, pid, pid, "/".into(), -1))
+    };
+    let sid = if parent_slot == 0 || inherited_sid <= 0 { pid } else { inherited_sid };
+    let inherited_group = if parent_slot == 0 || inherited_pgid <= 0 { pid } else { inherited_pgid };
+    let pgid = match params.pgid {
+        -1 => inherited_group,
+        0 => pid,
+        requested if requested > 0 => {
+            let exists_same_session = unsafe {
+                TASK_MANAGER.tasks.iter().flatten().any(|t| {
+                    t.pgid == requested && t.sid == sid
+                })
+            };
+            if !exists_same_session {
+                return usize::MAX;
+            }
+            requested
+        }
+        _ => return usize::MAX,
+    };
 
     let engine = Engine::default();
     let module = match Module::new(&engine, bytecode) {
@@ -747,7 +800,11 @@ pub(crate) fn sys_execve_wasm(
             .start(&mut store)
             .unwrap();
 
-        // 3. Сохраняем состояние в глобальный массив
+        // 3. Сохраняем runtime и реальные argv/envp для WASI.
+        WASM_LAUNCH[slot] = Some(WasmLaunchInfo {
+            argv: params.argv.clone(),
+            envp: params.envp.clone(),
+        });
         WASM_EXEC[slot] = Some(Box::new(WasmExec { store, instance }));
 
         // 4. Настраиваем CPUState для KERNEL MODE (Ring 0)!
@@ -767,9 +824,23 @@ pub(crate) fn sys_execve_wasm(
         };
 
         task.running = true;
+        task.pid = pid;
+        task.ppid = ppid;
+        task.pgid = pgid;
+        task.sid = sid;
         task.parent = parent_slot as i8;
+        task.cwd = inherited_cwd;
+        task.tty_id = inherited_tty;
         task.zombie = false;
+        task.stopped = false;
         task.exit_code = 0;
+        task.name = [0; 32];
+        if let Some(arg0) = params.argv.first() {
+            let raw = arg0.strip_suffix(&[0]).unwrap_or(arg0.as_slice());
+            let base = raw.rsplit(|b| *b == b'/').next().unwrap_or(raw);
+            let n = base.len().min(task.name.len() - 1);
+            task.name[..n].copy_from_slice(&base[..n]);
+        }
 
         let mut fd_table = FileDescriptorTable::with_stdio();
         install_child_fd(
@@ -797,8 +868,12 @@ pub(crate) fn sys_execve_wasm(
 
         TASK_MANAGER.tasks[slot] = Some(task);
         TASK_MANAGER.task_count += 1;
-        sti!();
-        slot
+        if params.foreground && parent_slot != 0 {
+            let _ = crate::tty::set_foreground(parent_slot, pgid);
+        }
+        // Syscall trampoline entered with IF=0; iretd restores the user's IF.
+        // Enabling IRQs here creates a timer-preemption window inside int 0x80.
+        pid as usize
     }
 }
 
@@ -831,7 +906,8 @@ extern "C" fn wasm_task_entry() -> ! {
     println!("Task {} exit", slot);
     // Завершаем задачу
     unsafe {
-        sys_exit(slot, 0);
+        WASM_LAUNCH[slot] = None;
+        sys_exit(slot, 0, 0);
     }
 
     loop {

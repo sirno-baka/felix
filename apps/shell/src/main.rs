@@ -12,21 +12,59 @@ use core::cmp::min;
 use libfelix::async_rt::yield_now;
 use libfelix::embedded_graphics;
 use libfelix::prelude::*;
+mod executor;
+mod line_editor;
+mod parser;
 mod terminal;
+use executor::{interpret, poll_background_jobs};
+use line_editor::LineEditor;
+use parser::{parse_line, CommandGroup, Connector, Redir, RedirKind, RedirTarget, SimpleCmd, PROTECTED};
 use terminal::{Terminal, CELL_H, CELL_W};
 use libfelix::syscall::{
-    self, close, execve, execve_wasm, kill, mkdir, open, pipe, read, rmdir, set_nonblock, unlink,
-    wait, wait_options, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGINT, WNOHANG,
+    self, chdir, close, execve_env_pgid, execve_wasm_env_pgid, getpid, getpgrp, kill, mkdir, mount, mount_list,
+    open, openpty, pipe, read, rmdir, set_nonblock, setpgid, task_list, tty_setfg, umount2, unlink,
+    waitpid_status, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGCONT, SIGINT,
+    SIGKILL, SIGSTOP, SIGTERM, SIGTSTP, TASK_RUNNING, TASK_STOPPED, TASK_ZOMBIE, WNOHANG,
 };
 
 // ---------------------------------------------------------------------------
 // Shell state
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobState {
+    Running,
+    Stopped,
+}
+
+struct BackgroundJob {
+    id: u32,
+    pgid: i32,
+    pids: Vec<i32>,
+    last_pid: i32,
+    command: String,
+    state: JobState,
+    capture_fd: Option<u32>,
+    stdin_w: Option<u32>,
+    last_status: i32,
+}
+
+struct EnvVar {
+    name: String,
+    value: String,
+    exported: bool,
+}
+
 struct Shell {
     cwd: String,
+    old_cwd: String,
     path: String,
-    command_cache: Option<Vec<String>>, // кэш всех команд
+    command_cache: Option<Vec<String>>,
+    jobs: Vec<BackgroundJob>,
+    next_job_id: u32,
+    env: Vec<EnvVar>,
+    last_status: i32,
+    should_exit: bool,
 }
 
 fn list_dir(path: &str) -> Vec<String> {
@@ -55,92 +93,189 @@ fn longest_common_prefix(strings: &[String]) -> String {
     if strings.is_empty() {
         return String::new();
     }
-    let first = &strings[0];
-    let mut prefix = String::new();
-    for (i, ch) in first.char_indices() {
-        for s in &strings[1..] {
-            if let Some(c) = s.chars().nth(i) {
-                if c != ch {
-                    return prefix;
-                }
-            } else {
-                return prefix;
-            }
-        }
-        prefix.push(ch);
+    let mut prefix = strings[0].clone();
+    while !prefix.is_empty() && strings.iter().any(|s| !s.starts_with(&prefix)) {
+        prefix.pop();
     }
     prefix
 }
 
-fn handle_tab_completion(shell: &mut Shell, input: &str, term: &mut TermBuffer) -> (String, bool) {
-    // Если ввод содержит пробелы — не дополняем команду (можно расширить для путей)
-    // if input.contains(' ') {
-    //     return (input.to_string(), false);
-    // }
-    let (tr_input, prefix) = match input.rsplit_once(' ') {
-        None => {
-            ("", input)
-        }
-        Some((tr_input, prefix)) => {
-            (tr_input, prefix)
+enum CompletionResult {
+    None,
+    Replace(String),
+    Listed,
+}
 
-        }
+fn input_token(input: &str) -> (&str, &str) {
+    let start = input
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(i, ch)| i + ch.len_utf8())
+        .unwrap_or(0);
+    (&input[..start], &input[start..])
+}
+
+fn command_position(before: &str) -> bool {
+    before
+        .rsplit('|')
+        .next()
+        .unwrap_or(before)
+        .trim()
+        .is_empty()
+}
+
+fn path_completion_matches(shell: &Shell, token: &str) -> Vec<String> {
+    let (dir_part, leaf) = match token.rfind('/') {
+        Some(i) => (&token[..=i], &token[i + 1..]),
+        None => ("", token),
     };
-    println!("{}", prefix);
-    let all_cmds = shell.get_commands().clone();
-    let mut matches: Vec<String> = all_cmds
-        .into_iter()
-        .filter(|cmd| cmd.starts_with(prefix))
-        .collect();
+
+    let list_path = if dir_part.is_empty() {
+        shell.cwd.clone()
+    } else if dir_part.starts_with('/') {
+        normalize_path(dir_part)
+    } else {
+        shell.resolve(dir_part)
+    };
+
+    let mut matches = Vec::new();
+    for entry in list_dir(&list_path) {
+        if entry.starts_with(leaf) {
+            let mut candidate = String::from(dir_part);
+            candidate.push_str(&entry);
+            matches.push(candidate);
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
+fn handle_tab_completion(shell: &mut Shell, input: &str, term: &mut TermBuffer) -> CompletionResult {
+    let (before, token) = input_token(input);
+    let is_command = command_position(before);
+
+    let mut matches = if is_command && !token.contains('/') {
+        shell
+            .get_commands()
+            .iter()
+            .filter(|cmd| cmd.starts_with(token))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        path_completion_matches(shell, token)
+    };
 
     if matches.is_empty() {
-        return (input.to_string(), false);
+        return CompletionResult::None;
     }
-
     matches.sort();
+    matches.dedup();
 
     if matches.len() == 1 {
-        // Единственное совпадение — заменяем ввод и добавляем пробел
-        if tr_input.is_empty() {
-            let new_input = format!("{} ", matches[0]);
-            return (new_input, true);
+        let mut replacement = matches[0].clone();
+        if !replacement.ends_with('/') {
+            replacement.push(' ');
         }
-        let new_input = format!("{} {}", tr_input, matches[0]);
-        (new_input, true)
-    } else {
-        // Несколько совпадений — находим общий префикс
-        let common = longest_common_prefix(&matches);
-        if common.len() > prefix.len() {
-            // Общий префикс длиннее текущего — заменяем на него (без пробела)
-            if tr_input.is_empty() {
-                let new_input = format!("{} ", common);
-                return (new_input, true);
-            }
-            let new_input = format!("{} {}", tr_input, common);
-            (new_input, true)
-
-        } else {
-            // Нет общего префикса — выводим список вариантов в терминал
-            let mut msg = String::from("");
-            for (i, m) in matches.iter().enumerate() {
-                if i > 0 {
-                    msg.push_str("  ");
-                }
-                msg.push_str(m);
-            }
-            term.push(&msg);
-            return (input.to_string(), true); // dirty, чтобы перерисовать терминал с подсказкой
-        }
+        return CompletionResult::Replace(format!("{}{}", before, replacement));
     }
+
+    let common = longest_common_prefix(&matches);
+    if common.len() > token.len() {
+        return CompletionResult::Replace(format!("{}{}", before, common));
+    }
+
+    // Put candidates on their own line and restore the current prompt/input.
+    term.write_bytes(b"\r\n");
+    let mut msg = String::new();
+    for (i, item) in matches.iter().enumerate() {
+        if i > 0 {
+            msg.push_str("  ");
+        }
+        msg.push_str(item);
+    }
+    term.push(&msg);
+    term.prompt_line(&shell.prompt());
+    term.write_bytes(input.as_bytes());
+    CompletionResult::Listed
 }
 
 impl Shell {
     fn new() -> Self {
-        Self {
+        let mut shell = Self {
             cwd: String::from("/"),
-            path: String::from("/"),
+            old_cwd: String::from("/"),
+            // Root contains the system apps today; `.` follows cwd.
+            path: String::from("/:."),
             command_cache: None,
+            jobs: Vec::new(),
+            next_job_id: 1,
+            env: Vec::new(),
+            last_status: 0,
+            should_exit: false,
+        };
+        shell.set_var("PATH", "/:.", true);
+        shell.set_var("HOME", "/", true);
+        shell.set_var("PWD", "/", true);
+        shell.set_var("OLDPWD", "/", true);
+        shell
+    }
+
+    fn get_var(&self, name: &str) -> Option<&str> {
+        self.env
+            .iter()
+            .find(|v| v.name == name)
+            .map(|v| v.value.as_str())
+    }
+
+    fn set_var(&mut self, name: &str, value: &str, exported: bool) {
+        if let Some(v) = self.env.iter_mut().find(|v| v.name == name) {
+            v.value.clear();
+            v.value.push_str(value);
+            v.exported |= exported;
+        } else {
+            self.env.push(EnvVar {
+                name: name.to_string(),
+                value: value.to_string(),
+                exported,
+            });
         }
+        if name == "PATH" {
+            self.path = value.to_string();
+            self.invalidate_cache();
+        }
+    }
+
+    fn export_name(&mut self, name: &str) -> bool {
+        if let Some(v) = self.env.iter_mut().find(|v| v.name == name) {
+            v.exported = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn unset_var(&mut self, name: &str) {
+        self.env.retain(|v| v.name != name);
+        if name == "PATH" {
+            self.path.clear();
+            self.invalidate_cache();
+        }
+    }
+
+    fn exported_env(&self) -> Vec<String> {
+        self.env
+            .iter()
+            .filter(|v| v.exported)
+            .map(|v| format!("{}={}\0", v.name, v.value))
+            .collect()
+    }
+
+    fn alloc_job_id(&mut self) -> u32 {
+        let id = self.next_job_id;
+        self.next_job_id = self.next_job_id.wrapping_add(1).max(1);
+        id
     }
 
     fn get_commands(&mut self) -> &Vec<String> {
@@ -150,14 +285,23 @@ impl Shell {
             for b in BUILTINS {
                 cmds.push(b.to_string());
             }
-            // Внешние команды из PATH
+            // External commands from PATH. Relative PATH entries are resolved
+            // against cwd, so `.` follows `cd` as users expect.
             for dir in self.path.split(':') {
                 if dir.is_empty() {
                     continue;
                 }
-                let files = list_dir(dir);
-                for f in files {
-                    cmds.push(f);
+                let resolved = if dir.starts_with('/') {
+                    normalize_path(dir)
+                } else {
+                    self.resolve(dir)
+                };
+                for f in list_dir(&resolved) {
+                    // `ls` marks directories with a trailing slash; they are
+                    // valid path completions but not executable command names.
+                    if !f.ends_with('/') {
+                        cmds.push(f);
+                    }
                 }
             }
             cmds.sort();
@@ -204,16 +348,17 @@ impl Shell {
             if dir.is_empty() {
                 continue;
             }
-            let candidate = if dir == "/" {
-                let mut s = String::from("/");
-                s.push_str(name);
-                s
+            let base = if dir.starts_with('/') {
+                normalize_path(dir)
             } else {
-                let mut s = String::from(dir);
-                s.push('/');
-                s.push_str(name);
-                normalize_path(&s)
+                self.resolve(dir)
             };
+            let candidate = if base == "/" {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", base, name)
+            };
+            let candidate = normalize_path(&candidate);
             if file_exists(&candidate) {
                 return Some(candidate);
             }
@@ -241,6 +386,85 @@ fn normalize_path(path: &str) -> String {
     out
 }
 
+fn expand_word(shell: &Shell, word: &str) -> String {
+    let chars: Vec<char> = word.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+
+    // Leading ~ expansion (suppressed when parser marked it protected).
+    if chars.first() == Some(&'~') && (chars.len() == 1 || chars.get(1) == Some(&'/')) {
+        out.push_str(shell.get_var("HOME").unwrap_or("/"));
+        i = 1;
+    }
+
+    while i < chars.len() {
+        if chars[i] == PROTECTED {
+            i += 1;
+            if let Some(ch) = chars.get(i) {
+                out.push(*ch);
+                i += 1;
+            }
+            continue;
+        }
+        if chars[i] != '$' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        if i >= chars.len() {
+            out.push('$');
+            break;
+        }
+        if chars[i] == '?' {
+            out.push_str(&shell.last_status.to_string());
+            i += 1;
+            continue;
+        }
+
+        let mut name = String::new();
+        if chars[i] == '{' {
+            i += 1;
+            while i < chars.len() && chars[i] != '}' {
+                name.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() && chars[i] == '}' {
+                i += 1;
+            }
+        } else {
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                name.push(chars[i]);
+                i += 1;
+            }
+        }
+        if name.is_empty() {
+            out.push('$');
+        } else if let Some(value) = shell.get_var(&name) {
+            out.push_str(value);
+        }
+    }
+    out
+}
+
+fn expand_cmd(shell: &Shell, cmd: &SimpleCmd) -> SimpleCmd {
+    let args = cmd.args.iter().map(|a| expand_word(shell, a)).collect();
+    let redirs = cmd
+        .redirs
+        .iter()
+        .map(|r| Redir {
+            fd: r.fd,
+            kind: r.kind,
+            target: match &r.target {
+                RedirTarget::Path(p) => RedirTarget::Path(expand_word(shell, p)),
+                RedirTarget::Fd(fd) => RedirTarget::Fd(*fd),
+            },
+        })
+        .collect();
+    SimpleCmd { args, redirs }
+}
+
 fn file_exists(path: &str) -> bool {
     File::open(path).is_ok()
 }
@@ -254,138 +478,83 @@ fn is_directory(path: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Parsing
+// Redirection helpers (parsing itself lives in parser.rs)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
-enum RedirKind {
-    In,
-    Out,
-    Append,
+struct RedirFds {
+    stdin: i32,
+    stdout: i32,
+    stderr: i32,
+    stderr_to_stdout: bool,
 }
 
-struct Redir {
-    kind: RedirKind,
-    path: String,
-}
-
-struct SimpleCmd {
-    args: Vec<String>,
-    redirs: Vec<Redir>,
-}
-
-fn split_pipeline(line: &str) -> Vec<String> {
-    let mut stages = Vec::new();
-    let mut cur = String::new();
-    for ch in line.chars() {
-        if ch == '|' {
-            let t = cur.trim().to_string();
-            if !t.is_empty() {
-                stages.push(t);
-            }
-            cur.clear();
-        } else {
-            cur.push(ch);
-        }
+impl RedirFds {
+    fn new() -> Self {
+        Self { stdin: -1, stdout: -1, stderr: -1, stderr_to_stdout: false }
     }
-    let t = cur.trim().to_string();
-    if !t.is_empty() {
-        stages.push(t);
-    }
-    stages
 }
 
-fn parse_simple(stage: &str) -> SimpleCmd {
-    let mut args = Vec::new();
-    let mut redirs = Vec::new();
-    let tokens: Vec<&str> = stage.split_whitespace().collect();
-    let mut i = 0;
-    while i < tokens.len() {
-        let t = tokens[i];
-        if t == "<" || t == ">" || t == ">>" {
-            let kind = match t {
-                "<" => RedirKind::In,
-                ">>" => RedirKind::Append,
-                _ => RedirKind::Out,
-            };
-            i += 1;
-            if i < tokens.len() {
-                redirs.push(Redir {
-                    kind,
-                    path: tokens[i].to_string(),
-                });
-            }
-        } else if t.starts_with(">>") && t.len() > 2 {
-            redirs.push(Redir {
-                kind: RedirKind::Append,
-                path: t[2..].to_string(),
-            });
-        } else if t.starts_with('>') && t.len() > 1 {
-            redirs.push(Redir {
-                kind: RedirKind::Out,
-                path: t[1..].to_string(),
-            });
-        } else if t.starts_with('<') && t.len() > 1 {
-            redirs.push(Redir {
-                kind: RedirKind::In,
-                path: t[1..].to_string(),
-            });
-        } else {
-            args.push(t.to_string());
-        }
-        i += 1;
+fn close_if_open(fd: &mut i32) {
+    if *fd >= 0 {
+        unsafe { close(*fd as u32); }
+        *fd = -1;
     }
-    SimpleCmd { args, redirs }
 }
 
-fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
-    let mut stdin_fd: i32 = -1;
-    let mut stdout_fd: i32 = -1;
+fn open_redir_path(shell: &Shell, r: &Redir, path: &str) -> Result<i32, String> {
+    let full = shell.resolve(path);
+    let mut cpath = full;
+    cpath.push('\0');
+    let flags = match r.kind {
+        RedirKind::In => O_RDONLY,
+        RedirKind::Out => O_WRONLY | O_CREAT | O_TRUNC,
+        RedirKind::Append => O_WRONLY | O_CREAT | O_APPEND,
+    };
+    let fd = unsafe { open(cpath.as_ptr(), flags) };
+    if fd == usize::MAX {
+        Err(format!("{}: cannot open", path))
+    } else {
+        Ok(fd as i32)
+    }
+}
 
+fn prepare_redirs(shell: &Shell, redirs: &[Redir]) -> Result<RedirFds, String> {
+    let mut fds = RedirFds::new();
     for r in redirs {
-        let full = shell.resolve(&r.path);
-        let mut path = full.clone();
-        path.push('\0');
-        match r.kind {
-            RedirKind::In => {
-                let fd = unsafe { open(path.as_ptr(), O_RDONLY) };
-                if fd == usize::MAX {
-                    return Err(format!("{}: No such file", r.path));
-                }
-                if stdin_fd >= 0 {
-                    unsafe {
-                        close(stdin_fd as u32);
+        match &r.target {
+            RedirTarget::Path(path) => {
+                let fd = open_redir_path(shell, r, path)?;
+                match r.fd {
+                    0 => { close_if_open(&mut fds.stdin); fds.stdin = fd; }
+                    1 => { close_if_open(&mut fds.stdout); fds.stdout = fd; }
+                    2 => { close_if_open(&mut fds.stderr); fds.stderr = fd; fds.stderr_to_stdout = false; }
+                    _ => {
+                        unsafe { close(fd as u32); }
+                        return Err(format!("redirection: fd {} is not supported", r.fd));
                     }
                 }
-                stdin_fd = fd as i32;
             }
-            RedirKind::Out => {
-                let fd = unsafe { open(path.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC) };
-                if fd == usize::MAX {
-                    return Err(format!("{}: cannot create", r.path));
+            RedirTarget::Fd(target) => {
+                if r.fd == 2 && *target == 1 {
+                    close_if_open(&mut fds.stderr);
+                    fds.stderr_to_stdout = true;
+                } else {
+                    return Err(format!("redirection: {}>&{} is not supported", r.fd, target));
                 }
-                if stdout_fd >= 0 {
-                    unsafe {
-                        close(stdout_fd as u32);
-                    }
-                }
-                stdout_fd = fd as i32;
-            }
-            RedirKind::Append => {
-                let fd = unsafe { open(path.as_ptr(), O_WRONLY | O_CREAT | O_APPEND) };
-                if fd == usize::MAX {
-                    return Err(format!("{}: cannot open", r.path));
-                }
-                if stdout_fd >= 0 {
-                    unsafe {
-                        close(stdout_fd as u32);
-                    }
-                }
-                stdout_fd = fd as i32;
             }
         }
     }
-    Ok((stdin_fd, stdout_fd))
+    Ok(fds)
+}
+
+/// Compatibility helper for builtins. Builtins currently write one output
+/// stream, so fd 1 is enough; fd 0/2 are still parsed and opened/closed safely.
+fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
+    let mut fds = prepare_redirs(shell, redirs)?;
+    // Current builtins do not consume redirected stdin/stderr themselves.
+    close_if_open(&mut fds.stdin);
+    close_if_open(&mut fds.stderr);
+    Ok((-1, fds.stdout))
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +644,8 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
     let name = cmd.args[0].as_str();
     match name {
         "help" | "exit" | "quit" | "pwd" | "cd" | "ls" | "cat" | "mkdir" | "rmdir" | "rm"
-        | "path" | "ps" | "clear" | "echo" | "head" | "lspci" | "ifconfig" => {}
+        | "path" | "ps" | "jobs" | "fg" | "bg" | "kill" | "wait" | "export" | "unset" | "env"
+        | "set" | "clear" | "echo" | "head" | "lspci" | "ifconfig" | "mount" | "mounts" | "umount" => {}
         _ => return false,
     }
 
@@ -520,7 +690,10 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
                 out.push(&msg);
             }
         }
-        "exit" | "quit" => out.push("Goodbye."),
+        "exit" | "quit" => {
+            shell.should_exit = true;
+            shell.last_status = cmd.args.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+        },
         "pwd" => {
             let s = shell.cwd.clone();
             if file_fd >= 0 {
@@ -535,17 +708,36 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
             }
         }
         "cd" => {
-            let target = cmd.args.get(1).map(|s| s.as_str()).unwrap_or("/");
-            let new_cwd = shell.resolve(target);
+            let target_owned = match cmd.args.get(1).map(|s| s.as_str()) {
+                None => shell.get_var("HOME").unwrap_or("/").to_string(),
+                Some("-") => shell.old_cwd.clone(),
+                Some(v) => v.to_string(),
+            };
+            let new_cwd = shell.resolve(&target_owned);
             if is_directory(&new_cwd) {
-                shell.cwd = new_cwd;
+                let mut cpath = new_cwd.clone();
+                cpath.push('\0');
+                if unsafe { chdir(cpath.as_ptr()) } == 0 {
+                    let previous = shell.cwd.clone();
+                    shell.old_cwd = previous.clone();
+                    shell.cwd = new_cwd;
+                    shell.set_var("OLDPWD", &previous, true);
+                    let now = shell.cwd.clone();
+                    shell.set_var("PWD", &now, true);
+                    shell.invalidate_cache();
+                    if cmd.args.get(1).map(|s| s.as_str()) == Some("-") {
+                        out.push(&shell.cwd);
+                    }
+                } else {
+                    out.push(&format!("cd: {}: chdir failed", target_owned));
+                    shell.last_status = 1;
+                }
             } else {
-                out.push(&format!("cd: {}: No such directory", target));
+                out.push(&format!("cd: {}: No such directory", target_owned));
+                shell.last_status = 1;
             }
             if file_fd >= 0 {
-                unsafe {
-                    close(file_fd as u32);
-                }
+                unsafe { close(file_fd as u32); }
             }
         }
         "ls" => {
@@ -635,24 +827,94 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
         }
         "path" => {
             if let Some(new_path) = cmd.args.get(1) {
-                shell.path = new_path.clone();
-                shell.invalidate_cache(); // <-- добавить
+                shell.set_var("PATH", new_path, true);
                 out.push(&format!("PATH={}", shell.path));
             } else {
                 out.push(&shell.path);
             }
-            if file_fd >= 0 {
-                unsafe {
-                    close(file_fd as u32);
-                }
-            }
+            if file_fd >= 0 { unsafe { close(file_fd as u32); } }
         }
         "ps" => {
-            out.push("ps: not implemented yet");
-            if file_fd >= 0 {
-                unsafe {
-                    close(file_fd as u32);
+            ps_to(file_fd, out);
+            if file_fd >= 0 { unsafe { close(file_fd as u32); } }
+        }
+        "mount" => {
+            if cmd.args.len() == 1 {
+                mounts_to(file_fd, out);
+                shell.last_status = 0;
+            } else if cmd.args.len() == 3 {
+                let source = cmd.args[1].clone();
+                let target = shell.resolve(&cmd.args[2]);
+                let mut csource = source.clone();
+                csource.push('\0');
+                let mut ctarget = target.clone();
+                ctarget.push('\0');
+                let rc = unsafe {
+                    mount(
+                        csource.as_ptr(),
+                        ctarget.as_ptr(),
+                        core::ptr::null(),
+                        0,
+                        core::ptr::null(),
+                    )
+                };
+                if rc != 0 {
+                    out.push(&format!("mount: {} on {} failed", source, target));
+                    shell.last_status = 1;
+                } else {
+                    out.push(&format!("{} mounted on {}", source, target));
+                    shell.last_status = 0;
                 }
+            } else {
+                out.push("Usage: mount [<device> <mountpoint>]");
+                shell.last_status = 1;
+            }
+            if file_fd >= 0 { unsafe { close(file_fd as u32); } }
+        }
+        "mounts" => {
+            mounts_to(file_fd, out);
+            if file_fd >= 0 { unsafe { close(file_fd as u32); } }
+        }
+        "umount" => {
+            if let Some(path) = cmd.args.get(1) {
+                let full = shell.resolve(path);
+                let mut cpath = full.clone();
+                cpath.push('\0');
+                let rc = unsafe { umount2(cpath.as_ptr(), 0) };
+                if rc != 0 {
+                    out.push(&format!("umount: {} failed", full));
+                    shell.last_status = 1;
+                } else {
+                    shell.last_status = 0;
+                }
+            } else {
+                out.push("Usage: umount <mountpoint>");
+                shell.last_status = 1;
+            }
+            if file_fd >= 0 { unsafe { close(file_fd as u32); } }
+        }
+        "jobs" => {
+            if shell.jobs.is_empty() {
+                if file_fd >= 0 {
+                    let msg = b"No background jobs\n";
+                    unsafe { write(file_fd as u32, msg.as_ptr(), msg.len()); }
+                } else {
+                    out.push("No background jobs");
+                }
+            } else {
+                for job in &shell.jobs {
+                    let state = if job.state == JobState::Stopped { "Stopped" } else { "Running" };
+                    let mut line = format!("[{}] {}  {}", job.id, state, job.command);
+                    if file_fd >= 0 {
+                        line.push('\n');
+                        unsafe { write(file_fd as u32, line.as_bytes().as_ptr(), line.len()); }
+                    } else {
+                        out.push(&line);
+                    }
+                }
+            }
+            if file_fd >= 0 {
+                unsafe { close(file_fd as u32); }
             }
         }
         "clear" => {
@@ -682,6 +944,65 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
         _ => {}
     }
     true
+}
+
+fn mounts_to(file_fd: i32, out: &mut TermBuffer) {
+    let total = unsafe { mount_list(core::ptr::null_mut(), 0) };
+    let mut items = alloc::vec![syscall::MountInfo::default(); total];
+    let n = if items.is_empty() { 0 } else { unsafe { mount_list(items.as_mut_ptr(), items.len()) } };
+    for item in items.iter().take(n) {
+        let end = item.path.iter().position(|b| *b == 0).unwrap_or(item.path.len());
+        let path = core::str::from_utf8(&item.path[..end]).unwrap_or("?");
+        if file_fd >= 0 {
+            let mut line = path.to_string();
+            line.push('\n');
+            unsafe { let _ = write(file_fd as u32, line.as_ptr(), line.len()); }
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+fn ps_to(file_fd: i32, out: &mut TermBuffer) {
+    let total = unsafe { task_list(core::ptr::null_mut(), 0) };
+    let mut items = alloc::vec![syscall::TaskInfo::default(); total];
+    let n = if items.is_empty() {
+        0
+    } else {
+        unsafe { task_list(items.as_mut_ptr(), items.len()) }
+    };
+
+    let emit = |line: &str, out: &mut TermBuffer| {
+        if file_fd >= 0 {
+            let mut text = line.to_string();
+            text.push('\n');
+            unsafe { write(file_fd as u32, text.as_ptr(), text.len()); }
+        } else {
+            out.push(line);
+        }
+    };
+
+    emit("PID  PPID  PGID  SID   TTY  STATE    EXIT  NAME             CWD", out);
+    for item in items.iter().take(n) {
+        let state = match item.state {
+            TASK_RUNNING => "RUN",
+            TASK_STOPPED => "STOP",
+            TASK_ZOMBIE => "ZOMBIE",
+            _ => "?",
+        };
+        let end = item.name.iter().position(|b| *b == 0).unwrap_or(item.name.len());
+        let name = core::str::from_utf8(&item.name[..end]).unwrap_or("?");
+        let cwd_end = item.cwd.iter().position(|b| *b == 0).unwrap_or(item.cwd.len());
+        let cwd = core::str::from_utf8(&item.cwd[..cwd_end]).unwrap_or("?");
+        let tty = if item.tty_id < 0 { "-".to_string() } else { item.tty_id.to_string() };
+        emit(
+            &format!(
+                "{:<4} {:<5} {:<5} {:<5} {:<4} {:<8} {:<5} {:<16} {}",
+                item.pid, item.ppid, item.pgid, item.sid, tty, state, item.exit_code, name, cwd
+            ),
+            out,
+        );
+    }
 }
 
 fn parse_ipv4(s: &str) -> Option<u32> {
@@ -944,15 +1265,29 @@ fn help_text() -> String {
   ifconfig         - show iface\n\
   ifconfig dhcp    - DHCP\n\
   ifconfig IP/PFX [GW]  - static\n\
+  jobs / fg / bg / wait / kill - job control\n\
+  mount            - list VFS mount points\n\
+  mount /dev/X /mnt/Y - mount ext2/FAT block device\n\
+  mounts           - list VFS mount points\n\
+  umount <path>    - unmount removable filesystem\n\
   clear            - clear terminal\n\
   help / exit\n\n\
-Redirection / pipes as usual.\n\
-Ctrl+C interrupts a running program (userspace).\n",
+Tab completes commands and paths relative to cwd.\n\
+cmd &              - run in background\n\
+cmd > file         - redirect stdout and detach (Felix convenience)\n\
+cmd >> file        - append stdout and detach\n\
+Pipes run in foreground.\n\
+Ctrl+C interrupts a foreground program (userspace).\n",
     )
 }
 
+#[cfg(any())]
+mod legacy_execution {
+use super::*;
 // ---------------------------------------------------------------------------
-// External process supervision (cooperative: UI + stdout + wait)
+// Legacy execution path kept out of the build while the new executor.rs owns
+// pipelines/job control. It remains here temporarily to make the transition
+// easy to inspect and can be deleted after testing.
 // ---------------------------------------------------------------------------
 
 enum UiTick {
@@ -1010,6 +1345,10 @@ fn spawn(
         }
     }
     let ptrs: Vec<*const u8> = c_strings.iter().map(|s| s.as_ptr()).collect();
+    if data.len() < 4 {
+        println!("Not executable file");
+        return None;
+    }
     unsafe {
         let pid = match &data[0..4] {
             &[0x0, 0x61, 0x73, 0x6d] => execve_wasm(
@@ -1198,6 +1537,7 @@ fn run_external(
     cmd: &SimpleCmd,
     forced_in: i32,
     forced_out: i32,
+    background: bool,
     out: &mut TermBuffer,
     ui: &mut UiBridge<'_>,
 ) -> Option<i32> {
@@ -1219,21 +1559,20 @@ fn run_external(
     };
     if forced_in >= 0 {
         if sin >= 0 {
-            unsafe {
-                close(sin as u32);
-            }
+            unsafe { close(sin as u32); }
         }
         sin = forced_in;
     }
     if forced_out >= 0 {
         if sout >= 0 {
-            unsafe {
-                close(sout as u32);
-            }
+            unsafe { close(sout as u32); }
         }
         sout = forced_out;
     }
 
+    // A child without explicit stdin gets a private pipe. Foreground jobs are
+    // fed keyboard data by supervise_child(); background jobs get EOF when the
+    // shell closes its writer, so they cannot steal terminal input.
     let mut stdin_r: i32 = -1;
     let mut stdin_w: i32 = -1;
     if sin < 0 {
@@ -1248,72 +1587,100 @@ fn run_external(
     let mut capture_r: i32 = -1;
     let mut capture_w: i32 = -1;
     let mut serr: i32 = -1;
-    if sout < 0 {
+
+    if !background {
+        // Foreground stdout/stderr are bridged into this GUI terminal. If
+        // stdout is redirected to a file, only stderr is captured.
         let mut fds = [0u32; 2];
         if unsafe { pipe(fds.as_mut_ptr()) } == 0 {
             capture_r = fds[0] as i32;
             capture_w = fds[1] as i32;
-            sout = capture_w;
-            serr = capture_w;
-        }
-    } else {
-        let mut fds = [0u32; 2];
-        if unsafe { pipe(fds.as_mut_ptr()) } == 0 {
-            capture_r = fds[0] as i32;
-            capture_w = fds[1] as i32;
+            if sout < 0 {
+                sout = capture_w;
+            }
             serr = capture_w;
         }
     }
+    // Background output must never go to an undrained anonymous pipe: a noisy
+    // task would block as soon as PIPE_BUF_SIZE fills. Explicit stdout
+    // redirection is kept; otherwise stdout/stderr use their default console.
 
     let pid = spawn(&full, sin, sout, serr, &cmd.args);
 
     if capture_w >= 0 {
-        unsafe {
-            close(capture_w as u32);
-        }
+        unsafe { close(capture_w as u32); }
     }
-    if sin >= 0 && forced_in < 0 {
-        unsafe {
-            close(sin as u32);
-        }
+
+    // Close only descriptors owned by this invocation. Pipeline fds supplied
+    // through forced_in/forced_out are owned by run_pipeline().
+    if stdin_r >= 0 {
+        unsafe { close(stdin_r as u32); }
+    } else if sin >= 0 && forced_in < 0 {
+        unsafe { close(sin as u32); }
     }
     if sout >= 0 && forced_out < 0 && sout != capture_w {
-        unsafe {
-            close(sout as u32);
-        }
+        unsafe { close(sout as u32); }
     }
 
-    if stdin_r >= 0 {
-        unsafe {
-            close(stdin_r as u32);
-        }
-    }
-
-    if let Some(p) = pid {
-        let cap = if capture_r >= 0 {
-            Some(capture_r as u32)
-        } else {
-            None
-        };
-        let kin = if stdin_w >= 0 {
-            Some(stdin_w as u32)
-        } else {
-            None
-        };
-        supervise_child(p, cap, kin, out, ui);
-        None
-    } else {
+    let Some(p) = pid else {
         if capture_r >= 0 {
-            unsafe {
-                close(capture_r as u32);
-            }
+            unsafe { close(capture_r as u32); }
         }
         if stdin_w >= 0 {
-            unsafe {
-                close(stdin_w as u32);
-            }
+            unsafe { close(stdin_w as u32); }
         }
+        return None;
+    };
+
+    if background {
+        if capture_r >= 0 {
+            unsafe { close(capture_r as u32); }
+        }
+        if stdin_w >= 0 {
+            unsafe { close(stdin_w as u32); }
+        }
+        return Some(p);
+    }
+
+    let cap = if capture_r >= 0 {
+        Some(capture_r as u32)
+    } else {
         None
+    };
+    let kin = if stdin_w >= 0 {
+        Some(stdin_w as u32)
+    } else {
+        None
+    };
+    supervise_child(p, cap, kin, out, ui);
+    None
+}
+
+fn split_background(line: &str) -> (&str, bool) {
+    let trimmed = line.trim_end();
+    if let Some(body) = trimmed.strip_suffix('&') {
+        (body.trim_end(), true)
+    } else {
+        (trimmed, false)
+    }
+}
+
+fn has_stdout_redirection(cmd: &SimpleCmd) -> bool {
+    cmd.redirs
+        .iter()
+        .any(|r| r.kind == RedirKind::Out || r.kind == RedirKind::Append)
+}
+
+fn reap_background_jobs(shell: &mut Shell) {
+    let mut i = 0;
+    while i < shell.jobs.len() {
+        let pid = shell.jobs[i].pid;
+        let done = unsafe { wait_options(pid, WNOHANG) } == pid as usize;
+        if done {
+            shell.jobs.remove(i);
+        } else {
+            i += 1;
+        }
     }
 }
 
@@ -1346,7 +1713,7 @@ fn run_pipeline(shell: &Shell, stages: &[String], out: &mut TermBuffer, ui: &mut
 
         // Only the last stage gets live UI supervision + capture.
         if is_last {
-            let _ = run_external(shell, &cmd, in_fd, -1, out, ui);
+            let _ = run_external(shell, &cmd, in_fd, -1, false, out, ui);
         } else {
             // Intermediate stages: fire-and-forget wait after all spawned.
             let name = cmd.args[0].as_str();
@@ -1372,6 +1739,7 @@ fn run_pipeline(shell: &Shell, stages: &[String], out: &mut TermBuffer, ui: &mut
 }
 
 fn interpret(shell: &mut Shell, line: &str, out: &mut TermBuffer, ui: &mut UiBridge<'_>) {
+    let (line, background_requested) = split_background(line);
     let stages = split_pipeline(line.trim());
     if stages.is_empty() {
         return;
@@ -1384,24 +1752,55 @@ fn interpret(shell: &mut Shell, line: &str, out: &mut TermBuffer, ui: &mut UiBri
         if try_builtin(shell, &cmd, out) {
             return;
         }
-        let _ = run_external(shell, &cmd, -1, -1, out, ui);
+
+        // Felix shell convenience: an external command with stdout redirected
+        // to a file is detached automatically. `cmd > file &` is also accepted.
+        let background = background_requested || has_stdout_redirection(&cmd);
+        if let Some(pid) = run_external(shell, &cmd, -1, -1, background, out, ui) {
+            shell.jobs.push(BackgroundJob {
+                pid,
+                command: line.to_string(),
+            });
+            out.push(&format!("[{}] started", pid));
+        }
+        return;
+    }
+
+    if background_requested {
+        out.push("background pipelines are not supported yet");
         return;
     }
     run_pipeline(shell, &stages, out, ui);
+}
+
 }
 
 // ---------------------------------------------------------------------------
 // GUI terminal
 // ---------------------------------------------------------------------------
 
+const SCAN_ESC: u8 = 0x01;
 const SCAN_BACKSPACE: u8 = 0x0E;
-const SCAN_ENTER: u8 = 0x1C;
 const SCAN_TAB: u8 = 0x0F;
-const MAX_INPUT: usize = 96;
+const SCAN_ENTER: u8 = 0x1C;
+const SCAN_A: u8 = 0x1E;
+const SCAN_D: u8 = 0x20;
+const SCAN_E: u8 = 0x12;
+const SCAN_U: u8 = 0x16;
+const SCAN_W: u8 = 0x11;
+const SCAN_K: u8 = 0x25;
+const SCAN_C: u8 = 0x2E;
+const SCAN_Z: u8 = 0x2C;
+const SCAN_HOME: u8 = 0x47;
 const SCAN_UP: u8 = 0x48;
-const SCAN_DOWN: u8 = 0x50;
 const SCAN_PGUP: u8 = 0x49;
+const SCAN_LEFT: u8 = 0x4B;
+const SCAN_RIGHT: u8 = 0x4D;
+const SCAN_END: u8 = 0x4F;
+const SCAN_DOWN: u8 = 0x50;
 const SCAN_PGDN: u8 = 0x51;
+const SCAN_DELETE: u8 = 0x53;
+const MAX_INPUT: usize = 1024;
 const CMD_HISTORY_MAX: usize = 64;
 const LINE_MAX_CHARS: usize = 69; // unused for wrap; VT reflows by window cols
 const HIST_PATH: &str = "/shell_hist";
@@ -1448,38 +1847,66 @@ fn refresh_terminal(win: &mut Window, term: &TermBuffer) {
     term.draw(win);
 }
 
+fn redraw_editor(term: &mut TermBuffer, shell: &Shell, editor: &LineEditor) {
+    term.write_bytes(b"\r\x1b[2K");
+    term.write_bytes(shell.prompt().as_bytes());
+    term.write_bytes(editor.text().as_bytes());
+    let back = editor.chars_after_cursor();
+    if back > 0 {
+        term.write_bytes(format!("\x1b[{}D", back).as_bytes());
+    }
+}
+
+fn block_on_yield() {
+    libfelix::async_rt::block_on(async { yield_now().await; });
+}
+
 const BUILTINS: &[&str] = &[
     "help", "exit", "quit", "pwd", "cd", "ls", "cat", "mkdir", "rmdir", "rm", "path", "ps",
-    "clear", "echo", "head", "lspci", "ifconfig",
+    "jobs", "fg", "bg", "kill", "wait", "export", "unset", "env", "set", "clear", "echo",
+    "head", "lspci", "ifconfig", "mount", "mounts", "umount",
 ];
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
+    let shell_pid = unsafe { getpid() };
+    println!("shell: userspace main started pid={}", shell_pid);
+
     let mut win = Window::create(30, 30, 640, 400, "Felix Shell").unwrap_or_else(|| {
         Window::create(40, 40, 480, 320, "Felix Shell").expect("wm_create failed")
     });
-    let mut ui = Ui::new();
-    let _ = ui;
 
     let mut shell = Shell::new();
+    // Become our own process group so foreground jobs can be handed the GUI tty
+    // and the shell can reclaim it afterwards.
+    let _ = unsafe { setpgid(0, shell_pid) };
+    let shell_pgid = unsafe { getpgrp() };
+    let _ = unsafe { tty_setfg(shell_pgid) };
     let mut term = TermBuffer::new(&win);
-    let mut input = String::new();
+    let mut editor = LineEditor::new();
     let mut cmd_hist: Vec<String> = load_cmd_history();
-    let mut hist_pos: Option<usize> = None; // None = текущая строка
-    let mut draft = String::new();          // то, что набирали до ↑
-    term.push("=== Felix User Shell ===");
-    term.push("\x1b[32mVT\x1b[0m · \x1b[31mESC\x1b[0m · help / clear / Ctrl+C");
-    term.push("");
+    let mut hist_pos: Option<usize> = None;
+    let mut draft = String::new();
 
-    term.prompt_line(&shell.prompt());
+    term.push("=== Felix User Shell ===");
+    term.push("Tab paths · arrows edit/history · Ctrl+C/Z · Ctrl+A/E/U/K/W · help");
+    term.push("");
+    redraw_editor(&mut term, &shell, &editor);
     refresh_terminal(&mut win, &term);
     let _ = win.flip();
 
     loop {
         let mut dirty = false;
+
+        // Background pipelines are reaped continuously, not only when the next
+        // command is entered. This is important with Felix's small task table.
+        if poll_background_jobs(&mut shell, &mut term) {
+            redraw_editor(&mut term, &shell, &editor);
+            dirty = true;
+        }
+
         let mut evbuf = [WmEvent::default(); 64];
         let n = win.poll_events(&mut evbuf);
-
         for e in &evbuf[..n] {
             if e.kind == EV_RESIZE {
                 term.resize_to(&win);
@@ -1489,104 +1916,192 @@ pub extern "C" fn main() -> i32 {
             if e.kind != EV_KEY_DOWN {
                 continue;
             }
+
             let scancode = e.a as u8;
             let ch = e.b as u8;
+            let mods = e.c as u8;
+            let ctrl = (mods & 2) != 0;
 
-            if ch == 0x03 || (scancode == 0x2e && (e.c as u8 & 2) != 0) {
+            // readline-like editing controls.
+            let edited = if ctrl && scancode == SCAN_A {
+                editor.home()
+            } else if ctrl && scancode == SCAN_E {
+                editor.end()
+            } else if ctrl && scancode == SCAN_U {
+                editor.kill_before()
+            } else if ctrl && scancode == SCAN_K {
+                editor.kill_after()
+            } else if ctrl && scancode == SCAN_W {
+                editor.delete_prev_word()
+            } else {
+                false
+            };
+            if edited {
+                hist_pos = None;
+                redraw_editor(&mut term, &shell, &editor);
+                dirty = true;
                 continue;
             }
 
-            if scancode == SCAN_ENTER {
-                let cmd = input.clone();
-                let t = cmd.trim();
-                if !t.is_empty() && cmd_hist.last().map(|s| s.as_str()) != Some(t) {
-                    cmd_hist.push(t.to_string());
-                    if cmd_hist.len() > CMD_HISTORY_MAX {
-                        cmd_hist.remove(0);
-                    }
-                    save_cmd_history(&cmd_hist);
+            if ctrl && scancode == SCAN_C {
+                if !editor.text().is_empty() {
+                    editor.clear();
+                    term.write_bytes(b"^C\r\n");
+                    redraw_editor(&mut term, &shell, &editor);
+                    hist_pos = None;
+                    draft.clear();
+                    dirty = true;
                 }
-                hist_pos = None;
-                draft.clear();
+                continue;
+            }
+            if ctrl && scancode == SCAN_D && editor.text().is_empty() {
+                shell.last_status = 0;
+                shell.should_exit = true;
+            }
+            if shell.should_exit {
+                break;
+            }
 
-                term.write_bytes(b"\r\n");
-                input.clear();
-
-                {
-                    let mut bridge = UiBridge {
-                        win: &mut win,
-                        prompt: shell.prompt(),
-                    };
-                    bridge.redraw(&term);
-                    if !cmd.trim().is_empty() {
-                        interpret(&mut shell, &cmd, &mut term, &mut bridge);
-                    }
-                }
-                term.prompt_line(&shell.prompt());
-                dirty = true;
-            } else if scancode == SCAN_PGUP {
-                term.scroll(8);
-                dirty = true;
-            } else if scancode == SCAN_PGDN {
-                term.scroll(-8);
-                dirty = true;
-            } else if scancode == SCAN_UP {
-                if !cmd_hist.is_empty() {
-                    let next = match hist_pos {
-                        None => {
-                            draft = input.clone();
-                            cmd_hist.len() - 1
+            match scancode {
+                SCAN_ENTER => {
+                    let cmd = editor.take();
+                    let trimmed = cmd.trim();
+                    if !trimmed.is_empty() && cmd_hist.last().map(|s| s.as_str()) != Some(trimmed) {
+                        cmd_hist.push(trimmed.to_string());
+                        if cmd_hist.len() > CMD_HISTORY_MAX {
+                            cmd_hist.remove(0);
                         }
-                        Some(0) => 0,
-                        Some(i) => i - 1,
-                    };
-                    hist_pos = Some(next);
-                    term.rubout_n(input.len());
-                    input = cmd_hist[next].clone();
-                    term.write_bytes(input.as_bytes());
-                    dirty = true;
-                }
-            } else if scancode == SCAN_DOWN {
-                if let Some(i) = hist_pos {
-                    term.rubout_n(input.len());
-                    if i + 1 < cmd_hist.len() {
-                        hist_pos = Some(i + 1);
-                        input = cmd_hist[i + 1].clone();
-                    } else {
-                        hist_pos = None;
-                        input = draft.clone();
+                        save_cmd_history(&cmd_hist);
                     }
-                    term.write_bytes(input.as_bytes());
-                    dirty = true;
-                }
-            } else if scancode == SCAN_BACKSPACE {
-                if input.pop().is_some() {
-                    term.write_bytes(b"\x08 \x08");
-                    dirty = true;
-                }
-            } else if scancode == SCAN_TAB {
-                let (new_input, completed) = handle_tab_completion(&mut shell, &input, &mut term);
-                if completed {
-                    term.rubout_n(input.len());
-                    input = new_input;
-                    term.write_bytes(input.as_bytes());
-                    dirty = true;
-                    // После вывода подсказок обновляем UI
-                    let prompt = shell.prompt();
+                    hist_pos = None;
+                    draft.clear();
+                    term.write_bytes(b"\r\n");
                     refresh_terminal(&mut win, &term);
                     let _ = win.flip();
+                    if !trimmed.is_empty() {
+                        interpret(&mut shell, &cmd, &mut term, &mut win);
+                    }
+                    if shell.should_exit {
+                        break;
+                    }
+                    redraw_editor(&mut term, &shell, &editor);
+                    dirty = true;
                 }
-            } else if ch >= 0x20 && ch < 0x7f && input.len() < MAX_INPUT {
-                input.push(ch as char);
-                term.write_bytes(&[ch]);
-                dirty = true;
+                SCAN_PGUP => {
+                    term.scroll(8);
+                    dirty = true;
+                }
+                SCAN_PGDN => {
+                    term.scroll(-8);
+                    dirty = true;
+                }
+                SCAN_LEFT => {
+                    if editor.left() {
+                        redraw_editor(&mut term, &shell, &editor);
+                        dirty = true;
+                    }
+                }
+                SCAN_RIGHT => {
+                    if editor.right() {
+                        redraw_editor(&mut term, &shell, &editor);
+                        dirty = true;
+                    }
+                }
+                SCAN_HOME => {
+                    if editor.home() {
+                        redraw_editor(&mut term, &shell, &editor);
+                        dirty = true;
+                    }
+                }
+                SCAN_END => {
+                    if editor.end() {
+                        redraw_editor(&mut term, &shell, &editor);
+                        dirty = true;
+                    }
+                }
+                SCAN_DELETE => {
+                    if editor.delete() {
+                        hist_pos = None;
+                        redraw_editor(&mut term, &shell, &editor);
+                        dirty = true;
+                    }
+                }
+                SCAN_BACKSPACE => {
+                    if editor.backspace() {
+                        hist_pos = None;
+                        redraw_editor(&mut term, &shell, &editor);
+                        dirty = true;
+                    }
+                }
+                SCAN_UP => {
+                    if !cmd_hist.is_empty() {
+                        let next = match hist_pos {
+                            None => {
+                                draft = editor.text().to_string();
+                                cmd_hist.len() - 1
+                            }
+                            Some(0) => 0,
+                            Some(i) => i - 1,
+                        };
+                        hist_pos = Some(next);
+                        editor.set(cmd_hist[next].clone());
+                        redraw_editor(&mut term, &shell, &editor);
+                        dirty = true;
+                    }
+                }
+                SCAN_DOWN => {
+                    if let Some(i) = hist_pos {
+                        if i + 1 < cmd_hist.len() {
+                            hist_pos = Some(i + 1);
+                            editor.set(cmd_hist[i + 1].clone());
+                        } else {
+                            hist_pos = None;
+                            editor.set(draft.clone());
+                        }
+                        redraw_editor(&mut term, &shell, &editor);
+                        dirty = true;
+                    }
+                }
+                SCAN_TAB => {
+                    let cursor = editor.cursor();
+                    let prefix = editor.text()[..cursor].to_string();
+                    let suffix = editor.text()[cursor..].to_string();
+                    match handle_tab_completion(&mut shell, &prefix, &mut term) {
+                        CompletionResult::None => {}
+                        CompletionResult::Replace(new_prefix) => {
+                            let new_cursor = new_prefix.len();
+                            let mut full = new_prefix;
+                            full.push_str(&suffix);
+                            editor.set_with_cursor(full, new_cursor);
+                            redraw_editor(&mut term, &shell, &editor);
+                            dirty = true;
+                        }
+                        CompletionResult::Listed => {
+                            redraw_editor(&mut term, &shell, &editor);
+                            dirty = true;
+                        }
+                    }
+                }
+                _ if ch >= 0x20 && ch < 0x7f && editor.text().len() < MAX_INPUT => {
+                    editor.insert(ch as char);
+                    hist_pos = None;
+                    redraw_editor(&mut term, &shell, &editor);
+                    dirty = true;
+                }
+                _ => {}
             }
         }
 
+        if shell.should_exit {
+            break;
+        }
         if dirty {
-            let prompt = shell.prompt();
             refresh_terminal(&mut win, &term);
             let _ = win.flip();
+        } else {
+            block_on_yield();
         }
     }
+
+    shell.last_status
 }

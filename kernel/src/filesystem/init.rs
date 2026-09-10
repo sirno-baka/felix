@@ -14,6 +14,7 @@ use crate::drivers::pcmcia::PcmciaDevice;
 use crate::filesystem::devfs::DevFS;
 use crate::filesystem::ext2::Ext2;
 use crate::filesystem::fat32::FatFs;
+use crate::filesystem::procfs::ProcFs;
 use crate::filesystem::vfs::{Filesystem, VFS};
 use crate::memory::paging::{PAGING, phys_to_virt};
 use crate::pci::ide::{IDE, IDEDevice};
@@ -38,7 +39,53 @@ struct ProbedFs {
     name: String,
     kind: &'static str,
     fs: Box<dyn Filesystem>,
-    has_shell: bool,
+    has_userspace: bool,
+}
+
+/// Runtime association used by hotplug: one block device may have a mount
+/// chosen automatically and additional mountpoints created from userspace.
+static DEVICE_MOUNTS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+fn record_device_mount(source: &str, target: &str) {
+    let mut mounts = DEVICE_MOUNTS.lock();
+    mounts.retain(|(_, mp)| mp != target);
+    mounts.push((source.into(), target.into()));
+}
+
+pub fn forget_device_mount(target: &str) {
+    DEVICE_MOUNTS.lock().retain(|(_, mp)| mp != target);
+}
+
+pub fn unmount_device_mounts(source: &str) {
+    let paths: Vec<String> = {
+        let mut mounts = DEVICE_MOUNTS.lock();
+        let paths = mounts
+            .iter()
+            .filter(|(dev, _)| dev == source)
+            .map(|(_, mp)| mp.clone())
+            .collect();
+        mounts.retain(|(dev, _)| dev != source);
+        paths
+    };
+    for path in paths {
+        let _ = VFS.get().unmount(&path);
+    }
+}
+
+pub fn mount_device_at(source: &str, target: &str) -> bool {
+    if target.is_empty() || target == "/" || VFS.get().is_mounted_at(target) {
+        return false;
+    }
+    let Some(disk) = DevFS::block_device(source) else { return false; };
+    let Some(probed) = try_mount(disk, source) else { return false; };
+    println!("[VFS] userspace mount /dev/{} ({}) at {}", source, probed.kind, target);
+    VFS.get().mount(target, probed.fs);
+    if VFS.get().is_mounted_at(target) {
+        record_device_mount(source, target);
+        true
+    } else {
+        false
+    }
 }
 
 /// Prefer bootloader-provided ramdisk (PXE / INT 13h path).
@@ -66,21 +113,14 @@ pub fn init_rootfs() -> bool {
             reserve_frames_past(info.disk_phys, info.disk_sectors);
 
             let ram = RamDisk::from_phys(info.disk_phys, info.disk_sectors);
-            let ram_fs = ram;
-            let ram_dev = ram;
-
-            devfs.register_block(
-                "ram0",
-                Mutex::new(Box::new(ram_dev) as Box<dyn BlockDevice>),
-            );
-
-            let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(ram_fs));
+            let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(ram));
+            devfs.register_block("ram0", arc.clone());
 
             match try_mount(arc, "ram0") {
-                Some(root) => {
+                Some(root) if root.has_userspace => {
                     println!(
-                        "[VFS] root = {} on /dev/ram0 (shell={})",
-                        root.kind, root.has_shell
+                        "[VFS] root = {} on /dev/ram0 (userspace=true)",
+                        root.kind
                     );
                     VFS.get().set_root(root.fs);
 
@@ -91,7 +131,14 @@ pub fn init_rootfs() -> bool {
                     attach_pcmcia(&devfs, pcmcia::init());
 
                     VFS.get().mount("/dev", devfs);
+                    VFS.get().mount("/proc", Box::new(ProcFs::new()));
                     return true;
+                }
+                Some(root) => {
+                    println!(
+                        "[init] ram0 has {} but no complete /init + /shell userspace; trying IDE…",
+                        root.kind
+                    );
                 }
                 None => {
                     println!("[init] BootInfo present but FS mount failed, trying IDE…");
@@ -111,12 +158,12 @@ pub fn init_rootfs() -> bool {
 
     attach_pcmcia(&devfs, pcmcia::init());
 
+    let mut shared_disks: Vec<Arc<spin::Mutex<dyn BlockDevice>>> = Vec::new();
     for (i, dev) in disks.iter().enumerate() {
         let name = disk_name(i);
-        devfs.register_block(
-            &name,
-            Mutex::new(Box::new(dev.clone()) as Box<dyn BlockDevice>),
-        );
+        let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(dev.clone()));
+        devfs.register_block(&name, arc.clone());
+        shared_disks.push(arc);
         println!(
             "[init] /dev/{}  size={} sectors (~{} MiB)",
             name,
@@ -126,12 +173,11 @@ pub fn init_rootfs() -> bool {
     }
     println!("[init] Try mount IDE disks");
     let mut probed: Vec<ProbedFs> = Vec::new();
-    for (i, dev) in disks.into_iter().enumerate() {
+    for (i, arc) in shared_disks.into_iter().enumerate() {
         let name = disk_name(i);
-        let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(dev));
         match try_mount(arc, &name) {
             Some(p) => {
-                println!("[init] {} → {} (shell={})", name, p.kind, p.has_shell);
+                println!("[init] {} → {} (userspace={})", name, p.kind, p.has_userspace);
                 probed.push(p);
             }
             None => println!("[init] {} → no supported filesystem", name),
@@ -142,12 +188,16 @@ pub fn init_rootfs() -> bool {
         println!("[init] nothing mountable");
         return false;
     }
+    if !probed.iter().any(|p| p.has_userspace) {
+        println!("[init] mountable filesystems found, but none contains both /init and /shell");
+        return false;
+    }
 
     let root_idx = pick_root(&probed);
     let root = probed.swap_remove(root_idx);
     println!(
-        "[VFS] root = {} on /dev/{} (shell={})",
-        root.kind, root.name, root.has_shell
+        "[VFS] root = {} on /dev/{} (userspace={})",
+        root.kind, root.name, root.has_userspace
     );
     VFS.get().set_root(root.fs);
 
@@ -158,6 +208,7 @@ pub fn init_rootfs() -> bool {
     }
 
     VFS.get().mount("/dev", devfs);
+    VFS.get().mount("/proc", Box::new(ProcFs::new()));
     true
 }
 
@@ -190,20 +241,19 @@ fn reserve_frames_past(disk_phys: u32, sectors: u32) {
 
 fn register_ide_disks(devfs: &DevFS, mount_extra: bool) {
     let disks = collect_ata_disks();
+    let mut shared: Vec<Arc<spin::Mutex<dyn BlockDevice>>> = Vec::new();
     for (i, dev) in disks.iter().enumerate() {
         let name = disk_name(i);
-        devfs.register_block(
-            &name,
-            Mutex::new(Box::new(dev.clone()) as Box<dyn BlockDevice>),
-        );
+        let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(dev.clone()));
+        devfs.register_block(&name, arc.clone());
+        shared.push(arc);
         println!("[init] /dev/{} (physical)", name);
     }
     if !mount_extra {
         return;
     }
-    for (i, dev) in disks.into_iter().enumerate() {
+    for (i, arc) in shared.into_iter().enumerate() {
         let name = disk_name(i);
-        let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(dev));
         if let Some(p) = try_mount(arc, &name) {
             let mp = format!("/mnt/{}", name);
             println!("[VFS] mount {} ({}) at {}", name, p.kind, mp);
@@ -239,27 +289,26 @@ const PCMCIA_MOUNT_PREFIX: &str = "pcmcia";
 /// guessing which numbered mount should be removed.
 static PCMCIA_MOUNT: Mutex<Option<String>> = Mutex::new(None);
 
-fn attach_pcmcia(devfs: &DevFS, dev: Option<PcmciaDevice>) {
-    mount_pcmcia_device(dev, Some(devfs));
+fn attach_pcmcia(_devfs: &DevFS, dev: Option<PcmciaDevice>) {
+    mount_pcmcia_device(dev);
 }
 
-fn mount_pcmcia_device(dev: Option<PcmciaDevice>, devfs: Option<&DevFS>) {
+fn mount_pcmcia_device(dev: Option<PcmciaDevice>) {
     match dev {
         Some(PcmciaDevice::CompactFlash(cf)) => {
-            if let Some(devfs) = devfs {
-                devfs.register_block(
-                    PCMCIA_NAME,
-                    Mutex::new(Box::new(cf.clone()) as Box<dyn BlockDevice>),
-                );
-            }
+            // DevFS and the mounted filesystem share the same serialized block
+            // device object, so raw /dev access cannot race filesystem I/O.
+            let sectors = cf.sectors();
+            let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(cf));
+            let _ = DevFS::unregister(PCMCIA_NAME);
+            DevFS::register_block_global(PCMCIA_NAME, arc.clone());
             println!(
                 "[init] /dev/{}  size={} sectors (~{} MiB)",
                 PCMCIA_NAME,
-                cf.sectors(),
-                (cf.sectors() * 512) / (1024 * 1024)
+                sectors,
+                (sectors * 512) / (1024 * 1024)
             );
-            let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(cf));
-            match mount_removable(arc, PCMCIA_MOUNT_PREFIX) {
+            match mount_removable_named(arc, PCMCIA_MOUNT_PREFIX, PCMCIA_NAME) {
                 Some(path) => {
                     println!("[PCMCIA] mounted at {}", path);
                     *PCMCIA_MOUNT.lock() = Some(path);
@@ -278,21 +327,7 @@ fn mount_pcmcia_device(dev: Option<PcmciaDevice>, devfs: Option<&DevFS>) {
 /// filesystem layer. The PCMCIA core is responsible for driver probing; this
 /// function only publishes the resulting BlockDevice through `try_mount()`.
 pub fn pcmcia_hotplug_device(dev: PcmciaDevice) {
-    match dev {
-        PcmciaDevice::CompactFlash(cf) => {
-            let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(cf));
-            match mount_removable(arc, PCMCIA_MOUNT_PREFIX) {
-                Some(path) => {
-                    println!("[PCMCIA] mounted at {}", path);
-                    *PCMCIA_MOUNT.lock() = Some(path);
-                }
-                None => println!("[PCMCIA] card has no supported filesystem"),
-            }
-        }
-        PcmciaDevice::Unsupported(info) => {
-            println!("[PCMCIA] card {:?} — no block driver", info.card_type);
-        }
-    }
+    mount_pcmcia_device(Some(dev));
 }
 
 /// Compatibility entry point for code that only reports presence changes.
@@ -306,10 +341,13 @@ pub fn pcmcia_hotplug(present: bool) {
         return;
     }
 
-    let path = PCMCIA_MOUNT.lock().take();
-    if let Some(path) = path {
-        VFS.get().unmount(&path);
+    let old_path = PCMCIA_MOUNT.lock().take();
+    unmount_device_mounts(PCMCIA_NAME);
+    if let Some(path) = old_path {
         println!("[PCMCIA] unmounted {}", path);
+    }
+    if DevFS::unregister(PCMCIA_NAME) {
+        println!("[PCMCIA] removed /dev/{}", PCMCIA_NAME);
     }
 }
 
@@ -318,24 +356,24 @@ pub fn try_mount(disk: Arc<spin::Mutex<dyn BlockDevice>>, name: &str) -> Option<
         let mut ext2 = Ext2::new_with_auto_partition(disk.clone());
         ext2.mount(None);
         if ext2.mounted {
-            let has_shell = fs_has_shell(&ext2);
+            let has_userspace = fs_has_userspace(&ext2);
             return Some(ProbedFs {
                 name: name.into(),
                 kind: "ext2",
                 fs: Box::new(ext2),
-                has_shell,
+                has_userspace,
             });
         }
     }
 
     match FatFs::mount_auto(disk) {
         Ok(fat) => {
-            let has_shell = fs_has_shell(&fat);
+            let has_userspace = fs_has_userspace(&fat);
             Some(ProbedFs {
                 name: name.into(),
                 kind: "fat",
                 fs: Box::new(fat),
-                has_shell,
+                has_userspace,
             })
         }
         Err(()) => None,
@@ -349,6 +387,14 @@ pub fn mount_removable(
     disk: Arc<spin::Mutex<dyn BlockDevice>>,
     prefix: &str,
 ) -> Option<String> {
+    mount_removable_named(disk, prefix, prefix)
+}
+
+pub fn mount_removable_named(
+    disk: Arc<spin::Mutex<dyn BlockDevice>>,
+    prefix: &str,
+    source: &str,
+) -> Option<String> {
     let mut index = 0usize;
     loop {
         let mount_point = format!("/mnt/{}{}", prefix, index);
@@ -360,18 +406,24 @@ pub fn mount_removable(
                 name, probed.kind, mount_point
             );
             VFS.get().mount(&mount_point, probed.fs);
-            return Some(mount_point);
+            if VFS.get().is_mounted_at(&mount_point) {
+                record_device_mount(source, &mount_point);
+                return Some(mount_point);
+            }
+            return None;
         }
         index = index.saturating_add(1);
     }
 }
 
-fn fs_has_shell(fs: &dyn Filesystem) -> bool {
-    fs.read_file("/shell").is_some() || fs.read_file("shell").is_some()
+fn fs_has_userspace(fs: &dyn Filesystem) -> bool {
+    let has_init = fs.read_file("/init").is_some() || fs.read_file("init").is_some();
+    let has_shell = fs.read_file("/shell").is_some() || fs.read_file("shell").is_some();
+    has_init && has_shell
 }
 
 fn pick_root(probed: &[ProbedFs]) -> usize {
-    if let Some(i) = probed.iter().position(|p| p.has_shell) {
+    if let Some(i) = probed.iter().position(|p| p.has_userspace) {
         return i;
     }
     if let Some(i) = probed.iter().position(|p| p.kind == "ext2") {

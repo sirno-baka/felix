@@ -13,6 +13,18 @@ pub enum PipeEnd {
     Write,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PtySide {
+    Master,
+    Slave,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceKind {
+    Block,
+    Char,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum FileDescriptor {
     /// Keyboard input (legacy / default stdin)
@@ -31,10 +43,15 @@ pub enum FileDescriptor {
         pipe_id: usize,
         end: PipeEnd,
     },
+    Pty {
+        pty_id: usize,
+        side: PtySide,
+    },
     Device {
         inode: u32,
         offset: u64,
         mode: FileMode,
+        kind: DeviceKind,
     },
     /// Directory for getdents64. `cookie` = next entry index.
     Dir {
@@ -59,6 +76,10 @@ impl FileDescriptor {
 
     pub fn new_pipe(pipe_id: usize, end: PipeEnd) -> Self {
         Self::Pipe { pipe_id, end }
+    }
+
+    pub fn new_pty(pty_id: usize, side: PtySide) -> Self {
+        Self::Pty { pty_id, side }
     }
 
     pub fn is_socket(&self) -> bool {

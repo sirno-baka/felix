@@ -26,6 +26,10 @@ pub struct RawMutex<T: ?Sized, const INT: bool> {
 pub struct MutexGuard<'a, T: ?Sized + 'a, const INT: bool> {
     lock: &'a AtomicBool,
     data: &'a mut T,
+    /// True only when this guard itself observed IF=1 and disabled it.
+    /// An IRQ enters with IF=0, so dropping a KMutex guard in an IRQ must
+    /// never execute STI and allow a nested scheduler interrupt.
+    restore_interrupts: bool,
 }
 
 impl<T, const INT: bool> RawMutex<T, INT> {
@@ -41,26 +45,48 @@ unsafe impl<T: ?Sized + Send, const INT: bool> Sync for RawMutex<T, INT> {}
 unsafe impl<T: ?Sized + Send, const INT: bool> Send for RawMutex<T, INT> {}
 
 impl<T: ?Sized, const INT: bool> RawMutex<T, INT> {
-    /// Loop until the inner lock as the value false then write true on it.
-    /// Once the value as been written the mutex is successfully locked.
-    /// If `const INT` as been set to `true`, interrupt flag is clear
-    fn obtain_lock(&self) {
-        // cli via nesting counter so nested KMutex / boot cli stay consistent.
-        if INT == true {
-            crate::wrappers::_cli();
+    /// Disable interrupts for KMutex while preserving the *actual* incoming IF.
+    /// This is deliberately per-guard rather than a global nesting counter:
+    /// hardware interrupt gates enter with IF=0 without touching that counter.
+    #[inline]
+    fn enter_irq_guard(&self) -> bool {
+        if !INT {
+            return false;
         }
-        // Spin with interrupts left as-is by caller. If INT, we already cli'd.
+        let eflags: u32;
+        unsafe {
+            core::arch::asm!("pushfd; pop {}", out(reg) eflags);
+        }
+        let was_enabled = (eflags & (1 << 9)) != 0;
+        if was_enabled {
+            unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+        }
+        was_enabled
+    }
+
+    #[inline]
+    fn leave_irq_guard(restore_interrupts: bool) {
+        if INT && restore_interrupts {
+            unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+        }
+    }
+
+    /// Loop until the inner lock becomes available. Returns whether this lock
+    /// acquisition disabled IF and therefore must restore it on guard drop.
+    fn obtain_lock(&self) -> bool {
+        let restore_interrupts = self.enter_irq_guard();
         // CRITICAL: never spin forever with IF=0 while another task holds the lock
-        // and cannot run — only valid on UP with IF=0 if the lock is free soon.
+        // and cannot run — KMutex is for short, non-sleeping critical sections.
         while self
             .lock
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            while self.lock.load(Ordering::Relaxed) != false {
+            while self.lock.load(Ordering::Relaxed) {
                 spin_loop();
             }
         }
+        restore_interrupts
     }
 
     /// Lock the mutex if available otherwise wait until a lock is successfull
@@ -71,20 +97,17 @@ impl<T: ?Sized, const INT: bool> RawMutex<T, INT> {
     pub fn lock(&self) -> MutexGuard<T, INT> {
         #[cfg(feature = "mutex_debug")]
         crate::dprintln!("{:?}", self);
-        self.obtain_lock();
+        let restore_interrupts = self.obtain_lock();
         MutexGuard {
             lock: &self.lock,
             data: unsafe { &mut *self.data.get() },
+            restore_interrupts,
         }
     }
 
     /// Try to lock the mutex. Returning a Guard if successfull
     pub fn try_lock(&self) -> Option<MutexGuard<T, INT>> {
-        // We must cli before obtaining lock otherwise we could lock and get
-        // interrupted right after it without cli
-        if INT == true {
-            crate::wrappers::_cli();
-        }
+        let restore_interrupts = self.enter_irq_guard();
         if self
             .lock
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -93,11 +116,10 @@ impl<T: ?Sized, const INT: bool> RawMutex<T, INT> {
             Some(MutexGuard {
                 lock: &self.lock,
                 data: unsafe { &mut *self.data.get() },
+                restore_interrupts,
             })
         } else {
-            if INT == true {
-                crate::wrappers::_sti();
-            }
+            Self::leave_irq_guard(restore_interrupts);
             None
         }
     }
@@ -129,9 +151,6 @@ impl<'a, T: ?Sized, const INT: bool> DerefMut for MutexGuard<'a, T, INT> {
 impl<'a, T: ?Sized, const INT: bool> Drop for MutexGuard<'a, T, INT> {
     fn drop(&mut self) {
         self.lock.store(false, Ordering::Release);
-        // Nesting _sti: only enables IF when outermost cli is released.
-        if INT == true {
-            crate::wrappers::_sti();
-        }
+        RawMutex::<T, INT>::leave_irq_guard(self.restore_interrupts);
     }
 }

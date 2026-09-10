@@ -27,8 +27,11 @@ pub mod prelude {
     pub use crate::args::Args;
     pub use crate::print;
     pub use crate::println;
-    pub use crate::rt::{arg, argc, args};
-    pub use crate::signal::{self, default, exit, exit_on_terminate, ignore, on, SIGINT, SIGKILL, SIGTERM};
+    pub use crate::rt::{arg, argc, args, env, envs};
+    pub use crate::signal::{
+        self, default, exit, exit_on_terminate, ignore, on, SIGCONT, SIGINT, SIGKILL, SIGSTOP,
+        SIGTERM, SIGTSTP, SIGTTIN, SIGTTOU,
+    };
     pub use crate::ui::{self, Button, Constraints, EventResult, Label, NodeId, Rect, ScrollViewId, TextInput, Ui, UiEvent, Widget, WidgetId};
     pub use crate::ui::layout::{self, LayoutApi};
     pub use taffy::prelude::{AlignContent, AlignItems, FlexDirection, JustifyContent, Position, Style};

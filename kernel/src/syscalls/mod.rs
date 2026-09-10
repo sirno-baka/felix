@@ -10,8 +10,23 @@ pub const SYS_CLOSE: u32 = 6; // close(fd)
 pub const SYS_MKDIR: u32 = 7; // mkdir
 pub const SYS_RMDIR: u32 = 8; // rmdir
 pub const SYS_UNLINK: u32 = 10; // delete/unlink(filename)
+pub const SYS_CHDIR: u32 = 12;
 
 pub const SYS_EXECVE: u32 = 11;
+pub const SYS_GETPID: u32 = 20;
+pub const SYS_MOUNT: u32 = 21;
+pub const SYS_DUP: u32 = 41;
+pub const SYS_UMOUNT2: u32 = 52;
+pub const SYS_SETPGID: u32 = 57;
+pub const SYS_GETPPID: u32 = 64;
+pub const SYS_GETPGRP: u32 = 65;
+pub const SYS_SETSID: u32 = 66;
+pub const SYS_GETTIMEOFDAY: u32 = 78;
+pub const SYS_GETPGID: u32 = 132;
+pub const SYS_GETSID: u32 = 147;
+pub const SYS_NANOSLEEP: u32 = 162;
+pub const SYS_GETCWD: u32 = 183;
+pub const SYS_CLOCK_GETTIME: u32 = 265;
 /// lseek(fd, offset, whence) — Linux i386 #19
 pub const SYS_LSEEK: u32 = 19;
 /// brk(addr) — Linux i386 #45; brk(0) returns current break
@@ -99,3 +114,14 @@ pub const SYS_IFCONFIG: u32 = 411;
 pub const SYS_FB_INFO: u32 = 412;
 /// fb_blit(*const FbBlit) → 0 / usize::MAX — copy a rect from user shadow to LFB
 pub const SYS_FB_BLIT: u32 = 413;
+/// waitpid_status(pid, *mut status, options) -> reaped pid / 0 / usize::MAX
+pub const SYS_WAITPID_STATUS: u32 = 414;
+/// task_list(*mut TaskInfoUser, max) -> number of task records written/required
+pub const SYS_TASK_LIST: u32 = 415;
+/// openpty(*mut [master,slave]) -> pty id / usize::MAX
+pub const SYS_OPENPTY: u32 = 416;
+/// pty_set_fg(pgid) / pty_get_fg(), keyed by the caller's controlling tty.
+pub const SYS_TTY_SETFG: u32 = 417;
+pub const SYS_TTY_GETFG: u32 = 418;
+/// mount_list(*mut MountInfoUser,max) -> count
+pub const SYS_MOUNT_LIST: u32 = 419;
