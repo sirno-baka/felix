@@ -132,11 +132,19 @@ pub extern "C" fn fail() -> ! {
 
 /// Detect PXE / iPXE SAN boot (not a real local IDE/SATA disk).
 ///
-/// Checks (any one is enough):
-/// 1. Classic PXE Installation Check — INT 1Ah AX=5650h → AL=50h
-/// 2. "PXENV+" or "!PXE" signature in low memory / option ROM area
-/// 3. "iPXE" string in 0xA0000..0xF0000 (iPXE option ROM / residual)
+/// A matching physical ATA boot sector takes precedence. Without one, PXE
+/// signatures indicate that INT 13h is backed by a network/SAN provider.
 fn is_network_boot() -> bool {
+    // An installed PXE option ROM is not evidence that this particular boot
+    // came from the network. SeaBIOS/QEMU may keep iPXE/PXENV signatures in
+    // memory even after loading our MBR from a real IDE disk. Prefer physical
+    // ATA only when its sector 0 matches the boot sector at 0x7c00; PXE/SAN
+    // disks exist behind the BIOS INT 13h hook, not the IDE I/O ports.
+    if booted_from_primary_ata() {
+        println!("[!] Boot disk matches physical IDE ATA");
+        return false;
+    }
+
     // if pxe_installation_check() {
     //     println!("[!] PXE installation check: yes");
     //     return true;
@@ -148,6 +156,127 @@ fn is_network_boot() -> bool {
     if scan_signature(b"iPXE") {
         println!("[!] Found iPXE signature");
         return true;
+    }
+    false
+}
+
+#[inline]
+fn inb(port: u16) -> u8 {
+    let value: u8;
+    unsafe { asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack)); }
+    value
+}
+
+#[inline]
+fn outb(port: u16, value: u8) {
+    unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)); }
+}
+
+/// Probe the legacy primary IDE channel without relying on BIOS INT 13h.
+/// A bounded poll is important because this also runs on machines with no IDE.
+fn booted_from_primary_ata() -> bool {
+    const DATA: u16 = 0x1f0;
+    const SECTOR_COUNT: u16 = 0x1f2;
+    const LBA_LOW: u16 = 0x1f3;
+    const LBA_MID: u16 = 0x1f4;
+    const LBA_HIGH: u16 = 0x1f5;
+    const DRIVE: u16 = 0x1f6;
+    const STATUS_COMMAND: u16 = 0x1f7;
+    const CMD_IDENTIFY: u8 = 0xec;
+    const STATUS_ERR: u8 = 1 << 0;
+    const STATUS_DRQ: u8 = 1 << 3;
+    const STATUS_BSY: u8 = 1 << 7;
+
+    for drive in [0xa0u8, 0xb0u8] {
+        outb(DRIVE, drive);
+        // ATA requires a short settling delay after selecting a device.
+        for _ in 0..4 { let _ = inb(STATUS_COMMAND); }
+        outb(SECTOR_COUNT, 0);
+        outb(LBA_LOW, 0);
+        outb(LBA_MID, 0);
+        outb(LBA_HIGH, 0);
+        outb(STATUS_COMMAND, CMD_IDENTIFY);
+
+        let first = inb(STATUS_COMMAND);
+        if first == 0 || first == 0xff {
+            continue;
+        }
+        for _ in 0..100_000 {
+            let status = inb(STATUS_COMMAND);
+            if status & STATUS_BSY != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            // Non-zero signature registers indicate ATAPI or another device,
+            // not the ATA disk the kernel can later use as its IDE root.
+            if inb(LBA_MID) != 0 || inb(LBA_HIGH) != 0 {
+                break;
+            }
+            if status & STATUS_ERR != 0 {
+                break;
+            }
+            if status & STATUS_DRQ != 0 {
+                // Drain IDENTIFY data so the channel is idle for later BIOS IO.
+                for _ in 0..256 {
+                    unsafe {
+                        asm!("in ax, dx", in("dx") DATA, out("ax") _, options(nomem, nostack));
+                    }
+                }
+                if ata_boot_sector_matches(drive) {
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+    false
+}
+
+/// Compare the physical ATA MBR with the boot sector still resident at 0x7c00.
+/// This distinguishes an actual IDE boot from PXE on systems that merely also
+/// have an IDE disk attached.
+fn ata_boot_sector_matches(drive: u8) -> bool {
+    const DATA: u16 = 0x1f0;
+    const SECTOR_COUNT: u16 = 0x1f2;
+    const LBA_LOW: u16 = 0x1f3;
+    const LBA_MID: u16 = 0x1f4;
+    const LBA_HIGH: u16 = 0x1f5;
+    const DRIVE: u16 = 0x1f6;
+    const STATUS_COMMAND: u16 = 0x1f7;
+    const CMD_READ_SECTORS: u8 = 0x20;
+    const STATUS_ERR: u8 = 1 << 0;
+    const STATUS_DRQ: u8 = 1 << 3;
+    const STATUS_BSY: u8 = 1 << 7;
+
+    outb(DRIVE, drive | 0x40); // LBA mode, sector 0
+    for _ in 0..4 { let _ = inb(STATUS_COMMAND); }
+    outb(SECTOR_COUNT, 1);
+    outb(LBA_LOW, 0);
+    outb(LBA_MID, 0);
+    outb(LBA_HIGH, 0);
+    outb(STATUS_COMMAND, CMD_READ_SECTORS);
+
+    for _ in 0..100_000 {
+        let status = inb(STATUS_COMMAND);
+        if status & STATUS_BSY != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        if status & STATUS_ERR != 0 {
+            return false;
+        }
+        if status & STATUS_DRQ != 0 {
+            let mut matches = true;
+            for i in 0..256usize {
+                let word: u16;
+                unsafe {
+                    asm!("in ax, dx", in("dx") DATA, out("ax") word, options(nomem, nostack));
+                    let boot_word = core::ptr::read_volatile((0x7c00usize as *const u16).add(i));
+                    if word != boot_word { matches = false; }
+                }
+            }
+            return matches;
+        }
     }
     false
 }
