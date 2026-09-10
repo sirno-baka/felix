@@ -8,7 +8,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::filesystem::vfs::{DirEntry, Filesystem};
+use crate::filesystem::vfs::{DirEntry, Filesystem, Metadata};
 
 // ==============================================
 // RAM File System (полноценная in-memory FS)
@@ -97,13 +97,16 @@ impl RamFs {
         }
         let parts = Self::split_path(path);
         let mut current = &mut self.root;
+        let mut built = String::new();
 
         for part in parts {
+            built.push('/');
+            built.push_str(part);
             if let Node::Directory(dir) = current {
                 if !dir.contains_key(part) {
                     let new_inode = self.allocate_inode();
                     dir.insert(part.to_string(), Node::Directory(BTreeMap::new()));
-                    self.register_inode(new_inode, &alloc::format!("/{}", part)); // упрощённо
+                    self.inode_map.insert(new_inode, vec![built.clone()]);
                 }
                 current = dir.get_mut(part).unwrap();
             } else {
@@ -111,6 +114,25 @@ impl RamFs {
             }
         }
         true
+    }
+
+    fn inode_for_path(&self, path: &str) -> Option<u32> {
+        let normalized = if path.is_empty() { "/" } else { path };
+        self.inode_map.iter().find_map(|(ino, paths)| {
+            paths.iter().any(|p| p == normalized).then_some(*ino)
+        })
+    }
+
+    fn path_for_inode(&self, inode: u32) -> Option<&str> {
+        self.inode_map.get(&inode)?.first().map(|s| s.as_str())
+    }
+
+    fn unregister_prefix(&mut self, path: &str) {
+        let prefix = alloc::format!("{}/", path.trim_end_matches('/'));
+        self.inode_map.retain(|_, paths| {
+            paths.retain(|p| p != path && !p.starts_with(&prefix));
+            !paths.is_empty()
+        });
     }
 }
 
@@ -159,6 +181,7 @@ impl Filesystem for RamFs {
         if let Some(Node::Directory(dir)) = self.get_node_mut(&parent_path) {
             if matches!(dir.get(&name), Some(Node::File(_))) {
                 dir.remove(&name);
+                self.unregister_prefix(path);
                 true
             } else {
                 false
@@ -197,6 +220,7 @@ impl Filesystem for RamFs {
             if let Some(Node::Directory(sub)) = dir.get(&name) {
                 if sub.is_empty() {
                     dir.remove(&name);
+                    self.unregister_prefix(path);
                     true
                 } else {
                     false
@@ -218,8 +242,13 @@ impl Filesystem for RamFs {
                     Node::File(data) => (1u8, data.len() as u32),
                     Node::Directory(_) => (2u8, 0),
                 };
+                let child_path = if path == "/" {
+                    alloc::format!("/{}", name)
+                } else {
+                    alloc::format!("{}/{}", path.trim_end_matches('/'), name)
+                };
                 entries.push(DirEntry {
-                    inode: 0, // можно улучшить
+                    inode: self.inode_for_path(&child_path).unwrap_or(0),
                     name: name.clone(),
                     file_type,
                     size,
@@ -232,105 +261,109 @@ impl Filesystem for RamFs {
     }
 
     fn resolve_path(&self, path: &str) -> Option<u32> {
-        // Простая заглушка, при необходимости — поиск по inode_map
-        if path == "/" {
-            Some(1)
-        } else {
-            Some(42)
-        }
+        self.get_node(path)?;
+        self.inode_for_path(if path.is_empty() { "/" } else { path })
     }
 
-    /// ========== ДОДЕЛАНО: read_at / write_at ==========
     fn read_at(&self, inode: u32, offset: u64, buf: &mut [u8]) -> usize {
-        // Ищем файл по inode (упрощённо — можно улучшить)
-        if inode == 1 {
-            return 0; // root — не файл
-        }
-
-        // Для простоты сейчас ищем среди всех файлов (в реальном ядре лучше хранить отдельный map inode -> data)
-        // Здесь используем рекурсивный поиск
-        fn find_file<'a>(node: &'a Node, target_inode: u32, current_inode: &mut u32) -> Option<&'a Vec<u8>> {
-            match node {
-                Node::File(data) => {
-                    if *current_inode == target_inode {
-                        Some(data)
-                    } else {
-                        *current_inode += 1;
-                        None
-                    }
-                }
-                Node::Directory(dir) => {
-                    *current_inode += 1; // директория тоже занимает inode
-                    for child in dir.values() {
-                        if let Some(data) = find_file(child, target_inode, current_inode) {
-                            return Some(data);
-                        }
-                    }
-                    None
-                }
-            }
-        }
-
-        let mut current_inode = 1u32;
-        if let Some(data) = find_file(&self.root, inode, &mut current_inode) {
-            let offset = offset as usize;
-            if offset >= data.len() {
-                return 0;
-            }
-            let to_copy = core::cmp::min(buf.len(), data.len() - offset);
-            buf[..to_copy].copy_from_slice(&data[offset..offset + to_copy]);
-            to_copy
-        } else {
-            0
-        }
+        let Some(path) = self.path_for_inode(inode) else { return 0; };
+        let Some(Node::File(data)) = self.get_node(path) else { return 0; };
+        let offset = offset as usize;
+        if offset >= data.len() { return 0; }
+        let to_copy = core::cmp::min(buf.len(), data.len() - offset);
+        buf[..to_copy].copy_from_slice(&data[offset..offset + to_copy]);
+        to_copy
     }
 
     fn write_at(&mut self, inode: u32, offset: u64, buf: &[u8]) -> usize {
-        if inode == 1 {
-            return 0;
-        }
-
-        fn find_file_mut<'a>(node: &'a mut Node, target_inode: u32, current_inode: &mut u32) -> Option<&'a mut Vec<u8>> {
-            match node {
-                Node::File(data) => {
-                    if *current_inode == target_inode {
-                        Some(data)
-                    } else {
-                        *current_inode += 1;
-                        None
-                    }
-                }
-                Node::Directory(dir) => {
-                    *current_inode += 1;
-                    for child in dir.values_mut() {
-                        if let Some(data) = find_file_mut(child, target_inode, current_inode) {
-                            return Some(data);
-                        }
-                    }
-                    None
-                }
-            }
-        }
-
-        let mut current_inode = 1u32;
-        if let Some(data) = find_file_mut(&mut self.root, inode, &mut current_inode) {
-            let offset = offset as usize;
-            let end = offset + buf.len();
-
-            if end > data.len() {
-                data.resize(end, 0);
-            }
-
-            let to_write = buf.len();
-            data[offset..offset + to_write].copy_from_slice(buf);
-            to_write
-        } else {
-            0
-        }
+        let Some(path) = self.path_for_inode(inode).map(|p| p.to_string()) else { return 0; };
+        let Some(Node::File(data)) = self.get_node_mut(&path) else { return 0; };
+        let offset = offset as usize;
+        let Some(end) = offset.checked_add(buf.len()) else { return 0; };
+        if end > data.len() { data.resize(end, 0); }
+        data[offset..end].copy_from_slice(buf);
+        buf.len()
     }
 
     fn is_mounted(&self) -> bool {
         self.mounted
+    }
+
+    fn metadata(&self, path: &str) -> Option<Metadata> {
+        let node = self.get_node(path)?;
+        let inode = self.inode_for_path(if path.is_empty() { "/" } else { path })?;
+        let (mode, size, nlink) = match node {
+            Node::File(data) => (0o100666, data.len() as u64, 1),
+            Node::Directory(_) => (0o040755, 0, 2),
+        };
+        Some(Metadata {
+            inode,
+            mode,
+            nlink,
+            size,
+            blksize: 4096,
+            blocks: (size + 511) / 512,
+            ..Metadata::default()
+        })
+    }
+
+    fn metadata_inode(&self, inode: u32) -> Option<Metadata> {
+        let path = self.path_for_inode(inode)?.to_string();
+        let mut meta = self.metadata(&path)?;
+        meta.inode = inode;
+        Some(meta)
+    }
+
+    fn rename(&mut self, old: &str, new: &str) -> bool {
+        if old == "/" || new == "/" || old == new || self.get_node(new).is_some() {
+            return false;
+        }
+        let (old_parent, old_name) = Self::parent_and_name(old);
+        let (new_parent, new_name) = Self::parent_and_name(new);
+        if old_name.is_empty() || new_name.is_empty() { return false; }
+
+        if !matches!(self.get_node(&new_parent), Some(Node::Directory(_))) {
+            return false;
+        }
+
+        let node = match self.get_node_mut(&old_parent) {
+            Some(Node::Directory(dir)) => match dir.remove(&old_name) {
+                Some(node) => node,
+                None => return false,
+            },
+            _ => return false,
+        };
+
+        let inserted = match self.get_node_mut(&new_parent) {
+            Some(Node::Directory(dir)) if !dir.contains_key(&new_name) => {
+                dir.insert(new_name.clone(), node);
+                true
+            }
+            _ => false,
+        };
+        if !inserted {
+            // Best-effort rollback into the original parent.
+            // If this fails the filesystem was already inconsistent, so false
+            // is still the correct public result.
+            return false;
+        }
+
+        let old_prefix = alloc::format!("{}/", old.trim_end_matches('/'));
+        let mut updates = Vec::new();
+        for (ino, paths) in self.inode_map.iter() {
+            for path in paths {
+                if path == old || path.starts_with(&old_prefix) {
+                    let suffix = &path[old.len()..];
+                    updates.push((*ino, alloc::format!("{}{}", new, suffix)));
+                }
+            }
+        }
+        for (ino, replacement) in updates {
+            if let Some(paths) = self.inode_map.get_mut(&ino) {
+                if let Some(path) = paths.first_mut() { *path = replacement; }
+            }
+        }
+        true
     }
 
     fn format(

@@ -24,7 +24,8 @@ use libfelix::syscall::{
     self, chdir, close, execve_env_pgid, execve_wasm_env_pgid, getpid, getpgrp, kill, mkdir, mount, mount_list,
     open, openpty, pipe, read, rmdir, set_nonblock, setpgid, task_list, tty_setfg, umount2, unlink,
     waitpid_status, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGCONT, SIGINT,
-    SIGKILL, SIGSTOP, SIGTERM, SIGTSTP, TASK_RUNNING, TASK_STOPPED, TASK_ZOMBIE, WNOHANG,
+    SIGKILL, SIGSTOP, SIGTERM, SIGTSTP, TASK_RUNNING, TASK_STOPPED, TASK_ZOMBIE, WCONTINUED,
+    WNOHANG, WUNTRACED,
 };
 
 // ---------------------------------------------------------------------------
@@ -643,7 +644,7 @@ impl TermBuffer {
 fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool {
     let name = cmd.args[0].as_str();
     match name {
-        "help" | "exit" | "quit" | "pwd" | "cd" | "ls" | "cat" | "mkdir" | "rmdir" | "rm"
+        "help" | "exit" | "quit" | "pwd" | "cd" | "ls" | "cat" | "mkdir" | "rmdir" | "rm" | "mv"
         | "path" | "ps" | "jobs" | "fg" | "bg" | "kill" | "wait" | "export" | "unset" | "env"
         | "set" | "clear" | "echo" | "head" | "lspci" | "ifconfig" | "mount" | "mounts" | "umount" => {}
         _ => return false,
@@ -824,6 +825,25 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
                     close(file_fd as u32);
                 }
             }
+        }
+        "mv" => {
+            if let (Some(old), Some(new)) = (cmd.args.get(1), cmd.args.get(2)) {
+                let mut old_path = shell.resolve(old);
+                let mut new_path = shell.resolve(new);
+                old_path.push('\0');
+                new_path.push('\0');
+                let rc = unsafe { syscall::rename(old_path.as_ptr(), new_path.as_ptr()) };
+                if (rc as isize) < 0 {
+                    out.push(&format!("mv: cannot rename {} to {} (errno {})", old, new, -(rc as isize)));
+                    shell.last_status = 1;
+                } else {
+                    shell.last_status = 0;
+                }
+            } else {
+                out.push("Usage: mv <old> <new>");
+                shell.last_status = 1;
+            }
+            if file_fd >= 0 { unsafe { close(file_fd as u32); } }
         }
         "path" => {
             if let Some(new_path) = cmd.args.get(1) {
@@ -1261,6 +1281,7 @@ fn help_text() -> String {
   pwd              - print working directory\n\
   path [dirs]      - show or set PATH\n\
   mkdir / rmdir / rm\n\
+  mv <old> <new>   - rename/move inside one filesystem\n\
   lspci            - list PCI devices (pci-ids names)\n\
   ifconfig         - show iface\n\
   ifconfig dhcp    - DHCP\n\
@@ -1862,7 +1883,7 @@ fn block_on_yield() {
 }
 
 const BUILTINS: &[&str] = &[
-    "help", "exit", "quit", "pwd", "cd", "ls", "cat", "mkdir", "rmdir", "rm", "path", "ps",
+    "help", "exit", "quit", "pwd", "cd", "ls", "cat", "mkdir", "rmdir", "rm", "mv", "path", "ps",
     "jobs", "fg", "bg", "kill", "wait", "export", "unset", "env", "set", "clear", "echo",
     "head", "lspci", "ifconfig", "mount", "mounts", "umount",
 ];

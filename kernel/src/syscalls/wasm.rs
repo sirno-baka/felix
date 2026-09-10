@@ -667,10 +667,14 @@ fn register_wasi_functions(
                 .and_then(|ext| ext.into_memory())
                 .ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
 
-            // Возвращаем фейковое время в наносекундах (например, 1 секунда)
-            let fake_time_ns: u64 = 1_000_000_000;
+            let ms = match _clock_id {
+                0 => crate::time::realtime_ms(),
+                1 => crate::time::uptime_ms(),
+                _ => return Ok(28), // WASI_EINVAL
+            };
+            let time_ns = ms.saturating_mul(1_000_000);
             memory
-                .write(&mut caller, time_ptr as usize, &fake_time_ns.to_le_bytes())
+                .write(&mut caller, time_ptr as usize, &time_ns.to_le_bytes())
                 .map_err(|_| wasmi::core::Trap::new("write time failed"))?;
             Ok(0) // WASI_ESUCCESS
         },
@@ -735,12 +739,12 @@ pub(crate) fn sys_execve_wasm(
     }
     let slot = slot_i8 as usize;
     let pid = unsafe { TASK_MANAGER.alloc_pid() };
-    let (ppid, inherited_pgid, inherited_sid, inherited_cwd, inherited_tty) = unsafe {
+    let (ppid, inherited_pgid, inherited_sid, inherited_cwd, inherited_tty, inherited_pty) = unsafe {
         TASK_MANAGER.tasks
             .get(parent_slot)
             .and_then(|t| t.as_ref())
-            .map(|p| (p.pid, p.pgid, p.sid, p.cwd.clone(), p.tty_id))
-            .unwrap_or((0, pid, pid, "/".into(), -1))
+            .map(|p| (p.pid, p.pgid, p.sid, p.cwd.clone(), p.tty_id, p.pty_id))
+            .unwrap_or((0, pid, pid, "/".into(), -1, -1))
     };
     let sid = if parent_slot == 0 || inherited_sid <= 0 { pid } else { inherited_sid };
     let inherited_group = if parent_slot == 0 || inherited_pgid <= 0 { pid } else { inherited_pgid };
@@ -831,6 +835,7 @@ pub(crate) fn sys_execve_wasm(
         task.parent = parent_slot as i8;
         task.cwd = inherited_cwd;
         task.tty_id = inherited_tty;
+        task.pty_id = inherited_pty;
         task.zombie = false;
         task.stopped = false;
         task.exit_code = 0;
@@ -864,6 +869,10 @@ pub(crate) fn sys_execve_wasm(
             params.stderr,
             FileDescriptor::ConsoleOut,
         );
+        task.pty_id = (0..3).find_map(|fd| match fd_table.get(fd) {
+            Some(FileDescriptor::Pty { pty_id, side: crate::filesystem::file::PtySide::Slave }) => Some(*pty_id as i16),
+            _ => None,
+        }).unwrap_or(task.pty_id);
         task.fd_table = fd_table;
 
         TASK_MANAGER.tasks[slot] = Some(task);

@@ -14,7 +14,7 @@ use fatfs::{FileSystem, FsOptions, Read, Seek, SeekFrom, Write};
 
 use crate::disk::PartitionConfig;
 use crate::disk::interface::BlockDevice;
-use crate::filesystem::vfs::{DirEntry, Filesystem};
+use crate::filesystem::vfs::{DirEntry, Filesystem, Metadata};
 use crate::println;
 use crate::spin::Mutex;
 
@@ -594,6 +594,94 @@ impl Filesystem for FatFs {
             file.read(buf).unwrap_or(0)
         })
         .unwrap_or(0)
+    }
+
+    fn metadata(&self, path: &str) -> Option<Metadata> {
+        let comps = split_path(path);
+        if comps.is_empty() {
+            return Some(Metadata {
+                inode: self.alloc_inode("/"),
+                mode: 0o040755,
+                nlink: 2,
+                blksize: 512,
+                ..Metadata::default()
+            });
+        }
+        let (name, parent) = comps.split_last()?;
+        let info = self.with_fs(|fs| {
+            let mut dir = fs.root_dir();
+            for c in parent {
+                dir = dir.open_dir(*c).ok()?;
+            }
+            for e in dir.iter() {
+                let e = e.ok()?;
+                if e.file_name() == *name {
+                    return Some((e.is_dir(), e.len() as u64));
+                }
+            }
+            None
+        })??;
+        let (is_dir, size) = info;
+        Some(Metadata {
+            inode: self.alloc_inode(path),
+            mode: if is_dir { 0o040755 } else { 0o100666 },
+            nlink: if is_dir { 2 } else { 1 },
+            size,
+            blksize: 512,
+            blocks: (size + 511) / 512,
+            ..Metadata::default()
+        })
+    }
+
+    fn metadata_inode(&self, inode: u32) -> Option<Metadata> {
+        let path = self.path_for_inode(inode)?;
+        let mut meta = self.metadata(&path)?;
+        meta.inode = inode;
+        Some(meta)
+    }
+
+    fn rename(&mut self, old: &str, new: &str) -> bool {
+        let Some((old_parent, old_name)) = parent_and_name(old) else { return false; };
+        let Some((new_parent, new_name)) = parent_and_name(new) else { return false; };
+        let ok = self.with_fs(|fs| {
+            let mut src_dir = fs.root_dir();
+            for c in &old_parent {
+                src_dir = match src_dir.open_dir(*c) { Ok(d) => d, Err(_) => return false };
+            }
+            let mut dst_dir = fs.root_dir();
+            for c in &new_parent {
+                dst_dir = match dst_dir.open_dir(*c) { Ok(d) => d, Err(_) => return false };
+            }
+            src_dir.rename(old_name, &dst_dir, new_name).is_ok()
+        }).unwrap_or(false);
+        if !ok { return false; }
+
+        // Synthetic FAT inode identities must survive rename so already-open
+        // file descriptors continue to resolve to the moved path.
+        let old_key = normalize_rel(old);
+        let new_key = normalize_rel(new);
+        let mut moved = Vec::new();
+        {
+            let mut p2i = self.path_to_ino.lock();
+            let prefix = if old_key == "/" { "/".to_string() } else { alloc::format!("{}/", old_key) };
+            let keys: Vec<String> = p2i.keys()
+                .filter(|k| k.as_str() == old_key.as_str() || k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for key in keys {
+                if let Some(ino) = p2i.remove(&key) {
+                    let suffix = if key == old_key { "" } else { &key[old_key.len()..] };
+                    let replacement = alloc::format!("{}{}", new_key, suffix);
+                    p2i.insert(replacement.clone(), ino);
+                    moved.push((ino, replacement));
+                }
+            }
+        }
+        if !moved.is_empty() {
+            let mut i2p = self.ino_to_path.lock();
+            for (ino, path) in moved { i2p.insert(ino, path); }
+        }
+        true
     }
 
     fn write_at(&mut self, inode: u32, offset: u64, buf: &[u8]) -> usize {

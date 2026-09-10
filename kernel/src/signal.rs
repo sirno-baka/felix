@@ -67,6 +67,12 @@ pub fn send_signal(slot: i8, sig: u32) -> bool {
 /// Stop a task without turning it into a zombie. Its CPU state and FDs remain
 /// intact so the shell can later resume it with SIGCONT/`bg`/`fg`.
 pub fn stop_task(slot: i8) -> bool {
+    stop_task_with_signal(slot, SIGSTOP)
+}
+
+/// Stop and latch the transition for waitpid(WUNTRACED). The event remains
+/// pending until the parent consumes it, even if SIGCONT arrives quickly.
+pub fn stop_task_with_signal(slot: i8, sig: u32) -> bool {
     if slot <= 0 {
         return false;
     }
@@ -77,8 +83,11 @@ pub fn stop_task(slot: i8) -> bool {
             }
             t.running = false;
             t.stopped = true;
-            t.pending_signals &= !sigbit(SIGSTOP);
-            println!("[signal] task {} stopped", slot);
+            t.stop_signal = sig;
+            t.wait_stopped_pending = true;
+            // POSIX: generating a stop signal discards a pending SIGCONT.
+            t.pending_signals &= !(sigbit(sig) | sigbit(SIGCONT));
+            println!("[signal] task {} stopped by {}", slot, sig);
             true
         } else {
             false
@@ -96,9 +105,19 @@ pub fn continue_task(slot: i8) -> bool {
             if t.zombie {
                 return false;
             }
+            let was_stopped = t.stopped;
             t.stopped = false;
             t.running = true;
-            t.pending_signals &= !sigbit(SIGCONT);
+            if was_stopped {
+                t.wait_continued_pending = true;
+            }
+            // POSIX: SIGCONT discards pending job-control stop signals whether
+            // or not SIGCONT itself is caught by a userspace handler.
+            t.pending_signals &= !(sigbit(SIGCONT)
+                | sigbit(SIGSTOP)
+                | sigbit(SIGTSTP)
+                | sigbit(SIGTTIN)
+                | sigbit(SIGTTOU));
             println!("[signal] task {} continued", slot);
             true
         } else {
@@ -122,7 +141,8 @@ pub fn force_kill(slot: i8, sig: u32) -> bool {
             t.running = false;
             t.stopped = false;
             t.zombie = true;
-            t.exit_code = 128 + (if sig == 0 { SIGKILL } else { sig }) as i32;
+            t.term_signal = if sig == 0 { SIGKILL } else { sig };
+            t.exit_code = 128 + t.term_signal as i32;
             pid
         } else {
             return false;
@@ -144,25 +164,24 @@ fn close_task_fds(slot: i8) {
     if slot <= 0 {
         return;
     }
-    let mut taken: [Option<FileDescriptor>; 64] = [None; 64];
-    unsafe {
+    let taken = unsafe {
         if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
-            for i in 0..64 {
-                taken[i] = t.fd_table.close(i);
-            }
+            t.fd_table.take_all()
+        } else {
+            alloc::vec::Vec::new()
         }
-    }
-    for desc in taken.into_iter().flatten() {
-        match desc {
+    };
+    for closed in taken {
+        if !closed.last_open_ref {
+            continue;
+        }
+        match closed.desc {
             FileDescriptor::Pipe { pipe_id, end } => match end {
                 PipeEnd::Read => crate::pipe::pipe_close_reader(pipe_id),
                 PipeEnd::Write => crate::pipe::pipe_close_writer(pipe_id),
             },
             FileDescriptor::Socket { socket_id } => {
-                let mut table = crate::net::SOCKET_TABLE.lock();
-                if let Some(sock) = table.get_mut(socket_id) {
-                    sock.state = SocketState::Closed;
-                }
+                crate::net::SOCKET_TABLE.lock().free(socket_id);
             }
             FileDescriptor::Pty { pty_id, side } => {
                 crate::tty::close_ref(pty_id, side);
@@ -239,6 +258,7 @@ pub fn deliver_pending(esp: u32) -> u32 {
                         t.running = false;
                         t.stopped = false;
                         t.zombie = true;
+                        t.term_signal = sig;
                         t.exit_code = 128 + sig as i32;
                     }
                     TASK_MANAGER.reparent_children_of(dead_pid);
@@ -281,6 +301,7 @@ fn deliver_pending_after_switch(esp: u32) -> u32 {
                 t.running = false;
                 t.stopped = false;
                 t.zombie = true;
+                t.term_signal = sig;
                 t.exit_code = 128 + sig as i32;
             }
             close_task_fds(slot);

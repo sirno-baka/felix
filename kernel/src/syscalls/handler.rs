@@ -3,7 +3,8 @@ use core::arch::asm;
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::drivers::pic::PICS;
 use crate::filesystem::VFS;
-use crate::filesystem::file::{DeviceKind, FileDescriptor, FileDescriptorTable, FileMode, PipeEnd, PtySide};
+use crate::filesystem::file::{ClosedFileDescriptor, DeviceKind, FileDescriptor, FileDescriptorTable, FileMode, PipeEnd, PtySide};
+use crate::filesystem::vfs::{Metadata, RenameError};
 use crate::memory::allocator::ALLOCATOR;
 use crate::memory::paging::{
     PAGE_SIZE, PAGING, PDEFlags, PTEFlags, PageDirectory, PhysAddr, VirtAddr, copy_kernel_mappings,
@@ -145,6 +146,11 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         crate::syscalls::SYS_MKDIR => sys_mkdir(current_slot, state.ebx as *const u8),
         crate::syscalls::SYS_RMDIR => sys_rmdir(current_slot, state.ebx as *const u8),
         crate::syscalls::SYS_UNLINK => sys_unlink(current_slot, state.ebx as *const u8),
+        crate::syscalls::SYS_RENAME => sys_rename(
+            current_slot,
+            state.ebx as *const u8,
+            state.ecx as *const u8,
+        ),
         crate::syscalls::SYS_CHDIR => sys_chdir(current_slot, state.ebx as *const u8),
         crate::syscalls::SYS_GETCWD => sys_getcwd(current_slot, state.ebx as *mut u8, state.ecx as usize),
         crate::syscalls::SYS_GETPID => sys_getpid(current_slot),
@@ -494,9 +500,12 @@ const SEEK_END: u32 = 2;
 // Linux errno (returned as -errno in eax)
 const EPERM: usize = (-1isize) as usize;
 const ENOENT: usize = (-2isize) as usize;
+const ENXIO: usize = (-6isize) as usize;
 const EBADF: usize = (-9isize) as usize;
 const ENOMEM: usize = (-12isize) as usize;
 const EFAULT: usize = (-14isize) as usize;
+const EEXIST: usize = (-17isize) as usize;
+const EXDEV: usize = (-18isize) as usize;
 const EINVAL: usize = (-22isize) as usize;
 const ENOTTY: usize = (-25isize) as usize;
 const ENOTDIR: usize = (-20isize) as usize;
@@ -551,47 +560,42 @@ fn probe_inode_size(inode: u32) -> u64 {
 }
 
 fn path_is_dir(path: &str) -> bool {
-    let path = path.trim_end_matches('/');
-    if path.is_empty() || path == "/" {
-        return true;
-    }
-    let (parent, name) = match path.rfind('/') {
-        Some(0) => ("/", &path[1..]),
-        Some(i) => (&path[..i], &path[i + 1..]),
-        None => ("/", path),
-    };
-    if let Some(entries) = VFS.get().list_directory_entries(parent) {
-        if let Some(e) = entries.iter().find(|e| e.name == name) {
-            return e.file_type == 2;
-        }
-    }
-    // точка монтирования без записи в родителе (`/mnt/sda`)
-    VFS.get().list_directory_entries(path).is_some()
-        && VFS.get().list_directory_entries(parent).is_none()
+    VFS.get().metadata(path).map_or(false, |m| m.mode & 0o170000 == S_IFDIR)
 }
 
-fn fill_stat64(st: &mut Stat64, inode: u32, mode: u32, size: u64) {
+fn fill_stat64(st: &mut Stat64, meta: Metadata) {
+    let fs_id = (meta.inode >> 24) as u64;
     *st = Stat64 {
-        st_dev: 1,
+        st_dev: fs_id + 1,
         __pad0: [0; 4],
-        __st_ino: inode,
-        st_mode: mode | 0o644,
-        st_nlink: 1,
-        st_uid: 0,
-        st_gid: 0,
-        st_rdev: 0,
+        __st_ino: meta.inode,
+        st_mode: meta.mode,
+        st_nlink: meta.nlink.max(1),
+        st_uid: meta.uid,
+        st_gid: meta.gid,
+        st_rdev: meta.rdev,
         __pad3: [0; 4],
-        st_size: size as i64,
-        st_blksize: 4096,
-        st_blocks: (size + 511) / 512,
-        st_atime: 0,
+        st_size: meta.size as i64,
+        st_blksize: meta.blksize.max(1),
+        st_blocks: meta.blocks,
+        st_atime: meta.atime,
         st_atime_nsec: 0,
-        st_mtime: 0,
+        st_mtime: meta.mtime,
         st_mtime_nsec: 0,
-        st_ctime: 0,
+        st_ctime: meta.ctime,
         st_ctime_nsec: 0,
-        st_ino: inode as u64,
+        st_ino: meta.inode as u64,
     };
+}
+
+fn synthetic_meta(inode: u32, mode: u32) -> Metadata {
+    Metadata {
+        inode,
+        mode,
+        nlink: 1,
+        blksize: 4096,
+        ..Metadata::default()
+    }
 }
 
 fn normalize_path(path: &str) -> String {
@@ -655,6 +659,37 @@ pub fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize
     let path_buf = resolve_task_path(current_slot, &raw_path);
     let path = path_buf.as_str();
 
+    // /dev/tty is process-relative: it reopens the concrete controlling PTY
+    // slave rather than dispatching I/O through a global DevFS device object.
+    if path == "/dev/tty" {
+        let pty_id = unsafe {
+            TASK_MANAGER.tasks
+                .get(current_slot)
+                .and_then(|t| t.as_ref())
+                .map(|t| t.pty_id)
+                .unwrap_or(-1)
+        };
+        if pty_id < 0 {
+            return ENXIO;
+        }
+        if !crate::tty::add_ref(pty_id as usize, PtySide::Slave) {
+            return ENXIO;
+        }
+        unsafe {
+            if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
+                if let Some(fd) = current.fd_table.alloc_fd() {
+                    if current.fd_table.insert(fd, FileDescriptor::new_pty(pty_id as usize, PtySide::Slave)) {
+                        let status = (flags as u32) & crate::filesystem::file::O_NONBLOCK;
+                        let _ = current.fd_table.set_flags(fd, status);
+                        return fd;
+                    }
+                }
+            }
+        }
+        crate::tty::close_ref(pty_id as usize, PtySide::Slave);
+        return ENOMEM;
+    }
+
     // Directory open (explicit or path is a dir)
     if path_is_dir(path) {
         if flags & O_WRONLY != 0 || flags & O_RDWR != 0 {
@@ -677,6 +712,7 @@ pub fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize
                             cookie: 0,
                         },
                     );
+                    let _ = current.fd_table.set_flags(fd, (flags as u32) & crate::filesystem::file::O_NONBLOCK);
                     return fd;
                 }
             }
@@ -714,7 +750,7 @@ pub fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize
     };
 
     let offset = if flags & O_APPEND != 0 {
-        probe_inode_size(inode)
+        VFS.get().metadata_inode(inode).map(|m| m.size).unwrap_or_else(|| probe_inode_size(inode))
     } else {
         0
     };
@@ -743,8 +779,12 @@ pub fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize
                         mode,
                     }
                 };
-                current.fd_table.insert(fd, desc);
-                return fd;
+                if current.fd_table.insert(fd, desc) {
+                    let status = (flags as u32) & crate::filesystem::file::OFD_STATUS_MASK;
+                    let _ = current.fd_table.set_flags(fd, status);
+                    return fd;
+                }
+                return ENOMEM;
             }
         }
     }
@@ -760,22 +800,15 @@ fn EMFILE_OR_ENOMEM() -> usize {
 
 pub fn sys_lseek(current_slot: usize, fd: usize, offset: i32, whence: u32) -> usize {
     unsafe {
-        if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
-            match current.fd_table.get_mut(fd) {
-                Some(FileDescriptor::File {
-                    inode,
-                    offset: off,
-                    ..
-                })
-                | Some(FileDescriptor::Device {
-                    inode,
-                    offset: off,
-                    ..
-                }) => {
-                    let size = probe_inode_size(*inode);
+        if let Some(ref current) = TASK_MANAGER.tasks[current_slot] {
+            match current.fd_table.get(fd).copied() {
+                Some(FileDescriptor::File { inode, .. })
+                | Some(FileDescriptor::Device { inode, .. }) => {
+                    let size = VFS.get().metadata_inode(inode).map(|m| m.size).unwrap_or_else(|| probe_inode_size(inode));
+                    let current_off = current.fd_table.get_offset(fd).unwrap_or(0);
                     let base = match whence {
                         SEEK_SET => 0i64,
-                        SEEK_CUR => *off as i64,
+                        SEEK_CUR => current_off as i64,
                         SEEK_END => size as i64,
                         _ => return EINVAL,
                     };
@@ -783,15 +816,17 @@ pub fn sys_lseek(current_slot: usize, fd: usize, offset: i32, whence: u32) -> us
                     if new < 0 {
                         return EINVAL;
                     }
-                    *off = new as u64;
-                    return *off as usize;
+                    let new = new as u64;
+                    if !current.fd_table.set_offset(fd, new) {
+                        return EBADF;
+                    }
+                    return new as usize;
                 }
-                Some(FileDescriptor::Dir { cookie, .. }) => {
+                Some(FileDescriptor::Dir { .. }) => {
                     if whence != SEEK_SET || offset != 0 {
                         return EINVAL;
                     }
-                    *cookie = 0;
-                    return 0;
+                    return if current.fd_table.set_cookie(fd, 0) { 0 } else { EBADF };
                 }
                 _ => return EBADF,
             }
@@ -1003,11 +1038,17 @@ pub fn sys_munmap(current_slot: usize, addr: u32, len: usize) -> usize {
 
 const TCGETS: u32 = 0x5401;
 const TCSETS: u32 = 0x5402;
+const TCSETSW: u32 = 0x5403;
+const TCSETSF: u32 = 0x5404;
 const TIOCGPGRP: u32 = 0x540F;
 const TIOCSPGRP: u32 = 0x5410;
+const IFLAG_ICRNL: u32 = 0x0100;
+const OFLAG_OPOST: u32 = 0x0001;
+const OFLAG_ONLCR: u32 = 0x0004;
 const LFLAG_ISIG: u32 = 0x0001;
 const LFLAG_ICANON: u32 = 0x0002;
 const LFLAG_ECHO: u32 = 0x0008;
+const LFLAG_TOSTOP: u32 = 0x0100;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1032,45 +1073,58 @@ pub fn sys_ioctl(current_slot: usize, fd: usize, req: u32, arg: u32) -> usize {
 
     if req == TIOCGPGRP {
         if arg == 0 { return EFAULT; }
-        let Some(pgid) = crate::tty::foreground(current_slot) else { return ENOTTY; };
+        let Some(pgid) = crate::tty::foreground_pty(pty_id) else { return ENOTTY; };
         unsafe { *(arg as *mut i32) = pgid; }
         return 0;
     }
     if req == TIOCSPGRP {
         if arg == 0 { return EFAULT; }
         let pgid = unsafe { *(arg as *const i32) };
-        return if crate::tty::set_foreground(current_slot, pgid) { 0 } else { EPERM };
+        return if crate::tty::set_foreground_pty(current_slot, pty_id, pgid) { 0 } else { EPERM };
     }
 
     match req {
         TCGETS => {
             if arg == 0 { return EFAULT; }
-            let Some((canonical, echo, isig)) = crate::tty::mode(pty_id) else { return ENOTTY; };
+            let Some(term) = crate::tty::termios(pty_id) else { return ENOTTY; };
             let mut lflag = 0u32;
-            if isig { lflag |= LFLAG_ISIG; }
-            if canonical { lflag |= LFLAG_ICANON; }
-            if echo { lflag |= LFLAG_ECHO; }
+            if term.isig { lflag |= LFLAG_ISIG; }
+            if term.canonical { lflag |= LFLAG_ICANON; }
+            if term.echo { lflag |= LFLAG_ECHO; }
+            if term.tostop { lflag |= LFLAG_TOSTOP; }
             unsafe {
                 *(arg as *mut TermiosUser) = TermiosUser {
-                    c_iflag: 0,
-                    c_oflag: 0,
+                    c_iflag: if term.icrnl { IFLAG_ICRNL } else { 0 },
+                    c_oflag: (if term.opost { OFLAG_OPOST } else { 0 })
+                        | (if term.onlcr { OFLAG_ONLCR } else { 0 }),
                     c_cflag: 0,
                     c_lflag: lflag,
                     c_line: 0,
-                    c_cc: [0; 19],
+                    c_cc: term.cc,
                 };
             }
             0
         }
-        TCSETS => {
+        TCSETS | TCSETSW | TCSETSF => {
             if arg == 0 { return EFAULT; }
             let term = unsafe { *(arg as *const TermiosUser) };
-            if crate::tty::set_mode(
-                pty_id,
-                term.c_lflag & LFLAG_ICANON != 0,
-                term.c_lflag & LFLAG_ECHO != 0,
-                term.c_lflag & LFLAG_ISIG != 0,
-            ) { 0 } else { ENOTTY }
+            let state = crate::tty::TermiosState {
+                canonical: term.c_lflag & LFLAG_ICANON != 0,
+                echo: term.c_lflag & LFLAG_ECHO != 0,
+                isig: term.c_lflag & LFLAG_ISIG != 0,
+                tostop: term.c_lflag & LFLAG_TOSTOP != 0,
+                icrnl: term.c_iflag & IFLAG_ICRNL != 0,
+                opost: term.c_oflag & OFLAG_OPOST != 0,
+                onlcr: term.c_oflag & OFLAG_ONLCR != 0,
+                cc: term.c_cc,
+            };
+            if !crate::tty::set_termios(pty_id, state) { return ENOTTY; }
+            if req == TCSETSF {
+                let _ = crate::tty::flush_input(pty_id);
+            }
+            // TCSETSW is equivalent to TCSETS for now because Felix does not
+            // keep a hardware TX FIFO behind the PTY output queue.
+            0
         }
         _ => ENOTTY,
     }
@@ -1091,32 +1145,24 @@ pub fn sys_fstat64(current_slot: usize, fd: usize, st_ptr: *mut Stat64) -> usize
                     None
                 }
             });
-            match desc {
-                Some(FileDescriptor::File { inode, .. }) => {
-                    let size = probe_inode_size(inode);
-                    fill_stat64(&mut *st_ptr, inode, S_IFREG, size);
-                    return 0;
+            let meta = match desc {
+                Some(FileDescriptor::File { inode, .. })
+                | Some(FileDescriptor::Device { inode, .. }) => {
+                    VFS.get().metadata_inode(inode).unwrap_or_else(|| synthetic_meta(inode, S_IFREG | 0o644))
                 }
-                Some(FileDescriptor::Device { inode, kind, .. }) => {
-                    let mode = match kind {
-                        DeviceKind::Block => S_IFBLK,
-                        DeviceKind::Char => S_IFCHR,
-                    };
-                    fill_stat64(&mut *st_ptr, inode, mode, 0);
-                    return 0;
-                }
-                Some(FileDescriptor::Dir { .. }) => {
-                    fill_stat64(&mut *st_ptr, 1, S_IFDIR, 0);
-                    return 0;
+                Some(FileDescriptor::Dir { path, path_len, .. }) => {
+                    let path = core::str::from_utf8(&path[..path_len as usize]).unwrap_or("/");
+                    VFS.get().metadata(path).unwrap_or_else(|| synthetic_meta(1, S_IFDIR | 0o755))
                 }
                 Some(FileDescriptor::ConsoleIn)
                 | Some(FileDescriptor::ConsoleOut)
-                | Some(FileDescriptor::Pty { .. }) => {
-                    fill_stat64(&mut *st_ptr, 0, S_IFCHR, 0);
-                    return 0;
-                }
-                _ => return EBADF,
-            }
+                | Some(FileDescriptor::Pty { .. }) => synthetic_meta(0, S_IFCHR | 0o620),
+                Some(FileDescriptor::Pipe { pipe_id, .. }) => synthetic_meta(pipe_id as u32, 0o010600),
+                Some(FileDescriptor::Socket { socket_id }) => synthetic_meta(socket_id as u32, 0o140600),
+                None => return EBADF,
+            };
+            fill_stat64(&mut *st_ptr, meta);
+            return 0;
         }
     }
     EBADF
@@ -1130,30 +1176,22 @@ pub fn sys_stat64(current_slot: usize, path_ptr: *const u8, st_ptr: *mut Stat64)
     if raw.is_empty() {
         return ENOENT;
     }
-    let path_buf = resolve_task_path(current_slot, &raw);
-    let path = path_buf.as_str();
-    if path_is_dir(path) {
-        unsafe {
-            fill_stat64(&mut *st_ptr, 1, S_IFDIR, 0);
-        }
+    let path = resolve_task_path(current_slot, &raw);
+    if path == "/dev/tty" {
+        let has_tty = unsafe {
+            TASK_MANAGER.tasks
+                .get(current_slot)
+                .and_then(|t| t.as_ref())
+                .map_or(false, |t| t.pty_id >= 0)
+        };
+        if !has_tty { return ENXIO; }
+        unsafe { fill_stat64(&mut *st_ptr, synthetic_meta(0, S_IFCHR | 0o620)); }
         return 0;
     }
-    let Some(inode) = VFS.get().resolve_path(path) else {
+    let Some(meta) = VFS.get().metadata(&path) else {
         return ENOENT;
     };
-    let kind = if let Some(name) = path.strip_prefix("/dev/") {
-        crate::filesystem::devfs::DevFS::device_kind(name)
-    } else {
-        None
-    };
-    let (mode, size) = match kind {
-        Some(DeviceKind::Block) => (S_IFBLK, 0),
-        Some(DeviceKind::Char) => (S_IFCHR, 0),
-        None => (S_IFREG, probe_inode_size(inode)),
-    };
-    unsafe {
-        fill_stat64(&mut *st_ptr, inode, mode, size);
-    }
+    unsafe { fill_stat64(&mut *st_ptr, meta); }
     0
 }
 
@@ -1165,17 +1203,13 @@ pub fn sys_getdents64(current_slot: usize, fd: usize, dirp: *mut u8, count: usiz
         let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] else {
             return EBADF;
         };
-        let (path_str, cookie) = match current.fd_table.get(fd) {
-            Some(FileDescriptor::Dir {
-                path,
-                path_len,
-                cookie,
-            }) => {
-                let s = core::str::from_utf8(&path[..*path_len as usize]).unwrap_or("/");
-                (s, *cookie)
+        let path_str = match current.fd_table.get(fd) {
+            Some(FileDescriptor::Dir { path, path_len, .. }) => {
+                core::str::from_utf8(&path[..*path_len as usize]).unwrap_or("/")
             }
             _ => return ENOTDIR,
         };
+        let cookie = current.fd_table.get_cookie(fd).unwrap_or(0);
         let entries = match VFS.get().list_directory_entries(path_str) {
             Some(e) => e,
             None => return ENOTDIR,
@@ -1206,9 +1240,7 @@ pub fn sys_getdents64(current_slot: usize, fd: usize, dirp: *mut u8, count: usiz
             written += reclen;
             idx += 1;
         }
-        if let Some(FileDescriptor::Dir { cookie, .. }) = current.fd_table.get_mut(fd) {
-            *cookie = idx as u32;
-        }
+        let _ = current.fd_table.set_cookie(fd, idx as u32);
         written
     }
 }
@@ -1229,25 +1261,16 @@ pub fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) 
                 Some(FileDescriptor::ConsoleIn) => {
                     return sys_read_stdin(buf_ptr, count);
                 }
-                Some(FileDescriptor::File {
-                    inode,
-                    offset,
-                    mode,
-                }) => {
+                Some(FileDescriptor::File { inode, mode, .. }) => {
                     if mode == FileMode::WriteOnly {
                         return 0;
                     }
+                    let offset = current.fd_table.get_offset(fd).unwrap_or(0);
                     let mut temp = alloc::vec![0u8; count];
                     let bytes = VFS.get().read_at(inode, offset, &mut temp);
                     if bytes > 0 {
                         core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr, bytes);
-                        if let Some(FileDescriptor::File {
-                            offset: off,
-                            ..
-                        }) = current.fd_table.get_mut(fd)
-                        {
-                            *off += bytes as u64;
-                        }
+                        let _ = current.fd_table.advance_offset(fd, bytes as u64);
                     }
                     return bytes;
                 }
@@ -1268,31 +1291,16 @@ pub fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) 
                 Some(FileDescriptor::Socket { .. }) => return 0,
                 Some(FileDescriptor::ConsoleOut) => return 0,
                 None => return 0,
-                Some(FileDescriptor::Device {
-                    inode,
-                    offset,
-                    mode,
-                    ..
-                }) => {
+                Some(FileDescriptor::Device { inode, mode, .. }) => {
                     if mode == FileMode::WriteOnly {
                         return 0;
                     }
-
+                    let offset = current.fd_table.get_offset(fd).unwrap_or(0);
                     let mut temp = alloc::vec![0u8; count];
-                    // VFS сам разберется, что это DevFS, и вызовет read_from_block_device или CharDevice::read
                     let bytes = VFS.get().read_at(inode, offset, &mut temp);
-
                     if bytes > 0 {
                         core::ptr::copy_nonoverlapping(temp.as_ptr(), buf_ptr, bytes);
-
-                        // Обновляем offset в таблице дескрипторов
-                        if let Some(FileDescriptor::Device {
-                            offset: off,
-                            ..
-                        }) = current.fd_table.get_mut(fd)
-                        {
-                            *off += bytes as u64;
-                        }
+                        let _ = current.fd_table.advance_offset(fd, bytes as u64);
                     }
                     return bytes;
                 }
@@ -1387,21 +1395,21 @@ pub fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usiz
                     }
                     return count;
                 }
-                Some(FileDescriptor::File {
-                    inode,
-                    offset,
-                    mode,
-                }) => {
+                Some(FileDescriptor::File { inode, mode, .. }) => {
                     if mode == FileMode::ReadOnly {
                         return 0;
                     }
+                    if current.fd_table.get_flags(fd) & crate::filesystem::file::O_APPEND != 0 {
+                        let (written, new_eof) = VFS.get().append_write(inode, buf);
+                        if written > 0 {
+                            let _ = current.fd_table.set_offset(fd, new_eof);
+                        }
+                        return written;
+                    }
+                    let offset = current.fd_table.get_offset(fd).unwrap_or(0);
                     let written = VFS.get().write_at(inode, offset, buf);
-                    if let Some(FileDescriptor::File {
-                        offset: off,
-                        ..
-                    }) = current.fd_table.get_mut(fd)
-                    {
-                        *off += written as u64;
+                    if written > 0 {
+                        let _ = current.fd_table.advance_offset(fd, written as u64);
                     }
                     return written;
                 }
@@ -1416,33 +1424,20 @@ pub fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usiz
                 }
                 Some(FileDescriptor::Pty { pty_id, side }) => {
                     let nonblock = current.fd_table.is_nonblock(fd);
-                    return crate::tty::write(pty_id, side, buf, nonblock);
+                    return crate::tty::write(current_slot, pty_id, side, buf, nonblock);
                 }
                 Some(FileDescriptor::Socket { .. }) => return 0,
-                Some(FileDescriptor::Device {
-                    inode,
-                    offset,
-                    mode,
-                    ..
-                }) => {
+                Some(FileDescriptor::Device { inode, mode, .. }) => {
                     if mode == FileMode::ReadOnly {
                         return 0;
                     }
-
-                    let mut temp = alloc::vec![0u8; count];
-                    core::ptr::copy_nonoverlapping(buf_ptr, temp.as_mut_ptr(), count);
-
-                    // VFS маршрутизирует в DevFS -> write_to_block_device (Read-Modify-Write)
-                    let bytes = VFS.get().write_at(inode, offset, &temp);
-
+                    // O_APPEND is meaningful for seekable regular files, not raw
+                    // character/block devices. Device writes use the shared OFD
+                    // offset so dup/dup2 still see one position.
+                    let offset = current.fd_table.get_offset(fd).unwrap_or(0);
+                    let bytes = VFS.get().write_at(inode, offset, buf);
                     if bytes > 0 {
-                        if let Some(FileDescriptor::Device {
-                            offset: off,
-                            ..
-                        }) = current.fd_table.get_mut(fd)
-                        {
-                            *off += bytes as u64;
-                        }
+                        let _ = current.fd_table.advance_offset(fd, bytes as u64);
                     }
                     return bytes;
                 }
@@ -1464,8 +1459,11 @@ pub fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usiz
     0
 }
 
-fn close_descriptor(desc: FileDescriptor) {
-    match desc {
+fn close_descriptor(closed: ClosedFileDescriptor) {
+    if !closed.last_open_ref {
+        return;
+    }
+    match closed.desc {
         FileDescriptor::Socket { socket_id } => {
             SOCKET_TABLE.lock().free(socket_id);
         }
@@ -1564,27 +1562,13 @@ pub fn sys_dup2(current_slot: usize, oldfd: usize, newfd: usize) -> usize {
             if current.fd_table.get(oldfd).is_none() || newfd >= 64 {
                 return usize::MAX;
             }
-            // POSIX dup2(fd, fd) is a no-op. Do this before bumping backing
-            // object refcounts, otherwise pipes/PTYs leak one reference.
             if oldfd == newfd {
                 return newfd;
             }
-            // Bump refcounts for descriptors whose backing object tracks
-            // reader/writer ownership independently of the fd table.
-            match current.fd_table.get(oldfd).copied() {
-                Some(FileDescriptor::Pipe { pipe_id, end }) => match end {
-                    PipeEnd::Read => pipe::pipe_add_reader(pipe_id),
-                    PipeEnd::Write => pipe::pipe_add_writer(pipe_id),
-                },
-                Some(FileDescriptor::Pty { pty_id, side }) => {
-                    let _ = crate::tty::add_ref(pty_id, side);
-                }
-                _ => {}
-            }
-            if oldfd != newfd {
-                if let Some(old) = current.fd_table.close(newfd) {
-                    close_descriptor(old);
-                }
+            // dup2 shares the same open-file description. Do not increment
+            // pipe/PTY backing counts: those belong to the OFD, not each fd.
+            if let Some(old) = current.fd_table.close(newfd) {
+                close_descriptor(old);
             }
             if current.fd_table.dup2(oldfd, newfd) {
                 return newfd;
@@ -1618,6 +1602,31 @@ pub fn sys_unlink(current_slot: usize, path_ptr: *const u8) -> usize {
     let path = resolve_task_path(current_slot, &raw);
     let success = VFS.get().remove_file(&path);
     if success { 0 } else { usize::MAX }
+}
+
+pub fn sys_rename(current_slot: usize, old_ptr: *const u8, new_ptr: *const u8) -> usize {
+    let old_raw = copy_cstr_from_user(old_ptr);
+    let new_raw = copy_cstr_from_user(new_ptr);
+    if old_raw.is_empty() || new_raw.is_empty() { return EINVAL; }
+    let old = resolve_task_path(current_slot, &old_raw);
+    let new = resolve_task_path(current_slot, &new_raw);
+    match VFS.get().rename(&old, &new) {
+        Ok(()) => {
+            // Regular file descriptors are inode-backed and survive naturally.
+            // Directory descriptors still carry a namespace path for getdents,
+            // so retarget every open directory fd after a successful rename.
+            unsafe {
+                for task in TASK_MANAGER.tasks.iter_mut().flatten() {
+                    task.fd_table.rewrite_dir_paths(&old, &new);
+                }
+            }
+            0
+        }
+        Err(RenameError::NotFound) => ENOENT,
+        Err(RenameError::Exists) => EEXIST,
+        Err(RenameError::CrossDevice) => EXDEV,
+        Err(RenameError::Unsupported) => EINVAL,
+    }
 }
 
 /// Читает содержимое директории и записывает имена файлов
@@ -1749,6 +1758,7 @@ pub fn sys_setsid(current_slot: usize) -> usize {
         task.sid = task.pid;
         task.pgid = task.pid;
         task.tty_id = -1;
+        task.pty_id = -1;
         task.pid as usize
     }
 }
@@ -1770,18 +1780,22 @@ pub struct TimeVal { tv_sec: i32, tv_usec: i32 }
 #[derive(Clone, Copy, Default)]
 pub struct TimeSpec { tv_sec: i32, tv_nsec: i32 }
 
-fn monotonic_ms() -> u64 { crate::time::jiffies() as u64 }
+fn monotonic_ms() -> u64 { crate::time::uptime_ms() }
 
 pub fn sys_gettimeofday(tv: *mut TimeVal) -> usize {
     if tv.is_null() { return EFAULT; }
-    let ms = monotonic_ms();
+    let ms = crate::time::realtime_ms();
     unsafe { *tv = TimeVal { tv_sec: (ms / 1000) as i32, tv_usec: ((ms % 1000) * 1000) as i32 }; }
     0
 }
 
-pub fn sys_clock_gettime(_clock_id: i32, tp: *mut TimeSpec) -> usize {
+pub fn sys_clock_gettime(clock_id: i32, tp: *mut TimeSpec) -> usize {
     if tp.is_null() { return EFAULT; }
-    let ms = monotonic_ms();
+    let ms = match clock_id {
+        0 => crate::time::realtime_ms(), // CLOCK_REALTIME
+        1 => monotonic_ms(),             // CLOCK_MONOTONIC
+        _ => return EINVAL,
+    };
     unsafe { *tp = TimeSpec { tv_sec: (ms / 1000) as i32, tv_nsec: ((ms % 1000) * 1_000_000) as i32 }; }
     0
 }
@@ -1897,13 +1911,14 @@ pub fn sys_exit(current_slot: usize, esp: u32, status: i32) -> u32 {
             if let Some(ref mut t) = TASK_MANAGER.tasks[current_slot] {
                 dead_pid = t.pid;
                 // Close all fds so pipe writers release EOF to readers.
-                let fds: alloc::vec::Vec<_> = t.fd_table.take_all().collect();
+                let fds = t.fd_table.take_all();
                 for desc in fds {
                     close_descriptor(desc);
                 }
                 t.running = false;
                 t.stopped = false;
                 t.zombie = true;
+                t.term_signal = 0;
                 t.exit_code = status;
             }
             crate::syscalls::wasm::clear_task_state(current_slot);
@@ -1918,6 +1933,8 @@ pub fn sys_exit(current_slot: usize, esp: u32, status: i32) -> u32 {
 /// `pid == -1` waits for any child.
 /// Returns the reaped child's slot (pid), or usize::MAX if no such child can ever appear.
 pub const WNOHANG: u32 = 1;
+pub const WUNTRACED: u32 = 2;
+pub const WCONTINUED: u32 = 8;
 
 fn signal_slot(slot: usize, sig: u32) -> bool {
     if slot == 0 || slot >= MAX_TASKS as usize { return false; }
@@ -1938,10 +1955,25 @@ fn signal_slot(slot: usize, sig: u32) -> bool {
             } else if handler != crate::signal::SIG_DFL {
                 crate::signal::send_signal(slot as i8, sig)
             } else {
-                crate::signal::stop_task(slot as i8)
+                crate::signal::stop_task_with_signal(slot as i8, sig)
             }
         }
-        crate::signal::SIGCONT => crate::signal::continue_task(slot as i8),
+        crate::signal::SIGCONT => {
+            // SIGCONT always resumes a stopped process. If userspace installed
+            // a handler, deliver it after the resume; SIG_IGN suppresses only
+            // handler delivery, never the resume itself.
+            let handler = unsafe {
+                TASK_MANAGER.tasks[slot]
+                    .as_ref()
+                    .map(|t| t.signal_handlers[(sig - 1) as usize])
+                    .unwrap_or(crate::signal::SIG_DFL)
+            };
+            let resumed = crate::signal::continue_task(slot as i8);
+            if resumed && handler != crate::signal::SIG_DFL && handler != crate::signal::SIG_IGN {
+                let _ = crate::signal::send_signal(slot as i8, sig);
+            }
+            resumed
+        }
         _ => crate::signal::send_signal(slot as i8, sig),
     }
 }
@@ -2025,40 +2057,108 @@ pub fn sys_wait_status(
     status_ptr: *mut i32,
     options: u32,
 ) -> usize {
-    let parent_pid = unsafe {
+    let (parent_pid, parent_pgid) = unsafe {
         TASK_MANAGER.tasks
             .get(current_slot)
             .and_then(|t| t.as_ref())
-            .map(|t| t.pid)
-            .unwrap_or(-1)
+            .map(|t| (t.pid, t.pgid))
+            .unwrap_or((-1, -1))
     };
     if parent_pid < 0 {
         return usize::MAX;
     }
-    let nohang = options & WNOHANG != 0;
+
+    let matches_selector = |child: &Task| -> bool {
+        if child.ppid != parent_pid {
+            return false;
+        }
+        match pid {
+            p if p > 0 => child.pid == p,
+            -1 => true,
+            0 => child.pgid == parent_pgid,
+            p => child.pgid == -p,
+        }
+    };
 
     loop {
-        let found = unsafe { TASK_MANAGER.find_zombie_child(parent_pid, pid) };
-        if let Some((child_slot, child_pid, exit_code)) = found {
-            if !status_ptr.is_null() {
-                unsafe { *status_ptr = exit_code; }
-            }
-            unsafe { TASK_MANAGER.reap(child_slot); }
-            return child_pid as usize;
+        enum ChildEvent {
+            Exited(usize, i32, i32, u32),
+            Stopped(usize, i32, u32),
+            Continued(usize, i32),
         }
 
-        if nohang {
+        let event = unsafe {
+            let mut found = None;
+            for (slot, task) in TASK_MANAGER.tasks.iter().enumerate() {
+                if slot == 0 { continue; }
+                let Some(child) = task.as_ref() else { continue; };
+                if !matches_selector(child) { continue; }
+
+                if child.zombie {
+                    found = Some(ChildEvent::Exited(slot, child.pid, child.exit_code, child.term_signal));
+                    break;
+                }
+                if options & WUNTRACED != 0 && child.wait_stopped_pending {
+                    found = Some(ChildEvent::Stopped(slot, child.pid, child.stop_signal));
+                    break;
+                }
+                if options & WCONTINUED != 0 && child.wait_continued_pending {
+                    found = Some(ChildEvent::Continued(slot, child.pid));
+                    break;
+                }
+            }
+            found
+        };
+
+        if let Some(event) = event {
+            match event {
+                ChildEvent::Exited(slot, child_pid, exit_code, term_signal) => {
+                    if !status_ptr.is_null() {
+                        // Unix wait status: normal exit code in bits 8..15;
+                        // signal termination in low 7 bits.
+                        let status = if term_signal != 0 {
+                            (term_signal & 0x7f) as i32
+                        } else {
+                            (exit_code & 0xff) << 8
+                        };
+                        unsafe { *status_ptr = status; }
+                    }
+                    unsafe { TASK_MANAGER.reap(slot); }
+                    return child_pid as usize;
+                }
+                ChildEvent::Stopped(slot, child_pid, sig) => {
+                    if !status_ptr.is_null() {
+                        // POSIX/Linux wait status: low byte 0x7f, stop signal in high byte.
+                        unsafe { *status_ptr = (((sig & 0xff) << 8) | 0x7f) as i32; }
+                    }
+                    unsafe {
+                        if let Some(child) = TASK_MANAGER.tasks[slot].as_mut() {
+                            child.wait_stopped_pending = false;
+                        }
+                    }
+                    return child_pid as usize;
+                }
+                ChildEvent::Continued(slot, child_pid) => {
+                    if !status_ptr.is_null() {
+                        unsafe { *status_ptr = 0xffff; }
+                    }
+                    unsafe {
+                        if let Some(child) = TASK_MANAGER.tasks[slot].as_mut() {
+                            child.wait_continued_pending = false;
+                        }
+                    }
+                    return child_pid as usize;
+                }
+            }
+        }
+
+        if options & WNOHANG != 0 {
             return 0;
         }
 
-        // If a specific child no longer exists, a blocking wait must not sleep
-        // forever. For pid=-1, likewise fail when there are no children left.
         let has_matching_child = unsafe {
             TASK_MANAGER.tasks.iter().enumerate().any(|(slot, task)| {
-                slot != 0
-                    && task.as_ref().map_or(false, |t| {
-                        t.ppid == parent_pid && (pid < 0 || pid == t.pid)
-                    })
+                slot != 0 && task.as_ref().map_or(false, |t| matches_selector(t))
             })
         };
         if !has_matching_child {
@@ -2143,16 +2243,35 @@ pub fn sys_fcntl(current_slot: usize, fd: usize, cmd: u32, arg: u32) -> usize {
                 return usize::MAX;
             }
             match cmd {
-                F_GETFL => return current.fd_table.get_flags(fd) as usize,
+                F_GETFL => {
+                    let access = match current.fd_table.get(fd).copied() {
+                        Some(FileDescriptor::File { mode, .. })
+                        | Some(FileDescriptor::Device { mode, .. }) => match mode {
+                            FileMode::ReadOnly => O_RDONLY as u32,
+                            FileMode::WriteOnly => O_WRONLY as u32,
+                            FileMode::ReadWrite => O_RDWR as u32,
+                        },
+                        Some(FileDescriptor::Pipe { end: PipeEnd::Read, .. })
+                        | Some(FileDescriptor::ConsoleIn)
+                        | Some(FileDescriptor::Dir { .. }) => O_RDONLY as u32,
+                        Some(FileDescriptor::Pipe { end: PipeEnd::Write, .. })
+                        | Some(FileDescriptor::ConsoleOut) => O_WRONLY as u32,
+                        Some(FileDescriptor::Pty { .. })
+                        | Some(FileDescriptor::Socket { .. }) => O_RDWR as u32,
+                        None => return EBADF,
+                    };
+                    return (access | current.fd_table.get_flags(fd)) as usize;
+                }
                 F_SETFL => {
-                    // Only O_NONBLOCK is meaningful for now.
-                    let flags = arg & crate::filesystem::file::O_NONBLOCK;
+                    // File status flags live in the shared OFD. Access mode is
+                    // immutable and intentionally ignored by F_SETFL.
+                    let flags = arg & crate::filesystem::file::OFD_STATUS_MASK;
                     if current.fd_table.set_flags(fd, flags) {
                         return 0;
                     }
-                    return usize::MAX;
+                    return EBADF;
                 }
-                _ => return usize::MAX,
+                _ => return EINVAL,
             }
         }
     }
@@ -2258,7 +2377,7 @@ pub fn sys_poll(current_slot: usize, fds: *mut PollFd, nfds: usize, timeout_ms: 
         return 0;
     }
     let nfds = nfds.min(64);
-    let start = crate::time::jiffies();
+    let start_ms = crate::time::uptime_ms();
 
     loop {
         if let Some(mut g) = crate::net::stack::NET_STACK.try_lock() {
@@ -2287,9 +2406,8 @@ pub fn sys_poll(current_slot: usize, fds: *mut PollFd, nfds: usize, timeout_ms: 
             return 0;
         }
         if timeout_ms > 0 {
-            let elapsed = crate::time::jiffies().wrapping_sub(start);
-            // jiffies ~1ms on this kernel
-            if elapsed as i32 >= timeout_ms {
+            let elapsed = crate::time::uptime_ms().saturating_sub(start_ms);
+            if elapsed >= timeout_ms as u64 {
                 return 0;
             }
         }
@@ -2491,18 +2609,8 @@ pub fn install_child_fd(
     }
     unsafe {
         if let Some(ref parent) = TASK_MANAGER.tasks[parent_slot] {
-            if let Some(desc) = parent.fd_table.get(parent_fd as usize).copied() {
-                match desc {
-                    FileDescriptor::Pipe { pipe_id, end } => match end {
-                        PipeEnd::Read => pipe::pipe_add_reader(pipe_id),
-                        PipeEnd::Write => pipe::pipe_add_writer(pipe_id),
-                    },
-                    FileDescriptor::Pty { pty_id, side } => {
-                        let _ = crate::tty::add_ref(pty_id, side);
-                    }
-                    _ => {}
-                }
-                child_table.set(child_fd, desc);
+            if let Some((desc, ofd)) = parent.fd_table.clone_entry(parent_fd as usize) {
+                child_table.set_shared(child_fd, desc, ofd);
                 return;
             }
         }
@@ -2542,12 +2650,12 @@ pub fn sys_execve(
     }
     let slot = slot_i8 as usize;
     let pid = unsafe { TASK_MANAGER.alloc_pid() };
-    let (ppid, inherited_pgid, inherited_sid, inherited_cwd, inherited_tty) = unsafe {
+    let (ppid, inherited_pgid, inherited_sid, inherited_cwd, inherited_tty, inherited_pty) = unsafe {
         TASK_MANAGER.tasks
             .get(parent_slot)
             .and_then(|t| t.as_ref())
-            .map(|p| (p.pid, p.pgid, p.sid, p.cwd.clone(), p.tty_id))
-            .unwrap_or((0, pid, pid, "/".to_string(), -1))
+            .map(|p| (p.pid, p.pgid, p.sid, p.cwd.clone(), p.tty_id, p.pty_id))
+            .unwrap_or((0, pid, pid, "/".to_string(), -1, -1))
     };
     let sid = if parent_slot == 0 || inherited_sid <= 0 { pid } else { inherited_sid };
     let inherited_group = if parent_slot == 0 || inherited_pgid <= 0 { pid } else { inherited_pgid };
@@ -2665,6 +2773,7 @@ pub fn sys_execve(
         task.parent = parent_slot as i8;
         task.cwd = inherited_cwd;
         task.tty_id = inherited_tty;
+        task.pty_id = inherited_pty;
         task.zombie = false;
         task.stopped = false;
         task.exit_code = 0;
@@ -2682,6 +2791,13 @@ pub fn sys_execve(
         install_child_fd(parent_slot, &mut fd_table, 0, stdin_fd, FileDescriptor::ConsoleIn);
         install_child_fd(parent_slot, &mut fd_table, 1, stdout_fd, FileDescriptor::ConsoleOut);
         install_child_fd(parent_slot, &mut fd_table, 2, stderr_fd, FileDescriptor::ConsoleOut);
+        // A terminal-facing spawn gets a concrete controlling PTY from any
+        // inherited slave stdio endpoint. Keep it even if fd 0/1/2 are later
+        // redirected so /dev/tty remains usable.
+        task.pty_id = (0..3).find_map(|fd| match fd_table.get(fd) {
+            Some(FileDescriptor::Pty { pty_id, side: PtySide::Slave }) => Some(*pty_id as i16),
+            _ => None,
+        }).unwrap_or(task.pty_id);
         task.fd_table = fd_table;
 
         // Publish only a fully initialized runnable task.

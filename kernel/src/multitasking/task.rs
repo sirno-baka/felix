@@ -89,10 +89,21 @@ pub struct Task {
     pub parent: i8,
     /// Per-process working directory inherited across spawn.
     pub cwd: String,
-    /// Controlling PTY id, -1 when none is attached.
+    /// Logical controlling TTY id (session/foreground process-group state).
     pub tty_id: i16,
+    /// Concrete PTY slave backing this process' controlling terminal. This is
+    /// kept separately so /dev/tty still works after stdio descriptors change.
+    pub pty_id: i16,
     pub zombie: bool,
     pub stopped: bool,
+    /// Signal that caused the most recent job-control stop.
+    pub stop_signal: u32,
+    /// Child-state transitions are latched until waitpid consumes them.
+    pub wait_stopped_pending: bool,
+    pub wait_continued_pending: bool,
+    /// 0 for normal exit, otherwise the terminating signal number. Kept
+    /// separately so waitpid can construct a real Unix wait status.
+    pub term_signal: u32,
     pub exit_code: i32,
     /// Short process name used by ps/task_list. NUL padded UTF-8/ASCII.
     pub name: [u8; 32],
@@ -150,8 +161,13 @@ impl Task {
             parent: -1,
             cwd: "/".to_string(),
             tty_id: -1,
+            pty_id: -1,
             zombie: false,
             stopped: false,
+            stop_signal: 0,
+            wait_stopped_pending: false,
+            wait_continued_pending: false,
+            term_signal: 0,
             exit_code: 0,
             name: [0; 32],
             pending_signals: 0,
@@ -260,7 +276,13 @@ impl TaskManager {
             task.sid = 0;
             task.parent = -1;
             task.cwd = "/".to_string();
+            task.tty_id = -1;
+            task.pty_id = -1;
             task.stopped = false;
+            task.stop_signal = 0;
+            task.wait_stopped_pending = false;
+            task.wait_continued_pending = false;
+            task.term_signal = 0;
             task.name[..4].copy_from_slice(b"idle");
 
             gdt::TSS.esp0 = task.kernel_stack;

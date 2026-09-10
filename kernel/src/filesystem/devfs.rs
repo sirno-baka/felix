@@ -8,7 +8,7 @@ use core::cmp;
 use crate::device::char::CharDevice;
 use crate::disk::interface::BlockDevice;
 use crate::filesystem::file::DeviceKind;
-use crate::filesystem::vfs::{DirEntry, Filesystem};
+use crate::filesystem::vfs::{DirEntry, Filesystem, Metadata};
 use crate::spin;
 use crate::sync::MutexLazy;
 use crate::sync::mutex::Mutex;
@@ -34,6 +34,10 @@ fn new_inode_counter() -> Mutex<u32> { Mutex::new(1) }
 /// and withdraw /dev entries at runtime.
 static DEVICES: MutexLazy<Mutex<Vec<DeviceNode>>> = MutexLazy::new(new_devices);
 static NEXT_INODE: MutexLazy<Mutex<u32>> = MutexLazy::new(new_inode_counter);
+
+/// Virtual controlling-terminal node. Opening it is handled by the syscall
+/// layer because the concrete PTY depends on the calling process.
+pub const TTY_INODE: u32 = 0x00ff_fffe;
 
 pub struct DevFS;
 
@@ -98,6 +102,9 @@ impl DevFS {
     }
 
     pub fn device_kind(name: &str) -> Option<DeviceKind> {
+        if name.trim_matches('/') == "tty" {
+            return Some(DeviceKind::Char);
+        }
         let devices = DEVICES.get().lock();
         let node = devices.iter().find(|d| d.name == name)?;
         Some(match &node.dev_type {
@@ -116,6 +123,9 @@ impl Filesystem for DevFS {
             .unwrap_or(path);
         if clean_name.is_empty() || clean_name == "dev" {
             return None;
+        }
+        if clean_name == "tty" {
+            return Some(TTY_INODE);
         }
         let devices = DEVICES.get().lock();
         devices
@@ -157,21 +167,26 @@ impl Filesystem for DevFS {
             return None;
         }
         let devices = DEVICES.get().lock();
-        Some(
-            devices
-                .iter()
-                .map(|d| DirEntry {
-                    inode: d.inode,
-                    name: d.name.clone(),
-                    // 2 = directory, 3 = block, 4 = char
-                    file_type: match &d.dev_type {
-                        DeviceType::Block(_) => 3,
-                        DeviceType::Char(_) => 4,
-                    },
-                    size: 0,
-                })
-                .collect(),
-        )
+        let mut entries: Vec<DirEntry> = devices
+            .iter()
+            .map(|d| DirEntry {
+                inode: d.inode,
+                name: d.name.clone(),
+                // 2 = directory, 3 = block, 4 = char
+                file_type: match &d.dev_type {
+                    DeviceType::Block(_) => 3,
+                    DeviceType::Char(_) => 4,
+                },
+                size: 0,
+            })
+            .collect();
+        entries.push(DirEntry {
+            inode: TTY_INODE,
+            name: "tty".into(),
+            file_type: 4,
+            size: 0,
+        });
+        Some(entries)
     }
 
     // DevFS не поддерживает создание/удаление файлов через обычные системные вызовы
@@ -195,6 +210,71 @@ impl Filesystem for DevFS {
     }
     fn is_mounted(&self) -> bool {
         true
+    }
+
+    fn metadata(&self, path: &str) -> Option<Metadata> {
+        let clean = path.trim_matches('/');
+        if clean.is_empty() || clean == "." || clean == "dev" {
+            return Some(Metadata {
+                inode: 0,
+                mode: 0o040755,
+                nlink: 2,
+                blksize: 4096,
+                ..Metadata::default()
+            });
+        }
+        let name = clean.rsplit('/').next()?;
+        if name == "tty" {
+            return Some(Metadata {
+                inode: TTY_INODE,
+                mode: 0o020620,
+                nlink: 1,
+                rdev: TTY_INODE as u64,
+                blksize: 1,
+                ..Metadata::default()
+            });
+        }
+        let devices = DEVICES.get().lock();
+        let node = devices.iter().find(|d| d.name == name)?;
+        let (mode, blksize) = match &node.dev_type {
+            DeviceType::Block(dev) => (0o060660, dev.lock().sector_size()),
+            DeviceType::Char(_) => (0o020660, 1),
+        };
+        Some(Metadata {
+            inode: node.inode,
+            mode,
+            nlink: 1,
+            rdev: node.inode as u64,
+            blksize,
+            ..Metadata::default()
+        })
+    }
+
+    fn metadata_inode(&self, inode: u32) -> Option<Metadata> {
+        if inode == TTY_INODE {
+            return Some(Metadata {
+                inode,
+                mode: 0o020620,
+                nlink: 1,
+                rdev: TTY_INODE as u64,
+                blksize: 1,
+                ..Metadata::default()
+            });
+        }
+        let devices = DEVICES.get().lock();
+        let node = devices.iter().find(|d| d.inode == inode)?;
+        let (mode, blksize) = match &node.dev_type {
+            DeviceType::Block(dev) => (0o060660, dev.lock().sector_size()),
+            DeviceType::Char(_) => (0o020660, 1),
+        };
+        Some(Metadata {
+            inode,
+            mode,
+            nlink: 1,
+            rdev: inode as u64,
+            blksize,
+            ..Metadata::default()
+        })
     }
 }
 

@@ -14,6 +14,30 @@ pub struct DirEntry {
     pub size: u32,     // размер файла (0 для директорий)
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Metadata {
+    pub inode: u32,
+    pub mode: u32,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u64,
+    pub size: u64,
+    pub blksize: u32,
+    pub blocks: u64,
+    pub atime: u32,
+    pub mtime: u32,
+    pub ctime: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameError {
+    NotFound,
+    Exists,
+    CrossDevice,
+    Unsupported,
+}
+
 pub trait Filesystem: Send + Sync {
     fn read_file(&self, path: &str) -> Option<Vec<u8>>;
     fn write_file(&mut self, path: &str, data: &[u8]) -> bool;
@@ -26,6 +50,14 @@ pub trait Filesystem: Send + Sync {
     fn read_at(&self, inode: u32, offset: u64, buf: &mut [u8]) -> usize;
     fn write_at(&mut self, inode: u32, offset: u64, buf: &[u8]) -> usize;
     fn is_mounted(&self) -> bool;
+
+    /// Backend metadata. Mode includes both file type and permission bits.
+    fn metadata(&self, _path: &str) -> Option<Metadata> { None }
+    fn metadata_inode(&self, _inode: u32) -> Option<Metadata> { None }
+
+    /// Rename within one filesystem. VFS rejects cross-mount renames before
+    /// reaching the backend.
+    fn rename(&mut self, _old: &str, _new: &str) -> bool { false }
 }
 
 pub struct Vfs {
@@ -188,6 +220,83 @@ impl Vfs {
             .map(|local_inode| ((fs_id as u32) << 24) | (local_inode & 0x00FFFFFF))
     }
 
+    pub fn metadata(&self, path: &str) -> Option<Metadata> {
+        let inner = self.inner.lock();
+        let normalized = normalize_dir_path(path);
+        let (fs, rel_path, fs_id) = resolve(&inner, &normalized);
+        if let Some(mut meta) = fs.metadata(&rel_path) {
+            meta.inode = ((fs_id as u32) << 24) | (meta.inode & 0x00ff_ffff);
+            return Some(meta);
+        }
+
+        // A parent implied only by mount points (e.g. /mnt for /mnt/usb0)
+        // is still a real directory in the VFS namespace.
+        if has_mount_descendant(&inner, &normalized) {
+            return Some(Metadata {
+                inode: 0,
+                mode: 0o040755,
+                nlink: 2,
+                blksize: 4096,
+                ..Metadata::default()
+            });
+        }
+        None
+    }
+
+    pub fn metadata_inode(&self, global_inode: u32) -> Option<Metadata> {
+        let inner = self.inner.lock();
+        let fs_id = (global_inode >> 24) as u8;
+        let local_inode = global_inode & 0x00ff_ffff;
+        let mut meta = if fs_id == 0 {
+            inner.root_fs.as_ref()?.metadata_inode(local_inode)?
+        } else {
+            inner.mounts.iter().find(|m| m.fs_id == fs_id)?.fs.metadata_inode(local_inode)?
+        };
+        meta.inode = global_inode;
+        Some(meta)
+    }
+
+    pub fn rename(&self, old_path: &str, new_path: &str) -> Result<(), RenameError> {
+        let mut inner = self.inner.lock();
+        let old_path = normalize_dir_path(old_path);
+        let new_path = normalize_dir_path(new_path);
+        if old_path == "/" || new_path == "/" {
+            return Err(RenameError::Unsupported);
+        }
+
+        let (old_rel, old_id) = {
+            let (_, rel, id) = resolve(&inner, &old_path);
+            (rel, id)
+        };
+        let (new_rel, new_id) = {
+            let (_, rel, id) = resolve(&inner, &new_path);
+            (rel, id)
+        };
+        if old_id != new_id {
+            return Err(RenameError::CrossDevice);
+        }
+
+        let fs: &mut dyn Filesystem = if old_id == 0 {
+            inner.root_fs.as_mut().ok_or(RenameError::NotFound)?.as_mut()
+        } else {
+            inner.mounts.iter_mut().find(|m| m.fs_id == old_id)
+                .ok_or(RenameError::NotFound)?.fs.as_mut()
+        };
+        let old_exists = fs.resolve_path(&old_rel).is_some() || fs.list_directory_entries(&old_rel).is_some();
+        if !old_exists {
+            return Err(RenameError::NotFound);
+        }
+        let new_exists = fs.resolve_path(&new_rel).is_some() || fs.list_directory_entries(&new_rel).is_some();
+        if new_exists {
+            return Err(RenameError::Exists);
+        }
+        if fs.rename(&old_rel, &new_rel) {
+            Ok(())
+        } else {
+            Err(RenameError::Unsupported)
+        }
+    }
+
     pub fn read_at(&self, global_inode: u32, offset: u64, buf: &mut [u8]) -> usize {
         let inner = self.inner.lock();
         let fs_id = (global_inode >> 24) as usize;
@@ -217,6 +326,34 @@ impl Vfs {
         }
         0
     }
+
+    /// Atomic O_APPEND primitive. EOF lookup and write happen while holding the
+    /// same VFS lock, so independently opened append descriptors cannot race
+    /// each other between stat() and write(). Returns (bytes_written, new_eof).
+    pub fn append_write(&self, global_inode: u32, buf: &[u8]) -> (usize, u64) {
+        let mut inner = self.inner.lock();
+        let fs_id = (global_inode >> 24) as u8;
+        let local_inode = global_inode & 0x00ff_ffff;
+
+        let fs: &mut dyn Filesystem = if fs_id == 0 {
+            match inner.root_fs.as_mut() {
+                Some(fs) => fs.as_mut(),
+                None => return (0, 0),
+            }
+        } else {
+            match inner.mounts.iter_mut().find(|m| m.fs_id == fs_id) {
+                Some(mount) => mount.fs.as_mut(),
+                None => return (0, 0),
+            }
+        };
+
+        let eof = match fs.metadata_inode(local_inode) {
+            Some(meta) => meta.size,
+            None => return (0, 0),
+        };
+        let written = fs.write_at(local_inode, eof, buf);
+        (written, eof.saturating_add(written as u64))
+    }
 }
 
 // ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
@@ -232,6 +369,17 @@ fn normalize_dir_path(path: &str) -> String {
 /// Add the immediate directory components implied by deeper mountpoints.
 /// Example: /mnt/usb0 and /mnt/cf0 make `ls /` show `mnt/`, while `ls /mnt`
 /// shows `usb0/` and `cf0/` even if the root filesystem has no /mnt inode.
+fn has_mount_descendant(inner: &VfsInner, path: &str) -> bool {
+    inner.mounts.iter().any(|mount| {
+        if path == "/" {
+            mount.point != "/"
+        } else {
+            mount.point.starts_with(path)
+                && mount.point.as_bytes().get(path.len()) == Some(&b'/')
+        }
+    })
+}
+
 fn add_mount_children(inner: &VfsInner, path: &str, entries: &mut Vec<DirEntry>) -> bool {
     let mut added = false;
     for mount in &inner.mounts {

@@ -49,6 +49,7 @@ pub const SYS_GETDENTS64: u32 = 220;
 pub const SYS_EXIT_GROUP: u32 = 252;
 /// kill(pid, sig) — queue signal for task. 0 on success, usize::MAX on error.
 pub const SYS_KILL: u32 = 37;
+pub const SYS_RENAME: u32 = 38;
 /// sigaction(sig, act, oldact) — set/get signal handler. 0 on success.
 pub const SYS_SIGACTION: u32 = 67;
 /// wait(pid, options) — block until child exits (-1 = any). options: WNOHANG=1

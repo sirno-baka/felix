@@ -8,7 +8,7 @@
 //   - switch to a fresh CPUState from schedule() which has no error-code
 //     on the stack, so iretd layout matches the timer/exit path.
 
-use crate::filesystem::file::{FileDescriptor, PipeEnd};
+use crate::filesystem::file::{ClosedFileDescriptor, FileDescriptor, PipeEnd};
 use crate::multitasking::task::{CPUState, TASK_MANAGER};
 use crate::net::SOCKET_TABLE;
 use crate::pipe;
@@ -22,8 +22,11 @@ fn is_user_cs(cs: u32) -> bool {
     (cs & 3) == 3
 }
 
-fn close_descriptor(desc: FileDescriptor) {
-    match desc {
+fn close_descriptor(closed: ClosedFileDescriptor) {
+    if !closed.last_open_ref {
+        return;
+    }
+    match closed.desc {
         FileDescriptor::Socket { socket_id } => {
             SOCKET_TABLE.lock().free(socket_id);
         }
@@ -31,6 +34,9 @@ fn close_descriptor(desc: FileDescriptor) {
             PipeEnd::Read => pipe::pipe_close_reader(pipe_id),
             PipeEnd::Write => pipe::pipe_close_writer(pipe_id),
         },
+        FileDescriptor::Pty { pty_id, side } => {
+            crate::tty::close_ref(pty_id, side);
+        }
         _ => {}
     }
 }
@@ -50,7 +56,7 @@ fn kill_current_task(esp: u32, reason: &str, exit_code: i32) -> u32 {
         }
 
         if let Some(ref mut t) = TASK_MANAGER.tasks[slot] {
-            let fds: alloc::vec::Vec<_> = t.fd_table.take_all().collect();
+            let fds: alloc::vec::Vec<_> = t.fd_table.take_all().into_iter().collect();
             for desc in fds {
                 close_descriptor(desc);
             }

@@ -30,6 +30,8 @@ pub const SYS_GETSID: u32 = 147;
 pub const SYS_NANOSLEEP: u32 = 162;
 pub const SYS_GETCWD: u32 = 183;
 pub const SYS_CLOCK_GETTIME: u32 = 265;
+pub const CLOCK_REALTIME: i32 = 0;
+pub const CLOCK_MONOTONIC: i32 = 1;
 pub const SYS_BRK: u32 = 45;
 pub const SYS_MMAP: u32 = 90;
 pub const SYS_MUNMAP: u32 = 91;
@@ -38,11 +40,30 @@ pub const SYS_IOCTL: u32 = 54;
 
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
+pub const TCSETSW: u32 = 0x5403;
+pub const TCSETSF: u32 = 0x5404;
 pub const TIOCGPGRP: u32 = 0x540F;
 pub const TIOCSPGRP: u32 = 0x5410;
+pub const IFLAG_ICRNL: u32 = 0x0100;
+pub const OFLAG_OPOST: u32 = 0x0001;
+pub const OFLAG_ONLCR: u32 = 0x0004;
 pub const LFLAG_ISIG: u32 = 0x0001;
 pub const LFLAG_ICANON: u32 = 0x0002;
 pub const LFLAG_ECHO: u32 = 0x0008;
+pub const LFLAG_TOSTOP: u32 = 0x0100;
+
+pub const VINTR: usize = 0;
+pub const VQUIT: usize = 1;
+pub const VERASE: usize = 2;
+pub const VKILL: usize = 3;
+pub const VEOF: usize = 4;
+pub const VTIME: usize = 5;
+pub const VMIN: usize = 6;
+pub const VSUSP: usize = 10;
+
+pub const TCSANOW: u32 = 0;
+pub const TCSADRAIN: u32 = 1;
+pub const TCSAFLUSH: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -57,13 +78,22 @@ pub struct Termios {
 
 impl Default for Termios {
     fn default() -> Self {
+        let mut c_cc = [0u8; 19];
+        c_cc[VINTR] = 0x03;
+        c_cc[VQUIT] = 0x1c;
+        c_cc[VERASE] = 0x7f;
+        c_cc[VKILL] = 0x15;
+        c_cc[VEOF] = 0x04;
+        c_cc[VTIME] = 0;
+        c_cc[VMIN] = 1;
+        c_cc[VSUSP] = 0x1a;
         Self {
-            c_iflag: 0,
-            c_oflag: 0,
+            c_iflag: IFLAG_ICRNL,
+            c_oflag: OFLAG_OPOST | OFLAG_ONLCR,
             c_cflag: 0,
-            c_lflag: LFLAG_ISIG | LFLAG_ECHO,
+            c_lflag: LFLAG_ISIG | LFLAG_ICANON | LFLAG_ECHO,
             c_line: 0,
-            c_cc: [0; 19],
+            c_cc,
         }
     }
 }
@@ -76,6 +106,7 @@ pub const MAP_PRIVATE: u32 = 0x02;
 pub const MAP_FIXED: u32 = 0x10;
 pub const MAP_ANONYMOUS: u32 = 0x20;
 pub const SYS_KILL: u32 = 37;
+pub const SYS_RENAME: u32 = 38;
 pub const SYS_SIGACTION: u32 = 67;
 pub const SYS_WAIT: u32 = 114;
 pub const SYS_PIPE: u32 = 42;
@@ -84,6 +115,38 @@ pub const SYS_FCNTL: u32 = 55;
 pub const SYS_POLL: u32 = 168;
 pub const SYS_STAT64: u32 = 195;
 pub const SYS_FSTAT64: u32 = 197;
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stat64 {
+    pub st_dev: u64,
+    pub __pad0: [u8; 4],
+    pub __st_ino: u32,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u64,
+    pub __pad3: [u8; 4],
+    pub st_size: i64,
+    pub st_blksize: u32,
+    pub st_blocks: u64,
+    pub st_atime: u32,
+    pub st_atime_nsec: u32,
+    pub st_mtime: u32,
+    pub st_mtime_nsec: u32,
+    pub st_ctime: u32,
+    pub st_ctime_nsec: u32,
+    pub st_ino: u64,
+}
+
+pub const S_IFMT: u32 = 0o170000;
+pub const S_IFIFO: u32 = 0o010000;
+pub const S_IFCHR: u32 = 0o020000;
+pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFBLK: u32 = 0o060000;
+pub const S_IFREG: u32 = 0o100000;
+pub const S_IFSOCK: u32 = 0o140000;
 pub const SYS_GETDENTS64: u32 = 220;
 pub const SYS_EXIT_GROUP: u32 = 252;
 
@@ -104,6 +167,44 @@ pub const F_GETFL: u32 = 3;
 pub const F_SETFL: u32 = 4;
 
 pub const WNOHANG: u32 = 1;
+pub const WUNTRACED: u32 = 2;
+pub const WCONTINUED: u32 = 8;
+
+#[inline]
+pub const fn wifexited(status: i32) -> bool {
+    (status & 0x7f) == 0
+}
+
+#[inline]
+pub const fn wexitstatus(status: i32) -> i32 {
+    (status >> 8) & 0xff
+}
+
+#[inline]
+pub const fn wifsignaled(status: i32) -> bool {
+    let sig = status & 0x7f;
+    sig != 0 && sig != 0x7f
+}
+
+#[inline]
+pub const fn wtermsig(status: i32) -> u32 {
+    (status & 0x7f) as u32
+}
+
+#[inline]
+pub const fn wifstopped(status: i32) -> bool {
+    (status & 0xff) == 0x7f
+}
+
+#[inline]
+pub const fn wstopsig(status: i32) -> u32 {
+    ((status >> 8) & 0xff) as u32
+}
+
+#[inline]
+pub const fn wifcontinued(status: i32) -> bool {
+    status == 0xffff
+}
 
 pub const SIGHUP: u32 = 1;
 pub const SIGINT: u32 = 2;
@@ -235,6 +336,18 @@ pub unsafe fn rmdir(path: *const u8) -> usize {
     ret
 }
 
+pub unsafe fn rename(old_path: *const u8, new_path: *const u8) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_RENAME => ret,
+        in("ebx") old_path,
+        in("ecx") new_path,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
 pub unsafe fn unlink(path: *const u8) -> usize {
     let ret: usize;
     asm!(
@@ -335,7 +448,17 @@ pub unsafe fn tcgetattr(fd: u32, termios: *mut Termios) -> usize {
 }
 
 pub unsafe fn tcsetattr(fd: u32, termios: *const Termios) -> usize {
-    ioctl(fd, TCSETS, termios as u32)
+    tcsetattr_action(fd, TCSANOW, termios)
+}
+
+pub unsafe fn tcsetattr_action(fd: u32, optional_actions: u32, termios: *const Termios) -> usize {
+    let request = match optional_actions {
+        TCSANOW => TCSETS,
+        TCSADRAIN => TCSETSW,
+        TCSAFLUSH => TCSETSF,
+        _ => return usize::MAX,
+    };
+    ioctl(fd, request, termios as u32)
 }
 
 pub unsafe fn tcgetpgrp(fd: u32) -> i32 {
@@ -792,6 +915,30 @@ pub unsafe fn fcntl(fd: u32, cmd: u32, arg: u32) -> usize {
     in("ecx") cmd,
     in("edx") arg,
     options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn stat64(path: *const u8, st: *mut Stat64) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_STAT64 => ret,
+        in("ebx") path,
+        in("ecx") st,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn fstat64(fd: u32, st: *mut Stat64) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_FSTAT64 => ret,
+        in("ebx") fd,
+        in("ecx") st,
+        options(nostack, preserves_flags)
     );
     ret
 }

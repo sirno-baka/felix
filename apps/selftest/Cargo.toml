@@ -1,0 +1,11 @@
+[package]
+name = "selftest"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "selftest"
+test = false
+
+[dependencies.libfelix]
+path = "../../lib"

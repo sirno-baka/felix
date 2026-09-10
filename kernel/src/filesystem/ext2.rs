@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 // fs/ext2.rs
 use crate::disk::PartitionConfig;
 use crate::disk::interface::BlockDevice;
-use crate::filesystem::vfs::DirEntry;
+use crate::filesystem::vfs::{DirEntry, Metadata};
 use crate::spin::Mutex;
 use crate::{print, println};
 use core::mem;
@@ -540,9 +540,18 @@ impl Ext2 {
                     break; // защита от повреждённых/нулевых записей
                 }
 
-                let name_slice = &block_buf[offset + 8..offset + 8 + entry.name_len as usize];
-                if core::str::from_utf8(name_slice).unwrap_or("") == name {
-                    return Some(entry.inode);
+                let name_start = offset + 8;
+                let name_end = name_start.saturating_add(entry.name_len as usize);
+                if name_end > self.block_size as usize
+                    || name_end > offset.saturating_add(entry.rec_len as usize)
+                {
+                    break;
+                }
+                if entry.inode != 0 {
+                    let name_slice = &block_buf[name_start..name_end];
+                    if core::str::from_utf8(name_slice).unwrap_or("") == name {
+                        return Some(entry.inode);
+                    }
                 }
 
                 offset += entry.rec_len as usize;
@@ -630,13 +639,14 @@ impl Ext2 {
 
         let mut indirect_buf = [0u8; 4096];
 
+        let now = (crate::time::realtime_ms() / 1000) as u32;
         let mut inode = Ext2Inode {
             i_mode: 0x8000 | 0o644, // regular file
             i_uid: 0,
             i_size: data.len() as u32,
-            i_atime: 0,
-            i_ctime: 0,
-            i_mtime: 0,
+            i_atime: now,
+            i_ctime: now,
+            i_mtime: now,
             i_dtime: 0,
             i_gid: 0,
             i_links_count: 1,
@@ -1027,7 +1037,9 @@ impl Ext2 {
 
         // обновляем inode
         inode.i_size = data.len() as u32;
-        inode.i_mtime = 0; // TODO: real time
+        let now = (crate::time::realtime_ms() / 1000) as u32;
+        inode.i_mtime = now;
+        inode.i_ctime = now;
         inode.i_blocks = num_blocks_needed * (self.block_size / 512);
 
         self.write_inode(inode_num, &inode);
@@ -1330,13 +1342,14 @@ impl Ext2 {
         };
 
         // Создаём inode директории
+        let now = (crate::time::realtime_ms() / 1000) as u32;
         let mut inode = Ext2Inode {
             i_mode: 0x4000 | 0o755, // directory + rwxr-xr-x
             i_uid: 0,
             i_size: self.block_size, // обычно один блок
-            i_atime: 0,
-            i_ctime: 0,
-            i_mtime: 0,
+            i_atime: now,
+            i_ctime: now,
+            i_mtime: now,
             i_dtime: 0,
             i_gid: 0,
             i_links_count: 2, // . и ..
@@ -1499,6 +1512,113 @@ impl Ext2 {
         true
     }
 
+    fn update_dotdot(&self, dir_inode: u32, parent_inode: u32) -> bool {
+        let inode = self.read_inode(dir_inode);
+        let block = inode.i_block[0];
+        if block == 0 { return false; }
+        let mut buf = [0u8; 4096];
+        unsafe { self.read_blocks(block, buf.as_mut_ptr(), 1); }
+        let mut offset = 0usize;
+        while offset + 8 <= self.block_size as usize {
+            let entry = unsafe {
+                core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const Ext2DirEntry)
+            };
+            if entry.rec_len == 0 || entry.rec_len as usize > self.block_size as usize - offset {
+                break;
+            }
+            let start = offset + 8;
+            let end = start + entry.name_len as usize;
+            if end > self.block_size as usize { break; }
+            if &buf[start..end] == b".." {
+                let mut changed = entry;
+                changed.inode = parent_inode;
+                unsafe {
+                    core::ptr::write_unaligned(buf.as_mut_ptr().add(offset) as *mut Ext2DirEntry, changed);
+                    self.write_blocks(block, buf.as_ptr(), 1);
+                }
+                return true;
+            }
+            offset += entry.rec_len as usize;
+        }
+        false
+    }
+
+    pub fn metadata_by_inode(&self, inode_num: u32) -> Option<Metadata> {
+        if !self.mounted || inode_num == 0 { return None; }
+        let inode = self.read_inode(inode_num);
+        if inode.i_mode == 0 { return None; }
+        Some(Metadata {
+            inode: inode_num,
+            mode: inode.i_mode as u32,
+            nlink: inode.i_links_count as u32,
+            uid: inode.i_uid as u32,
+            gid: inode.i_gid as u32,
+            rdev: 0,
+            size: inode.i_size as u64,
+            blksize: self.block_size,
+            blocks: inode.i_blocks as u64,
+            atime: inode.i_atime,
+            mtime: inode.i_mtime,
+            ctime: inode.i_ctime,
+        })
+    }
+
+    pub fn rename_path(&mut self, old: &str, new: &str) -> bool {
+        if !self.mounted || old == "/" || new == "/" || old == new { return false; }
+        let Some(inode_num) = self.resolve_path(old) else { return false; };
+        if self.resolve_path(new).is_some() { return false; }
+        let Some((old_parent_path, old_name)) = self.split_path(old) else { return false; };
+        let Some((new_parent_path, new_name)) = self.split_path(new) else { return false; };
+        let Some(old_parent) = self.resolve_path(&old_parent_path) else { return false; };
+        let Some(new_parent) = self.resolve_path(&new_parent_path) else { return false; };
+        if (self.read_inode(old_parent).i_mode & 0xf000) != 0x4000
+            || (self.read_inode(new_parent).i_mode & 0xf000) != 0x4000 {
+            return false;
+        }
+
+        let mut inode = self.read_inode(inode_num);
+        let is_dir = (inode.i_mode & 0xf000) == 0x4000;
+        if is_dir {
+            let old_clean = old.trim_end_matches('/');
+            let new_parent_clean = new_parent_path.trim_end_matches('/');
+            if new_parent_clean == old_clean
+                || (new_parent_clean.starts_with(old_clean)
+                    && new_parent_clean.as_bytes().get(old_clean.len()) == Some(&b'/')) {
+                return false;
+            }
+        }
+        let file_type = if is_dir { 2 } else { 1 };
+
+        // Link the existing inode under the new name first; only then remove
+        // the old dirent. If the second step fails, roll back the new link.
+        if !self.add_dir_entry(new_parent, &new_name, inode_num, file_type) { return false; }
+        if !self.remove_dir_entry(old_parent, &old_name) {
+            let _ = self.remove_dir_entry(new_parent, &new_name);
+            return false;
+        }
+
+        if is_dir && old_parent != new_parent {
+            if !self.update_dotdot(inode_num, new_parent) {
+                // Namespace move already happened; keep it usable rather than
+                // attempting a destructive rollback after two dirent writes.
+                return false;
+            }
+            let mut op = self.read_inode(old_parent);
+            let mut np = self.read_inode(new_parent);
+            op.i_links_count = op.i_links_count.saturating_sub(1);
+            np.i_links_count = np.i_links_count.saturating_add(1);
+            let now = (crate::time::realtime_ms() / 1000) as u32;
+            op.i_mtime = now; op.i_ctime = now;
+            np.i_mtime = now; np.i_ctime = now;
+            self.write_inode(old_parent, &op);
+            self.write_inode(new_parent, &np);
+        }
+        let now = (crate::time::realtime_ms() / 1000) as u32;
+        inode.i_ctime = now;
+        self.write_inode(inode_num, &inode);
+        true
+    }
+
     fn is_directory_empty(&self, dir_inode: u32) -> bool {
         let inode = self.read_inode(dir_inode);
         if inode.i_block[0] == 0 {
@@ -1555,8 +1675,14 @@ impl Ext2 {
                     core::ptr::read_unaligned(block_buf.as_ptr().add(offset) as *const Ext2DirEntry)
                 };
 
-                if entry.rec_len == 0 || entry.inode == 0 {
+                if entry.rec_len == 0
+                    || entry.rec_len as usize > self.block_size as usize - offset
+                {
                     break;
+                }
+                if entry.inode == 0 {
+                    offset += entry.rec_len as usize;
+                    continue;
                 }
 
                 let name_len = entry.name_len as usize;
@@ -1624,6 +1750,19 @@ impl crate::filesystem::Filesystem for Ext2 {
 
     fn is_mounted(&self) -> bool {
         self.mounted
+    }
+
+    fn metadata(&self, path: &str) -> Option<Metadata> {
+        let inode = self.resolve_path(path)?;
+        self.metadata_by_inode(inode)
+    }
+
+    fn metadata_inode(&self, inode: u32) -> Option<Metadata> {
+        self.metadata_by_inode(inode)
+    }
+
+    fn rename(&mut self, old: &str, new: &str) -> bool {
+        self.rename_path(old, new)
     }
 
     fn read_at(&self, inode_num: u32, offset: u64, buf: &mut [u8]) -> usize {
@@ -1728,6 +1867,11 @@ impl crate::filesystem::Filesystem for Ext2 {
         inode.i_size = new_size;
         let used_blocks = ((new_size as u32 + self.block_size - 1) / self.block_size).min(12);
         inode.i_blocks = used_blocks * (self.block_size / 512);
+        if written != 0 {
+            let now = (crate::time::realtime_ms() / 1000) as u32;
+            inode.i_mtime = now;
+            inode.i_ctime = now;
+        }
         self.write_inode(inode_num, &inode);
         written
     }
