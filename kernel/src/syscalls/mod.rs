@@ -7,8 +7,8 @@ pub const SYS_READ: u32 = 3;
 pub const SYS_WRITE: u32 = 4;
 pub const SYS_OPEN: u32 = 5; // open(filename) → fd или -1
 pub const SYS_CLOSE: u32 = 6; // close(fd)
-pub const SYS_MKDIR: u32 = 7; // mkdir
-pub const SYS_RMDIR: u32 = 8; // rmdir
+pub const SYS_MKDIR: u32 = 39;
+pub const SYS_RMDIR: u32 = 40;
 pub const SYS_UNLINK: u32 = 10; // delete/unlink(filename)
 pub const SYS_CHDIR: u32 = 12;
 
@@ -52,9 +52,9 @@ pub const SYS_KILL: u32 = 37;
 pub const SYS_RENAME: u32 = 38;
 /// sigaction(sig, act, oldact) — set/get signal handler. 0 on success.
 pub const SYS_SIGACTION: u32 = 67;
-/// wait(pid, options) — block until child exits (-1 = any). options: WNOHANG=1
+/// Linux i386 waitpid(pid, status, options). options: WNOHANG=1.
 /// Returns pid of the reaped child, 0 if WNOHANG and none ready, or usize::MAX on error.
-pub const SYS_WAIT: u32 = 114;
+pub const SYS_WAIT: u32 = 7;
 /// pipe(pipefd: *mut u32) — writes [read_fd, write_fd], returns 0 or usize::MAX
 pub const SYS_PIPE: u32 = 42;
 /// dup2(oldfd, newfd) → newfd or usize::MAX
@@ -64,10 +64,13 @@ pub const SYS_FCNTL: u32 = 55;
 /// poll(fds, nfds, timeout_ms) — timeout -1 = block, 0 = nonblock
 pub const SYS_POLL: u32 = 168;
 
-pub const SYS_MALLOC: u32 = 200;
-pub const SYS_FREE: u32 = 201;
-pub const SYS_REALLOC: u32 = 202; // ← добавь
-pub const SYS_LS: u32 = 302; // ls()
+// Felix-private ABI. Keep it away from the Linux i386 syscall namespace.
+pub const SYS_SPAWN: u32 = 0xF000;
+pub const SYS_EXECVE_WASM: u32 = 0xF001;
+pub const SYS_MALLOC: u32 = 0xF010;
+pub const SYS_FREE: u32 = 0xF011;
+pub const SYS_REALLOC: u32 = 0xF012;
+pub const SYS_LS: u32 = 0xF013;
 
 // Socket syscalls (Linux i386 numbers)
 pub const SYS_SOCKET: u32 = 359;
@@ -88,41 +91,39 @@ pub const SYS_SHUTDOWN: u32 = 373;
 
 // Window manager (kernel compositor)
 /// create(x, y, w, h, title_ptr) → window_id or usize::MAX
-pub const SYS_WM_CREATE: u32 = 400;
+pub const SYS_WM_CREATE: u32 = 0xF100;
 /// destroy(id) → 0 / usize::MAX
-pub const SYS_WM_DESTROY: u32 = 401;
+pub const SYS_WM_DESTROY: u32 = 0xF101;
 /// move(id, x, y) → 0 / usize::MAX
-pub const SYS_WM_MOVE: u32 = 402;
+pub const SYS_WM_MOVE: u32 = 0xF102;
 /// info(id, *mut WindowInfo) → 0 / usize::MAX
-pub const SYS_WM_INFO: u32 = 403;
+pub const SYS_WM_INFO: u32 = 0xF103;
 /// flip(id, user_pixels, len) → 0 / usize::MAX  (copy + compose)
-pub const SYS_WM_FLIP: u32 = 404;
+pub const SYS_WM_FLIP: u32 = 0xF104;
 /// focus(id) → 0 / usize::MAX
-pub const SYS_WM_FOCUS: u32 = 405;
+pub const SYS_WM_FOCUS: u32 = 0xF105;
 /// screen_size(*mut u32 /*w,h*/) → 0
-pub const SYS_WM_SCREEN: u32 = 406;
+pub const SYS_WM_SCREEN: u32 = 0xF106;
 /// mouse_state(*mut MouseState) → 0 / usize::MAX
-pub const SYS_MOUSE_STATE: u32 = 407;
+pub const SYS_MOUSE_STATE: u32 = 0xF107;
 /// wm_poll(id, *mut WmEvent, max) → number of events copied
-pub const SYS_WM_POLL: u32 = 408;
-pub const SYS_WM_WINDOWS: u32 = 409;
+pub const SYS_WM_POLL: u32 = 0xF108;
+pub const SYS_WM_WINDOWS: u32 = 0xF109;
 /// pci_list(*mut PciInfoUser, max) → number of devices written (or needed if max=0)
-pub const SYS_PCI_LIST: u32 = 410;
+pub const SYS_PCI_LIST: u32 = 0xF110;
 /// ifconfig(cmd, *mut IfConfigUser) → 0 / usize::MAX
 /// cmd: 0=get, 1=static, 2=dhcp
-pub const SYS_IFCONFIG: u32 = 411;
+pub const SYS_IFCONFIG: u32 = 0xF111;
 /// fb_info(*mut FbInfoUser) → 0 / usize::MAX
-pub const SYS_FB_INFO: u32 = 412;
+pub const SYS_FB_INFO: u32 = 0xF112;
 /// fb_blit(*const FbBlit) → 0 / usize::MAX — copy a rect from user shadow to LFB
-pub const SYS_FB_BLIT: u32 = 413;
-/// waitpid_status(pid, *mut status, options) -> reaped pid / 0 / usize::MAX
-pub const SYS_WAITPID_STATUS: u32 = 414;
+pub const SYS_FB_BLIT: u32 = 0xF113;
 /// task_list(*mut TaskInfoUser, max) -> number of task records written/required
-pub const SYS_TASK_LIST: u32 = 415;
+pub const SYS_TASK_LIST: u32 = 0xF115;
 /// openpty(*mut [master,slave]) -> pty id / usize::MAX
-pub const SYS_OPENPTY: u32 = 416;
+pub const SYS_OPENPTY: u32 = 0xF116;
 /// pty_set_fg(pgid) / pty_get_fg(), keyed by the caller's controlling tty.
-pub const SYS_TTY_SETFG: u32 = 417;
-pub const SYS_TTY_GETFG: u32 = 418;
+pub const SYS_TTY_SETFG: u32 = 0xF117;
+pub const SYS_TTY_GETFG: u32 = 0xF118;
 /// mount_list(*mut MountInfoUser,max) -> count
-pub const SYS_MOUNT_LIST: u32 = 419;
+pub const SYS_MOUNT_LIST: u32 = 0xF119;

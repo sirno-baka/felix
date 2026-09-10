@@ -5,7 +5,7 @@ extern crate alloc;
 
 use libfelix::prelude::*;
 use libfelix::syscall::{
-    close, getcwd, getpid, getppid, mount_list, openpty, pipe, read, task_list, write,
+    close, execve, getcwd, getpid, getppid, mount_list, openpty, pipe, read, task_list, write,
     MountInfo, TaskInfo,
 };
 
@@ -114,6 +114,14 @@ fn test_mounts() -> bool {
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
+    // The first image execs itself at the end of the suite. Reaching this
+    // branch proves that execve replaced the image instead of spawning a
+    // child or returning to the caller.
+    if libfelix::rt::arg(1) == Some("--exec-target") {
+        println!("selftest: PASS (execve)");
+        return 0;
+    }
+
     println!("selftest: begin pid={} ppid={}", unsafe { getpid() }, unsafe { getppid() });
 
     if !test_process_identity() { return fail("process-identity"); }
@@ -123,6 +131,11 @@ pub extern "C" fn main() -> i32 {
     if !test_pty() { return fail("pty"); }
     if !test_mounts() { return fail("mounts"); }
 
-    println!("selftest: PASS");
-    0
+    let path = b"/selftest\0";
+    let arg0 = b"/selftest\0";
+    let arg1 = b"--exec-target\0";
+    let argv = [arg0.as_ptr(), arg1.as_ptr(), core::ptr::null()];
+    let ret = unsafe { execve(path.as_ptr(), argv.as_ptr(), core::ptr::null()) };
+    println!("selftest: FAIL execve returned {}", ret);
+    1
 }

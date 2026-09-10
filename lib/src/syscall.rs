@@ -8,12 +8,13 @@ pub const SYS_WRITE: u32 = 4;
 pub const SYS_OPEN: u32 = 5;
 pub const SYS_CLOSE: u32 = 6;
 
-pub const SYS_MKDIR: u32 = 7;
-pub const SYS_RMDIR: u32 = 8;
+pub const SYS_MKDIR: u32 = 39;
+pub const SYS_RMDIR: u32 = 40;
 pub const SYS_UNLINK: u32 = 10;
 pub const SYS_EXECVE: u32 = 11;
 pub const SYS_CHDIR: u32 = 12;
-pub const SYS_EXECVE_WASM: u32 = 1000;
+pub const SYS_SPAWN: u32 = 0xF000;
+pub const SYS_EXECVE_WASM: u32 = 0xF001;
 
 pub const SYS_LSEEK: u32 = 19;
 pub const SYS_GETPID: u32 = 20;
@@ -108,7 +109,7 @@ pub const MAP_ANONYMOUS: u32 = 0x20;
 pub const SYS_KILL: u32 = 37;
 pub const SYS_RENAME: u32 = 38;
 pub const SYS_SIGACTION: u32 = 67;
-pub const SYS_WAIT: u32 = 114;
+pub const SYS_WAIT: u32 = 7;
 pub const SYS_PIPE: u32 = 42;
 pub const SYS_DUP2: u32 = 63;
 pub const SYS_FCNTL: u32 = 55;
@@ -241,11 +242,11 @@ pub struct PollFd {
     pub revents: i16,
 }
 
-pub const SYS_MALLOC: u32 = 200;
-pub const SYS_FREE: u32 = 201;
-pub const SYS_REALLOC: u32 = 202;
+pub const SYS_MALLOC: u32 = 0xF010;
+pub const SYS_FREE: u32 = 0xF011;
+pub const SYS_REALLOC: u32 = 0xF012;
 
-pub const SYS_LS: u32 = 302;
+pub const SYS_LS: u32 = 0xF013;
 
 // ====================== WRAPPERS ======================
 
@@ -587,7 +588,7 @@ pub unsafe fn umount2(path: *const u8, flags: u32) -> usize {
     ret
 }
 
-/// Parameters for `execve` (passed via edx).
+/// Parameters for Felix-private in-memory spawn (passed via edx).
 #[repr(C)]
 pub struct ExecParams {
     pub stdin: i32,
@@ -607,12 +608,27 @@ pub struct ExecParams {
     pub foreground: u32,
 }
 
+/// Replace the current process with an ELF loaded from `path`.
+/// Returns only on error, as usize::MAX.
+pub unsafe fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_EXECVE => ret,
+        in("ebx") path,
+        in("ecx") argv,
+        in("edx") envp,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
 /// Spawn a new task from an in-memory ELF image.
 /// `argv` is a slice of C-string pointers (like Unix argv), including argv[0].
 /// Returns the new task's pid (slot), or usize::MAX on failure.
 ///
 /// ABI: ebx=buf, ecx=len, edx=*const ExecParams.
-pub unsafe fn execve(
+pub unsafe fn spawn(
     buf: *const u8,
     buf_size: usize,
     stdin_fd: i32,
@@ -634,7 +650,7 @@ pub unsafe fn execve(
     let ret: usize;
     asm!(
     "int 0x80",
-    inlateout("eax") SYS_EXECVE => ret,
+    inlateout("eax") SYS_SPAWN => ret,
     in("ebx") buf,
     in("ecx") buf_size,
     in("edx") &params as *const ExecParams,
@@ -643,7 +659,7 @@ pub unsafe fn execve(
     ret
 }
 
-pub unsafe fn execve_wasm(
+pub unsafe fn spawn_wasm(
     buf: *const u8,
     buf_size: usize,
     stdin_fd: i32,
@@ -675,7 +691,7 @@ pub unsafe fn execve_wasm(
 }
 
 /// ELF exec with an explicit exported environment (`KEY=VALUE\0` strings).
-pub unsafe fn execve_env(
+pub unsafe fn spawn_env(
     buf: *const u8,
     buf_size: usize,
     stdin_fd: i32,
@@ -698,7 +714,7 @@ pub unsafe fn execve_env(
     let ret: usize;
     asm!(
         "int 0x80",
-        inlateout("eax") SYS_EXECVE => ret,
+        inlateout("eax") SYS_SPAWN => ret,
         in("ebx") buf,
         in("ecx") buf_size,
         in("edx") &params as *const ExecParams,
@@ -708,7 +724,7 @@ pub unsafe fn execve_env(
 }
 
 /// ELF exec with environment and atomic process-group placement.
-pub unsafe fn execve_env_pgid(
+pub unsafe fn spawn_env_pgid(
     buf: *const u8,
     buf_size: usize,
     stdin_fd: i32,
@@ -733,7 +749,7 @@ pub unsafe fn execve_env_pgid(
     let ret: usize;
     asm!(
         "int 0x80",
-        inlateout("eax") SYS_EXECVE => ret,
+        inlateout("eax") SYS_SPAWN => ret,
         in("ebx") buf,
         in("ecx") buf_size,
         in("edx") &params as *const ExecParams,
@@ -743,7 +759,7 @@ pub unsafe fn execve_env_pgid(
 }
 
 /// WASM exec with an explicit exported environment.
-pub unsafe fn execve_wasm_env(
+pub unsafe fn spawn_wasm_env(
     buf: *const u8,
     buf_size: usize,
     stdin_fd: i32,
@@ -776,7 +792,7 @@ pub unsafe fn execve_wasm_env(
 }
 
 /// WASM exec with environment and atomic process-group placement.
-pub unsafe fn execve_wasm_env_pgid(
+pub unsafe fn spawn_wasm_env_pgid(
     buf: *const u8,
     buf_size: usize,
     stdin_fd: i32,
@@ -859,7 +875,8 @@ pub unsafe fn wait_options(pid: i32, options: u32) -> usize {
     "int 0x80",
     inlateout("eax") SYS_WAIT => ret,
     in("ebx") pid,
-    in("ecx") options,
+    in("ecx") core::ptr::null_mut::<i32>(),
+    in("edx") options,
     options(nostack, preserves_flags)
     );
     ret
@@ -870,7 +887,7 @@ pub unsafe fn waitpid_status(pid: i32, status: *mut i32, options: u32) -> usize 
     let ret: usize;
     asm!(
         "int 0x80",
-        inlateout("eax") SYS_WAITPID_STATUS => ret,
+        inlateout("eax") SYS_WAIT => ret,
         in("ebx") pid,
         in("ecx") status,
         in("edx") options,
@@ -992,28 +1009,27 @@ pub const SYS_RECVFROM: u32 = 371;
 pub const SYS_SHUTDOWN: u32 = 373;
 
 // Window manager — must match kernel/src/syscalls/mod.rs
-pub const SYS_WM_CREATE: u32 = 400;
-pub const SYS_WM_DESTROY: u32 = 401;
-pub const SYS_WM_MOVE: u32 = 402;
-pub const SYS_WM_INFO: u32 = 403;
-pub const SYS_WM_FLIP: u32 = 404;
-pub const SYS_WM_FOCUS: u32 = 405;
-pub const SYS_WM_SCREEN: u32 = 406;
-pub const SYS_MOUSE_STATE: u32 = 407;
-pub const SYS_WM_POLL: u32 = 408;
-pub const SYS_WM_WINDOWS: u32 = 409;
+pub const SYS_WM_CREATE: u32 = 0xF100;
+pub const SYS_WM_DESTROY: u32 = 0xF101;
+pub const SYS_WM_MOVE: u32 = 0xF102;
+pub const SYS_WM_INFO: u32 = 0xF103;
+pub const SYS_WM_FLIP: u32 = 0xF104;
+pub const SYS_WM_FOCUS: u32 = 0xF105;
+pub const SYS_WM_SCREEN: u32 = 0xF106;
+pub const SYS_MOUSE_STATE: u32 = 0xF107;
+pub const SYS_WM_POLL: u32 = 0xF108;
+pub const SYS_WM_WINDOWS: u32 = 0xF109;
 
 /// pci_list(*mut PciInfo, max) → count written (or total if max=0)
-pub const SYS_PCI_LIST: u32 = 410;
-pub const SYS_IFCONFIG: u32 = 411;
-pub const SYS_FB_INFO: u32 = 412;
-pub const SYS_FB_BLIT: u32 = 413;
-pub const SYS_WAITPID_STATUS: u32 = 414;
-pub const SYS_TASK_LIST: u32 = 415;
-pub const SYS_OPENPTY: u32 = 416;
-pub const SYS_TTY_SETFG: u32 = 417;
-pub const SYS_TTY_GETFG: u32 = 418;
-pub const SYS_MOUNT_LIST: u32 = 419;
+pub const SYS_PCI_LIST: u32 = 0xF110;
+pub const SYS_IFCONFIG: u32 = 0xF111;
+pub const SYS_FB_INFO: u32 = 0xF112;
+pub const SYS_FB_BLIT: u32 = 0xF113;
+pub const SYS_TASK_LIST: u32 = 0xF115;
+pub const SYS_OPENPTY: u32 = 0xF116;
+pub const SYS_TTY_SETFG: u32 = 0xF117;
+pub const SYS_TTY_GETFG: u32 = 0xF118;
+pub const SYS_MOUNT_LIST: u32 = 0xF119;
 
 pub const TASK_RUNNING: u8 = 0;
 pub const TASK_STOPPED: u8 = 1;

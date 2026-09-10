@@ -96,7 +96,7 @@ macro_rules! run {
         unsafe {
             let path = concat!($app, "\0");
             // parent_slot 0 = idle; this macro is kernel-side only
-            let _ = crate::syscalls::handler::sys_execve(
+            let _ = crate::syscalls::handler::sys_spawn(
                 0,
                 path.as_ptr() as *const u8,
                 0,
@@ -350,7 +350,7 @@ pub extern "C" fn higher_half_entry() -> ! {
             }
         };
         let init_argv = [b"/init\0".to_vec()];
-        let init_pid = crate::syscalls::handler::sys_execve(
+        let init_pid = crate::syscalls::handler::sys_spawn(
             0,
             data.as_ptr(),
             data.len(),

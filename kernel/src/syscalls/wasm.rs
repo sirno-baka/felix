@@ -1,4 +1,4 @@
-pub const SYS_EXECVE_WASM: u32 = 1000;
+pub const SYS_EXECVE_WASM: u32 = crate::syscalls::SYS_EXECVE_WASM;
 
 use crate::filesystem::file::{FileDescriptor, FileDescriptorTable};
 use crate::memory::paging::{PDEFlags, copy_kernel_mappings};

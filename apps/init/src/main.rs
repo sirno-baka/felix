@@ -7,7 +7,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use libfelix::prelude::*;
 use libfelix::syscall::{
-    execve_env, execve_wasm_env, getpid, sys_sleep, waitpid_status, wifexited,
+    getpid, spawn_env, spawn_wasm_env, sys_sleep, waitpid_status, wifexited,
     wifsignaled, wexitstatus, wtermsig, WNOHANG,
 };
 
@@ -141,10 +141,10 @@ fn spawn_service(service: &mut Service) -> bool {
 
     let pid = unsafe {
         match &service.image[..4] {
-            b"\x7fELF" => execve_env(
+            b"\x7fELF" => spawn_env(
                 service.image.as_ptr(), service.image.len(), -1, -1, -1, &argv, &envp,
             ),
-            b"\0asm" => execve_wasm_env(
+            b"\0asm" => spawn_wasm_env(
                 service.image.as_ptr(), service.image.len(), -1, -1, -1, &argv, &envp,
             ),
             _ => usize::MAX,

@@ -21,9 +21,9 @@ use line_editor::LineEditor;
 use parser::{parse_line, CommandGroup, Connector, Redir, RedirKind, RedirTarget, SimpleCmd, PROTECTED};
 use terminal::{Terminal, CELL_H, CELL_W};
 use libfelix::syscall::{
-    self, chdir, close, execve_env_pgid, execve_wasm_env_pgid, getpid, getpgrp, kill, mkdir, mount, mount_list,
+    self, chdir, close, getpid, getpgrp, kill, mkdir, mount, mount_list,
     open, openpty, pipe, read, rmdir, set_nonblock, setpgid, task_list, tty_setfg, umount2, unlink,
-    waitpid_status, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGCONT, SIGINT,
+    spawn, spawn_env_pgid, spawn_wasm, spawn_wasm_env_pgid, waitpid_status, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGCONT, SIGINT,
     SIGKILL, SIGSTOP, SIGTERM, SIGTSTP, TASK_RUNNING, TASK_STOPPED, TASK_ZOMBIE, WCONTINUED,
     WNOHANG, WUNTRACED,
 };
@@ -1372,7 +1372,7 @@ fn spawn(
     }
     unsafe {
         let pid = match &data[0..4] {
-            &[0x0, 0x61, 0x73, 0x6d] => execve_wasm(
+            &[0x0, 0x61, 0x73, 0x6d] => spawn_wasm(
                 data.as_ptr(),
                 data.len(),
                 stdin_fd,
@@ -1380,7 +1380,7 @@ fn spawn(
                 stderr_fd,
                 &ptrs,
             ),
-            b"\x7fELF" => execve(
+            b"\x7fELF" => spawn(
                 data.as_ptr(),
                 data.len(),
                 stdin_fd,

@@ -91,6 +91,20 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
     if syscall_num == crate::syscalls::SYS_EXIT_GROUP {
         return sys_exit(current_slot, esp, state.ebx as i32);
     }
+    if syscall_num == crate::syscalls::SYS_EXECVE {
+        return match sys_execve_path(
+            current_slot,
+            state.ebx as *const u8,
+            state.ecx as *const *const u8,
+            state.edx as *const *const u8,
+        ) {
+            Some(new_esp) => new_esp,
+            None => {
+                state.eax = usize::MAX as u32;
+                esp
+            }
+        };
+    }
 
     let ret = match syscall_num {
         // === File descriptors ===
@@ -174,9 +188,9 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         ),
         crate::syscalls::SYS_UMOUNT2 => sys_umount2(current_slot, state.ebx as *const u8, state.ecx as u32),
         crate::syscalls::SYS_MOUNT_LIST => sys_mount_list(state.ebx as *mut MountInfoUser, state.ecx as usize),
-        crate::syscalls::SYS_EXECVE => {
+        crate::syscalls::SYS_SPAWN => {
             let params = read_exec_params(state.edx as *const ExecParamsUser);
-            sys_execve(
+            sys_spawn(
                 current_slot,
                 state.ebx as *const u8,
                 state.ecx as usize,
@@ -189,8 +203,8 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                 params.foreground,
             )
         }
-        crate::syscalls::SYS_WAIT => sys_wait(current_slot, state.ebx as i32, state.ecx as u32),
-        crate::syscalls::SYS_WAITPID_STATUS => sys_wait_status(
+        // Linux i386 waitpid(pid, status, options).
+        crate::syscalls::SYS_WAIT => sys_wait_status(
             current_slot,
             state.ebx as i32,
             state.ecx as *mut i32,
@@ -2045,10 +2059,6 @@ pub fn sys_sigaction(
     usize::MAX
 }
 
-pub fn sys_wait(current_slot: usize, pid: i32, options: u32) -> usize {
-    sys_wait_status(current_slot, pid, core::ptr::null_mut(), options)
-}
-
 /// waitpid-like syscall that returns the child's actual exit status through
 /// `status_ptr`. The child is reaped only when an exit is observed.
 pub fn sys_wait_status(
@@ -2618,12 +2628,102 @@ pub fn install_child_fd(
     child_table.set(child_fd, default);
 }
 
-// ====================== EXECVE ======================
-/// Spawn a new task from an ELF image in memory.
+// ====================== EXEC / SPAWN ======================
+
+fn read_cstr_vector(ptr: *const *const u8, max_items: usize, max_len: usize) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    if ptr.is_null() { return out; }
+    unsafe {
+        for i in 0..max_items {
+            let item = *ptr.add(i);
+            if item.is_null() { break; }
+            let mut bytes = Vec::new();
+            for j in 0..max_len {
+                let b = *item.add(j);
+                bytes.push(b);
+                if b == 0 { break; }
+            }
+            if bytes.last() != Some(&0) { bytes.push(0); }
+            out.push(bytes);
+        }
+    }
+    out
+}
+
+/// Linux i386 execve(path, argv, envp): replace the calling process image.
+/// On success the syscall trampoline returns using the new task's CPUState, so
+/// the old image never observes a return. PID/session/fds/cwd are preserved.
+fn sys_execve_path(
+    current_slot: usize,
+    path_ptr: *const u8,
+    argv_ptr: *const *const u8,
+    envp_ptr: *const *const u8,
+) -> Option<u32> {
+    if current_slot == 0 || path_ptr.is_null() { return None; }
+    let raw_path = copy_cstr_from_user(path_ptr);
+    if raw_path.is_empty() { return None; }
+    let path = resolve_task_path(current_slot, &raw_path);
+    let image = VFS.get().read_file(&path)?;
+    if image.len() < 4 || &image[..4] != b"\x7fELF" { return None; }
+
+    let mut argv = read_cstr_vector(argv_ptr, 64, 256);
+    if argv.is_empty() {
+        let mut arg0 = path.as_bytes().to_vec();
+        arg0.push(0);
+        argv.push(arg0);
+    }
+    let envp = read_cstr_vector(envp_ptr, 64, 512);
+
+    let temporary_pid = sys_spawn(
+        current_slot,
+        image.as_ptr(),
+        image.len(),
+        0,
+        1,
+        2,
+        &argv,
+        &envp,
+        -1,
+        false,
+    );
+    if temporary_pid == usize::MAX { return None; }
+
+    unsafe {
+        let child_slot = TASK_MANAGER.slot_by_pid(temporary_pid as i32)?;
+        let mut replacement = TASK_MANAGER.tasks[child_slot].take()?;
+        let old = TASK_MANAGER.tasks[current_slot].take()?;
+
+        // exec preserves process identity and open descriptors. Signal
+        // dispositions were initialized to defaults by sys_spawn; pending
+        // signals remain pending across exec.
+        replacement.pid = old.pid;
+        replacement.ppid = old.ppid;
+        replacement.parent = old.parent;
+        replacement.pgid = old.pgid;
+        replacement.sid = old.sid;
+        replacement.cwd = old.cwd;
+        replacement.tty_id = old.tty_id;
+        replacement.pty_id = old.pty_id;
+        replacement.pending_signals = old.pending_signals;
+        replacement.fd_table = old.fd_table;
+
+        let new_esp = replacement.cpu_state_ptr;
+        let new_cr3 = replacement.page_dir_phys;
+        let new_kstack = replacement.kernel_stack;
+        TASK_MANAGER.tasks[current_slot] = Some(replacement);
+        TASK_MANAGER.task_count -= 1; // discard temporary child slot
+        crate::gdt::TSS.esp0 = new_kstack;
+        asm!("mov cr3, {}", in(reg) new_cr3);
+        println!("[execve] replaced pid={} path={}", TASK_MANAGER.current_pid(), path);
+        Some(new_esp)
+    }
+}
+
+/// Felix-private spawn from an ELF image in memory.
 /// Returns the new task's slot (pid) on success, or usize::MAX on failure.
 /// `stdin_fd`/`stdout_fd`/`stderr_fd`: parent fd to install as child's 0/1/2,
 /// or `-1` for default ConsoleIn / ConsoleOut.
-pub fn sys_execve(
+pub fn sys_spawn(
     parent_slot: usize,
     buf_ptr: *const u8,
     count: usize,
@@ -2645,7 +2745,7 @@ pub fn sys_execve(
     }
     let slot_i8 = unsafe { TASK_MANAGER.get_free_slot() };
     if slot_i8 < 0 {
-        println!("[execve] No free task slot!");
+        println!("[spawn] No free task slot!");
         return usize::MAX;
     }
     let slot = slot_i8 as usize;
@@ -2669,7 +2769,7 @@ pub fn sys_execve(
                 })
             };
             if !exists_same_session {
-                println!("[execve] requested pgid {} does not exist in sid {}", requested, sid);
+                println!("[spawn] requested pgid {} does not exist in sid {}", requested, sid);
                 return usize::MAX;
             }
             requested
@@ -2715,7 +2815,7 @@ pub fn sys_execve(
         let entry_point = match crate::elf::load_elf(buf, task.pd_mut()) {
             Ok(e) => e,
             Err(e) => {
-                println!("[execve] ELF load failed: {:?}", e);
+                println!("[spawn] ELF load failed: {:?}", e);
                 if kernel_pd_phys != 0 {
                     asm!("mov cr3, {}", in(reg) kernel_pd_phys);
                 }
@@ -2805,7 +2905,7 @@ pub fn sys_execve(
         TASK_MANAGER.task_count += 1;
 
         println!(
-            "[execve] OK pid={} slot={} pgid={} sid={} entry={:#x} stack={:#x} pd_phys={:#x} ppid={}",
+            "[spawn] OK pid={} slot={} pgid={} sid={} entry={:#x} stack={:#x} pd_phys={:#x} ppid={}",
             pid, slot, pgid, sid, entry_point, USER_STACK_TOP, child_pd_phys, ppid
         );
 
@@ -2814,7 +2914,7 @@ pub fn sys_execve(
         // run before this handoff completes.
         if foreground && parent_slot != 0 {
             if !crate::tty::set_foreground(parent_slot, pgid) {
-                println!("[execve] tty foreground handoff to pgid {} failed", pgid);
+                println!("[spawn] tty foreground handoff to pgid {} failed", pgid);
             }
         }
 

@@ -113,10 +113,10 @@ fn spawn(
 
     let pid = unsafe {
         match &data[..4] {
-            b"\0asm" => execve_wasm_env_pgid(
+            b"\0asm" => spawn_wasm_env_pgid(
                 data.as_ptr(), data.len(), stdin_fd, stdout_fd, stderr_fd, &argv, &envp, pgid, foreground,
             ),
-            b"\x7fELF" => execve_env_pgid(
+            b"\x7fELF" => spawn_env_pgid(
                 data.as_ptr(), data.len(), stdin_fd, stdout_fd, stderr_fd, &argv, &envp, pgid, foreground,
             ),
             _ => usize::MAX,
