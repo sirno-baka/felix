@@ -960,6 +960,21 @@ pub unsafe fn fstat64(fd: u32, st: *mut Stat64) -> usize {
     ret
 }
 
+/// Linux i386 getdents64(fd, dirp, count).
+/// Returns bytes written, 0 at end of directory, or a negative errno encoded in usize.
+pub unsafe fn getdents64(fd: u32, dirp: *mut u8, count: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_GETDENTS64 => ret,
+        in("ebx") fd,
+        in("ecx") dirp,
+        in("edx") count,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
 /// Returns number of ready fds. timeout_ms: -1 block, 0 nonblock, >0 ms.
 pub unsafe fn poll(fds: *mut PollFd, nfds: usize, timeout_ms: i32) -> usize {
     let ret: usize;

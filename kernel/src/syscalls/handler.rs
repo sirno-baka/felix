@@ -400,13 +400,25 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
             state.ebx as usize,
             state.ecx as *mut u8,
             state.edx as *mut u32,
-            state.esi as u32,
+            0,
         ),
         crate::syscalls::SYS_CONNECT => sys_connect(
             current_slot,
             state.ebx as usize,
             state.ecx as *const u8,
             state.edx as usize,
+        ),
+        crate::syscalls::SYS_GETSOCKNAME => sys_getsockname(
+            current_slot,
+            state.ebx as usize,
+            state.ecx as *mut u8,
+            state.edx as *mut u32,
+        ),
+        crate::syscalls::SYS_GETPEERNAME => sys_getpeername(
+            current_slot,
+            state.ebx as usize,
+            state.ecx as *mut u8,
+            state.edx as *mut u32,
         ),
         crate::syscalls::SYS_SENDTO => sys_sendto(
             current_slot,
@@ -516,12 +528,14 @@ const EPERM: usize = (-1isize) as usize;
 const ENOENT: usize = (-2isize) as usize;
 const ENXIO: usize = (-6isize) as usize;
 const EBADF: usize = (-9isize) as usize;
+const EAGAIN: usize = (-11isize) as usize;
 const ENOMEM: usize = (-12isize) as usize;
 const EFAULT: usize = (-14isize) as usize;
 const EEXIST: usize = (-17isize) as usize;
 const EXDEV: usize = (-18isize) as usize;
 const EINVAL: usize = (-22isize) as usize;
 const ENOTTY: usize = (-25isize) as usize;
+const EPIPE: usize = (-32isize) as usize;
 const ENOTDIR: usize = (-20isize) as usize;
 
 const S_IFREG: u32 = 0o100000;
@@ -1479,6 +1493,12 @@ fn close_descriptor(closed: ClosedFileDescriptor) {
     }
     match closed.desc {
         FileDescriptor::Socket { socket_id } => {
+            // Keep NET_STACK and SOCKET_TABLE lifetime in sync. Previously only
+            // the metadata entry was freed, leaking the smoltcp socket/handle on
+            // every close and preventing public socket ids from being reused.
+            if let Some(ref mut stack) = *NET_STACK.lock() {
+                stack.remove_handle(socket_id);
+            }
             SOCKET_TABLE.lock().free(socket_id);
         }
         FileDescriptor::Pipe { pipe_id, end } => match end {
@@ -2351,20 +2371,43 @@ fn fd_poll_revents(current_slot: usize, fd: i32, events: i16) -> i16 {
                 rev
             }
             Some(FileDescriptor::Socket { socket_id }) => {
+                let logical_state = SOCKET_TABLE
+                    .try_lock()
+                    .and_then(|table| table.get(socket_id).map(|s| s.state));
                 let mut rev = 0i16;
                 if let Some(stack_guard) = crate::net::stack::NET_STACK.try_lock() {
                     if let Some(ref stack) = *stack_guard {
                         if let Some((handle, is_tcp)) = stack.get_handle(socket_id) {
                             if is_tcp {
                                 let socket = stack.sockets.get::<tcp::Socket>(handle);
-                                if events & POLLIN != 0 && socket.can_recv() {
-                                    rev |= POLLIN;
-                                }
-                                if events & POLLOUT != 0 && socket.can_send() {
-                                    rev |= POLLOUT;
+                                if logical_state == Some(SocketState::Listening) {
+                                    // In smoltcp the listening socket itself becomes
+                                    // the accepted connection. A completed handshake
+                                    // therefore makes the listener readable even when
+                                    // the peer has not sent application data yet.
+                                    if events & POLLIN != 0
+                                        && matches!(
+                                            socket.state(),
+                                            tcp::State::Established | tcp::State::CloseWait
+                                        )
+                                    {
+                                        rev |= POLLIN;
+                                    }
+                                } else {
+                                    if events & POLLIN != 0
+                                        && (socket.can_recv() || !socket.may_recv())
+                                    {
+                                        rev |= POLLIN;
+                                    }
+                                    if events & POLLOUT != 0 && socket.can_send() {
+                                        rev |= POLLOUT;
+                                    }
+                                    if !socket.is_open() {
+                                        rev |= POLLHUP;
+                                    }
                                 }
                             } else {
-                                // UDP: всегда можно писать, читать если есть данные
+                                // UDP: always writable, readable when a datagram is queued.
                                 if events & POLLOUT != 0 { rev |= POLLOUT; }
                                 if events & POLLIN != 0 {
                                     let socket = stack.sockets.get::<udp::Socket>(handle);
@@ -3079,16 +3122,151 @@ pub fn sys_listen(current_slot: usize, fd: usize, backlog: usize) -> usize {
     usize::MAX
 }
 
+fn endpoint_to_sockaddr(endpoint: IpEndpoint) -> Option<SockAddrIn> {
+    let ip = match endpoint.addr {
+        IpAddress::Ipv4(ip) => ip,
+        _ => return None,
+    };
+    Some(SockAddrIn {
+        sin_family: AF_INET,
+        sin_port: endpoint.port.to_be(),
+        sin_addr: crate::net::InAddr { s_addr: ip.to_bits() },
+        sin_zero: [0; 8],
+    })
+}
+
 pub fn sys_accept4(
     current_slot: usize,
     fd: usize,
-    _addr: *mut u8,
-    _addrlen: *mut u32,
-    _flags: u32,
+    addr: *mut u8,
+    addrlen: *mut u32,
+    flags: u32,
 ) -> usize {
-    // Пока заглушка — возвращаем ошибку
-    // Позже: берём из accept_queue, создаём новый сокет + новый fd
-    usize::MAX
+    const SOCK_NONBLOCK: u32 = crate::filesystem::file::O_NONBLOCK;
+
+    if flags & !SOCK_NONBLOCK != 0 {
+        return EINVAL;
+    }
+    if !addr.is_null() && addrlen.is_null() {
+        return EFAULT;
+    }
+
+    let (listener_id, listener_nonblock, accepted_fd) = unsafe {
+        let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] else {
+            return EBADF;
+        };
+        let listener_id = match current.fd_table.get(fd) {
+            Some(FileDescriptor::Socket { socket_id }) => *socket_id,
+            _ => return EBADF,
+        };
+        let Some(accepted_fd) = current.fd_table.alloc_fd() else {
+            return ENOMEM;
+        };
+        (listener_id, current.fd_table.is_nonblock(fd), accepted_fd)
+    };
+
+    let (domain, ty, protocol) = {
+        let table = SOCKET_TABLE.lock();
+        let Some(listener) = table.get(listener_id) else {
+            return EBADF;
+        };
+        if listener.state != SocketState::Listening || listener.ty != SOCK_STREAM {
+            return EINVAL;
+        }
+        (listener.domain, listener.ty, listener.protocol)
+    };
+
+    loop {
+        let accepted = {
+            let mut guard = NET_STACK.lock();
+            let Some(ref mut stack) = *guard else {
+                return ENXIO;
+            };
+            stack.poll(crate::time::jiffies() as i64);
+            stack.accept_tcp(listener_id)
+        };
+
+        if let Some((accepted_id, local_endpoint, remote_endpoint)) = accepted {
+            let Some(local_addr) = endpoint_to_sockaddr(local_endpoint) else {
+                if let Some(ref mut stack) = *NET_STACK.lock() {
+                    stack.remove_handle(accepted_id);
+                }
+                return EINVAL;
+            };
+            let Some(peer_addr) = endpoint_to_sockaddr(remote_endpoint) else {
+                if let Some(ref mut stack) = *NET_STACK.lock() {
+                    stack.remove_handle(accepted_id);
+                }
+                return EINVAL;
+            };
+
+            {
+                let mut table = SOCKET_TABLE.lock();
+                if !table.insert_with_id(accepted_id, domain, ty, protocol, current_slot) {
+                    drop(table);
+                    if let Some(ref mut stack) = *NET_STACK.lock() {
+                        stack.remove_handle(accepted_id);
+                    }
+                    return ENOMEM;
+                }
+                let socket = table.get_mut(accepted_id).unwrap();
+                socket.local_addr = Some(local_addr);
+                socket.peer_addr = Some(peer_addr);
+                socket.state = SocketState::Connected;
+            }
+
+            let installed = unsafe {
+                if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
+                    if current.fd_table.insert(accepted_fd, FileDescriptor::new_socket(accepted_id)) {
+                        if flags & SOCK_NONBLOCK != 0 {
+                            let _ = current.fd_table.set_flags(accepted_fd, SOCK_NONBLOCK);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if !installed {
+                if let Some(ref mut stack) = *NET_STACK.lock() {
+                    stack.remove_handle(accepted_id);
+                }
+                SOCKET_TABLE.lock().free(accepted_id);
+                return ENOMEM;
+            }
+
+            if !addr.is_null() {
+                let required = core::mem::size_of::<SockAddrIn>();
+                let supplied = unsafe { *addrlen as usize };
+                let copy_len = supplied.min(required);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (&peer_addr as *const SockAddrIn).cast::<u8>(),
+                        addr,
+                        copy_len,
+                    );
+                    *addrlen = required as u32;
+                }
+            }
+
+            return accepted_fd;
+        }
+
+        if listener_nonblock {
+            return EAGAIN;
+        }
+
+        // Blocking accept: release all networking locks and sleep until the next
+        // IRQ. The next iteration polls smoltcp again and re-checks the listener.
+        unsafe {
+            asm!("sti");
+            asm!("hlt");
+            asm!("cli");
+        }
+    }
 }
 
 
@@ -3216,150 +3394,257 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
 
     usize::MAX // timeout
 }
-pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) -> usize {
-    print!("{:?}", buf);
+
+fn sys_socket_name(
+    current_slot: usize,
+    fd: usize,
+    addr_ptr: *mut u8,
+    addrlen_ptr: *mut u32,
+    peer: bool,
+) -> usize {
+    if addr_ptr.is_null() || addrlen_ptr.is_null() {
+        return usize::MAX;
+    }
+
     let socket_id = unsafe {
         match TASK_MANAGER.tasks[current_slot]
             .as_ref()
             .and_then(|t| t.fd_table.get(fd))
         {
             Some(FileDescriptor::Socket { socket_id }) => *socket_id,
-            _ => return 0,
+            _ => return usize::MAX,
         }
     };
 
-    let mut stack_guard = match NET_STACK.try_lock() {
-        Some(g) => g,
-        None => return usize::MAX,
-    };
-    let stack = match stack_guard.as_mut() {
-        Some(s) => s,
-        None => return usize::MAX,
-    };
-
-    let ts = crate::time::jiffies() as i64;
-    stack.poll(ts);
-
-    let (handle, is_tcp) = match stack.get_handle(socket_id) {
-        Some(h) => h,
-        None => return 0,
-    };
-
-    let data = unsafe { core::slice::from_raw_parts(buf, len) };
-
-    if is_tcp {
-        let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-        let n = match socket.send_slice(data) {
-            Ok(n) => n,
-            Err(_) => return usize::MAX,
+    let socket_addr = {
+        let table = SOCKET_TABLE.lock();
+        let Some(socket) = table.get(socket_id) else {
+            return usize::MAX;
         };
-        stack.poll(ts);
-        return n;
+        if peer {
+            socket.peer_addr
+        } else {
+            socket.local_addr
+        }
+    };
+
+    let Some(socket_addr) = socket_addr else {
+        return usize::MAX;
+    };
+    let required_len = core::mem::size_of::<SockAddrIn>();
+    let supplied_len = unsafe { *addrlen_ptr as usize };
+    if supplied_len < required_len {
+        unsafe {
+            *addrlen_ptr = required_len as u32;
+        }
+        return usize::MAX;
     }
 
-    let peer = {
-        let table = SOCKET_TABLE.lock();
-        table.get(socket_id).and_then(|s| s.peer_addr)
+    unsafe {
+        (addr_ptr as *mut SockAddrIn).write(socket_addr);
+        *addrlen_ptr = required_len as u32;
+    }
+    0
+}
+
+pub fn sys_getsockname(
+    current_slot: usize,
+    fd: usize,
+    addr_ptr: *mut u8,
+    addrlen_ptr: *mut u32,
+) -> usize {
+    sys_socket_name(current_slot, fd, addr_ptr, addrlen_ptr, false)
+}
+
+pub fn sys_getpeername(
+    current_slot: usize,
+    fd: usize,
+    addr_ptr: *mut u8,
+    addrlen_ptr: *mut u32,
+) -> usize {
+    sys_socket_name(current_slot, fd, addr_ptr, addrlen_ptr, true)
+}
+
+pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if buf.is_null() {
+        return EFAULT;
+    }
+
+    let (socket_id, nonblock) = unsafe {
+        let Some(ref current) = TASK_MANAGER.tasks[current_slot] else {
+            return EBADF;
+        };
+        let socket_id = match current.fd_table.get(fd) {
+            Some(FileDescriptor::Socket { socket_id }) => *socket_id,
+            _ => return EBADF,
+        };
+        (socket_id, current.fd_table.is_nonblock(fd))
     };
+    let data = unsafe { core::slice::from_raw_parts(buf, len) };
 
-    let Some(peer) = peer else { return 0 };
+    loop {
+        let mut stack_guard = NET_STACK.lock();
+        let Some(ref mut stack) = *stack_guard else {
+            return ENXIO;
+        };
 
-    let endpoint = IpEndpoint {
-        addr: IpAddress::Ipv4(Ipv4Addr::from_bits(
-            peer.sin_addr.s_addr,
-        )),
-        port: u16::from_be(peer.sin_port),
-    };
+        let ts = crate::time::jiffies() as i64;
+        stack.poll(ts);
 
-    let socket = stack.sockets.get_mut::<udp::Socket>(handle);
-    match socket.send_slice(data, endpoint) {
-        Ok(()) => {
-            stack.poll(crate::time::jiffies() as i64);
-            len
+        let (handle, is_tcp) = match stack.get_handle(socket_id) {
+            Some(h) => h,
+            None => return EBADF,
+        };
+
+        if is_tcp {
+            let result = {
+                let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+                if !socket.may_send() {
+                    Some(EPIPE)
+                } else if !socket.can_send() {
+                    None
+                } else {
+                    match socket.send_slice(data) {
+                        Ok(n) if n > 0 => Some(n),
+                        Ok(_) => None,
+                        Err(_) => Some(EPIPE),
+                    }
+                }
+            };
+
+            if let Some(result) = result {
+                stack.poll(ts);
+                return result;
+            }
+        } else {
+            let peer = {
+                let table = SOCKET_TABLE.lock();
+                table.get(socket_id).and_then(|s| s.peer_addr)
+            };
+            let Some(peer) = peer else {
+                return EINVAL;
+            };
+            let endpoint = IpEndpoint {
+                addr: IpAddress::Ipv4(Ipv4Addr::from_bits(peer.sin_addr.s_addr)),
+                port: u16::from_be(peer.sin_port),
+            };
+            let socket = stack.sockets.get_mut::<udp::Socket>(handle);
+            match socket.send_slice(data, endpoint) {
+                Ok(()) => {
+                    stack.poll(ts);
+                    return len;
+                }
+                Err(_) => {}
+            }
         }
-        Err(_) => 0,
+
+        drop(stack_guard);
+        if nonblock {
+            return EAGAIN;
+        }
+        unsafe {
+            asm!("sti");
+            asm!("hlt");
+            asm!("cli");
+        }
     }
 }
 
 pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) -> usize {
-    if buf.is_null() || len == 0 {
+    if len == 0 {
         return 0;
     }
+    if buf.is_null() {
+        return EFAULT;
+    }
 
-    let socket_id = unsafe {
-        match TASK_MANAGER.tasks[current_slot]
-            .as_ref()
-            .and_then(|t| t.fd_table.get(fd))
-        {
+    let (socket_id, nonblock) = unsafe {
+        let Some(ref current) = TASK_MANAGER.tasks[current_slot] else {
+            return EBADF;
+        };
+        let socket_id = match current.fd_table.get(fd) {
             Some(FileDescriptor::Socket { socket_id }) => *socket_id,
-            _ => return 0,
-        }
+            _ => return EBADF,
+        };
+        (socket_id, current.fd_table.is_nonblock(fd))
     };
-
-    let mut stack_guard = match NET_STACK.try_lock() {
-        Some(g) => g,
-        None => return usize::MAX,
-    };
-    let stack = match stack_guard.as_mut() {
-        Some(s) => s,
-        None => return usize::MAX,
-    };
-
-    let ts = crate::time::jiffies() as i64;
-    stack.poll(ts);
-
-    let (handle, is_tcp) = match stack.get_handle(socket_id) {
-        Some(h) => h,
-        None => return 0,
-    };
-
-    // Прямой slice из пользовательского буфера — без аллокации
     let user_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
 
-    if is_tcp {
-        let ret = {
-            let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-            match socket.recv_slice(user_buf) {
-                Ok(n) if n > 0 => n,
-                Ok(_) => {
-                    if socket.state() == tcp::State::CloseWait
-                        || socket.state() == tcp::State::Closed
-                    {
-                        0
-                    } else {
-                        usize::MAX
+    loop {
+        let mut stack_guard = NET_STACK.lock();
+        let Some(ref mut stack) = *stack_guard else {
+            return ENXIO;
+        };
+
+        let ts = crate::time::jiffies() as i64;
+        stack.poll(ts);
+
+        let (handle, is_tcp) = match stack.get_handle(socket_id) {
+            Some(h) => h,
+            None => return EBADF,
+        };
+
+        if is_tcp {
+            let result = {
+                let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+                if socket.can_recv() {
+                    match socket.recv_slice(user_buf) {
+                        Ok(n) => Some(n),
+                        Err(smoltcp::socket::tcp::RecvError::Finished) => Some(0),
+                        Err(_) => Some(EPIPE),
+                    }
+                } else if !socket.may_recv() {
+                    Some(0)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(result) = result {
+                stack.poll(ts);
+                return result;
+            }
+        } else {
+            let result = {
+                let socket = stack.sockets.get_mut::<udp::Socket>(handle);
+                if !socket.can_recv() {
+                    None
+                } else {
+                    match socket.recv_slice(user_buf) {
+                        Ok((size, ep)) => Some(Ok((size, ep.endpoint))),
+                        Err(smoltcp::socket::udp::RecvError::Truncated) => Some(Err(0usize)),
+                        Err(_) => Some(Err(EAGAIN)),
                     }
                 }
-                Err(_) => usize::MAX,
-            }
-        };
-        stack.poll(ts);
-        ret
-    } else {
-        let socket = stack.sockets.get_mut::<udp::Socket>(handle);
-        match socket.recv_slice(user_buf) {
-            Ok((size, ep)) => {
-                // сохраняем peer для последующего sendto
-                let mut table = SOCKET_TABLE.lock();
-                if let Some(sock) = table.get_mut(socket_id) {
-                    let ip = match ep.endpoint.addr {
-                        IpAddress::Ipv4(a) => a.to_bits(),
-                        _ => 0,
-                    };
-                    sock.peer_addr = Some(SockAddrIn {
-                        sin_family: AF_INET,
-                        sin_port: ep.endpoint.port.to_be(),
-                        sin_addr: crate::net::InAddr { s_addr: ip },
-                        sin_zero: [0; 8],
-                    });
+            };
+
+            if let Some(result) = result {
+                match result {
+                    Ok((size, endpoint)) => {
+                        let mut table = SOCKET_TABLE.lock();
+                        if let Some(sock) = table.get_mut(socket_id) {
+                            if let Some(peer) = endpoint_to_sockaddr(endpoint) {
+                                sock.peer_addr = Some(peer);
+                            }
+                        }
+                        return size;
+                    }
+                    Err(code) => return code,
                 }
-                size
             }
-            Err(smoltcp::socket::udp::RecvError::Truncated) => {
-                // Буфер был меньше UDP-пакета — пакет потерян
-                0
-            }
-            Err(_) => 0,
+        }
+
+        drop(stack_guard);
+        if nonblock {
+            return EAGAIN;
+        }
+        unsafe {
+            asm!("sti");
+            asm!("hlt");
+            asm!("cli");
         }
     }
 }

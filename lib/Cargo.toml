@@ -19,5 +19,6 @@ httparse = { version = "1.10", default-features = false }
 defmt = "1.1.1"
 taffy = { version = "0.14", default-features = false, features = ["alloc", "flexbox", "taffy_tree"] }
 micromath = "2.1.0"
+png-decoder = { version = "0.2.0", default-features = false }
 
 #rand_core_06 = { package = "rand_core", version = "0.6", default-features = false }

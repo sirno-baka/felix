@@ -333,7 +333,7 @@ pub extern "C" fn higher_half_entry() -> ! {
             halt();
         }
         init_usb();
-        // drivers::net::init_net();
+        drivers::net::init_net();
         // ---------------------------------------------------------------
         // Launch userspace init while TIMER is still masked and IF=0.
         // PID 0 remains the kernel idle task; the first userspace PID is 1.

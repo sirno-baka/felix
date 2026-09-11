@@ -204,7 +204,7 @@ run: all usb-image
 	@qemu-system-i386 \
 		-drive file=build/disk.img,index=0,media=disk,format=raw,if=ide \
 		-boot order=c \
-		-netdev user,id=net0 \
+		-netdev user,id=net0,hostfwd=tcp:127.0.0.1:18080-:8080 \
 		-device rtl8139,netdev=net0,mac=52:54:00:12:34:56 \
 		-device pci-ohci,id=ohci \
 		-drive if=none,id=usbstick,format=raw,file=build/usb.img \

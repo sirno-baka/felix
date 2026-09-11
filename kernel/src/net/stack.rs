@@ -50,6 +50,12 @@ impl Default for IfConfigUser {
     }
 }
 
+fn new_tcp_socket() -> tcp::Socket<'static> {
+    let rx = tcp::SocketBuffer::new(vec![0u8; 65536]);
+    let tx = tcp::SocketBuffer::new(vec![0u8; 65536]);
+    tcp::Socket::new(rx, tx)
+}
+
 pub struct NetStack {
     pub iface: Interface,
     pub device: AnyNic,
@@ -236,10 +242,7 @@ impl NetStack {
         let handle = match ty {
             SOCK_STREAM => {
                 // TCP
-                let rx = tcp::SocketBuffer::new(vec![0u8; 65536]);
-                let tx = tcp::SocketBuffer::new(vec![0u8; 65536]);
-                let socket = tcp::Socket::new(rx, tx);
-                self.sockets.add(socket)
+                self.sockets.add(new_tcp_socket())
             }
             SOCK_DGRAM => {
                 // UDP
@@ -272,6 +275,51 @@ impl NetStack {
             return None;
         }
         self.handles[id - 1]
+    }
+
+    fn install_existing_handle(&mut self, handle: SocketHandle, is_tcp: bool) -> usize {
+        if let Some(idx) = self.handles.iter().position(|h| h.is_none()) {
+            self.handles[idx] = Some((handle, is_tcp));
+            idx + 1
+        } else {
+            self.handles.push(Some((handle, is_tcp)));
+            self.handles.len()
+        }
+    }
+
+    /// Turn an established smoltcp listener socket into a connected socket and
+    /// immediately replace the listener with a fresh socket listening on the
+    /// same endpoint. The listener keeps its public socket id; the accepted
+    /// connection gets a new public socket id.
+    pub fn accept_tcp(&mut self, listener_id: usize) -> Option<(usize, IpEndpoint, IpEndpoint)> {
+        let (accepted_handle, is_tcp) = self.get_handle(listener_id)?;
+        if !is_tcp {
+            return None;
+        }
+
+        let (listen_endpoint, local_endpoint, remote_endpoint) = {
+            let socket = self.sockets.get::<tcp::Socket>(accepted_handle);
+            if !matches!(socket.state(), tcp::State::Established | tcp::State::CloseWait) {
+                return None;
+            }
+            (
+                socket.listen_endpoint(),
+                socket.local_endpoint()?,
+                socket.remote_endpoint()?,
+            )
+        };
+
+        // smoltcp has no Berkeley-style accept queue: a listening TCP socket
+        // itself becomes the established connection. Keep that established
+        // socket as the accepted connection and install a fresh listener under
+        // the original Felix socket id.
+        let mut replacement = new_tcp_socket();
+        replacement.listen(listen_endpoint).ok()?;
+        let replacement_handle = self.sockets.add(replacement);
+        self.handles[listener_id - 1] = Some((replacement_handle, true));
+
+        let accepted_id = self.install_existing_handle(accepted_handle, true);
+        Some((accepted_id, local_endpoint, remote_endpoint))
     }
 
     pub fn remove_handle(&mut self, id: usize) {

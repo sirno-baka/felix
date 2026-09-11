@@ -33,7 +33,10 @@ pub use theme::{
     LABEL_FG, PANEL_BG, PANEL_BORDER, SCROLLBAR_BG, SCROLLBAR_THUMB, TEXT,
 };
 pub use widget::{EventResult, Widget};
-pub use widgets::{Button, Label, TextInput};
+pub use widgets::{
+    Button, FileItem, FileKind, FileView, FileViewIcons, FileViewMode, Icon, IconImage,
+    IconImageError, Label, TextArea, TextInput, ToolbarButton, TreeNode, TreeView, TreeViewIcons,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiEvent {
@@ -169,6 +172,26 @@ impl Ui {
     }
     pub fn row(&mut self, parent: NodeId) -> NodeId {
         self.container(parent, FlexDirection::Row)
+    }
+    /// Explorer-style horizontal toolbar container.
+    pub fn toolbar(&mut self, parent: NodeId) -> NodeId {
+        let n = self.container(parent, FlexDirection::Row);
+        let _ = self.style(n, |s| {
+            s.size.height = Dimension::length(36.0);
+            s.flex_shrink = 0.0;
+            s.align_items = Some(AlignItems::CENTER);
+            s.gap = TSize {
+                width: LP::length(2.0),
+                height: LP::length(0.0),
+            };
+            s.padding = taffy::geometry::Rect {
+                left: LP::length(3.0),
+                right: LP::length(3.0),
+                top: LP::length(2.0),
+                bottom: LP::length(2.0),
+            };
+        });
+        n
     }
     pub fn flex(&mut self, parent: NodeId, direction: FlexDirection) -> NodeId {
         self.container(parent, direction)
@@ -320,9 +343,113 @@ impl Ui {
         };
         self.add_widget(parent, Box::new(Button::new(label)), s)
     }
+
+    pub fn toolbar_button(&mut self, parent: NodeId, label: &str) -> WidgetId {
+        let mut s = Style::default();
+        s.flex_shrink = 0.0;
+        self.add_widget(parent, Box::new(ToolbarButton::new(label)), s)
+    }
+
+    pub fn toolbar_button_image(
+        &mut self,
+        parent: NodeId,
+        label: &str,
+        image: IconImage,
+    ) -> WidgetId {
+        let mut s = Style::default();
+        s.flex_shrink = 0.0;
+        self.add_widget(parent, Box::new(ToolbarButton::with_icon(label, image)), s)
+    }
+
+    pub fn toolbar_button_png(
+        &mut self,
+        parent: NodeId,
+        label: &str,
+        png: &[u8],
+    ) -> Result<WidgetId, IconImageError> {
+        Ok(self.toolbar_button_image(parent, label, IconImage::from_png_bytes(png)?))
+    }
+
+    pub fn toolbar_button_png_file(
+        &mut self,
+        parent: NodeId,
+        label: &str,
+        path: &str,
+    ) -> Result<WidgetId, IconImageError> {
+        Ok(self.toolbar_button_image(parent, label, IconImage::from_png_file(path)?))
+    }
     pub fn label(&mut self, parent: NodeId, text: &str) -> WidgetId {
         self.add_widget(parent, Box::new(Label::new(text)), Style::default())
     }
+    pub fn icon(&mut self, parent: NodeId, image: &'static IconImage) -> WidgetId {
+        self.add_widget(parent, Box::new(Icon::new(image)), Style::default())
+    }
+
+    /// Add an owned icon image, e.g. one decoded from PNG at runtime.
+    pub fn icon_image(&mut self, parent: NodeId, image: IconImage) -> WidgetId {
+        self.add_widget(parent, Box::new(Icon::from_image(image)), Style::default())
+    }
+
+    /// Decode an embedded/in-memory PNG and add it as an icon widget.
+    pub fn icon_png(&mut self, parent: NodeId, png: &[u8]) -> Result<WidgetId, IconImageError> {
+        Ok(self.icon_image(parent, IconImage::from_png_bytes(png)?))
+    }
+
+    /// Read a PNG through the Felix VFS and add it as an icon widget.
+    pub fn icon_png_file(
+        &mut self,
+        parent: NodeId,
+        path: &str,
+    ) -> Result<WidgetId, IconImageError> {
+        Ok(self.icon_image(parent, IconImage::from_png_file(path)?))
+    }
+
+    /// Add a file browser view. The view owns and renders its whole file list,
+    /// so a directory with many entries doesn't create hundreds of Taffy nodes.
+    pub fn file_view(&mut self, parent: NodeId) -> WidgetId {
+        let mut s = Style::default();
+        s.flex_grow = 1.0;
+        s.flex_shrink = 1.0;
+        s.min_size = TSize {
+            width: LPA::length(0.0),
+            height: LPA::length(0.0),
+        };
+        self.add_widget(parent, Box::new(FileView::new()), s)
+    }
+
+    pub fn tree_view(&mut self, parent: NodeId) -> WidgetId {
+        let mut s = Style::default();
+        s.flex_grow = 1.0;
+        s.flex_shrink = 1.0;
+        s.min_size = TSize {
+            width: LPA::length(100.0),
+            height: LPA::length(0.0),
+        };
+        self.add_widget(parent, Box::new(TreeView::new()), s)
+    }
+
+    pub fn text_area(&mut self, parent: NodeId) -> WidgetId {
+        let mut s = Style::default();
+        s.flex_grow = 1.0;
+        s.flex_shrink = 1.0;
+        s.min_size = TSize {
+            width: LPA::length(0.0),
+            height: LPA::length(0.0),
+        };
+        self.add_widget(parent, Box::new(TextArea::new()), s)
+    }
+
+    pub fn text_area_with(&mut self, parent: NodeId, text: &str) -> WidgetId {
+        let mut s = Style::default();
+        s.flex_grow = 1.0;
+        s.flex_shrink = 1.0;
+        s.min_size = TSize {
+            width: LPA::length(0.0),
+            height: LPA::length(0.0),
+        };
+        self.add_widget(parent, Box::new(TextArea::with_text(text)), s)
+    }
+
     pub fn text_input(&mut self, parent: NodeId) -> WidgetId {
         self.text_input_with(parent, "")
     }
@@ -363,11 +490,59 @@ impl Ui {
             .as_any_mut()
             .downcast_mut::<Button>()
     }
+    pub fn toolbar_button_mut(&mut self, id: WidgetId) -> Option<&mut ToolbarButton> {
+        self.widgets
+            .get_mut(id.0)?
+            .as_any_mut()
+            .downcast_mut::<ToolbarButton>()
+    }
     pub fn label_mut(&mut self, id: WidgetId) -> Option<&mut Label> {
         self.widgets
             .get_mut(id.0)?
             .as_any_mut()
             .downcast_mut::<Label>()
+    }
+    pub fn icon_mut(&mut self, id: WidgetId) -> Option<&mut Icon> {
+        self.widgets
+            .get_mut(id.0)?
+            .as_any_mut()
+            .downcast_mut::<Icon>()
+    }
+    pub fn file_view_mut(&mut self, id: WidgetId) -> Option<&mut FileView> {
+        self.widgets
+            .get_mut(id.0)?
+            .as_any_mut()
+            .downcast_mut::<FileView>()
+    }
+    pub fn file_view_ref(&self, id: WidgetId) -> Option<&FileView> {
+        self.widgets
+            .get(id.0)?
+            .as_any()
+            .downcast_ref::<FileView>()
+    }
+    pub fn tree_view_mut(&mut self, id: WidgetId) -> Option<&mut TreeView> {
+        self.widgets
+            .get_mut(id.0)?
+            .as_any_mut()
+            .downcast_mut::<TreeView>()
+    }
+    pub fn tree_view_ref(&self, id: WidgetId) -> Option<&TreeView> {
+        self.widgets
+            .get(id.0)?
+            .as_any()
+            .downcast_ref::<TreeView>()
+    }
+    pub fn text_area_mut(&mut self, id: WidgetId) -> Option<&mut TextArea> {
+        self.widgets
+            .get_mut(id.0)?
+            .as_any_mut()
+            .downcast_mut::<TextArea>()
+    }
+    pub fn text_area_ref(&self, id: WidgetId) -> Option<&TextArea> {
+        self.widgets
+            .get(id.0)?
+            .as_any()
+            .downcast_ref::<TextArea>()
     }
     pub fn text_input_mut(&mut self, id: WidgetId) -> Option<&mut TextInput> {
         self.widgets
@@ -397,6 +572,25 @@ impl Ui {
         }
         if let Some(v) = self.button_mut(id) {
             v.set_label(text);
+            self.needs_layout = true;
+        }
+    }
+    pub fn set_icon_image(&mut self, id: WidgetId, image: &'static IconImage) {
+        if let Some(old) = self.rect(id) {
+            self.mark_dirty_rect(old);
+        }
+        if let Some(v) = self.icon_mut(id) {
+            v.set_image(image);
+            self.needs_layout = true;
+        }
+    }
+
+    pub fn set_icon_owned_image(&mut self, id: WidgetId, image: IconImage) {
+        if let Some(old) = self.rect(id) {
+            self.mark_dirty_rect(old);
+        }
+        if let Some(v) = self.icon_mut(id) {
+            v.set_owned_image(image);
             self.needs_layout = true;
         }
     }
@@ -704,24 +898,40 @@ impl Ui {
                     };
                     changed |= self.scroll_to(sid, off)
                 }
+
                 let target = self.hit_test(*x, *y);
-                if target != self.hovered {
-                    if let Some(old) = self.hovered {
+                let old_hovered = self.hovered;
+
+                // Notify the widget the pointer just left so controls can clear
+                // their internal hover state.
+                if old_hovered != target {
+                    if let Some(old) = old_hovered {
                         let r = self.widgets[old.0].event(event, self.focus == Some(old));
                         if r != EventResult::Ignored || self.widgets[old.0].dirty() {
                             self.mark_dirty_rect(self.widgets[old.0].rect());
                             changed = true;
                         }
                     }
-                    if let Some(new) = target {
-                        let r = self.widgets[new.0].event(event, self.focus == Some(new));
-                        if r != EventResult::Ignored || self.widgets[new.0].dirty() {
-                            self.mark_dirty_rect(self.widgets[new.0].rect());
+                    self.hovered = target;
+                }
+
+                // Mouse moves must also be delivered while staying inside the
+                // same widget. Composite widgets such as FileView need this for
+                // per-item hover and scrollbar dragging. A pressed widget keeps
+                // receiving moves even if the pointer leaves its rectangle.
+                let receiver = self.pressed.or(target);
+                if let Some(id) = receiver {
+                    // Avoid sending the exact same move twice to the old widget
+                    // when it was already notified above and is still the receiver.
+                    if !(old_hovered != target && old_hovered == Some(id)) {
+                        let r = self.widgets[id.0].event(event, self.focus == Some(id));
+                        if r != EventResult::Ignored || self.widgets[id.0].dirty() {
+                            self.mark_dirty_rect(self.widgets[id.0].rect());
                             changed = true;
                         }
                     }
-                    self.hovered = target
                 }
+
                 changed
             }
             UiEvent::Up { x, y } => {

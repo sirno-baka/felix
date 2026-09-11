@@ -13,6 +13,7 @@ use taffy::prelude::{TaffyAuto, TaffyZero};
 pub trait LayoutApi {
     fn column(&mut self, parent: NodeId) -> NodeId;
     fn row(&mut self, parent: NodeId) -> NodeId;
+    fn toolbar(&mut self, parent: NodeId) -> NodeId;
     fn flex(&mut self, parent: NodeId, direction: FlexDirection) -> NodeId;
     fn panel(&mut self, parent: NodeId) -> NodeId;
     fn spacer(&mut self, parent: NodeId) -> NodeId;
@@ -27,6 +28,9 @@ impl LayoutApi for Ui {
     }
     fn row(&mut self, parent: NodeId) -> NodeId {
         Ui::row(self, parent)
+    }
+    fn toolbar(&mut self, parent: NodeId) -> NodeId {
+        Ui::toolbar(self, parent)
     }
     fn flex(&mut self, parent: NodeId, direction: FlexDirection) -> NodeId {
         Ui::flex(self, parent, direction)

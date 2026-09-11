@@ -23,7 +23,9 @@ pub mod flags;
 
 pub mod prelude {
     pub use crate::async_rt::{self, block_on, wait_readable, yield_now, Executor};
-    pub use crate::fs::{File, IoError, IoResult};
+    pub use crate::fs::{
+        self as fs, read_dir_entries, DirEntry, File, FileType, IoError, IoResult,
+    };
     pub use crate::args::Args;
     pub use crate::print;
     pub use crate::println;
@@ -32,7 +34,12 @@ pub mod prelude {
         self, default, exit, exit_on_terminate, ignore, on, SIGCONT, SIGINT, SIGKILL, SIGSTOP,
         SIGTERM, SIGTSTP, SIGTTIN, SIGTTOU,
     };
-    pub use crate::ui::{self, Button, Constraints, EventResult, Label, NodeId, Rect, ScrollViewId, TextInput, Ui, UiEvent, Widget, WidgetId};
+    pub use crate::ui::{
+        self, Button, Constraints, EventResult, FileItem, FileKind, FileView, FileViewIcons,
+        FileViewMode, Icon, IconImage, IconImageError, Label, NodeId, Rect, ScrollViewId,
+        TextArea, TextInput, ToolbarButton, TreeNode, TreeView, TreeViewIcons, Ui, UiEvent, Widget,
+        WidgetId,
+    };
     pub use crate::ui::layout::{self, LayoutApi};
     pub use taffy::prelude::{AlignContent, AlignItems, FlexDirection, JustifyContent, Position, Style};
     pub use crate::wm::{self, mouse, rgb, screen_size, MouseState, Window, WindowInfo, WmEvent};

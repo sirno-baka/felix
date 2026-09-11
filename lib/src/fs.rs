@@ -1,6 +1,9 @@
 //! Высокоуровневый файловый API для userspace
 
-use crate::syscall::{self, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
+use crate::syscall::{
+    self, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
+    S_IFMT, S_IFREG, S_IFSOCK,
+};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -14,6 +17,40 @@ pub enum IoError {
 }
 
 pub type IoResult<T> = Result<T, IoError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    Directory,
+    Regular,
+    CharDevice,
+    BlockDevice,
+    Fifo,
+    Socket,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub name: String,
+    pub inode: u64,
+    pub file_type: FileType,
+    pub mode: u32,
+    pub size: u64,
+    pub mtime: u64,
+    pub is_mount_point: bool,
+}
+
+impl DirEntry {
+    #[inline]
+    pub fn is_dir(&self) -> bool {
+        self.file_type == FileType::Directory
+    }
+
+    #[inline]
+    pub fn is_executable(&self) -> bool {
+        self.file_type == FileType::Regular && self.mode & 0o111 != 0
+    }
+}
 
 fn path_to_cstr(path: &str) -> Vec<u8> {
     let mut v = Vec::with_capacity(path.len() + 1);
@@ -212,7 +249,9 @@ pub fn remove_dir(path: &str) -> IoResult<()> {
     }
 }
 
-/// Список имён в директории (сырая строка от SYS_LS)
+/// Список имён в директории (сырая строка от SYS_LS).
+/// Оставлено для обратной совместимости; новый код должен использовать
+/// [`read_dir_entries`].
 pub fn read_dir(path: &str) -> IoResult<String> {
     let cpath = path_to_cstr(path);
     let mut buf = [0u8; 4096];
@@ -222,4 +261,152 @@ pub fn read_dir(path: &str) -> IoResult<String> {
     } else {
         Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
     }
+}
+
+/// Получить metadata для одного пути через stat64.
+pub fn metadata(path: &str) -> IoResult<syscall::Stat64> {
+    let cpath = path_to_cstr(path);
+    let mut st = syscall::Stat64::default();
+    let ret = unsafe { syscall::stat64(cpath.as_ptr(), &mut st) };
+    if (ret as i32) < 0 {
+        Err(IoError::NotFound)
+    } else {
+        Ok(st)
+    }
+}
+
+/// Точки монтирования, известные VFS.
+pub fn mount_points() -> Vec<String> {
+    let count = unsafe { syscall::mount_list(core::ptr::null_mut(), 0) };
+    if count == 0 || (count as i32) < 0 {
+        return Vec::new();
+    }
+
+    let mut raw = Vec::with_capacity(count);
+    raw.resize_with(count, syscall::MountInfo::default);
+    let written = unsafe { syscall::mount_list(raw.as_mut_ptr(), raw.len()) };
+    if (written as i32) < 0 {
+        return Vec::new();
+    }
+
+    raw.truncate(written.min(raw.len()));
+    raw.into_iter()
+        .filter_map(|entry| {
+            let len = entry.path.iter().position(|&b| b == 0).unwrap_or(entry.path.len());
+            if len == 0 {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&entry.path[..len]).into_owned())
+            }
+        })
+        .collect()
+}
+
+/// Структурированное чтение директории через getdents64 + stat64.
+///
+/// Возвращает имя, inode, тип, mode, размер, mtime и признак mount point.
+pub fn read_dir_entries(path: &str) -> IoResult<Vec<DirEntry>> {
+    let dir = File::open_ro(path)?;
+    let fd = dir.as_raw_fd();
+    let mounts = mount_points();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+
+    loop {
+        let n = unsafe { syscall::getdents64(fd, buf.as_mut_ptr(), buf.len()) };
+        if (n as i32) < 0 {
+            return Err(IoError::Other(n));
+        }
+        if n == 0 {
+            break;
+        }
+
+        let mut pos = 0usize;
+        while pos < n {
+            if n - pos < 19 {
+                return Err(IoError::Other(usize::MAX));
+            }
+
+            let p = unsafe { buf.as_ptr().add(pos) };
+            let inode = unsafe { core::ptr::read_unaligned(p as *const u64) };
+            let reclen = unsafe { core::ptr::read_unaligned(p.add(16) as *const u16) } as usize;
+            let dtype = unsafe { *p.add(18) };
+
+            if reclen < 20 || pos + reclen > n {
+                return Err(IoError::Other(usize::MAX));
+            }
+
+            let name_area = &buf[pos + 19..pos + reclen];
+            let name_len = name_area.iter().position(|&b| b == 0).unwrap_or(name_area.len());
+            let name = String::from_utf8_lossy(&name_area[..name_len]).into_owned();
+            pos += reclen;
+
+            if name.is_empty() || name == "." || name == ".." {
+                continue;
+            }
+
+            let full_path = join_path(path, &name);
+            let stat = metadata(&full_path).ok();
+
+            let (mode, size, mtime, file_type) = if let Some(st) = stat {
+                let mode = st.st_mode;
+                let raw_size = st.st_size;
+                let mtime = st.st_mtime;
+                (
+                    mode,
+                    raw_size.max(0) as u64,
+                    mtime as u64,
+                    file_type_from_mode(mode),
+                )
+            } else {
+                let fallback = match dtype {
+                    4 => FileType::Directory,
+                    8 => FileType::Regular,
+                    _ => FileType::Unknown,
+                };
+                (0, 0, 0, fallback)
+            };
+
+            out.push(DirEntry {
+                name,
+                inode,
+                file_type,
+                mode,
+                size,
+                mtime,
+                is_mount_point: mounts.iter().any(|m| same_path(m, &full_path)),
+            });
+        }
+    }
+
+    Ok(out)
+}
+
+fn file_type_from_mode(mode: u32) -> FileType {
+    match mode & S_IFMT {
+        S_IFDIR => FileType::Directory,
+        S_IFREG => FileType::Regular,
+        S_IFCHR => FileType::CharDevice,
+        S_IFBLK => FileType::BlockDevice,
+        S_IFIFO => FileType::Fifo,
+        S_IFSOCK => FileType::Socket,
+        _ => FileType::Unknown,
+    }
+}
+
+fn join_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() || parent == "/" {
+        let mut out = String::from("/");
+        out.push_str(name);
+        out
+    } else {
+        let mut out = String::from(parent.trim_end_matches('/'));
+        out.push('/');
+        out.push_str(name);
+        out
+    }
+}
+
+fn same_path(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
 }
