@@ -1,0 +1,4 @@
+# std-apps are normal std programs for the built-in PopugOS target.
+# The standard library comes from the custom `popugos` rustup toolchain.
+[build]
+target = "i686-unknown-popugos"

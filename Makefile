@@ -1,5 +1,11 @@
 UNAME := $(shell uname)
 
+# Custom JSON targets used by the kernel/boot/userspace are no_std and need
+# Cargo to build their core/alloc/compiler_builtins. Keep this explicit here
+# instead of in .cargo/config.toml so std-apps can use the prebuilt PopugOS std.
+BUILD_STD_FLAGS := -Z build-std=core,compiler_builtins,alloc \
+	-Z build-std-features=compiler-builtins-mem
+
 # Every cargo invocation needs both the custom getrandom backend selected by
 # Felix and warning suppression. Recipe-local `export` commands do not persist
 # between Makefile lines, so keep this as an exported make variable.
@@ -26,8 +32,9 @@ ifeq ($(UNAME), Linux)
 	E2CP   := e2cp
 endif
 
-# Native userspace = every apps/<name> except wasm-*
-NATIVE_APPS := $(sort $(filter-out wasm-%,$(patsubst apps/%/Cargo.toml,%,$(wildcard apps/*/Cargo.toml))))
+# Native userspace = every apps/<name> except wasm-* and applications already
+# migrated to the std userspace.
+NATIVE_APPS := $(sort $(filter-out wasm-% filemanager,$(patsubst apps/%/Cargo.toml,%,$(wildcard apps/*/Cargo.toml))))
 WASM_APPS   := $(sort $(patsubst apps/%/Cargo.toml,%,$(wildcard apps/wasm-*/Cargo.toml)))
 ROOTFS_FILES := $(shell find rootfs -type f ! -name README ! -name '.gitkeep' 2>/dev/null)
 
@@ -56,14 +63,14 @@ build:
 	@echo "Building Felix..."
 	@echo "  native apps: $(NATIVE_APPS)"
 	@echo "  wasm apps:   $(WASM_APPS)"
-	@cargo build --target=x86_16-felix.json --package=felix-boot --release -Z json-target-spec
-	@cargo build --target=x86_16-felix.json --package=felix-bootloader -Z json-target-spec
-	@#cargo build --target=x86_16-felix.json --package=felix-bootloader --release -Z json-target-spec
-	@cargo build --target=x86_32-felix.json --package=felix-kernel -Z json-target-spec
-	@#cargo build --target=x86_32-felix.json --package=felix-kernel --release -Z json-target-spec
+	@cargo build $(BUILD_STD_FLAGS) --target=x86_16-felix.json --package=felix-boot --release -Z json-target-spec
+	@cargo build $(BUILD_STD_FLAGS) --target=x86_16-felix.json --package=felix-bootloader -Z json-target-spec
+	@#cargo build $(BUILD_STD_FLAGS) --target=x86_16-felix.json --package=felix-bootloader --release -Z json-target-spec
+	@cargo build $(BUILD_STD_FLAGS) --target=x86_32-felix.json --package=felix-kernel -Z json-target-spec
+	@#cargo build $(BUILD_STD_FLAGS) --target=x86_32-felix.json --package=felix-kernel --release -Z json-target-spec
 	@for p in $(NATIVE_APPS); do \
 		echo "  cargo build $$p"; \
-		cargo build --target=x86_32-felix.json --package=$$p --release -Z json-target-spec; \
+		cargo build $(BUILD_STD_FLAGS) --target=x86_32-felix.json --package=$$p --release -Z json-target-spec; \
 	done
 	@for p in $(WASM_APPS); do \
 		echo "  cargo build $$p (wasm)"; \

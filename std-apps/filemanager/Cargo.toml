@@ -1,0 +1,13 @@
+[package]
+name = "filemanager"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "filemanager"
+path = "src/main.rs"
+
+[dependencies]
+popui = { path = "../../popui" }
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "sync", "time", "macros"] }
+taffy = { version = "0.14", default-features = false, features = ["alloc", "flexbox", "taffy_tree"] }

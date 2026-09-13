@@ -1,0 +1,25 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "popui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+test = false
+
+[dependencies]
+popugos = { path = "../popugos" }
+taffy = { version = "0.14", default-features = false, features = ["alloc", "flexbox", "taffy_tree"] }
+embedded-graphics = { version = "0.8.2", default-features = false }
+embedded-graphics-unicodefonts = "0.2.0"
+png-decoder = { version = "0.2.0", default-features = false }
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "sync", "time", "macros"] }
+
+[patch.crates-io]
+tokio = { git = "https://github.com/sirno-baka/tokio", branch = "popugos" }
+mio = { git = "https://github.com/sirno-baka/mio", branch = "master" }
+socket2 = { git = "https://github.com/sirno-baka/socket2", branch = "master" }

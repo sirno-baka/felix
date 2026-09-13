@@ -24,7 +24,13 @@ const STATUS_AUX: u8 = 1 << 5;
 
 static READY: AtomicBool = AtomicBool::new(false);
 static CYCLE: AtomicU8 = AtomicU8::new(0);
-static PACKET: [AtomicU8; 3] = [AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0)];
+static PACKET_LEN: AtomicU8 = AtomicU8::new(3);
+static PACKET: [AtomicU8; 4] = [
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+];
 
 /// Absolute cursor position (screen pixels).
 static TIME: AtomicU32 = AtomicU32::new(0);
@@ -130,6 +136,13 @@ fn mouse_read() -> u8 {
     if wait_output_full() { inb(PS2_DATA) } else { 0 }
 }
 
+fn set_sample_rate(rate: u8) -> bool {
+    mouse_write(0xF3);
+    if mouse_read() != 0xFA { return false; }
+    mouse_write(rate);
+    mouse_read() == 0xFA
+}
+
 /// Initialize 8042 aux device + enable streaming. Call with IF=0 after PIC init.
 pub fn init() {
     debugln!("[mouse] init");
@@ -165,11 +178,21 @@ pub fn init() {
         debugln!("[mouse] reset no ACK ({:#x}), trying anyway", ack);
     }
     let _aa = mouse_read(); // 0xAA self-test
-    let _id = mouse_read(); // device id
+    let _id = mouse_read(); // initial device id
 
     // Defaults
     mouse_write(0xF6);
     let _ = mouse_read();
+
+    // IntelliMouse negotiation. A wheel-capable device changes its id to 3
+    // after the 200/100/80 sample-rate sequence (Explorer mice may report 4).
+    let wheel_id = if set_sample_rate(200) && set_sample_rate(100) && set_sample_rate(80) {
+        mouse_write(0xF2);
+        if mouse_read() == 0xFA { mouse_read() } else { 0 }
+    } else {
+        0
+    };
+    PACKET_LEN.store(if wheel_id == 3 || wheel_id == 4 { 4 } else { 3 }, Ordering::Relaxed);
 
     // Enable data reporting
     mouse_write(0xF4);
@@ -245,7 +268,7 @@ pub extern "C" fn mouse_handler() {
 
     PACKET[cycle as usize].store(byte, Ordering::Relaxed);
     let next = cycle + 1;
-    if next >= 3 {
+    if next >= PACKET_LEN.load(Ordering::Relaxed) {
         CYCLE.store(0, Ordering::Relaxed);
         process_packet();
     } else {
@@ -259,6 +282,7 @@ fn process_packet() {
     let b0 = PACKET[0].load(Ordering::Relaxed);
     let b1 = PACKET[1].load(Ordering::Relaxed);
     let b2 = PACKET[2].load(Ordering::Relaxed);
+    let b3 = PACKET[3].load(Ordering::Relaxed);
 
     // Overflow → ignore move
     if b0 & 0xC0 != 0 {
@@ -307,8 +331,20 @@ fn process_packet() {
         } else if (buttons & 1) == 0 && (prev & 1) != 0 {
             crate::drivers::wm::on_mouse_up(x, y);
         }
+        if (buttons & 2) != 0 && (prev & 2) == 0 {
+            crate::drivers::wm::on_mouse_right_down(x, y);
+        } else if (buttons & 2) == 0 && (prev & 2) != 0 {
+            crate::drivers::wm::on_mouse_right_up(x, y);
+        }
         if dx != 0 || dy != 0 {
             crate::drivers::wm::on_mouse_move(x, y);
+        }
+        if PACKET_LEN.load(Ordering::Relaxed) == 4 {
+            let nibble = (b3 & 0x0F) as i8;
+            let wheel = if nibble & 0x08 != 0 { nibble | !0x0F } else { nibble };
+            if wheel != 0 {
+                crate::drivers::wm::on_mouse_wheel(x, y, wheel as i32);
+            }
         }
 
         // Redraw cursor (try_lock only — never block in IRQ)
@@ -335,24 +371,35 @@ pub fn redraw_cursor() {
         return;
     };
 
-    let (x, y) = position();
+    hide_cursor(fb);
+    show_cursor(fb);
+}
 
+/// Remove the software cursor before the compositor touches the framebuffer.
+/// The compositor already owns the framebuffer lock when calling this.
+pub fn hide_cursor(fb: &mut crate::drivers::framebuffer::Framebuffer) {
     unsafe {
-        // Restore old
-        if CUR_DRAWN {
-            for row in 0..CUR_H {
-                for col in 0..CUR_W {
-                    let px = CUR_OX + col as i32;
-                    let py = CUR_OY + row as i32;
-                    if px >= 0 && py >= 0 {
-                        let c = UNDER[row * CUR_W + col];
-                        fb.put_pixel_raw(px as u32, py as u32, c);
-                    }
+        if !CUR_DRAWN { return; }
+        for row in 0..CUR_H {
+            for col in 0..CUR_W {
+                let px = CUR_OX + col as i32;
+                let py = CUR_OY + row as i32;
+                if px >= 0 && py >= 0
+                    && (px as u32) < fb.info.width as u32
+                    && (py as u32) < fb.info.height as u32
+                {
+                    fb.put_pixel_raw(px as u32, py as u32, UNDER[row * CUR_W + col]);
                 }
             }
         }
+        CUR_DRAWN = false;
+    }
+}
 
-        // Save under new position + draw
+/// Paint the cursor as the final compositor layer and refresh its under-buffer.
+pub fn show_cursor(fb: &mut crate::drivers::framebuffer::Framebuffer) {
+    let (x, y) = position();
+    unsafe {
         for row in 0..CUR_H {
             for col in 0..CUR_W {
                 let px = x + col as i32;
@@ -403,12 +450,4 @@ fn read_pixel(fb: &crate::drivers::framebuffer::Framebuffer, x: u32, y: u32) -> 
         let r = *ptr.add(2) as u32;
         (r << 16) | (g << 8) | b
     }
-}
-
-/// After full-screen compose the under-buffer is stale — force redraw.
-pub fn invalidate_cursor() {
-    unsafe {
-        CUR_DRAWN = false;
-    }
-    redraw_cursor();
 }

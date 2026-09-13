@@ -4,17 +4,16 @@
 use crate::drivers::pic::PICS;
 use crate::multitasking::task::{CPUState, TASK_MANAGER};
 use crate::println;
-use crate::time::{SYSTEM_FRACTION, jiffies};
+use crate::time::uptime_ms;
 use core::arch::asm;
 use core::arch::naked_asm;
 
 pub const TIMER_INT: u8 = 32;
 
-// Как часто поллить сеть (в тиках таймера)
-// При SYSTEM_FRACTION ≈ 1.0 (1 мс) → каждые 10 мс
-const NET_POLL_EVERY: usize = 10;
-
-static mut NET_POLL_COUNTER: usize = 0;
+// Poll the network by elapsed time, not by IRQ count, so changing the PIT
+// frequency does not change the networking cadence.
+const NET_POLL_EVERY_MS: u64 = 10;
+static mut LAST_NET_POLL_MS: u64 = 0;
 
 /// Naked interrupt handler for timer (IRQ0)
 #[unsafe(naked)]
@@ -74,10 +73,10 @@ pub extern "C" fn timer() {
 pub extern "C" fn timer_handler(esp: u32) -> u32 {
     unsafe {
         // === 1. Сетевой полл (неблокирующий) ===
-        NET_POLL_COUNTER += 1;
-        if NET_POLL_COUNTER >= NET_POLL_EVERY {
-            NET_POLL_COUNTER = 0;
-            poll_network();
+        let now_ms = uptime_ms();
+        if now_ms.saturating_sub(LAST_NET_POLL_MS) >= NET_POLL_EVERY_MS {
+            LAST_NET_POLL_MS = now_ms;
+            poll_network(now_ms as i64);
         }
 
         // === 2. Планировщик ===
@@ -93,10 +92,7 @@ pub extern "C" fn timer_handler(esp: u32) -> u32 {
 }
 
 /// Безопасный полл из IRQ-контекста
-unsafe fn poll_network() {
-    // Считаем текущее время в миллисекундах
-    let timestamp_ms = (jiffies() as f64 * SYSTEM_FRACTION) as i64;
-
+unsafe fn poll_network(timestamp_ms: i64) {
     // Пытаемся взять стек без блокировки
     if let Some(mut guard) = crate::net::stack::NET_STACK.try_lock() {
         if let Some(ref mut stack) = *guard {

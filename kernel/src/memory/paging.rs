@@ -1,5 +1,6 @@
 use crate::println;
 use crate::sync::mutex::Mutex;
+use alloc::vec::Vec;
 use core::arch::asm;
 use core::fmt;
 use core::ptr::write_bytes;
@@ -539,6 +540,7 @@ impl PageDirectory {
 pub struct PageManager {
     pub dir: PageDirectory,
     pub next_free_page: u32,
+    free_frames: Vec<u32>,
 }
 
 impl PageManager {
@@ -546,6 +548,7 @@ impl PageManager {
         PageManager {
             dir: PageDirectory::new(),
             next_free_page: 0,
+            free_frames: Vec::new(),
         }
     }
 
@@ -601,21 +604,41 @@ impl PageManager {
     }
 
     pub fn alloc_phys_frame(&mut self) -> u32 {
+        if let Some(frame) = self.free_frames.pop() {
+            return frame;
+        }
         let frame = self.next_free_page;
         self.next_free_page += 1;
         frame
     }
 
-    pub fn free_phys_frame(&mut self, _frame: u32) {}
+    pub fn free_phys_frame(&mut self, frame: u32) {
+        let first_dynamic = FRAME_ALLOC_START >> 12;
+        if frame < first_dynamic || frame >= self.next_free_page {
+            return;
+        }
+        // `sys_munmap` only calls this after removing the last mapping to a
+        // userspace page. Keep a small duplicate guard anyway: a duplicated
+        // frame in this stack would later alias two unrelated virtual pages.
+        if !self.free_frames.iter().any(|&free| free == frame) {
+            self.free_frames.push(frame);
+        }
+    }
 
     pub(crate) fn alloc_frame(&mut self) -> u32 {
+        if let Some(frame) = self.free_frames.pop() {
+            return frame;
+        }
+
         // Guard: never hand out frames past detected physical RAM.
         let max_page = detected_ram_bytes() >> 12;
         let frame = self.next_free_page;
         if frame >= max_page {
             panic!(
-                "[pg] out of physical frames (next={}, max={})",
-                frame, max_page
+                "[pg] out of physical frames (next={}, max={}, reusable={})",
+                frame,
+                max_page,
+                self.free_frames.len()
             );
         }
         self.next_free_page += 1;

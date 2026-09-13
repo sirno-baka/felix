@@ -119,15 +119,32 @@ impl File {
     }
 
     /// Читать файл целиком до EOF.
-    /// Читает кусками по 512 байт, пока read не вернёт 0.
+    ///
+    /// Для обычных файлов сначала узнаём размер через fstat64 и сразу
+    /// резервируем нужную ёмкость. Это особенно важно для ELF: старый вариант
+    /// читал по 512 байт и заставлял Vec многократно расти 1→2→4 MiB.
     pub fn read_to_end(&mut self) -> IoResult<Vec<u8>> {
-        let mut result = Vec::new();
-        let mut chunk = [0u8; 512];
+        const READ_CHUNK: usize = 16 * 1024;
+
+        let mut st = syscall::Stat64::default();
+        let stat_ok = unsafe { syscall::fstat64(self.fd, &mut st) } == 0;
+        let expected = if stat_ok && st.st_size > 0 {
+            st.st_size as usize
+        } else {
+            0
+        };
+
+        let mut result = if expected > 0 {
+            Vec::with_capacity(expected)
+        } else {
+            Vec::new()
+        };
+        let mut chunk = [0u8; READ_CHUNK];
 
         loop {
             let n = self.read(&mut chunk)?;
             if n == 0 {
-                break; // EOF
+                break;
             }
             result.extend_from_slice(&chunk[..n]);
         }

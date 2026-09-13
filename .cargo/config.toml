@@ -1,8 +1,8 @@
-[unstable]
-build-std = ["core", "compiler_builtins", "alloc"]
-build-std-features = ["compiler-builtins-mem"]
-
+# Shared flags only. Targets and build-std are intentionally selected by the
+# individual build entry points:
+#   * root Makefile -> x86_16/x86_32 Felix JSON targets + -Z build-std
+#   * std-apps      -> built-in i686-unknown-popugos + prebuilt PopugOS std
+# Keeping a global target here would leak the kernel targets into std-apps.
 [build]
 rustflags = ["--cfg", "test_disabled", "--cfg", "getrandom_backend=\"custom\""]
-target = ["x86_32-felix.json", "x86_16-felix.json"]
 

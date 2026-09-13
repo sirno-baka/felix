@@ -1,0 +1,11 @@
+[package]
+name = "tokio-smoke"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "tokio-smoke"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.53.1", default-features = false, features = ["net", "rt", "sync", "time"] }

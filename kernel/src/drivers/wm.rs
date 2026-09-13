@@ -52,6 +52,10 @@ pub const EV_FOCUS_IN: u32 = 7;
 pub const EV_FOCUS_OUT: u32 = 8;
 /// Client size changed: a=client_w, b=client_h.
 pub const EV_RESIZE: u32 = 9;
+/// Pointer left this window's client area.
+pub const EV_MOUSE_LEAVE: u32 = 10;
+/// Mouse wheel: a=x, b=y, c=signed wheel steps.
+pub const EV_MOUSE_WHEEL: u32 = 11;
 
 /// Fixed ring of window events (drop oldest on overflow).
 struct EventQueue {
@@ -76,6 +80,17 @@ impl EventQueue {
     }
 
     fn push(&mut self, ev: WmEvent) {
+        // Pointer IRQs can arrive much faster than a large client can repaint.
+        // Intermediate positions have no semantic value when no button edge is
+        // between them, so keep only the newest consecutive move. This avoids
+        // visible hover lag without dropping clicks or key events.
+        if ev.kind == EV_MOUSE_MOVE && self.head != self.tail {
+            let last = (self.tail + EV_CAP - 1) % EV_CAP;
+            if self.buf[last].kind == EV_MOUSE_MOVE {
+                self.buf[last] = ev;
+                return;
+            }
+        }
         let next = (self.tail + 1) % EV_CAP;
         if next == self.head {
             // full — drop oldest
@@ -394,6 +409,8 @@ pub struct Compositor {
     next_id: u8,
     next_z: u8,
     drag: Option<DragState>,
+    hovered_client: Option<u8>,
+    mouse_capture: Option<u8>,
     dirty: Option<DirtyRect>,
 }
 
@@ -407,6 +424,8 @@ impl Compositor {
             next_id: 1,
             next_z: 1,
             drag: None,
+            hovered_client: None,
+            mouse_capture: None,
             dirty: None,
         }
     }
@@ -471,6 +490,26 @@ impl Compositor {
         ids
     }
 
+    /// Top-most client under a screen coordinate. A title bar/border blocks
+    /// windows below it but is not itself a client event target.
+    fn client_at(&self, x: i32, y: i32) -> Option<(u8, i32, i32)> {
+        let ids = self.sorted_ids();
+        for id in ids.iter().rev().flatten() {
+            let Some(w) = self.find(*id) else { continue; };
+            let th = w.title_height() as i32;
+            let cx = x - w.x;
+            let cy = y - (w.y + th);
+            let client_h = w.h.saturating_sub(th as u32) as i32;
+            if cx >= 0 && cy >= 0 && cx < w.w as i32 && cy < client_h {
+                return Some((*id, cx, cy));
+            }
+            if x >= w.x && x < w.x + w.w as i32 && y >= w.y && y < w.y + w.h as i32 {
+                return None;
+            }
+        }
+        None
+    }
+
     fn mark_dirty(&mut self, rect: DirtyRect) {
         self.dirty = Some(match self.dirty {
             Some(old) => old.union(rect),
@@ -490,6 +529,7 @@ impl Compositor {
         let Some(fb) = guard.as_mut() else {
             return;
         };
+        crate::drivers::mouse::hide_cursor(fb);
         fb.fill_fast(self.bg);
 
         for id in self.sorted_ids().iter().flatten() {
@@ -497,8 +537,7 @@ impl Compositor {
                 self.draw_window_clipped(fb, w, DirtyRect::new(0, 0, self.screen_w, self.screen_h));
             }
         }
-        drop(guard);
-        crate::drivers::mouse::invalidate_cursor();
+        crate::drivers::mouse::show_cursor(fb);
     }
 
     /// Compose one dirty region. The region is first restored from the desktop
@@ -570,6 +609,7 @@ impl Compositor {
         let Some(fb) = guard.as_mut() else {
             return;
         };
+        crate::drivers::mouse::hide_cursor(fb);
 
         // 1. Paint new position first.
         self.compose_opaque_region(fb, id, new);
@@ -623,8 +663,7 @@ impl Compositor {
             self.compose_region(fb, old);
         }
 
-        drop(guard);
-        crate::drivers::mouse::invalidate_cursor();
+        crate::drivers::mouse::show_cursor(fb);
     }
 
     /// Region-aware client update. The client surface is opaque, so paint the
@@ -646,9 +685,9 @@ impl Compositor {
 
         let mut guard = FRAMEBUFFER.lock();
         let Some(fb) = guard.as_mut() else { return; };
+        crate::drivers::mouse::hide_cursor(fb);
         self.compose_opaque_region(fb, id, rect);
-        drop(guard);
-        crate::drivers::mouse::invalidate_cursor();
+        crate::drivers::mouse::show_cursor(fb);
     }
 
     /// Compatibility wrapper: compose exactly this window's current rectangle.
@@ -660,9 +699,9 @@ impl Compositor {
 
         let mut guard = FRAMEBUFFER.lock();
         let Some(fb) = guard.as_mut() else { return; };
+        crate::drivers::mouse::hide_cursor(fb);
         self.compose_region(fb, w.rect());
-        drop(guard);
-        crate::drivers::mouse::invalidate_cursor();
+        crate::drivers::mouse::show_cursor(fb);
     }
 
     /// Consume the compositor dirty region.
@@ -680,9 +719,9 @@ impl Compositor {
             return;
         };
 
+        crate::drivers::mouse::hide_cursor(fb);
         self.compose_region(fb, dirty);
-        drop(guard);
-        crate::drivers::mouse::invalidate_cursor();
+        crate::drivers::mouse::show_cursor(fb);
     }
 
     fn draw_window_clipped(&self, fb: &mut Framebuffer, w: &Window, clip: DirtyRect) {
@@ -1092,6 +1131,8 @@ pub fn init() {
         wm.next_id = 1;
         wm.next_z = 1;
         wm.drag = None;
+        wm.hovered_client = None;
+        wm.mouse_capture = None;
         wm.dirty = None;
         wm.compose();
     }
@@ -1172,6 +1213,8 @@ pub fn destroy_window(id: u32) -> bool {
             if slot.as_ref().map(|w| w.id) == Some(id) {
                 let rect = slot.as_ref().map(|w| w.rect()).unwrap_or(DirtyRect::new(0, 0, 0, 0));
                 *slot = None;
+                if wm.hovered_client == Some(id) { wm.hovered_client = None; }
+                if wm.mouse_capture == Some(id) { wm.mouse_capture = None; }
                 wm.mark_dirty(rect);
                 wm.compose_dirty();
                 return true;
@@ -1192,11 +1235,17 @@ pub fn destroy_windows_of(owner_slot: i8) {
         let mut any = false;
         let mut dirty_rects: [Option<DirtyRect>; MAX_WINDOWS] = [None; MAX_WINDOWS];
         let mut n = 0;
+        let hovered = wm.hovered_client;
+        let captured = wm.mouse_capture;
+        let mut hovered_removed = false;
+        let mut capture_removed = false;
 
         for slot in wm.windows.iter_mut() {
             if slot.as_ref().map(|w| w.owner_slot) == Some(owner_slot) {
                 if let Some(w) = slot.as_ref() {
                     dirty_rects[n] = Some(w.rect());
+                    hovered_removed |= hovered == Some(w.id);
+                    capture_removed |= captured == Some(w.id);
                     n += 1;
                 }
                 *slot = None;
@@ -1207,6 +1256,8 @@ pub fn destroy_windows_of(owner_slot: i8) {
         for rect in dirty_rects.iter().take(n).flatten() {
             wm.mark_dirty(*rect);
         }
+        if hovered_removed { wm.hovered_client = None; }
+        if capture_removed { wm.mouse_capture = None; }
 
         if any {
             wm.drag = None;
@@ -1372,6 +1423,7 @@ pub fn on_mouse_down(x: i32, y: i32) {
     let Some(mut wm) = WM.try_lock() else {
         return;
     };
+    wm.mouse_capture = None;
     let ids = wm.sorted_ids();
     for id in ids.iter().rev().flatten() {
         let Some(w) = wm.find(*id) else {
@@ -1406,6 +1458,8 @@ pub fn on_mouse_down(x: i32, y: i32) {
             if let Some(rect) = old_rect {
                 wm.mark_dirty(rect);
             }
+            if wm.hovered_client == Some(target) { wm.hovered_client = None; }
+            if wm.mouse_capture == Some(target) { wm.mouse_capture = None; }
             wm.drag = None;
             wm.compose_dirty();
             drop(wm);
@@ -1545,6 +1599,9 @@ pub fn on_mouse_down(x: i32, y: i32) {
             }
         }
 
+        wm.hovered_client = in_client.then_some(target);
+        wm.mouse_capture = in_client.then_some(target);
+
         if start_drag {
             wm.drag = Some(DragState {
                 id: target,
@@ -1566,6 +1623,63 @@ pub fn on_mouse_down(x: i32, y: i32) {
         return;
     }
     wm.drag = None;
+}
+
+/// Right button down. Unlike the primary button it never starts a title drag or
+/// resize; it is delivered to the top-most client so userspace can open a
+/// context menu. `c=2` is the right-button code in the userspace WM ABI.
+pub fn on_mouse_right_down(x: i32, y: i32) {
+    let Some(mut wm) = WM.try_lock() else { return; };
+    let ids = wm.sorted_ids();
+    for id in ids.iter().rev().flatten() {
+        let Some(w) = wm.find_mut(*id) else { continue; };
+        if !w.visible { continue; }
+        let th = w.title_height() as i32;
+        let cx = x - w.x;
+        let cy = y - (w.y + th);
+        let client_h = w.h.saturating_sub(th as u32) as i32;
+        if cx >= 0 && cy >= 0 && cx < w.w as i32 && cy < client_h {
+            w.events.push(WmEvent {
+                kind: EV_MOUSE_DOWN,
+                a: cx,
+                b: cy,
+                c: 2,
+                d: 0,
+            });
+            return;
+        }
+        if x >= w.x && x < w.x + w.w as i32 && y >= w.y && y < w.y + w.h as i32 {
+            return;
+        }
+    }
+}
+
+/// Right button up. Kept in the ABI even though PopUI currently opens context
+/// menus on the down edge.
+pub fn on_mouse_right_up(x: i32, y: i32) {
+    let Some(mut wm) = WM.try_lock() else { return; };
+    let ids = wm.sorted_ids();
+    for id in ids.iter().rev().flatten() {
+        let Some(w) = wm.find_mut(*id) else { continue; };
+        if !w.visible { continue; }
+        let th = w.title_height() as i32;
+        let cx = x - w.x;
+        let cy = y - (w.y + th);
+        let client_h = w.h.saturating_sub(th as u32) as i32;
+        if cx >= 0 && cy >= 0 && cx < w.w as i32 && cy < client_h {
+            w.events.push(WmEvent {
+                kind: EV_MOUSE_UP,
+                a: cx,
+                b: cy,
+                c: 2,
+                d: 0,
+            });
+            return;
+        }
+        if x >= w.x && x < w.x + w.w as i32 && y >= w.y && y < w.y + w.h as i32 {
+            return;
+        }
+    }
 }
 
 /// Pointer move: title drag or client MouseMove.
@@ -1627,30 +1741,30 @@ pub fn on_mouse_move(x: i32, y: i32) {
         return;
     }
 
-    let ids = wm.sorted_ids();
-    for id in ids.iter().rev().flatten() {
-        let Some(w) = wm.find_mut(*id) else {
-            continue;
-        };
-        if !w.visible {
-            continue;
+    if let Some(id) = wm.mouse_capture {
+        if let Some(w) = wm.find_mut(id) {
+            let cx = x - w.x;
+            let cy = y - (w.y + w.title_height() as i32);
+            w.events.push(WmEvent { kind: EV_MOUSE_MOVE, a: cx, b: cy, c: 0, d: 0 });
+        } else {
+            wm.mouse_capture = None;
         }
-        let th = w.title_height() as i32;
-        let cx = x - w.x;
-        let cy = y - (w.y + th);
-        let client_h = w.h.saturating_sub(th as u32) as i32;
-        if cx >= 0 && cy >= 0 && cx < w.w as i32 && cy < client_h {
-            w.events.push(WmEvent {
-                kind: EV_MOUSE_MOVE,
-                a: cx,
-                b: cy,
-                c: 0,
-                d: 0,
-            });
-            return;
+        return;
+    }
+
+    let target = wm.client_at(x, y);
+    let next_hover = target.map(|(id, _, _)| id);
+    if wm.hovered_client != next_hover {
+        if let Some(old) = wm.hovered_client {
+            if let Some(w) = wm.find_mut(old) {
+                w.events.push(WmEvent { kind: EV_MOUSE_LEAVE, a: 0, b: 0, c: 0, d: 0 });
+            }
         }
-        if x >= w.x && x < w.x + w.w as i32 && y >= w.y && y < w.y + w.h as i32 {
-            return;
+        wm.hovered_client = next_hover;
+    }
+    if let Some((id, cx, cy)) = target {
+        if let Some(w) = wm.find_mut(id) {
+            w.events.push(WmEvent { kind: EV_MOUSE_MOVE, a: cx, b: cy, c: 0, d: 0 });
         }
     }
 }
@@ -1678,31 +1792,29 @@ pub fn on_mouse_up(x: i32, y: i32) {
         }
     }
 
-    let ids = wm.sorted_ids();
-    for id in ids.iter().rev().flatten() {
-        let Some(w) = wm.find_mut(*id) else {
-            continue;
-        };
-        if !w.visible {
-            continue;
+    if let Some(id) = wm.mouse_capture.take() {
+        if let Some(w) = wm.find_mut(id) {
+            let cx = x - w.x;
+            let cy = y - (w.y + w.title_height() as i32);
+            w.events.push(WmEvent { kind: EV_MOUSE_UP, a: cx, b: cy, c: 1, d: 0 });
         }
-        let th = w.title_height() as i32;
-        let cx = x - w.x;
-        let cy = y - (w.y + th);
-        let client_h = w.h.saturating_sub(th as u32) as i32;
-        if cx >= 0 && cy >= 0 && cx < w.w as i32 && cy < client_h {
-            w.events.push(WmEvent {
-                kind: EV_MOUSE_UP,
-                a: cx,
-                b: cy,
-                c: 1,
-                d: 0,
-            });
-            return;
+        return;
+    }
+
+    if let Some((id, cx, cy)) = wm.client_at(x, y) {
+        if let Some(w) = wm.find_mut(id) {
+            w.events.push(WmEvent { kind: EV_MOUSE_UP, a: cx, b: cy, c: 1, d: 0 });
         }
-        if x >= w.x && x < w.x + w.w as i32 && y >= w.y && y < w.y + w.h as i32 {
-            return;
-        }
+    }
+}
+
+/// Deliver signed wheel steps to the top-most client below the pointer.
+pub fn on_mouse_wheel(x: i32, y: i32, delta: i32) {
+    if delta == 0 { return; }
+    let Some(mut wm) = WM.try_lock() else { return; };
+    let Some((id, cx, cy)) = wm.client_at(x, y) else { return; };
+    if let Some(w) = wm.find_mut(id) {
+        w.events.push(WmEvent { kind: EV_MOUSE_WHEEL, a: cx, b: cy, c: delta, d: 0 });
     }
 }
 

@@ -1,0 +1,13 @@
+[package]
+name = "hello"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "hello"
+path = "src/main.rs"
+
+
+[dependencies]
+ureq = { version = "2.10", features = ["json"] } # Enable json feature if you need it
+serde = { version = "1.0", features = ["derive"] }

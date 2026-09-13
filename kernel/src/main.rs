@@ -23,6 +23,7 @@ mod net;
 mod pci;
 mod pipe;
 mod print;
+mod random;
 mod shell;
 mod signal;
 mod spin;

@@ -27,6 +27,8 @@ pub const SYS_GETSID: u32 = 147;
 pub const SYS_NANOSLEEP: u32 = 162;
 pub const SYS_GETCWD: u32 = 183;
 pub const SYS_CLOCK_GETTIME: u32 = 265;
+/// getrandom(buf, len, flags) — Linux i386 #355
+pub const SYS_GETRANDOM: u32 = 355;
 /// lseek(fd, offset, whence) — Linux i386 #19
 pub const SYS_LSEEK: u32 = 19;
 /// brk(addr) — Linux i386 #45; brk(0) returns current break

@@ -177,6 +177,11 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         crate::syscalls::SYS_DUP => sys_dup(current_slot, state.ebx as usize),
         crate::syscalls::SYS_GETTIMEOFDAY => sys_gettimeofday(state.ebx as *mut TimeVal),
         crate::syscalls::SYS_CLOCK_GETTIME => sys_clock_gettime(state.ebx as i32, state.ecx as *mut TimeSpec),
+        crate::syscalls::SYS_GETRANDOM => sys_getrandom(
+            state.ebx as *mut u8,
+            state.ecx as usize,
+            state.edx as u32,
+        ),
         crate::syscalls::SYS_NANOSLEEP => sys_nanosleep(state.ebx as *const TimeSpec, state.ecx as *mut TimeSpec),
         crate::syscalls::SYS_TTY_SETFG => sys_tty_setfg(current_slot, state.ebx as i32),
         crate::syscalls::SYS_TTY_GETFG => sys_tty_getfg(current_slot),
@@ -536,12 +541,37 @@ const EXDEV: usize = (-18isize) as usize;
 const EINVAL: usize = (-22isize) as usize;
 const ENOTTY: usize = (-25isize) as usize;
 const EPIPE: usize = (-32isize) as usize;
+const ECONNREFUSED: usize = (-111isize) as usize;
+const ETIMEDOUT: usize = (-110isize) as usize;
+const EINPROGRESS: usize = (-115isize) as usize;
 const ENOTDIR: usize = (-20isize) as usize;
 
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFCHR: u32 = 0o020000;
 const S_IFBLK: u32 = 0o060000;
+
+/// Linux i386 getrandom(2). Felix currently has one entropy pool, so
+/// GRND_RANDOM/GRND_NONBLOCK do not select a different source; the flag bits
+/// are accepted for ABI compatibility.
+pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> usize {
+    const GRND_NONBLOCK: u32 = 0x0001;
+    const GRND_RANDOM: u32 = 0x0002;
+
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM) != 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    if buf.is_null() {
+        return EFAULT;
+    }
+
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    crate::random::fill_bytes(out);
+    len
+}
 
 /// Linux i386 `struct stat64` (glibc layout).
 #[repr(C, packed)]
@@ -978,17 +1008,39 @@ pub fn sys_mmap2(
             // Hint — we honour it if non-zero and not FIXED (simple)
             addr & !(page_size - 1)
         } else {
-            // Auto: bump allocator from mmap_next
-            if task.mmap_next < 0x6000_0000 {
-                task.mmap_next = 0x6000_0000;
+            // First-fit reuse of page-aligned holes returned by munmap. Rust's
+            // PopugOS allocator uses mmap per allocation, so a pure bump VA
+            // allocator would otherwise exhaust address space in long-running
+            // Tokio/Mio workloads even after physical pages are recycled.
+            let mut reused = None;
+            for i in 0..task.mmap_free.len() {
+                let (hole_start, hole_len) = task.mmap_free[i];
+                if hole_len < len_u {
+                    continue;
+                }
+                reused = Some(hole_start);
+                if hole_len == len_u {
+                    task.mmap_free.swap_remove(i);
+                } else {
+                    task.mmap_free[i] = (hole_start + len_u, hole_len - len_u);
+                }
+                break;
             }
-            // Keep below user stack (~0xBFFF_F000)
-            if task.mmap_next.saturating_add(len_u) >= 0xB000_0000 {
-                return ENOMEM;
+
+            if let Some(v) = reused {
+                v
+            } else {
+                if task.mmap_next < 0x6000_0000 {
+                    task.mmap_next = 0x6000_0000;
+                }
+                // Keep below user stack / reserved upper userspace.
+                if task.mmap_next.saturating_add(len_u) >= 0xB000_0000 {
+                    return ENOMEM;
+                }
+                let v = task.mmap_next;
+                task.mmap_next = task.mmap_next.saturating_add(len_u);
+                v
             }
-            let v = task.mmap_next;
-            task.mmap_next = task.mmap_next.saturating_add(len_u);
-            v
         };
 
         // Don't map into kernel half
@@ -1054,9 +1106,51 @@ pub fn sys_munmap(current_slot: usize, addr: u32, len: usize) -> usize {
             while p < end && p < 0xC000_0000 {
                 let should = task.page_refcounts.dec(p);
                 if should {
+                    // Capture the physical frame before clearing the PTE. The
+                    // old implementation unmapped the VA but leaked the frame
+                    // forever, which makes allocation-heavy runtimes such as
+                    // Tokio exhaust all RAM after enough mmap/munmap churn.
+                    let frame = task.pd().translate(p).map(|phys| phys >> 12);
                     task.pd_mut().unmap(p);
+                    if let Some(frame) = frame {
+                        PAGING.lock().free_phys_frame(frame);
+                    }
                 }
                 p += page_size;
+            }
+
+            // Recycle the virtual range as well. Only the auto-mmap arena is
+            // eligible; stack/ELF/fixed mappings must never become allocator
+            // holes. If a page is still referenced, keep the whole range out of
+            // the free list rather than risk overlapping a live mapping.
+            if start >= 0x6000_0000 && end <= 0xB000_0000 && end > start {
+                let mut q = start;
+                let mut fully_unmapped = true;
+                while q < end {
+                    if task.pd().translate(q).is_some() {
+                        fully_unmapped = false;
+                        break;
+                    }
+                    q += page_size;
+                }
+                if fully_unmapped {
+                    task.mmap_free.push((start, end - start));
+                    task.mmap_free.sort_unstable_by_key(|entry| entry.0);
+
+                    let mut i = 0usize;
+                    while i + 1 < task.mmap_free.len() {
+                        let (a_start, a_len) = task.mmap_free[i];
+                        let (b_start, b_len) = task.mmap_free[i + 1];
+                        let a_end = a_start.saturating_add(a_len);
+                        if a_end >= b_start {
+                            let merged_end = a_end.max(b_start.saturating_add(b_len));
+                            task.mmap_free[i] = (a_start, merged_end - a_start);
+                            task.mmap_free.remove(i + 1);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
             }
             return 0;
         }
@@ -2394,6 +2488,18 @@ fn fd_poll_revents(current_slot: usize, fd: i32, events: i16) -> i16 {
                                         rev |= POLLIN;
                                     }
                                 } else {
+                                    if logical_state == Some(SocketState::Connecting)
+                                        && socket.state() == tcp::State::Established
+                                    {
+                                        if let Some(mut table) = SOCKET_TABLE.try_lock() {
+                                            if let Some(meta) = table.get_mut(socket_id) {
+                                                meta.local_addr = socket
+                                                    .local_endpoint()
+                                                    .and_then(endpoint_to_sockaddr);
+                                                meta.state = SocketState::Connected;
+                                            }
+                                        }
+                                    }
                                     if events & POLLIN != 0
                                         && (socket.can_recv() || !socket.may_recv())
                                     {
@@ -2435,7 +2541,7 @@ pub fn sys_poll(current_slot: usize, fds: *mut PollFd, nfds: usize, timeout_ms: 
     loop {
         if let Some(mut g) = crate::net::stack::NET_STACK.try_lock() {
             if let Some(ref mut stack) = *g {
-                stack.poll(crate::time::jiffies() as i64);
+                stack.poll(crate::time::uptime_ms() as i64);
             }
         }
         let mut ready = 0usize;
@@ -3182,7 +3288,7 @@ pub fn sys_accept4(
             let Some(ref mut stack) = *guard else {
                 return ENXIO;
             };
-            stack.poll(crate::time::jiffies() as i64);
+            stack.poll(crate::time::uptime_ms() as i64);
             stack.accept_tcp(listener_id)
         };
 
@@ -3271,19 +3377,26 @@ pub fn sys_accept4(
 
 
 pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: usize) -> usize {
+    if addr_ptr.is_null() {
+        return EFAULT;
+    }
     if addrlen < core::mem::size_of::<SockAddrIn>() {
-        return usize::MAX;
+        return EINVAL;
     }
     let addr = unsafe { *(addr_ptr as *const SockAddrIn) };
+    if addr.sin_family != AF_INET {
+        return EINVAL;
+    }
 
-    let socket_id = unsafe {
-        match TASK_MANAGER.tasks[current_slot]
-            .as_ref()
-            .and_then(|t| t.fd_table.get(fd))
-        {
+    let (socket_id, nonblock) = unsafe {
+        let Some(ref current) = TASK_MANAGER.tasks[current_slot] else {
+            return EBADF;
+        };
+        let socket_id = match current.fd_table.get(fd) {
             Some(FileDescriptor::Socket { socket_id }) => *socket_id,
-            _ => return usize::MAX,
-        }
+            _ => return EBADF,
+        };
+        (socket_id, current.fd_table.is_nonblock(fd))
     };
 
     let endpoint = IpEndpoint {
@@ -3291,16 +3404,16 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
         port: u16::from_be(addr.sin_port),
     };
     let local_port = 49152u16 + (socket_id as u16 & 0x3FFF);
-    // --- UDP: простой bind, без retry ---
+
+    // UDP connect only records the peer and binds an ephemeral local port.
     {
         let mut guard = NET_STACK.lock();
-        let stack = match guard.as_mut() {
-            Some(s) => s,
-            None => return usize::MAX,
+        let Some(ref mut stack) = *guard else {
+            return ENXIO;
         };
         let (handle, is_tcp) = match stack.get_handle(socket_id) {
             Some(h) => h,
-            None => return usize::MAX,
+            None => return EBADF,
         };
 
         if !is_tcp {
@@ -3309,90 +3422,125 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
                 addr: None,
                 port: local_port,
             };
-            match socket.bind(listen) {
-                Ok(()) => {
-                    let mut table = SOCKET_TABLE.lock();
-                    if let Some(sock) = table.get_mut(socket_id) {
-                        sock.peer_addr = Some(addr);
-                        sock.state = SocketState::Connected;
-                    }
-                    return 0;
-                }
-                Err(_) => return usize::MAX,
+            if socket.bind(listen).is_err() {
+                return EINVAL;
             }
+            let mut table = SOCKET_TABLE.lock();
+            if let Some(sock) = table.get_mut(socket_id) {
+                sock.peer_addr = Some(addr);
+                sock.state = SocketState::Connected;
+            }
+            return 0;
         }
     }
 
-    // --- TCP: retry loop с поллингом ---
-    let mut connect_issued = false;
-
-    // Эфемерный порт; addr=None — smoltcp берёт source с iface (ДHCP/static).
-    let local_port = 49152u16 + (socket_id as u16 & 0x3FFF);
     let local = IpListenEndpoint {
         addr: None,
         port: local_port,
     };
 
-    for attempt in 0..200 {
+    // Start the TCP handshake exactly once. Mio/Tokio sockets are non-blocking,
+    // so connect(2) must return -EINPROGRESS after SYN is queued and let poll()
+    // report writability when smoltcp reaches ESTABLISHED.
+    {
+        let mut guard = NET_STACK.lock();
+        let Some(ref mut stack) = *guard else {
+            return ENXIO;
+        };
+        stack.poll(crate::time::uptime_ms() as i64);
+
+        let (handle, is_tcp) = match stack.get_handle(socket_id) {
+            Some(h) => h,
+            None => return EBADF,
+        };
+        if !is_tcp {
+            return EINVAL;
+        }
+
+        let state = stack.sockets.get::<tcp::Socket>(handle).state();
+        if state == tcp::State::Established {
+            let local_addr = stack.sockets
+                .get::<tcp::Socket>(handle)
+                .local_endpoint()
+                .and_then(endpoint_to_sockaddr);
+            let mut table = SOCKET_TABLE.lock();
+            if let Some(sock) = table.get_mut(socket_id) {
+                sock.local_addr = local_addr;
+                sock.peer_addr = Some(addr);
+                sock.state = SocketState::Connected;
+            }
+            return 0;
+        }
+        if !matches!(state, tcp::State::Closed) {
+            return if nonblock { EINPROGRESS } else { EINVAL };
+        }
+
+        let connect_result = {
+            let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
+            socket.connect(stack.iface.context(), endpoint, local)
+        };
+        match connect_result {
+            Ok(()) => {}
+            Err(smoltcp::socket::tcp::ConnectError::Unaddressable) => return EINVAL,
+            Err(_) => return EINVAL,
+        }
+
+        stack.poll(crate::time::uptime_ms() as i64);
+        let local_addr = stack.sockets
+            .get::<tcp::Socket>(handle)
+            .local_endpoint()
+            .and_then(endpoint_to_sockaddr);
+        let mut table = SOCKET_TABLE.lock();
+        if let Some(sock) = table.get_mut(socket_id) {
+            sock.local_addr = local_addr;
+            sock.peer_addr = Some(addr);
+            sock.state = SocketState::Connecting;
+        }
+    }
+
+    if nonblock {
+        return EINPROGRESS;
+    }
+
+    // Blocking std::net::TcpStream::connect keeps the old synchronous behaviour.
+    let start = crate::time::uptime_ms();
+    loop {
         {
             let mut guard = NET_STACK.lock();
-            let stack = match guard.as_mut() {
-                Some(s) => s,
-                None => return usize::MAX,
+            let Some(ref mut stack) = *guard else {
+                return ENXIO;
             };
-
-            stack.poll(crate::time::jiffies() as i64);
-
-            let (handle, _is_tcp) = match stack.get_handle(socket_id) {
+            stack.poll(crate::time::uptime_ms() as i64);
+            let (handle, _) = match stack.get_handle(socket_id) {
                 Some(h) => h,
-                None => return usize::MAX,
+                None => return EBADF,
             };
-
-            let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
-
-            if !connect_issued {
-                match socket.connect(stack.iface.context(), endpoint, local) {
-                    Ok(()) => {
-                        connect_issued = true;
-                        // Поллим ещё раз чтобы smoltcp отправил ARP + SYN
-                        stack.poll(crate::time::jiffies() as i64);
+            let socket = stack.sockets.get::<tcp::Socket>(handle);
+            match socket.state() {
+                tcp::State::Established => {
+                    let local_addr = socket.local_endpoint().and_then(endpoint_to_sockaddr);
+                    let mut table = SOCKET_TABLE.lock();
+                    if let Some(sock) = table.get_mut(socket_id) {
+                        sock.local_addr = local_addr;
+                        sock.peer_addr = Some(addr);
+                        sock.state = SocketState::Connected;
                     }
-                    Err(smoltcp::socket::tcp::ConnectError::Unaddressable) => {
-                        // ARP ещё не прошёл — отпустим лок и попробуем снова
-                    }
-                    Err(e) => {
-                        println!("connect: fatal err {:?} (attempt {})", e, attempt);
-                        return usize::MAX;
-                    }
+                    return 0;
                 }
-            } else {
-                match socket.state() {
-                    smoltcp::socket::tcp::State::Established => {
-                        let mut table = SOCKET_TABLE.lock();
-                        if let Some(sock) = table.get_mut(socket_id) {
-                            sock.peer_addr = Some(addr);
-                            sock.state = SocketState::Connected;
-                        }
-                        return 0;
-                    }
-                    smoltcp::socket::tcp::State::Closed
-                    | smoltcp::socket::tcp::State::CloseWait => {
-                        return usize::MAX;
-                    }
-                    _ => {} // SynSent / SynReceived — продолжаем поллить
-                }
+                tcp::State::Closed => return ECONNREFUSED,
+                _ => {}
             }
-        } // лок отпущен
+        }
 
-        // Короткий сон, даём таймеру поллить сеть
+        if crate::time::uptime_ms().saturating_sub(start) >= 10_000 {
+            return ETIMEDOUT;
+        }
         unsafe {
             asm!("sti");
             asm!("hlt");
             asm!("cli");
         }
     }
-
-    usize::MAX // timeout
 }
 
 fn sys_socket_name(
@@ -3491,7 +3639,7 @@ pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) ->
             return ENXIO;
         };
 
-        let ts = crate::time::jiffies() as i64;
+        let ts = crate::time::uptime_ms() as i64;
         stack.poll(ts);
 
         let (handle, is_tcp) = match stack.get_handle(socket_id) {
@@ -3579,7 +3727,7 @@ pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) ->
             return ENXIO;
         };
 
-        let ts = crate::time::jiffies() as i64;
+        let ts = crate::time::uptime_ms() as i64;
         stack.poll(ts);
 
         let (handle, is_tcp) = match stack.get_handle(socket_id) {
@@ -3856,7 +4004,12 @@ pub fn sys_ifconfig(cmd: u32, buf: *mut crate::net::stack::IfConfigUser) -> usiz
             } else {
                 Some(ip4(cfg.gateway))
             };
-            match ifconfig_static(ip, cfg.prefix as u8, gw) {
+            let dns = if cfg.dns == 0 {
+                None
+            } else {
+                Some(ip4(cfg.dns))
+            };
+            match ifconfig_static(ip, cfg.prefix as u8, gw, dns) {
                 Ok(()) => 0,
                 Err(_) => usize::MAX,
             }

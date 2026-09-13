@@ -16,7 +16,7 @@ use crate::syscall::{self};
 
 pub use crate::syscall::{
     MouseState, WindowInfo, WmEvent, EV_CLOSE, EV_FOCUS_IN, EV_FOCUS_OUT, EV_KEY_DOWN, EV_KEY_UP,
-    EV_MOUSE_DOWN, EV_MOUSE_MOVE, EV_MOUSE_UP, EV_NONE, EV_RESIZE,
+    EV_MOUSE_DOWN, EV_MOUSE_LEAVE, EV_MOUSE_MOVE, EV_MOUSE_UP, EV_MOUSE_WHEEL, EV_NONE, EV_RESIZE,
 };
 
 /// Must match kernel `drivers::wm::TITLE_H`.

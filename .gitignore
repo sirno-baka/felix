@@ -1,6 +1,10 @@
 /build
 /target
+/popui/target
+/popugos/target
+/popui/.renderer.rs.disabled
 bx_enh_dbg.ini
 out.txt
 
 .idea
+std-apps/.cargo/config.local.toml

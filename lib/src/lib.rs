@@ -43,7 +43,7 @@ pub mod prelude {
     pub use crate::ui::layout::{self, LayoutApi};
     pub use taffy::prelude::{AlignContent, AlignItems, FlexDirection, JustifyContent, Position, Style};
     pub use crate::wm::{self, mouse, rgb, screen_size, MouseState, Window, WindowInfo, WmEvent};
-    pub use crate::wm::{EV_CLOSE, EV_FOCUS_IN, EV_FOCUS_OUT, EV_KEY_DOWN, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_MOVE, EV_MOUSE_UP, EV_RESIZE};
+    pub use crate::wm::{EV_CLOSE, EV_FOCUS_IN, EV_FOCUS_OUT, EV_KEY_DOWN, EV_KEY_UP, EV_MOUSE_DOWN, EV_MOUSE_LEAVE, EV_MOUSE_MOVE, EV_MOUSE_UP, EV_MOUSE_WHEEL, EV_RESIZE};
     pub use alloc::boxed::Box;
     pub use alloc::string::String;
     pub use alloc::vec::Vec;

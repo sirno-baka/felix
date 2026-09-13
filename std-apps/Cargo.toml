@@ -1,0 +1,25 @@
+[workspace]
+members = ["hello", "tokio-smoke", "reqwest-smoke", "ui-smoke", "filemanager"]
+default-members = ["tokio-smoke", "reqwest-smoke", "ui-smoke", "filemanager"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = "thin"
+strip = "debuginfo"
+
+[patch.crates-io]
+# Git is the portable/default source. Cargo.lock pins the exact commits after
+# the first successful build. Local SDK worktrees can be overlaid separately
+# while developing Mio/socket2/Tokio without hard-coding machine paths here.
+mio = { git = "https://github.com/sirno-baka/mio", branch = "master" }
+socket2 = { git = "https://github.com/sirno-baka/socket2", branch = "master" }
+tokio = { git = "https://github.com/sirno-baka/tokio", branch = "popugos" }

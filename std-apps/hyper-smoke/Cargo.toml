@@ -1,0 +1,20 @@
+[package]
+name = "hyper-smoke"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "hyper-smoke"
+path = "src/main.rs"
+
+[dependencies]
+bytes = "1"
+getrandom = { version = "0.2.17", features = ["custom"] }
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+rustls-rustcrypto = "0.0.2-alpha"
+tokio = { path = "../../../tokio-popugos/tokio", default-features = false, features = ["net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["tls12"] }
+webpki-roots = "1"

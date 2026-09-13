@@ -31,6 +31,7 @@ pub const SYS_GETSID: u32 = 147;
 pub const SYS_NANOSLEEP: u32 = 162;
 pub const SYS_GETCWD: u32 = 183;
 pub const SYS_CLOCK_GETTIME: u32 = 265;
+pub const SYS_GETRANDOM: u32 = 355;
 pub const CLOCK_REALTIME: i32 = 0;
 pub const CLOCK_MONOTONIC: i32 = 1;
 pub const SYS_BRK: u32 = 45;
@@ -495,6 +496,19 @@ pub unsafe fn gettimeofday(tv: *mut TimeVal) -> usize {
 pub unsafe fn clock_gettime(clock_id: i32, tp: *mut TimeSpec) -> usize {
     let ret: usize;
     asm!("int 0x80", inlateout("eax") SYS_CLOCK_GETTIME => ret, in("ebx") clock_id, in("ecx") tp, options(nostack, preserves_flags));
+    ret
+}
+
+pub unsafe fn getrandom(buf: *mut u8, len: usize, flags: u32) -> isize {
+    let ret: isize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_GETRANDOM => ret,
+        in("ebx") buf,
+        in("ecx") len,
+        in("edx") flags,
+        options(nostack, preserves_flags)
+    );
     ret
 }
 
@@ -1365,6 +1379,8 @@ pub const EV_CLOSE: u32 = 6;
 pub const EV_FOCUS_IN: u32 = 7;
 pub const EV_FOCUS_OUT: u32 = 8;
 pub const EV_RESIZE: u32 = 9;
+pub const EV_MOUSE_LEAVE: u32 = 10;
+pub const EV_MOUSE_WHEEL: u32 = 11;
 
 /// Non-blocking: copy up to `max` events for window `id` into `out`.
 pub unsafe fn wm_poll(id: u32, out: *mut WmEvent, max: usize) -> usize {

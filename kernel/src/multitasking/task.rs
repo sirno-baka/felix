@@ -79,6 +79,10 @@ pub struct Task {
     pub heap_next: u32,
     /// Next free VA for anonymous mmap (grows up).
     pub mmap_next: u32,
+    /// Page-aligned holes returned by munmap inside the anonymous mmap arena.
+    /// Reusing them keeps long-running allocation-heavy processes from
+    /// exhausting virtual address space even when physical frames are recycled.
+    pub mmap_free: Vec<(u32, u32)>,
     pub page_refcounts: PageRefcounts,
     /// Stable process identity. Scheduler slot is an implementation detail.
     pub pid: i32,
@@ -153,6 +157,7 @@ impl Task {
             kernel_stack: 0,
             heap_next: 0,
             mmap_next: 0x6000_0000,
+            mmap_free: Vec::new(),
             page_refcounts: PageRefcounts::new(),
             pid: -1,
             ppid: -1,

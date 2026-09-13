@@ -1,15 +1,28 @@
 use crate::io::{inb, outb};
 use alloc::string::String;
 use core::arch::asm;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 #[unsafe(no_mangle)]
 static JIFFIES: AtomicUsize = AtomicUsize::new(0);
 
-// Number of ms between each irq0
-// This value should be written only onth at the boot
-#[unsafe(no_mangle)]
-pub static mut SYSTEM_FRACTION: f64 = 1.0;
+// Actual PIT channel-0 divisor programmed by pit::init().
+// Keep the hardware timebase as an integer ratio instead of a mutable f64 so
+// uptime stays correct for any selected PIT frequency.
+const PIT_BASE_FREQUENCY: u64 = 1_193_182;
+static PIT_DIVISOR: AtomicU32 = AtomicU32::new(0);
+
+/// Update the timebase after programming PIT channel 0.
+/// The divisor is the actual 16-bit value written to the PIT, not the requested
+/// frequency, so integer rounding in PIT setup is accounted for exactly.
+pub fn set_pit_divisor(divisor: u32) {
+    PIT_DIVISOR.store(divisor, Ordering::Release);
+}
+
+#[inline]
+pub fn pit_divisor() -> u32 {
+    PIT_DIVISOR.load(Ordering::Acquire)
+}
 
 pub struct Time {
     pub second: usize,
@@ -17,8 +30,9 @@ pub struct Time {
 }
 
 impl Time {
+    /// Seconds since boot with millisecond precision (for log timestamps).
     pub fn as_f64(&self) -> f64 {
-        (self.second as f64 * 1000.0) + (self.millisecond as f64 / 1000.0)
+        self.second as f64 + (self.millisecond as f64 / 1000.0)
     }
 }
 
@@ -37,8 +51,7 @@ fn read_tsc_asm() -> u64 {
 }
 
 
-/// Construct a Time structure using the JIFFIES and SYSTEM_FRACTION to calculate time elapsed
-/// since boot
+/// Construct a timestamp from the monotonic PIT-derived uptime.
 #[inline(always)]
 pub fn get_timestamp() -> Time {
     // Use the programmed PIT timebase instead of assuming a fixed TSC clock.
@@ -64,10 +77,18 @@ pub fn jiffies() -> usize {
     JIFFIES.load(Ordering::Relaxed)
 }
 
-/// Monotonic milliseconds since boot, scaled by the programmed PIT period.
+/// Monotonic milliseconds since boot, derived from the actual programmed PIT
+/// divisor. One PIT tick is `divisor / 1_193_182` seconds.
 #[inline]
 pub fn uptime_ms() -> u64 {
-    unsafe { (jiffies() as f64 * SYSTEM_FRACTION) as u64 }
+    let divisor = pit_divisor() as u64;
+    if divisor == 0 {
+        return 0;
+    }
+    (jiffies() as u64)
+        .saturating_mul(divisor)
+        .saturating_mul(1000)
+        / PIT_BASE_FREQUENCY
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -223,10 +244,9 @@ fn raw_delay_ms(ms: usize) {
 
 #[inline]
 fn sleep_ms(ms: usize) {
-    unsafe {
-        let saved_time = (JIFFIES.load(Ordering::Relaxed) as f64 * SYSTEM_FRACTION) as usize;
-        while saved_time + ms > (JIFFIES.load(Ordering::Relaxed) as f64 * SYSTEM_FRACTION) as usize
-        {
+    let deadline = uptime_ms().saturating_add(ms as u64);
+    while uptime_ms() < deadline {
+        unsafe {
             crate::wrappers::sti!();
             crate::wrappers::hlt!();
             crate::wrappers::cli!();

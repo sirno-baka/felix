@@ -141,7 +141,13 @@ impl NetStack {
         );
     }
 
-    pub fn set_static(&mut self, ip: Ipv4Address, prefix: u8, gateway: Option<Ipv4Address>) -> Result<(), &'static str> {
+    pub fn set_static(
+        &mut self,
+        ip: Ipv4Address,
+        prefix: u8,
+        gateway: Option<Ipv4Address>,
+        dns: Option<Ipv4Address>,
+    ) -> Result<(), &'static str> {
         if prefix > 32 {
             return Err("bad prefix");
         }
@@ -150,7 +156,7 @@ impl NetStack {
         }
         self.if_mode = IF_MODE_STATIC;
         let cidr = Ipv4Cidr::new(ip, prefix);
-        self.apply_ipv4(cidr, gateway, None);
+        self.apply_ipv4(cidr, gateway, dns);
         Ok(())
     }
 
@@ -361,9 +367,14 @@ pub fn ifconfig_get() -> Option<IfConfigUser> {
     NET_STACK.lock().as_ref().map(|s| s.snapshot())
 }
 
-pub fn ifconfig_static(ip: Ipv4Address, prefix: u8, gw: Option<Ipv4Address>) -> Result<(), &'static str> {
+pub fn ifconfig_static(
+    ip: Ipv4Address,
+    prefix: u8,
+    gw: Option<Ipv4Address>,
+    dns: Option<Ipv4Address>,
+) -> Result<(), &'static str> {
     match NET_STACK.lock().as_mut() {
-        Some(s) => s.set_static(ip, prefix, gw),
+        Some(s) => s.set_static(ip, prefix, gw, dns),
         None => Err("no nic"),
     }
 }
