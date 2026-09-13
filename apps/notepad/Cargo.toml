@@ -1,0 +1,12 @@
+[package]
+name = "notepad"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "notepad"
+test = false
+
+[dependencies]
+libfelix = { path = "../../lib" }
+taffy = { version = "0.14.0", default-features = false, features = ["alloc"] }
