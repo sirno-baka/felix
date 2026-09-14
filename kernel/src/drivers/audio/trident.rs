@@ -3,7 +3,8 @@
 //! Small no_std Rust port of the old OSS trident driver used as the hardware
 //! reference. A single looping PCM voice uses a two-half DMA buffer. Shared IRQ
 //! handling only acknowledges hardware and records which half is safe; refill
-//! and mixing happen later from the PIT bottom half.
+//! and mixing happen later from the PIT bottom half. If a safe shared PIC line
+//! is unavailable, voice position is polled and controller IRQs remain off.
 
 use alloc::boxed::Box;
 use core::sync::atomic::{compiler_fence, Ordering};
@@ -120,8 +121,10 @@ pub struct Trident {
     channel: u8,
     dma: Box<DmaBuffer>,
     running: bool,
+    irq_enabled: bool,
     idle_halves: usize,
     pending_halves: u8,
+    last_poll_half: u8,
 }
 
 unsafe impl Send for Trident {}
@@ -165,6 +168,7 @@ impl Trident {
     }
 
     pub fn irq(&self) -> u8 { self.irq }
+    pub fn set_irq_enabled(&mut self, enabled: bool) { self.irq_enabled = enabled; }
 
     #[inline]
     fn p(&self, reg: u16) -> u16 { self.iobase.wrapping_add(reg) }
@@ -360,11 +364,16 @@ impl Trident {
         compiler_fence(Ordering::SeqCst);
 
         self.program_voice()?;
-        self.enable_loop_irqs();
-        self.enable_voice_irq();
+        if self.irq_enabled {
+            self.enable_loop_irqs();
+            self.enable_voice_irq();
+        } else {
+            self.disable_voice_irq();
+        }
         outl(self.p(T4D_MUSICVOL_WAVEVOL), 0);
         self.idle_halves = 0;
         self.pending_halves = 0;
+        self.last_poll_half = 0;
         self.start_voice();
         self.running = true;
         Ok(())
@@ -381,7 +390,7 @@ impl Trident {
     /// Fast shared-IRQ path. Return false if the card did not assert its own
     /// address interrupt. It only ACKs hardware and records a refill request.
     pub fn ack_irq(&mut self) -> bool {
-        if !self.running { return false; }
+        if !self.running || !self.irq_enabled { return false; }
         let event = inl(self.p(T4D_MISCINT));
         if event & ADDRESS_IRQ == 0 { return false; }
 
@@ -399,18 +408,34 @@ impl Trident {
         true
     }
 
-    /// PIT bottom half. Polling the same status before consuming pending work
-    /// makes playback independent of whether the shared PIC line is usable.
+    /// PIT bottom half. With a registered IRQ it consumes pending address
+    /// interrupts. In pure-polling mode it watches CSO cross the half boundary.
     pub fn poll(&mut self, mixer: &mut Mixer) {
         if !self.running { return; }
-        let _ = self.ack_irq();
+
+        if self.irq_enabled {
+            // Also inspect status here: if IRQ9 was storm-masked later, playback
+            // continues because AINT/MISC are still drained by PIT.
+            let event = inl(self.p(T4D_MISCINT));
+            if event & ADDRESS_IRQ != 0 {
+                let _ = self.ack_irq();
+            }
+        } else {
+            let cso = self.current_frame() as usize % RING_FRAMES;
+            let current_half = if cso >= HALF_FRAMES { 1u8 } else { 0u8 };
+            if current_half != self.last_poll_half {
+                // The half just left by hardware is now safe to refill.
+                self.pending_halves |= 1u8 << self.last_poll_half;
+                self.last_poll_half = current_half;
+            }
+        }
 
         let pending = self.pending_halves;
         self.pending_halves = 0;
         if pending == 0 { return; }
 
         for half in 0..2usize {
-            if pending & (1 << half) == 0 { continue; }
+            if pending & (1u8 << half) == 0 { continue; }
             let data = self.fill_half(half, mixer);
             compiler_fence(Ordering::SeqCst);
             if data { self.idle_halves = 0; } else { self.idle_halves = self.idle_halves.saturating_add(1); }
@@ -446,8 +471,10 @@ pub fn probe_first() -> Result<Option<Trident>, &'static str> {
         channel,
         dma,
         running: false,
+        irq_enabled: false,
         idle_halves: 0,
         pending_halves: 0,
+        last_poll_half: 0,
     };
     card.init_ac97()?;
 
