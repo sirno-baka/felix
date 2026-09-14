@@ -222,9 +222,12 @@ impl CharDevice for AudioCharDevice {
     fn read(&self, _offset: u64, _buf: &mut [u8]) -> usize { 0 }
 
     fn write(&self, _offset: u64, buf: &[u8]) -> usize {
-        // Generic kernel/VFS writes have no process identity. sys_write uses the
-        // owner-aware fast path and therefore gets its own mixer stream.
-        write_stream(0, buf)
+        // CharDevice itself is global, but a VFS write runs in the caller's
+        // syscall context. Key streams by task slot so two applications can
+        // write /dev/audio concurrently and be mixed rather than concatenated.
+        let slot = unsafe { crate::multitasking::task::TASK_MANAGER.get_current_slot() };
+        let owner = if slot >= 0 { slot as usize } else { 0 };
+        write_stream(owner, buf)
     }
 }
 
@@ -290,8 +293,8 @@ pub fn is_audio_inode(inode: u32) -> bool {
     own != 0 && own == inode
 }
 
-/// Owner-aware `/dev/audio` write used by sys_write. Input is fixed-format
-/// S16LE/48k/stereo. A partial return simply means this stream ring is full.
+/// Write fixed-format S16LE/48k/stereo into one owner's stream ring. A partial
+/// return simply means that ring is full; userspace may retry the remainder.
 pub fn write_stream(owner: usize, bytes: &[u8]) -> usize {
     let mut audio = AUDIO.lock();
     if audio.backend.is_none() { return 0; }
