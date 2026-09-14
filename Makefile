@@ -222,6 +222,7 @@ run: all usb-image
 		-netdev user,id=net0,hostfwd=tcp:127.0.0.1:18080-:8080 \
 		-device rtl8139,netdev=net0,mac=52:54:00:12:34:56 \
 		-device pci-ohci,id=ohci \
+		-device AC97
 		-drive if=none,id=usbstick,format=raw,file=build/usb.img \
 		-device usb-storage,bus=ohci.0,drive=usbstick \
 		-no-reboot -no-shutdown -vga std -m 128M \

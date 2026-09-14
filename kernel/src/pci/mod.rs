@@ -79,6 +79,12 @@ fn device_name(vendor_id: u16, device_id: u16) -> &'static str {
         (0x8086, 0x7111) => "82371AB/EB/MB PIIX4 IDE",
         (0x8086, 0x7113) => "82371AB/EB/MB PIIX4 ACPI",
 
+        // === Trident / SiS / ALi audio ===
+        (0x1023, 0x2000) => "Trident 4DWave DX Audio",
+        (0x1023, 0x2001) => "Trident 4DWave NX Audio",
+        (0x1039, 0x7018) => "SiS 7018 PCI Audio",
+        (0x10B9, 0x5451) => "ALi M5451 Audio Accelerator",
+
         // === Trident (видеокарта твоего ноутбука) ===
         (0x1023, 0x9525) => "Cyber 9525",
         (0x1023, 0x9520) => "Cyber 9520",

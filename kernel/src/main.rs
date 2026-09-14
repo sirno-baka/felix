@@ -333,6 +333,7 @@ pub extern "C" fn higher_half_entry() -> ! {
             println!("[!] init_rootfs failed — no mountable disk");
             halt();
         }
+        drivers::audio::init();
         init_usb();
         drivers::net::init_net();
         // ---------------------------------------------------------------

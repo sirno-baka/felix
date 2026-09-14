@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod framebuffer;
 pub mod keyboard;
 pub(crate) mod keyboard_buffer;
