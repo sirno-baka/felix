@@ -1,15 +1,15 @@
 //! Trident 4DWave / SiS 7018 / ALi M5451 AC'97 playback backend.
 //!
-//! This is a small no_std Rust port of the old OSS trident driver used as the
-//! hardware reference.  Felix uses one looping PCM voice and refills its two
-//! DMA halves on address interrupts.  The same status routine is pollable from
-//! PIT, so playback survives a masked/broken shared legacy IRQ.
+//! Small no_std Rust port of the old OSS trident driver used as the hardware
+//! reference. A single looping PCM voice uses a two-half DMA buffer. Shared IRQ
+//! handling only acknowledges hardware and records which half is safe; refill
+//! and mixing happen later from the PIT bottom half.
 
 use alloc::boxed::Box;
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::drivers::audio::Mixer;
-use crate::io::{inb, inl, inw, io_wait, outb, outl, outw};
+use crate::io::{inl, inw, io_wait, outb, outl, outw};
 use crate::pci::bar::Bar;
 use crate::pci::device::PciDevice;
 use crate::KERNEL_OFFSET;
@@ -24,7 +24,6 @@ const DEV_NX: u16 = 0x2001;
 const DEV_SIS7018: u16 = 0x7018;
 const DEV_ALI5451: u16 = 0x5451;
 
-const T4D_REC_CH: u16 = 0x70;
 const T4D_START_A: u16 = 0x80;
 const T4D_STOP_A: u16 = 0x84;
 const T4D_AINT_A: u16 = 0x98;
@@ -94,7 +93,7 @@ const ALI_AC97_READ_MIXER_MASK: u32 = 0xfeff;
 const ALI_REV_02: u8 = 0x02;
 const DMA_MASK_30BIT: u32 = 0x3fff_ffff;
 
-// 4096 stereo frames = 16 KiB DMA. Each half is ~42.7 ms at 48 kHz.
+// 4096 stereo frames = 16 KiB. Each half is ~42.7 ms at 48 kHz.
 const RING_FRAMES: usize = 4096;
 const RING_SAMPLES: usize = RING_FRAMES * 2;
 const HALF_FRAMES: usize = RING_FRAMES / 2;
@@ -122,6 +121,7 @@ pub struct Trident {
     dma: Box<DmaBuffer>,
     running: bool,
     idle_halves: usize,
+    pending_halves: u8,
 }
 
 unsafe impl Send for Trident {}
@@ -177,6 +177,15 @@ impl Trident {
         }
     }
 
+    fn ali_tick_delay(&self) -> Result<(), &'static str> {
+        let first = inl(self.p(ALI_STIMER));
+        for _ in 0..0xffff {
+            if inl(self.p(ALI_STIMER)) != first { return Ok(()); }
+            core::hint::spin_loop();
+        }
+        Err("ALi system timer not advancing")
+    }
+
     fn ac97_write(&self, reg: u8, val: u16) -> Result<(), &'static str> {
         let value = (val as u32) << 16;
         let (addr, mask, busy) = match self.chip {
@@ -192,9 +201,7 @@ impl Trident {
 
         for _ in 0..0xffff {
             if (inw(self.p(addr)) as u32 & busy) == 0 {
-                if self.chip == Chip::Ali5451 {
-                    self.ali_tick_delay()?;
-                }
+                if self.chip == Chip::Ali5451 { self.ali_tick_delay()?; }
                 outl(self.p(addr), value | mask | reg as u32);
                 return Ok(());
             }
@@ -222,24 +229,13 @@ impl Trident {
                 outl(self.p(addr), mask | reg as u32);
                 for _ in 0..0xffff {
                     let data = inl(self.p(addr));
-                    if data & busy == 0 {
-                        return Ok((data >> 16) as u16);
-                    }
+                    if data & busy == 0 { return Ok((data >> 16) as u16); }
                     core::hint::spin_loop();
                 }
                 break;
             }
         }
         Err("Trident AC97 read timeout")
-    }
-
-    fn ali_tick_delay(&self) -> Result<(), &'static str> {
-        let first = inl(self.p(ALI_STIMER));
-        for _ in 0..0xffff {
-            if inl(self.p(ALI_STIMER)) != first { return Ok(()); }
-            core::hint::spin_loop();
-        }
-        Err("ALi system timer not advancing")
     }
 
     fn init_ac97(&self) -> Result<(), &'static str> {
@@ -255,19 +251,16 @@ impl Trident {
             }
             Chip::Sis7018 => {
                 outl(self.p(SI_AC97_GPIO), 0);
-                outl(
-                    self.p(SI_SERIAL_INTF_CTRL),
-                    PCMOUT | SURROUT | CENTEROUT | LFEOUT | SECONDARY_ID,
-                );
+                outl(self.p(SI_SERIAL_INTF_CTRL), PCMOUT | SURROUT | CENTEROUT | LFEOUT | SECONDARY_ID);
                 for _ in 0..20_000 { io_wait(); }
             }
             Chip::Dx => outl(self.p(DX_AC97_COM_STAT), 0x0002),
             Chip::Nx => outl(self.p(NX_AC97_COM_STAT), 0x0002),
         }
 
-        self.ac97_write(AC97_POWERDOWN, 0x0000)?;
-        self.ac97_write(AC97_MASTER_VOL, 0x0000)?;
-        self.ac97_write(AC97_PCM_OUT_VOL, 0x0000)?;
+        self.ac97_write(AC97_POWERDOWN, 0)?;
+        self.ac97_write(AC97_MASTER_VOL, 0)?;
+        self.ac97_write(AC97_PCM_OUT_VOL, 0)?;
         let v1 = self.ac97_read(AC97_VENDOR_ID1).unwrap_or(0xffff);
         let v2 = self.ac97_read(AC97_VENDOR_ID2).unwrap_or(0xffff);
         crate::println!("[audio/trident] AC97 codec {:04x}:{:04x}", v1, v2);
@@ -285,14 +278,12 @@ impl Trident {
 
     fn enable_voice_irq(&self) {
         let (_, _, _, ainten) = self.bank_regs();
-        let v = inl(self.p(ainten)) | self.voice_mask();
-        outl(self.p(ainten), v);
+        outl(self.p(ainten), inl(self.p(ainten)) | self.voice_mask());
     }
 
     fn disable_voice_irq(&self) {
         let (_, _, aint, ainten) = self.bank_regs();
-        let v = inl(self.p(ainten)) & !self.voice_mask();
-        outl(self.p(ainten), v);
+        outl(self.p(ainten), inl(self.p(ainten)) & !self.voice_mask());
         outl(self.p(aint), self.voice_mask());
     }
 
@@ -309,7 +300,7 @@ impl Trident {
     fn program_voice(&self) -> Result<(), &'static str> {
         let lba = virt_to_phys(self.dma.samples.as_ptr())?;
         let eso = (RING_FRAMES - 1) as u32;
-        let delta = 0x1000u32; // exactly 48 kHz
+        let delta = 0x1000u32; // 48 kHz
         let control = CHANNEL_LOOP | CHANNEL_SIGNED | CHANNEL_STEREO | CHANNEL_16BITS;
         let attribute = if self.chip == Chip::Sis7018 { PCM_LR } else { 0 };
 
@@ -319,17 +310,17 @@ impl Trident {
         match self.chip {
             Chip::Ali5451 => {
                 data[0] = 0;
-                data[2] = (eso << 16) | (delta & 0xffff);
+                data[2] = (eso << 16) | delta;
                 data[3] = 0;
             }
             Chip::Sis7018 => {
                 data[0] = 0;
-                data[2] = (eso << 16) | (delta & 0xffff);
+                data[2] = (eso << 16) | delta;
                 data[3] = (attribute as u32) << 16;
             }
             Chip::Dx => {
                 data[0] = 0;
-                data[2] = (eso << 16) | (delta & 0xffff);
+                data[2] = (eso << 16) | delta;
                 data[3] = 0;
             }
             Chip::Nx => {
@@ -340,9 +331,9 @@ impl Trident {
         }
 
         outb(self.p(T4D_LFO_GC_CIR), self.channel);
-        for i in 0..5 {
+        for (i, value) in data.iter().enumerate() {
             if i == 3 && self.chip == Chip::Ali5451 { continue; }
-            outl(self.p(CHANNEL_START + (i as u16) * 4), data[i]);
+            outl(self.p(CHANNEL_START + (i as u16) * 4), *value);
         }
         Ok(())
     }
@@ -373,6 +364,7 @@ impl Trident {
         self.enable_voice_irq();
         outl(self.p(T4D_MUSICVOL_WAVEVOL), 0);
         self.idle_halves = 0;
+        self.pending_halves = 0;
         self.start_voice();
         self.running = true;
         Ok(())
@@ -383,42 +375,50 @@ impl Trident {
         self.disable_voice_irq();
         self.running = false;
         self.idle_halves = 0;
+        self.pending_halves = 0;
     }
 
-    /// Return false if this card has no pending interrupt source. This makes the
-    /// driver safe on a shared legacy PCI INTx line.
-    pub fn service(&mut self, mixer: &mut Mixer) -> bool {
+    /// Fast shared-IRQ path. Return false if the card did not assert its own
+    /// address interrupt. It only ACKs hardware and records a refill request.
+    pub fn ack_irq(&mut self) -> bool {
         if !self.running { return false; }
-
         let event = inl(self.p(T4D_MISCINT));
         if event & ADDRESS_IRQ == 0 { return false; }
 
         let (_, _, aint, _) = self.bank_regs();
         let active = inl(self.p(aint));
         let ours = active & self.voice_mask();
-
-        // The card asserted ADDRESS_IRQ, so clear every outstanding channel bit
-        // even if firmware left a stale unused voice pending. Felix is the sole
-        // owner of this controller.
         if active != 0 { outl(self.p(aint), active); }
         outl(self.p(T4D_MISCINT), MISC_ACK);
 
-        if ours == 0 {
-            return true;
+        if ours != 0 {
+            let cso = self.current_frame() as usize % RING_FRAMES;
+            let safe_half = if cso >= HALF_FRAMES { 0 } else { 1 };
+            self.pending_halves |= 1u8 << safe_half;
         }
+        true
+    }
 
-        let cso = self.current_frame() as usize % RING_FRAMES;
-        // If HC is in the second half, first half is safe to refill; after wrap
-        // into first half, second half is safe.
-        let half = if cso >= HALF_FRAMES { 0 } else { 1 };
-        let data = self.fill_half(half, mixer);
-        compiler_fence(Ordering::SeqCst);
-        if data { self.idle_halves = 0; } else { self.idle_halves += 1; }
+    /// PIT bottom half. Polling the same status before consuming pending work
+    /// makes playback independent of whether the shared PIC line is usable.
+    pub fn poll(&mut self, mixer: &mut Mixer) {
+        if !self.running { return; }
+        let _ = self.ack_irq();
+
+        let pending = self.pending_halves;
+        self.pending_halves = 0;
+        if pending == 0 { return; }
+
+        for half in 0..2usize {
+            if pending & (1 << half) == 0 { continue; }
+            let data = self.fill_half(half, mixer);
+            compiler_fence(Ordering::SeqCst);
+            if data { self.idle_halves = 0; } else { self.idle_halves = self.idle_halves.saturating_add(1); }
+        }
 
         if self.idle_halves >= 3 && !mixer.has_data() {
             self.stop();
         }
-        true
     }
 }
 
@@ -426,14 +426,11 @@ pub fn probe_first() -> Result<Option<Trident>, &'static str> {
     let Some((dev, chip)) = crate::pci::enumerate()
         .into_iter()
         .find_map(|d| identify(&d).map(|c| (d, c)))
-    else {
-        return Ok(None);
-    };
+    else { return Ok(None); };
 
     let iobase = io_bar0(&dev)?;
-    // Keep firmware command bits; enable I/O decode + bus mastering.
     let command = dev.read_u16(0x04);
-    dev.write_u16(0x04, command | 0x0005);
+    dev.write_u16(0x04, command | 0x0005); // I/O + bus master
 
     let channel = if chip == Chip::Ali5451 { 0 } else { 63 };
     let dma = Box::new(DmaBuffer { samples: [0; RING_SAMPLES] });
@@ -450,6 +447,7 @@ pub fn probe_first() -> Result<Option<Trident>, &'static str> {
         dma,
         running: false,
         idle_halves: 0,
+        pending_halves: 0,
     };
     card.init_ac97()?;
 
