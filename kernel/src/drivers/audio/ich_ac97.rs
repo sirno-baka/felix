@@ -2,7 +2,9 @@
 //!
 //! Uses a 32-entry Buffer Descriptor List and keeps eight fragments queued.
 //! The shared IRQ path only acknowledges hardware and records pending work;
-//! actual mixing/refill happens from the PIT audio poll.
+//! actual mixing/refill happens from the PIT audio poll. If the PCI IRQ cannot
+//! safely join Felix's shared INTx dispatcher, hardware IRQ generation stays
+//! disabled and the same status registers are polled from PIT.
 
 use alloc::boxed::Box;
 use core::sync::atomic::{compiler_fence, Ordering};
@@ -88,6 +90,7 @@ pub struct IchAc97 {
     bdl: Box<Bdl>,
     dma: Box<DmaBuffer>,
     running: bool,
+    irq_enabled: bool,
     last_civ: u8,
     lvi: u8,
     idle_appends: usize,
@@ -140,6 +143,7 @@ fn virt_to_phys<T>(p: *const T) -> Result<u32, &'static str> {
 impl IchAc97 {
     pub fn name(&self) -> &'static str { chip_name(self.device_id) }
     pub fn irq(&self) -> u8 { self.irq }
+    pub fn set_irq_enabled(&mut self, enabled: bool) { self.irq_enabled = enabled; }
 
     #[inline]
     fn nport(&self, reg: u16) -> u16 { self.nam.wrapping_add(reg) }
@@ -149,6 +153,10 @@ impl IchAc97 {
     fn codec_read(&self, reg: u16) -> u16 { inw(self.nport(reg)) }
     #[inline]
     fn codec_write(&self, reg: u16, value: u16) { outw(self.nport(reg), value); }
+
+    fn run_control(&self) -> u8 {
+        if self.irq_enabled { CR_RPBM | CR_FEIE | CR_IOCE } else { CR_RPBM }
+    }
 
     fn reset_pcm_out(&self) -> Result<(), &'static str> {
         outb(self.bport(PO_CR), 0);
@@ -239,9 +247,10 @@ impl IchAc97 {
         outb(self.bport(PO_LVI), self.lvi);
         outw(self.bport(PO_SR), SR_W1C);
 
-        let gc = inl(self.bport(GLOB_CNT)) | GLOB_CNT_GIE | GLOB_CNT_COLD;
+        let mut gc = inl(self.bport(GLOB_CNT)) | GLOB_CNT_COLD;
+        if self.irq_enabled { gc |= GLOB_CNT_GIE; } else { gc &= !GLOB_CNT_GIE; }
         outl(self.bport(GLOB_CNT), gc);
-        outb(self.bport(PO_CR), CR_RPBM | CR_FEIE | CR_IOCE);
+        outb(self.bport(PO_CR), self.run_control());
         self.running = true;
         Ok(())
     }
@@ -262,13 +271,13 @@ impl IchAc97 {
         let pending = sr & (SR_BCIS | SR_LVBCI | SR_FIFOE);
         if pending == 0 { return false; }
         outw(self.bport(PO_SR), pending);
-        self.pending_completion |= pending & (SR_BCIS | SR_LVBCI) != 0;
-        self.pending_fifo_error |= pending & SR_FIFOE != 0;
+        if pending & (SR_BCIS | SR_LVBCI) != 0 { self.pending_completion = true; }
+        if pending & SR_FIFOE != 0 { self.pending_fifo_error = true; }
         true
     }
 
-    /// Bottom half, called by PIT. It also polls status first so playback keeps
-    /// working when the PIC IRQ is masked or storm-protected.
+    /// Bottom half, called by PIT. It polls status too, so pure-polling mode and
+    /// storm-masked legacy IRQs use the same refill path.
     pub fn poll(&mut self, mixer: &mut Mixer) {
         if !self.running { return; }
         let _ = self.ack_irq();
@@ -279,9 +288,7 @@ impl IchAc97 {
         self.pending_completion = false;
         self.pending_fifo_error = false;
 
-        if fifo_error {
-            crate::println!("[audio/ich] PCM FIFO error");
-        }
+        if fifo_error { crate::println!("[audio/ich] PCM FIFO error"); }
 
         let civ = inb(self.bport(PO_CIV)) & 31;
         let mut completed = 0usize;
@@ -308,7 +315,7 @@ impl IchAc97 {
         if self.idle_appends >= ACTIVE_FRAGS + 2 && !mixer.has_data() {
             self.stop();
         } else if inw(self.bport(PO_SR)) & SR_DCH != 0 && mixer.has_data() {
-            outb(self.bport(PO_CR), CR_RPBM | CR_FEIE | CR_IOCE);
+            outb(self.bport(PO_CR), self.run_control());
         }
     }
 }
@@ -334,6 +341,7 @@ pub fn probe_first() -> Result<Option<IchAc97>, &'static str> {
         bdl,
         dma,
         running: false,
+        irq_enabled: false,
         last_civ: 0,
         lvi: 0,
         idle_appends: 0,
