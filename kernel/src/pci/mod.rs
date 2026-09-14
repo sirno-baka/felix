@@ -16,12 +16,9 @@ pub fn enumerate() -> Vec<PciDevice> {
 
     for bus in 0..=255u8 {
         for device in 0..32u8 {
-            // First check function 0
             if let Some(dev) = read_device(bus, device, 0) {
                 let is_multi = dev.is_multifunction();
                 devices.push(dev);
-
-                // If multifunction — check remaining functions
                 if is_multi {
                     for function in 1..8u8 {
                         if let Some(dev) = read_device(bus, device, function) {
@@ -36,7 +33,6 @@ pub fn enumerate() -> Vec<PciDevice> {
     devices
 }
 
-/// Простая таблица известных Vendor ID
 fn vendor_name(vendor_id: u16) -> &'static str {
     match vendor_id {
         0x8086 => "Intel",
@@ -49,7 +45,6 @@ fn vendor_name(vendor_id: u16) -> &'static str {
         0x10B9 => "ALi",
         0x104C => "Texas Instruments",
         0x1179 => "Toshiba",
-        0x8086 => "Intel", // уже есть, но для ясности
         0x15AD => "VMware",
         0x1AF4 => "Red Hat (Virtio)",
         0x1234 => "QEMU",
@@ -57,10 +52,9 @@ fn vendor_name(vendor_id: u16) -> &'static str {
     }
 }
 
-/// Известные устройства (Vendor + Device)
 fn device_name(vendor_id: u16, device_id: u16) -> &'static str {
     match (vendor_id, device_id) {
-        // === Intel Ethernet (то, что нам нужно) ===
+        // === Intel Ethernet ===
         (0x8086, 0x1229) => "82557/82558/82559 Fast Ethernet (PRO/100)",
         (0x8086, 0x1209) => "82559ER Fast Ethernet",
         (0x8086, 0x1030) => "82559 Fast Ethernet Controller",
@@ -70,8 +64,20 @@ fn device_name(vendor_id: u16, device_id: u16) -> &'static str {
         (0x8086, 0x100F) => "82545EM Gigabit Ethernet",
         (0x8086, 0x10D3) => "82574L Gigabit Ethernet",
 
+        // === Intel AC'97 audio ===
+        (0x8086, 0x2415) => "82801AA ICH AC'97 Audio",
+        (0x8086, 0x2425) => "82801AB ICH0 AC'97 Audio",
+        (0x8086, 0x2445) => "82801BA ICH2 AC'97 Audio",
+        (0x8086, 0x2485) => "ICH3 AC'97 Audio",
+        (0x8086, 0x24C5) => "ICH4 AC'97 Audio",
+        (0x8086, 0x24D5) => "ICH5 AC'97 Audio",
+        (0x8086, 0x25A6) => "6300ESB AC'97 Audio",
+        (0x8086, 0x266E) => "ICH6 AC'97 Audio",
+        (0x8086, 0x27DE) => "ICH7 AC'97 Audio",
+        (0x8086, 0x2698) => "ESB2 AC'97 Audio",
+        (0x8086, 0x7195) => "440MX AC'97 Audio",
+
         // === Intel chipset / bridges ===
-        (0x8086, 0x2415) => "82801AA AC'97 Audio",
         (0x8086, 0x2440) => "82801BA Hub Interface to PCI Bridge",
         (0x8086, 0x244B) => "82801BA/BAM (ICH2) LPC Interface",
         (0x8086, 0x244E) => "82801 PCI Bridge",
@@ -79,24 +85,31 @@ fn device_name(vendor_id: u16, device_id: u16) -> &'static str {
         (0x8086, 0x7111) => "82371AB/EB/MB PIIX4 IDE",
         (0x8086, 0x7113) => "82371AB/EB/MB PIIX4 ACPI",
 
-        // === Trident (видеокарта твоего ноутбука) ===
+        // === Trident / SiS / ALi audio ===
+        (0x1023, 0x2000) => "Trident 4DWave DX Audio",
+        (0x1023, 0x2001) => "Trident 4DWave NX Audio",
+        (0x1039, 0x7018) => "SiS 7018 PCI Audio",
+        (0x10B9, 0x5451) => "ALi M5451 Audio Accelerator",
+
+        // === Trident video ===
         (0x1023, 0x9525) => "Cyber 9525",
         (0x1023, 0x9520) => "Cyber 9520",
         (0x1023, 0x9660) => "TGUI 9660",
         (0x1023, 0x9680) => "TGUI 9680",
 
-        // === Realtek ===
+        // === ALi / Texas Instruments ===
         (0x10B9, 0x5237) => "M5237 USB OHCI",
         (0x10B9, 0x5229) => "M5229 IDE",
         (0x10B9, 0x1533) => "M1533 PCI-ISA",
         (0x10B9, 0x7101) => "M7101 PMU",
         (0x104C, 0x8023) => "TSB43AB22 OHCI 1394",
 
+        // === Realtek ===
         (0x10EC, 0x8139) => "RTL-8139 Fast Ethernet",
         (0x10EC, 0x8168) => "RTL8111/8168 Gigabit Ethernet",
         (0x10EC, 0x8169) => "RTL8169 Gigabit Ethernet",
 
-        // === Virtio / QEMU (для тестов) ===
+        // === Virtio / QEMU ===
         (0x1AF4, 0x1000) => "Virtio network device",
         (0x1AF4, 0x1001) => "Virtio block device",
         (0x1AF4, 0x1050) => "Virtio GPU",
@@ -112,7 +125,6 @@ fn device_name(vendor_id: u16, device_id: u16) -> &'static str {
     }
 }
 
-/// Красивый вывод всех устройств
 pub fn print_devices() {
     let devices = enumerate();
     crate::println!("=== PCI Devices ({} found) ===", devices.len());
@@ -139,14 +151,12 @@ pub fn print_devices() {
     crate::println!("==============================");
 }
 
-/// Find first device with given Vendor ID + Device ID
 pub fn find_device(vendor_id: u16, device_id: u16) -> Option<PciDevice> {
     enumerate()
         .into_iter()
         .find(|d| d.vendor_id == vendor_id && d.device_id == device_id)
 }
 
-/// Find all devices of a specific class + subclass
 pub fn find_by_class(class_code: u8, subclass: u8) -> Vec<PciDevice> {
     enumerate()
         .into_iter()
@@ -154,7 +164,6 @@ pub fn find_by_class(class_code: u8, subclass: u8) -> Vec<PciDevice> {
         .collect()
 }
 
-/// Find network controllers (Class 0x02)
 pub fn find_network_controllers() -> Vec<PciDevice> {
-    find_by_class(0x02, 0x00) // Ethernet
+    find_by_class(0x02, 0x00)
 }
