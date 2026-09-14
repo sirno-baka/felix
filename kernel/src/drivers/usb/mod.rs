@@ -17,9 +17,14 @@ pub mod ohci;
 /// Probe every PCI OHCI controller and bind class drivers.
 pub fn init() {
     // init_all() both starts every OHCI controller and enumerates ports that
-    // are already connected. Root-hub insert/remove is polled from idle on
-    // legacy shared-IRQ targets until the kernel has a shared INTx dispatcher.
+    // are already connected. Root-hub insert/remove remains polling-driven;
+    // OHCI interrupt sources stay disabled on the fragile C1M shared-IRQ path.
     ohci::init_all();
+
+    // main.rs reaches USB only after rootfs + /dev are mounted, which is exactly
+    // when the audio core can publish /dev/audio. Keep this boot hook here so
+    // we do not disturb the already-sensitive main initialization ordering.
+    crate::drivers::audio::init();
 }
 
 /// Poll/drain controller hotplug events from process/task context. All USB
@@ -28,4 +33,3 @@ pub fn init() {
 pub fn poll_events() {
     ohci::poll_hotplug();
 }
-
