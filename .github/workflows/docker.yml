@@ -2,7 +2,7 @@ name: Docker build
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "audio-pipeline" ]
   pull_request:
     branches: [ "main" ]
 
