@@ -645,6 +645,36 @@ impl PageManager {
         frame
     }
 
+    /// Reserve a physically contiguous range, reusing a verified free run first.
+    ///
+    /// Callers access this range through the contiguous higher-half mapping;
+    /// arbitrary successive entries from the free list cannot be used.
+    fn alloc_contiguous_frames(&mut self, pages: u32) -> u32 {
+        self.free_frames.sort_unstable();
+        if pages > 0 {
+            let mut run = 0usize;
+            for i in 0..self.free_frames.len() {
+                if i == 0 || self.free_frames[i] != self.free_frames[i - 1] + 1 { run = i; }
+                if i - run + 1 == pages as usize {
+                    let first = self.free_frames[run];
+                    self.free_frames.drain(run..=i);
+                    return first;
+                }
+            }
+        }
+        let first = self.next_free_page;
+        let end = first.checked_add(pages).expect("physical frame range overflow");
+        let max_page = detected_ram_bytes() >> 12;
+        if end > max_page {
+            panic!(
+                "[pg] out of contiguous physical frames (first={}, pages={}, max={})",
+                first, pages, max_page
+            );
+        }
+        self.next_free_page = end;
+        first
+    }
+
     /// Higher-half aware page-manager initialisation.
     ///
     /// Called from higher_half_entry() after the early dual-mapping PD
@@ -910,11 +940,7 @@ pub fn alloc_kernel_stack(size: usize) -> u32 {
     let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     let first = interrupt_sync::without_interrupts(|| unsafe {
         let mut pm = PAGING.lock();
-        let f = pm.alloc_frame();
-        for _ in 1..pages {
-            let _ = pm.alloc_frame();
-        }
-        f
+        pm.alloc_contiguous_frames(pages as u32)
     });
     let base = phys_to_virt(first << 12);
     unsafe {

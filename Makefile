@@ -25,11 +25,13 @@ endif
 ifeq ($(UNAME), Darwin)
 	E2MKFS := $(shell brew --prefix e2fsprogs)/sbin/mkfs.ext2
 	E2CP   := $(shell brew --prefix e2tools)/bin/e2cp
+	E2MKDIR := $(shell brew --prefix e2tools)/bin/e2mkdir
 endif
 
 ifeq ($(UNAME), Linux)
 	E2MKFS := mkfs.ext2
 	E2CP   := e2cp
+	E2MKDIR := e2mkdir
 endif
 
 # Native userspace = every apps/<name> except wasm-* and applications already
@@ -103,22 +105,28 @@ objcopy:
 define populate_ext2
 	@echo "=== Populating $(1) ==="
 	@$(E2CP) -p build/kernel.bin $(1):/kernel.bin && echo "  → /kernel.bin"
+	@for dir in bin etc lib lib/rhai home home/user usr usr/share usr/share/felix tmp var; do \
+		$(E2MKDIR) $(1):/$$dir || exit 1; \
+	done
 	@for p in $(NATIVE_APPS); do \
-		$(E2CP) -p build/$$p $(1):/$$p && echo "  → /$$p"; \
+		if [ "$$p" = init ]; then dst=/init; else dst=/bin/$$p; fi; \
+		$(E2CP) -p build/$$p $(1):$$dst && echo "  → $$dst"; \
 	done
 	@for w in build/*.wasm; do \
 		[ -f "$$w" ] || continue; \
 		base=$$(basename $$w); \
-		$(E2CP) -p $$w $(1):/$$base && echo "  → /$$base"; \
+		$(E2CP) -p $$w $(1):/bin/$$base && echo "  → /bin/$$base"; \
 	done
-	@if [ -f build/wasm ]; then $(E2CP) -p build/wasm $(1):/wasm && echo "  → /wasm"; fi
-	@if [ -f build/busybox.wasm ]; then $(E2CP) -p build/busybox.wasm $(1):/busybox && echo "  → /busybox"; fi
+	@if [ -f build/wasm ]; then $(E2CP) -p build/wasm $(1):/bin/wasm && echo "  → /bin/wasm"; fi
+	@if [ -f build/busybox.wasm ]; then $(E2CP) -p build/busybox.wasm $(1):/bin/busybox && echo "  → /bin/busybox"; fi
 	@if [ -d rootfs ]; then \
 		find rootfs -type f ! -name README ! -name '.gitkeep' | while read -r f; do \
 			rel=$${f#rootfs/}; \
 			$(E2CP) -p "$$f" $(1):/$$rel && echo "  → /$$rel"; \
 		done; \
 	fi
+	@$(E2CP) -p build/boot.bin $(1):/usr/share/felix/boot.bin && echo "  → /usr/share/felix/boot.bin"
+	@$(E2CP) -p build/bootloader.bin $(1):/usr/share/felix/bootloader.bin && echo "  → /usr/share/felix/bootloader.bin"
 endef
 
 .PHONY: floppy-image
@@ -251,7 +259,7 @@ smoke: all usb-image
 	@grep -q 'Felix init: service manager pid=1' build/smoke.log || { echo "smoke: userspace init did not run as PID 1"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'selftest: PASS' build/smoke.log || { echo "smoke: userspace selftest failed"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'init: boot selftest pid=.* status=0' build/smoke.log || { echo "smoke: PID 1 did not reap selftest cleanly"; tail -n 160 build/smoke.log; exit 1; }
-	@grep -q 'init: started pid=.* /shell' build/smoke.log || { echo "smoke: shell was not spawned"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'init: started pid=.* /bin/shell' build/smoke.log || { echo "smoke: shell was not spawned"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'shell: userspace main started pid=' build/smoke.log || { echo "smoke: shell did not reach main"; tail -n 160 build/smoke.log; exit 1; }
 	@echo "smoke: PASS"
 

@@ -69,6 +69,8 @@ pub const SYS_POLL: u32 = 168;
 // Felix-private ABI. Keep it away from the Linux i386 syscall namespace.
 pub const SYS_SPAWN: u32 = 0xF000;
 pub const SYS_EXECVE_WASM: u32 = 0xF001;
+/// Spawn an ELF by a NUL-terminated VFS path. ebx=path, edx=ExecParams.
+pub const SYS_SPAWN_PATH: u32 = 0xF002;
 pub const SYS_MALLOC: u32 = 0xF010;
 pub const SYS_FREE: u32 = 0xF011;
 pub const SYS_REALLOC: u32 = 0xF012;

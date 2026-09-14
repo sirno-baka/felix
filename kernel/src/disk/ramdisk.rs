@@ -107,4 +107,8 @@ impl BlockDevice for RamDisk {
     fn sector_size(&self) -> u32 {
         SECTOR_SIZE
     }
+
+    fn sector_count(&self) -> u64 {
+        self.size_sectors() as u64
+    }
 }

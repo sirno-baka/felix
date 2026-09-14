@@ -131,8 +131,8 @@ pub extern "C" fn main() -> i32 {
     if !test_pty() { return fail("pty"); }
     if !test_mounts() { return fail("mounts"); }
 
-    let path = b"/selftest\0";
-    let arg0 = b"/selftest\0";
+    let path = b"/bin/selftest\0";
+    let arg0 = b"/bin/selftest\0";
     let arg1 = b"--exec-target\0";
     let argv = [arg0.as_ptr(), arg1.as_ptr(), core::ptr::null()];
     let ret = unsafe { execve(path.as_ptr(), argv.as_ptr(), core::ptr::null()) };

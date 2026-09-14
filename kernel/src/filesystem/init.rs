@@ -136,7 +136,7 @@ pub fn init_rootfs() -> bool {
                 }
                 Some(root) => {
                     println!(
-                        "[init] ram0 has {} but no complete /init + /shell userspace; trying IDE…",
+                        "[init] ram0 has {} but no complete /init + /bin/shell userspace; trying IDE…",
                         root.kind
                     );
                 }
@@ -189,7 +189,7 @@ pub fn init_rootfs() -> bool {
         return false;
     }
     if !probed.iter().any(|p| p.has_userspace) {
-        println!("[init] mountable filesystems found, but none contains both /init and /shell");
+        println!("[init] mountable filesystems found, but none contains both /init and /bin/shell");
         return false;
     }
 
@@ -418,7 +418,7 @@ pub fn mount_removable_named(
 
 fn fs_has_userspace(fs: &dyn Filesystem) -> bool {
     let has_init = fs.read_file("/init").is_some() || fs.read_file("init").is_some();
-    let has_shell = fs.read_file("/shell").is_some() || fs.read_file("shell").is_some();
+    let has_shell = fs.read_file("/bin/shell").is_some() || fs.read_file("bin/shell").is_some();
     has_init && has_shell
 }
 

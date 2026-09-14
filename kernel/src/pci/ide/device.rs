@@ -192,4 +192,8 @@ impl BlockDevice for IDEDevice {
     fn sector_size(&self) -> u32 {
         self.sector_size()
     }
+
+    fn sector_count(&self) -> u64 {
+        self.size as u64
+    }
 }

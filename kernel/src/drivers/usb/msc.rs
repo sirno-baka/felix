@@ -211,6 +211,10 @@ impl BlockDevice for UsbMsc {
     fn sector_size(&self) -> u32 {
         self.block_size.max(512)
     }
+
+    fn sector_count(&self) -> u64 {
+        self.blocks as u64
+    }
 }
 
 pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {

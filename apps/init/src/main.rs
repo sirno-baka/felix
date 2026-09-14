@@ -11,8 +11,8 @@ use libfelix::syscall::{
     wifsignaled, wexitstatus, wtermsig, WNOHANG,
 };
 
-const SELFTEST: &str = "/selftest";
-const DEFAULT_SHELL: &str = "/shell";
+const SELFTEST: &str = "/bin/selftest";
+const DEFAULT_SHELL: &str = "/bin/shell";
 const POLL_MS: u32 = 50;
 
 fn exit_code_from_wait(status: i32) -> i32 {
@@ -44,7 +44,7 @@ fn read_file(path: &str) -> Option<Vec<u8>> {
 }
 
 fn parse_config() -> Vec<(bool, Vec<String>)> {
-    let data = read_file("/init.conf").or_else(|| read_file("/etc/init.conf"));
+    let data = read_file("/etc/init.conf");
     let Some(data) = data else { return Vec::new(); };
     let text = core::str::from_utf8(&data).unwrap_or("");
     let mut specs = Vec::new();
@@ -136,7 +136,7 @@ fn spawn_service(service: &mut Service) -> bool {
     }
     let argv: Vec<*const u8> = argv_store.iter().map(|s| s.as_ptr()).collect();
 
-    let env_store = [String::from("PATH=/\0"), String::from("HOME=/\0")];
+    let env_store = [String::from("PATH=/bin\0"), String::from("HOME=/home/user\0")];
     let envp: Vec<*const u8> = env_store.iter().map(|s| s.as_ptr()).collect();
 
     let pid = unsafe {

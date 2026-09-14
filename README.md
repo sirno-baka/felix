@@ -678,7 +678,7 @@ The current preference is approximately:
 1. BootInfo/PXE RAM disk when present;
 2. ATA disks;
 3. scan available partitions/filesystems;
-4. prefer a filesystem containing `/shell`;
+4. prefer a filesystem containing `/init` and `/bin/shell`;
 5. otherwise prefer ext2;
 6. otherwise use the first mountable filesystem.
 
@@ -1177,7 +1177,7 @@ Current features:
 
 - windowed terminal
 - simple VT/escape-sequence handling
-- persistent command history in `/shell_hist`
+- persistent command history in `/home/user/.shell_history`
 - Up/Down history navigation
 - tab completion
 - external native ELF execution
@@ -1485,6 +1485,29 @@ Generated main image:
 ```text
 build/disk.img
 ```
+
+An existing Felix installation can be refreshed from mounted installation
+media without deleting user data:
+
+```text
+felix-install --source /mnt/usb0 --target /mnt/system --device /dev/sda
+```
+
+The command replaces `/kernel.bin`, `/init`, `/bin`, `/lib` and `/usr`.
+Existing `/etc` files, `/home`, `/var`, and unrelated files are retained. The
+optional `--device` argument installs stage 1 and stage 2 while preserving the
+target MBR partition table.
+
+The in-system `format` utility creates an MBR partition starting at LBA 2048
+and formats it as ext2:
+
+```text
+format /dev/sdb --yes
+```
+
+The device must be unmounted. `--yes` is mandatory because all files on the
+device are erased. Formatting runs entirely in userspace through `/dev` and the
+pure-Rust `am-fs-ext4` library in its ext2-compatible mode.
 
 ## Standard disk-image layout
 

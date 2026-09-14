@@ -1442,32 +1442,23 @@ pub fn on_mouse_down(x: i32, y: i32) {
 
         let target = *id;
 
-        // Close button: tear the window down in the WM immediately.
-        // Also SIGTERM the owner — if it is hung / ignores the event, the
-        // frame is already gone. Default signal action reaps the task.
+        // Closing a window is not the same thing as terminating its owner.
+        // A process may own several windows (for example the Rhai IDE and a
+        // window created by the script running inside it), so killing the
+        // owner here would tear all of them down.  Let the client unwind and
+        // destroy this particular window after handling EV_CLOSE.
         if hit_close(w, x, y) {
-            let mut owner = -1i8;
-            let old_rect = wm.find(target).map(|win| win.rect());
-            for slot in wm.windows.iter_mut() {
-                if slot.as_ref().map(|ww| ww.id) == Some(target) {
-                    owner = slot.as_ref().map(|ww| ww.owner_slot).unwrap_or(-1);
-                    *slot = None;
-                    break;
-                }
+            if let Some(win) = wm.find_mut(target) {
+                win.events.push(WmEvent {
+                    kind: EV_CLOSE,
+                    a: 0,
+                    b: 0,
+                    c: 0,
+                    d: 0,
+                });
             }
-            if let Some(rect) = old_rect {
-                wm.mark_dirty(rect);
-            }
-            if wm.hovered_client == Some(target) { wm.hovered_client = None; }
-            if wm.mouse_capture == Some(target) { wm.mouse_capture = None; }
+            wm.mouse_capture = None;
             wm.drag = None;
-            wm.compose_dirty();
-            drop(wm);
-            if owner > 0 {
-                // Not a queued signal — mark zombie immediately so ignore/hang
-                // cannot keep the task runnable.
-                let _ = crate::signal::force_kill(owner, crate::signal::SIGKILL);
-            }
             return;
         }
 

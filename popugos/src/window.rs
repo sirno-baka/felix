@@ -1,4 +1,4 @@
-use std::{fmt, string::String, vec, vec::Vec};
+use std::{fmt, string::String, vec::Vec};
 
 use embedded_graphics::{
     draw_target::DrawTarget,
@@ -229,8 +229,12 @@ impl Window {
             return Err(WindowError::InfoFailed);
         }
         let info = WindowInfo::from(raw);
-        let buffer = blank_buffer(info.pitch, info.client_height);
-        Ok(Self { id, info, buffer, clip: None, alive: true })
+        // Allocate the (potentially multi-megabyte) backing store lazily in
+        // `buffer_mut`.  On i686 PopugOS, keeping the large `Vec` allocation
+        // inside this function made optimized code keep the Result sret
+        // pointer across the mmap allocator call; the custom ABI currently
+        // does not preserve that value reliably for large mappings.
+        Ok(Self { id, info, buffer: Vec::new(), clip: None, alive: true })
     }
 
     pub fn id(&self) -> u32 { self.id }
@@ -239,7 +243,16 @@ impl Window {
     pub fn client_height(&self) -> u32 { self.info.client_height }
     pub fn pitch(&self) -> usize { self.info.pitch as usize }
     pub fn buffer(&self) -> &[u8] { &self.buffer }
-    pub fn buffer_mut(&mut self) -> &mut [u8] { &mut self.buffer }
+    pub fn buffer_mut(&mut self) -> &mut [u8] {
+        self.ensure_buffer();
+        &mut self.buffer
+    }
+
+    fn ensure_buffer(&mut self) {
+        if self.buffer.is_empty() {
+            initialize_buffer(&mut self.buffer, self.info.pitch, self.info.client_height);
+        }
+    }
 
     pub fn info(&self) -> Result<WindowInfo, WindowError> {
         let mut raw = sys::RawWindowInfo::default();
@@ -366,7 +379,8 @@ impl Window {
         self.info.client_width = width;
         self.info.client_height = height;
         self.info.pitch = width.saturating_mul(4);
-        let mut buffer = blank_buffer(self.info.pitch, height);
+        let mut buffer = Vec::new();
+        initialize_buffer(&mut buffer, self.info.pitch, height);
         let copy_w = old_w.min(width) as usize;
         let copy_h = old_h.min(height) as usize;
         let row_bytes = copy_w.saturating_mul(4);
@@ -404,15 +418,18 @@ pub fn screen_size() -> (u32, u32) {
     }
 }
 
-fn blank_buffer(pitch: u32, height: u32) -> Vec<u8> {
-    let mut buffer = vec![0u8; (pitch as usize).saturating_mul(height as usize)];
+#[inline(never)]
+fn initialize_buffer(buffer: &mut Vec<u8>, pitch: u32, height: u32) {
+    let len = (pitch as usize).saturating_mul(height as usize);
+    buffer.clear();
+    buffer.reserve_exact(len);
+    buffer.resize(len, 0);
     for pixel in buffer.chunks_exact_mut(4) {
         pixel[0] = 0x20;
         pixel[1] = 0x18;
         pixel[2] = 0x10;
         pixel[3] = 0;
     }
-    buffer
 }
 
 impl OriginDimensions for Window {
@@ -427,6 +444,7 @@ impl DrawTarget for Window {
     where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
+        self.ensure_buffer();
         let width = self.info.client_width as i32;
         let height = self.info.client_height as i32;
         let pitch = self.pitch();
@@ -445,6 +463,7 @@ impl DrawTarget for Window {
     }
 
     fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
+        self.ensure_buffer();
         let bounds = Rectangle::new(Point::zero(), Size::new(self.info.client_width, self.info.client_height));
         let mut area = area.intersection(&bounds);
         if let Some(clip) = self.clip { area = area.intersection(&clip); }

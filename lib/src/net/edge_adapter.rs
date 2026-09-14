@@ -56,6 +56,24 @@ impl embedded_io::Error for NetError {
     }
 }
 
+const ERRNO_EAGAIN: isize = -11;
+const ERRNO_EPIPE: isize = -32;
+
+/// Decode the signed i386 syscall result before it can be mistaken for a very
+/// large byte count by embedded-io.
+fn decode_io_result(raw: usize) -> Result<Option<usize>, NetError> {
+    let signed = raw as isize;
+    if signed >= 0 {
+        Ok(Some(signed as usize))
+    } else if signed == ERRNO_EAGAIN {
+        Ok(None)
+    } else if signed == ERRNO_EPIPE {
+        Err(NetError::Closed)
+    } else {
+        Err(NetError::Io)
+    }
+}
+
 // ===========================================================================
 // SockAddr helpers (same as your UDP echo)
 // ===========================================================================
@@ -118,11 +136,9 @@ impl Read for FelixTcpStream {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         loop {
             let n = unsafe { recvfrom(self.fd, buf.as_mut_ptr(), buf.len()) };
-            if n == usize::MAX {
-                // нет данных — ждём
-                async_rt::wait_readable(self.fd).await;
-            } else {
-                return Ok(n); // 0 = EOF, >0 = данные
+            match decode_io_result(n)? {
+                None => async_rt::wait_readable(self.fd).await,
+                Some(n) => return Ok(n), // 0 = EOF, >0 = данные
             }
         }
     }
@@ -132,7 +148,9 @@ impl Write for FelixTcpStream {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         loop {
             let n = unsafe { sendto(self.fd, buf.as_ptr(), buf.len()) };
-            if n == usize::MAX {
+            if let Some(n) = decode_io_result(n)? {
+                return Ok(n);
+            } else {
                 // буфер полон — ждём
                 let mut pfd = syscall::PollFd {
                     fd: self.fd as i32,
@@ -141,8 +159,6 @@ impl Write for FelixTcpStream {
                 };
                 unsafe { syscall::poll(&mut pfd, 1, 0) };
                 async_rt::yield_now().await;
-            } else {
-                return Ok(n);
             }
         }
     }
@@ -190,10 +206,9 @@ impl Read for FelixTcpReadHalf {
         loop {
             // TCP must use recvfrom, not SYS_READ (file path returns 0 → fake EOF).
             let n = unsafe { recvfrom(self.fd, buf.as_mut_ptr(), buf.len()) };
-            if n == usize::MAX {
-                async_rt::wait_readable(self.fd).await;
-            } else {
-                return Ok(n);
+            match decode_io_result(n)? {
+                None => async_rt::wait_readable(self.fd).await,
+                Some(n) => return Ok(n),
             }
         }
     }
@@ -214,7 +229,9 @@ impl Write for FelixTcpWriteHalf {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         loop {
             let n = unsafe { sendto(self.fd, buf.as_ptr(), buf.len()) };
-            if n == usize::MAX {
+            if let Some(n) = decode_io_result(n)? {
+                return Ok(n);
+            } else {
                 let mut pfd = syscall::PollFd {
                     fd: self.fd as i32,
                     events: POLLOUT,
@@ -222,8 +239,6 @@ impl Write for FelixTcpWriteHalf {
                 };
                 unsafe { syscall::poll(&mut pfd, 1, 0) };
                 async_rt::yield_now().await;
-            } else {
-                return Ok(n);
             }
         }
     }
@@ -276,11 +291,7 @@ impl UdpSend for FelixUdpSocket {
             );
         };
         let n = unsafe { sendto(self.fd, data.as_ptr(), data.len()) };
-        if n == usize::MAX {
-            Err(NetError::Io)
-        } else {
-            Ok(())
-        }
+        decode_io_result(n)?.map(|_| ()).ok_or(NetError::Io)
     }
 }
 
@@ -288,11 +299,12 @@ impl UdpReceive for FelixUdpSocket {
     async fn receive(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddr), Self::Error> {
         loop {
             let n = unsafe { recvfrom(self.fd, buffer.as_mut_ptr(), buffer.len()) };
-            if n == usize::MAX {
-                async_rt::wait_readable(self.fd).await;
-            } else {
-                let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-                return Ok((n, addr));
+            match decode_io_result(n)? {
+                None => async_rt::wait_readable(self.fd).await,
+                Some(n) => {
+                    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+                    return Ok((n, addr));
+                }
             }
         }
     }
@@ -339,11 +351,12 @@ impl UdpReceive for FelixUdpRecvHalf {
     async fn receive(&mut self, buffer: &mut [u8]) -> Result<(usize, SocketAddr), Self::Error> {
         loop {
             let n = unsafe { recvfrom(self.fd, buffer.as_mut_ptr(), buffer.len()) };
-            if n == usize::MAX {
-                async_rt::wait_readable(self.fd).await;
-            } else {
-                let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-                return Ok((n, addr));
+            match decode_io_result(n)? {
+                None => async_rt::wait_readable(self.fd).await,
+                Some(n) => {
+                    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+                    return Ok((n, addr));
+                }
             }
         }
     }
@@ -364,7 +377,7 @@ impl UdpSend for FelixUdpSendHalf {
             connect(self.fd, &sockaddr as *const _ as *const u8, size_of::<SockAddrIn>() as u32);
         };
         let n = unsafe { sendto(self.fd, data.as_ptr(), data.len()) };
-        if n == usize::MAX { Err(NetError::Io) } else { Ok(()) }
+        decode_io_result(n)?.map(|_| ()).ok_or(NetError::Io)
     }
 }
 
@@ -428,7 +441,7 @@ impl TcpConnect for FelixStack {
         let (ip, port) = to_v4(remote)?;
 
         let fd = unsafe { socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) };
-        if fd == usize::MAX {
+        if (fd as isize) < 0 {
             return Err(NetError::SocketFailed);
         }
 
@@ -436,7 +449,7 @@ impl TcpConnect for FelixStack {
         let ret = unsafe {
             connect(fd as u32, &sockaddr as *const _ as *const u8, size_of::<SockAddrIn>() as u32)
         };
-        if ret == usize::MAX {
+        if (ret as isize) < 0 {
             unsafe { close(fd as u32) };
             return Err(NetError::ConnectFailed);
         }
@@ -453,7 +466,7 @@ impl UdpBind for FelixStack {
         let (ip, port) = to_v4(local)?;
 
         let fd = unsafe { socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP) };
-        if fd == usize::MAX {
+        if (fd as isize) < 0 {
             return Err(NetError::SocketFailed);
         }
 
@@ -461,7 +474,7 @@ impl UdpBind for FelixStack {
         let ret = unsafe {
             bind(fd as u32, &sockaddr as *const _ as *const u8, size_of::<SockAddrIn>() as u32)
         };
-        if ret == usize::MAX {
+        if (ret as isize) < 0 {
             unsafe { close(fd as u32) };
             return Err(NetError::BindFailed);
         }

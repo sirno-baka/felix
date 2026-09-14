@@ -27,6 +27,7 @@ enum NodeCtx {
 }
 
 type ClickHandler = Box<dyn FnMut(&mut Ui)>;
+type ChangeHandler = Box<dyn FnMut(&mut Ui)>;
 type ContextHandler = Box<dyn FnMut(&mut Ui, i32, i32)>;
 
 /// Retained-mode PopugOS UI tree.
@@ -40,6 +41,7 @@ pub struct Ui {
     widget_nodes: Vec<NodeId>,
     widget_clips: Vec<Option<Rect>>,
     clicks: Vec<Option<ClickHandler>>,
+    changes: Vec<Option<ChangeHandler>>,
     contexts: Vec<Option<ContextHandler>>,
     root: NodeId,
     root_w: u32,
@@ -75,6 +77,7 @@ impl Ui {
             widget_nodes: Vec::new(),
             widget_clips: Vec::new(),
             clicks: Vec::new(),
+            changes: Vec::new(),
             contexts: Vec::new(),
             root,
             root_w: width,
@@ -265,6 +268,7 @@ impl Ui {
         self.widget_nodes.push(node);
         self.widget_clips.push(None);
         self.clicks.push(None);
+        self.changes.push(None);
         self.contexts.push(None);
         self.needs_layout = true;
         id
@@ -316,6 +320,13 @@ impl Ui {
 
     pub fn on_click<F: FnMut(&mut Ui) + 'static>(&mut self, id: WidgetId, callback: F) {
         if let Some(slot) = self.clicks.get_mut(id.0) {
+            *slot = Some(Box::new(callback));
+        }
+    }
+
+    /// Register a callback for edits or other value changes reported by a widget.
+    pub fn on_change<F: FnMut(&mut Ui) + 'static>(&mut self, id: WidgetId, callback: F) {
+        if let Some(slot) = self.changes.get_mut(id.0) {
             *slot = Some(Box::new(callback));
         }
     }
@@ -387,13 +398,21 @@ impl Ui {
         }
 
         let mut clicked = None;
-        let handled = self.dispatch_inner(event, &mut clicked);
+        let mut changed = None;
+        let handled = self.dispatch_inner(event, &mut clicked, &mut changed);
         if let Some(id) = clicked {
             let mut callback = self.clicks[id.0].take();
             if let Some(callback) = callback.as_mut() {
                 callback(self);
             }
             self.clicks[id.0] = callback;
+        }
+        if let Some(id) = changed {
+            let mut callback = self.changes[id.0].take();
+            if let Some(callback) = callback.as_mut() {
+                callback(self);
+            }
+            self.changes[id.0] = callback;
         }
         handled
     }
@@ -538,7 +557,7 @@ impl Ui {
         }
     }
 
-    fn dispatch_inner(&mut self, event: &UiEvent, clicked: &mut Option<WidgetId>) -> bool {
+    fn dispatch_inner(&mut self, event: &UiEvent, clicked: &mut Option<WidgetId>, changed: &mut Option<WidgetId>) -> bool {
         match *event {
             UiEvent::Down { x, y } => {
                 let target = self.hit_test(x, y);
@@ -555,6 +574,7 @@ impl Ui {
                     if result == EventResult::Clicked {
                         *clicked = Some(id);
                     }
+                    if result == EventResult::Changed { *changed = Some(id); }
                     true
                 } else {
                     false
@@ -565,25 +585,26 @@ impl Ui {
                 let old = self.hovered;
                 self.hovered = target;
                 let receiver = self.pressed.or(target);
-                let mut changed = old != target;
+                let mut handled = old != target;
                 if old != target {
                     if let Some(id) = old {
                         let leave = UiEvent::Leave;
                         let result = self.widgets[id.0].event(&leave, self.focus == Some(id));
                         if result != EventResult::Ignored || self.widgets[id.0].dirty() {
                             self.mark_dirty_rect(self.widget_dirty_rect(id));
-                            changed = true;
+                            handled = true;
                         }
                     }
                 }
                 if let Some(id) = receiver {
                     let result = self.widgets[id.0].event(event, self.focus == Some(id));
+                    if result == EventResult::Changed { *changed = Some(id); }
                     if result != EventResult::Ignored || self.widgets[id.0].dirty() {
                         self.mark_dirty_rect(self.widget_dirty_rect(id));
-                        changed = true;
+                        handled = true;
                     }
                 }
-                changed
+                handled
             }
             UiEvent::Leave => {
                 let old = self.hovered.take();
@@ -600,6 +621,7 @@ impl Ui {
             UiEvent::Wheel { x, y, .. } => {
                 let Some(id) = self.hit_test(x, y) else { return false; };
                 let result = self.widgets[id.0].event(event, self.focus == Some(id));
+                if result == EventResult::Changed { *changed = Some(id); }
                 if result != EventResult::Ignored || self.widgets[id.0].dirty() {
                     self.mark_dirty_rect(self.widget_dirty_rect(id));
                 }
@@ -613,6 +635,7 @@ impl Ui {
                     if result == EventResult::Clicked {
                         *clicked = Some(id);
                     }
+                    if result == EventResult::Changed { *changed = Some(id); }
                     if result != EventResult::Ignored || self.widgets[id.0].dirty() {
                         self.mark_dirty_rect(self.widget_dirty_rect(id));
                     }
@@ -629,6 +652,7 @@ impl Ui {
                     {
                         *clicked = Some(id);
                     }
+                    if result == EventResult::Changed { *changed = Some(id); }
                     if result != EventResult::Ignored || self.widgets[id.0].dirty() {
                         self.mark_dirty_rect(self.widget_dirty_rect(id));
                     }

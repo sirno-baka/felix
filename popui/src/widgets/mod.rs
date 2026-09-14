@@ -13,7 +13,7 @@ pub use file_view::{FileItem, FileKind, FileView, FileViewIcons, FileViewMode};
 pub use icon::Icon;
 pub use label::Label;
 pub use menu::{Menu, MenuEntry, MenuId};
-pub use text_area::TextArea;
+pub use text_area::{EditorDiagnostic, TextArea};
 pub use text_input::TextInput;
 pub use toolbar_button::ToolbarButton;
 pub use tree_view::{TreeNode, TreeView, TreeViewIcons};

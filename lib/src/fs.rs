@@ -102,6 +102,12 @@ impl File {
         self.fd
     }
 
+    /// Move the file/device cursor to an absolute byte offset.
+    pub fn seek(&mut self, offset: u32) -> IoResult<u32> {
+        let pos = unsafe { syscall::lseek(self.fd, offset as i32, syscall::SEEK_SET) };
+        if (pos as i32) < 0 { Err(IoError::Other(pos)) } else { Ok(pos as u32) }
+    }
+
     /// Прочитать до `buf.len()` байт.
     /// Возвращает количество реально прочитанных байт.
     /// 0 = EOF (или нет данных).

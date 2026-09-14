@@ -40,8 +40,44 @@ make image
 After booting Felix, run the example from its shell:
 
 ```text
-/hello first second
+/bin/hello first second
 ```
+
+## Rhai system scripts
+
+The `rhai` application is the system script runtime. It supports script files,
+one-line evaluation, and an interactive REPL:
+
+```text
+/bin/rhai /etc/init.rhai
+/bin/rhai -e "print(40 + 2)"
+/bin/rhai
+```
+
+The shell automatically sends files ending in `.rhai` through `/bin/rhai`, so a
+script can also be launched directly:
+
+```text
+/home/user/window-demo.rhai
+```
+
+Scripts receive `ARGS`, `PROGRAM`, and (for files) `SCRIPT`. Felix-specific
+objects include `fs`, `http`, `json`, and `ui`, plus environment access,
+`sleep`, and synchronous process execution through `run`. The default
+`/etc/init.conf` launches `/etc/init.rhai` once during startup. Rhai imports
+resolve from `/lib/rhai` without a module cache or manifest.
+The current 32-bit runtime uses Rhai's `only_i32` and `no_float` modes because
+the PopugOS sysroot does not yet provide the C/libm floating-point symbols.
+
+`rhai-ide` is the graphical system editor for `.rhai` programs. It provides
+token highlighting, line numbers, live parser diagnostics, identifier
+completion, file open/save, and a Run command with captured output.
+
+Scripts can create retained native interfaces through `ui.window`. Containers
+provide rows, columns, panels, spacing and basic widgets, with size, padding,
+gap and grow layout controls. Events returned by `app.poll()` are maps with a
+`kind` and, for widget signals, a `target`. A complete example is installed as
+`/home/user/window-demo.rhai`.
 
 ## Add another application
 

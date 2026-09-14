@@ -56,23 +56,40 @@ impl Allocator {
         unsafe { Layout::from_size_align_unchecked(size, align) }
     }
 
-    /// Добавляем блок обратно в free list
+    /// Insert by address and merge adjacent ranges. Large window surfaces and
+    /// temporary executable buffers otherwise leave the 16 MiB heap fragmented
+    /// even when most of it has already been freed.
     unsafe fn add_free_block(&self, ptr: *mut u8, size: usize) {
         let block = ptr as *mut FreeBlock;
         (*block).size = size;
 
-        let mut current_head = self.free_list.load(Ordering::Acquire);
-        loop {
-            (*block).next = current_head;
-            match self.free_list.compare_exchange(
-                current_head,
-                block,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(head) => current_head = head,
-            }
+        let mut previous: *mut FreeBlock = null_mut();
+        let mut current = self.free_list.load(Ordering::Relaxed);
+        while !current.is_null() && (current as usize) < ptr as usize {
+            previous = current;
+            current = (*current).next;
+        }
+
+        (*block).next = current;
+        if previous.is_null() {
+            self.free_list.store(block, Ordering::Relaxed);
+        } else {
+            (*previous).next = block;
+        }
+
+        // Merge the inserted range with its successor first.
+        if !current.is_null() && (ptr as usize + (*block).size) == current as usize {
+            (*block).size += (*current).size;
+            (*block).next = (*current).next;
+        }
+
+        // Then merge it into its predecessor; `block` already includes the
+        // successor, so this also joins all three ranges in one pass.
+        if !previous.is_null()
+            && (previous as usize + (*previous).size) == block as usize
+        {
+            (*previous).size += (*block).size;
+            (*previous).next = (*block).next;
         }
     }
 }

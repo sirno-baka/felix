@@ -765,6 +765,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "felix-install"
+version = "0.1.0"
+dependencies = [
+ "libfelix",
+]
+
+[[package]]
 name = "felix-kernel"
 version = "0.4.0"
 dependencies = [

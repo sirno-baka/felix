@@ -1,0 +1,11 @@
+[package]
+name = "felix-install"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "felix-install"
+test = false
+
+[dependencies.libfelix]
+path = "../../lib"

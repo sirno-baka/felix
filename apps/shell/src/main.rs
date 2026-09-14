@@ -23,7 +23,7 @@ use terminal::{Terminal, CELL_H, CELL_W};
 use libfelix::syscall::{
     self, chdir, close, getpid, getpgrp, kill, mkdir, mount, mount_list,
     open, openpty, pipe, read, rmdir, set_nonblock, setpgid, task_list, tty_setfg, umount2, unlink,
-    spawn, spawn_env_pgid, spawn_wasm, spawn_wasm_env_pgid, waitpid_status, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGCONT, SIGINT,
+    spawn_path_env_pgid, spawn_wasm_env_pgid, waitpid_status, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGCONT, SIGINT,
     SIGKILL, SIGSTOP, SIGTERM, SIGTSTP, TASK_RUNNING, TASK_STOPPED, TASK_ZOMBIE, WCONTINUED,
     WNOHANG, WUNTRACED,
 };
@@ -207,8 +207,8 @@ impl Shell {
         let mut shell = Self {
             cwd: String::from("/"),
             old_cwd: String::from("/"),
-            // Root contains the system apps today; `.` follows cwd.
-            path: String::from("/:."),
+            // System programs live in /bin; `.` follows the current directory.
+            path: String::from("/bin:."),
             command_cache: None,
             jobs: Vec::new(),
             next_job_id: 1,
@@ -216,8 +216,8 @@ impl Shell {
             last_status: 0,
             should_exit: false,
         };
-        shell.set_var("PATH", "/:.", true);
-        shell.set_var("HOME", "/", true);
+        shell.set_var("PATH", "/bin:.", true);
+        shell.set_var("HOME", "/home/user", true);
         shell.set_var("PWD", "/", true);
         shell.set_var("OLDPWD", "/", true);
         shell
@@ -1298,6 +1298,7 @@ cmd &              - run in background\n\
 cmd > file         - redirect stdout and detach (Felix convenience)\n\
 cmd >> file        - append stdout and detach\n\
 Pipes run in foreground.\n\
+Files ending in .rhai are run through /bin/rhai.\n\
 Ctrl+C interrupts a foreground program (userspace).\n",
     )
 }
@@ -1824,7 +1825,7 @@ const SCAN_DELETE: u8 = 0x53;
 const MAX_INPUT: usize = 1024;
 const CMD_HISTORY_MAX: usize = 64;
 const LINE_MAX_CHARS: usize = 69; // unused for wrap; VT reflows by window cols
-const HIST_PATH: &str = "/shell_hist";
+const HIST_PATH: &str = "/home/user/.shell_history";
 
 fn load_cmd_history() -> Vec<String> {
     let mut f = match File::open_ro(HIST_PATH) {

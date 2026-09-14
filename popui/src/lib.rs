@@ -30,7 +30,8 @@ pub use ui::{Ui, WidgetId};
 pub use widget::{EventResult, Widget};
 pub use widgets::{
     Button, FileItem, FileKind, FileView, FileViewIcons, FileViewMode, Icon, Label, Menu,
-    MenuEntry, MenuId, TextArea, TextInput, ToolbarButton, TreeNode, TreeView, TreeViewIcons,
+    EditorDiagnostic, MenuEntry, MenuId, TextArea, TextInput, ToolbarButton, TreeNode, TreeView,
+    TreeViewIcons,
 };
 
 pub use popugos::window::{Event as WindowEvent, Window, WindowBuilder, WindowError};

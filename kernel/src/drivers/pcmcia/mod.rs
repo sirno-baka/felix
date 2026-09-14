@@ -292,6 +292,10 @@ impl crate::disk::interface::BlockDevice for CompactFlash {
     fn sector_size(&self) -> u32 {
         self.ata.sector_size()
     }
+
+    fn sector_count(&self) -> u64 {
+        self.identify.sectors
+    }
 }
 
 fn print_socket_status(status: &SocketStatus) {
@@ -572,4 +576,3 @@ pub fn bind_card() -> Option<PcmciaDevice> {
 //         crate::println!("[PCMCIA] 16-bit I/O configured, IOCTRL={:02x}", pc16.ioctrl());
 //     }
 // }
-

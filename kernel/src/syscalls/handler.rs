@@ -19,7 +19,7 @@ use core::arch::naked_asm;
 use core::ffi::CStr;
 use core::net::Ipv4Addr;
 use core::ops::Deref;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 pub const SYSCALL_INT: u8 = 0x80;
 
@@ -199,6 +199,20 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                 current_slot,
                 state.ebx as *const u8,
                 state.ecx as usize,
+                params.stdin,
+                params.stdout,
+                params.stderr,
+                &params.argv,
+                &params.envp,
+                params.pgid,
+                params.foreground,
+            )
+        }
+        crate::syscalls::SYS_SPAWN_PATH => {
+            let params = read_exec_params(state.edx as *const ExecParamsUser);
+            sys_spawn_path(
+                current_slot,
+                state.ebx as *const u8,
                 params.stdin,
                 params.stdout,
                 params.stderr,
@@ -544,6 +558,14 @@ const EPIPE: usize = (-32isize) as usize;
 const ECONNREFUSED: usize = (-111isize) as usize;
 const ETIMEDOUT: usize = (-110isize) as usize;
 const EINPROGRESS: usize = (-115isize) as usize;
+
+static NEXT_EPHEMERAL_PORT: AtomicU32 = AtomicU32::new(0);
+
+fn alloc_ephemeral_port() -> u16 {
+    const FIRST: u32 = 49_152;
+    const COUNT: u32 = 65_536 - FIRST;
+    (FIRST + NEXT_EPHEMERAL_PORT.fetch_add(1, Ordering::Relaxed) % COUNT) as u16
+}
 const ENOTDIR: usize = (-20isize) as usize;
 
 const S_IFREG: u32 = 0o100000;
@@ -2823,10 +2845,9 @@ fn sys_execve_path(
     }
     let envp = read_cstr_vector(envp_ptr, 64, 512);
 
-    let temporary_pid = sys_spawn(
+    let temporary_pid = sys_spawn_image(
         current_slot,
-        image.as_ptr(),
-        image.len(),
+        &image,
         0,
         1,
         2,
@@ -2884,14 +2905,59 @@ pub fn sys_spawn(
     requested_pgid: i32,
     foreground: bool,
 ) -> usize {
-    let mut kernel_buf = alloc::vec![0u8; count];
-    unsafe {
-        core::ptr::copy_nonoverlapping(buf_ptr, kernel_buf.as_mut_ptr(), count);
-    }
-    let buf = &kernel_buf[..];
-    if count == 0 {
+    if count == 0 || buf_ptr.is_null() {
         return usize::MAX;
     }
+    // Do not retain a userspace slice while constructing the child page tables:
+    // allocator/page-table work can make that pointer unsafe to dereference.
+    // New code should use SYS_SPAWN_PATH, which reads the ELF exactly once.
+    let mut owned = alloc::vec![0u8; count];
+    unsafe { core::ptr::copy_nonoverlapping(buf_ptr, owned.as_mut_ptr(), count); }
+    sys_spawn_image(
+        parent_slot, &owned, stdin_fd, stdout_fd, stderr_fd, argv, envp,
+        requested_pgid, foreground,
+    )
+}
+
+pub fn sys_spawn_path(
+    parent_slot: usize,
+    path_ptr: *const u8,
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
+    argv: &[alloc::vec::Vec<u8>],
+    envp: &[alloc::vec::Vec<u8>],
+    requested_pgid: i32,
+    foreground: bool,
+) -> usize {
+    if path_ptr.is_null() { return usize::MAX; }
+    let raw_path = copy_cstr_from_user(path_ptr);
+    if raw_path.is_empty() { return usize::MAX; }
+    let path = resolve_task_path(parent_slot, &raw_path);
+    let image = match VFS.get().read_file(&path) {
+        Some(image) => image,
+        None => return usize::MAX,
+    };
+    if image.len() < 4 || &image[..4] != b"\x7fELF" {
+        return usize::MAX;
+    }
+    sys_spawn_image(
+        parent_slot, &image, stdin_fd, stdout_fd, stderr_fd, argv, envp,
+        requested_pgid, foreground,
+    )
+}
+
+fn sys_spawn_image(
+    parent_slot: usize,
+    buf: &[u8],
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
+    argv: &[alloc::vec::Vec<u8>],
+    envp: &[alloc::vec::Vec<u8>],
+    requested_pgid: i32,
+    foreground: bool,
+) -> usize {
     let slot_i8 = unsafe { TASK_MANAGER.get_free_slot() };
     if slot_i8 < 0 {
         println!("[spawn] No free task slot!");
@@ -3403,7 +3469,7 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
         addr: IpAddress::Ipv4(Ipv4Addr::from_bits(addr.sin_addr.s_addr)),
         port: u16::from_be(addr.sin_port),
     };
-    let local_port = 49152u16 + (socket_id as u16 & 0x3FFF);
+    let local_port = alloc_ephemeral_port();
 
     // UDP connect only records the peer and binds an ephemeral local port.
     {

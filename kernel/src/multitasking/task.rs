@@ -133,6 +133,33 @@ pub struct CPUState {
 }
 
 impl Task {
+    /// Called only after the task can no longer run, from another task's stack.
+    fn release_memory(&mut self) {
+        use crate::memory::paging::{phys_to_virt, PAGING};
+        interrupt_sync::without_interrupts(|| unsafe {
+            let mut paging = PAGING.lock();
+            for index in 0..768 {
+                let entry = (*self.page_dir).entries[index];
+                // Identity large pages are borrowed kernel mappings.
+                if entry & PDEFlags::PRESENT == 0 || entry & PDEFlags::DIR_PAGE_SIZE != 0 {
+                    continue;
+                }
+                if entry & PDEFlags::USER == 0 { continue; }
+                let table_phys = entry & 0xffff_f000;
+                let table = phys_to_virt(table_phys) as *const u32;
+                for slot in 0..1024 {
+                    let page = *table.add(slot);
+                    if page & 1 != 0 { paging.free_phys_frame((page & 0xffff_f000) >> 12); }
+                }
+                paging.free_phys_frame(table_phys >> 12);
+                (*self.page_dir).entries[index] = 0;
+            }
+            paging.free_phys_frame(self.page_dir_phys >> 12);
+            for offset in (0..STACK_SIZE).step_by(4096) {
+                paging.free_phys_frame((self.stack_base - KERNEL_OFFSET + offset as u32) >> 12);
+            }
+        });
+    }
     pub fn pd(&self) -> &PageDirectory {
         unsafe { &*self.page_dir }
     }
@@ -586,6 +613,9 @@ impl TaskManager {
             return false;
         };
         self.reparent_children_of(dead_pid);
+        if let Some(task) = self.tasks[id].as_mut() {
+            task.release_memory();
+        }
         self.tasks[id] = None;
         self.task_count -= 1;
         true

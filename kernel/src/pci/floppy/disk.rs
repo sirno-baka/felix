@@ -444,4 +444,8 @@ impl BlockDevice for Floppy {
     fn sector_size(&self) -> u32 {
         SECTOR_SIZE
     }
+
+    fn sector_count(&self) -> u64 {
+        (SPT as u64) * (HEADS as u64) * (TRACKS as u64)
+    }
 }

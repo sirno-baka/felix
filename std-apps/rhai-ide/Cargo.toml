@@ -1,0 +1,15 @@
+[package]
+name = "rhai-ide"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rhai-ide"
+path = "src/main.rs"
+
+[dependencies]
+felix-rhai = { path = "../rhai" }
+rhai = { version = "1.26", default-features = false, features = ["std", "only_i64", "no_float", "serde"] }
+popui = { path = "../../popui" }
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "sync", "time", "macros"] }
+taffy = { version = "0.14", default-features = false, features = ["alloc", "flexbox", "taffy_tree"] }

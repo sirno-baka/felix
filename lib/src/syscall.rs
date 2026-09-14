@@ -15,6 +15,7 @@ pub const SYS_EXECVE: u32 = 11;
 pub const SYS_CHDIR: u32 = 12;
 pub const SYS_SPAWN: u32 = 0xF000;
 pub const SYS_EXECVE_WASM: u32 = 0xF001;
+pub const SYS_SPAWN_PATH: u32 = 0xF002;
 
 pub const SYS_LSEEK: u32 = 19;
 pub const SYS_GETPID: u32 = 20;
@@ -155,6 +156,19 @@ pub const SYS_EXIT_GROUP: u32 = 252;
 pub const SEEK_SET: u32 = 0;
 pub const SEEK_CUR: u32 = 1;
 pub const SEEK_END: u32 = 2;
+
+pub unsafe fn lseek(fd: u32, offset: i32, whence: u32) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_LSEEK => ret,
+        in("ebx") fd,
+        in("ecx") offset,
+        in("edx") whence,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
 
 // open flags
 pub const O_RDONLY: u32 = 0;
@@ -766,6 +780,40 @@ pub unsafe fn spawn_env_pgid(
         inlateout("eax") SYS_SPAWN => ret,
         in("ebx") buf,
         in("ecx") buf_size,
+        in("edx") &params as *const ExecParams,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+/// Spawn an ELF directly from a VFS path, avoiding a complete userspace copy.
+/// `path` and every argv/envp entry must be NUL-terminated.
+pub unsafe fn spawn_path_env_pgid(
+    path: *const u8,
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
+    argv: &[*const u8],
+    envp: &[*const u8],
+    pgid: i32,
+    foreground: bool,
+) -> usize {
+    let params = ExecParams {
+        stdin: stdin_fd,
+        stdout: stdout_fd,
+        stderr: stderr_fd,
+        argc: argv.len() as u32,
+        argv: argv.as_ptr(),
+        envc: envp.len() as u32,
+        envp: envp.as_ptr(),
+        pgid,
+        foreground: foreground as u32,
+    };
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_SPAWN_PATH => ret,
+        in("ebx") path,
         in("edx") &params as *const ExecParams,
         options(nostack, preserves_flags)
     );

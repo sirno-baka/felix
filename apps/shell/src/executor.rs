@@ -88,14 +88,51 @@ fn spawn(
     pgid: i32,
     foreground: bool,
 ) -> Option<i32> {
-    let mut f = File::open(path).ok()?;
-    let data = f.read_to_end().ok()?;
-    if data.len() < 4 {
-        return None;
+    // WASM still uses the in-memory interpreter ABI. Native ELF and Rhai use
+    // path-based spawn below so large binaries are never duplicated in the
+    // shell heap.
+    if path.ends_with(".wasm") {
+        let mut file = File::open(path).ok()?;
+        let image = file.read_to_end().ok()?;
+        if image.len() < 4 || &image[..4] != b"\0asm" { return None; }
+
+        let mut argv_store = Vec::new();
+        for arg in args {
+            let mut value = arg.clone();
+            value.push('\0');
+            argv_store.push(value);
+        }
+        let argv: Vec<*const u8> = argv_store.iter().map(|s| s.as_ptr()).collect();
+        let env_store = shell.exported_env();
+        let envp: Vec<*const u8> = env_store.iter().map(|s| s.as_ptr()).collect();
+        let pid = unsafe {
+            spawn_wasm_env_pgid(
+                image.as_ptr(), image.len(), stdin_fd, stdout_fd, stderr_fd,
+                &argv, &envp, pgid, foreground,
+            )
+        };
+        return (pid != usize::MAX).then_some(pid as i32);
     }
 
+    // Rhai is the system script format. The shell keeps script execution in
+    // userspace by transparently spawning /bin/rhai with the script path as argv[1].
+    let is_rhai = path.ends_with(".rhai");
+    let executable = if is_rhai { "/bin/rhai" } else { path };
+
     let mut argv_store = Vec::new();
-    if args.is_empty() {
+    if is_rhai {
+        let mut runtime = String::from("/bin/rhai");
+        runtime.push('\0');
+        argv_store.push(runtime);
+        let mut script = path.to_string();
+        script.push('\0');
+        argv_store.push(script);
+        for arg in args.iter().skip(1) {
+            let mut s = arg.clone();
+            s.push('\0');
+            argv_store.push(s);
+        }
+    } else if args.is_empty() {
         let mut s = path.to_string();
         s.push('\0');
         argv_store.push(s);
@@ -111,17 +148,12 @@ fn spawn(
     let env_store = shell.exported_env();
     let envp: Vec<*const u8> = env_store.iter().map(|s| s.as_ptr()).collect();
 
-    let pid = unsafe {
-        match &data[..4] {
-            b"\0asm" => spawn_wasm_env_pgid(
-                data.as_ptr(), data.len(), stdin_fd, stdout_fd, stderr_fd, &argv, &envp, pgid, foreground,
-            ),
-            b"\x7fELF" => spawn_env_pgid(
-                data.as_ptr(), data.len(), stdin_fd, stdout_fd, stderr_fd, &argv, &envp, pgid, foreground,
-            ),
-            _ => usize::MAX,
-        }
-    };
+    let mut executable_c = executable.to_string();
+    executable_c.push('\0');
+    let pid = unsafe { spawn_path_env_pgid(
+        executable_c.as_ptr(), stdin_fd, stdout_fd, stderr_fd,
+        &argv, &envp, pgid, foreground,
+    ) };
     (pid != usize::MAX).then_some(pid as i32)
 }
 

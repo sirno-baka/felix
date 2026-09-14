@@ -236,16 +236,23 @@ impl Filesystem for DevFS {
         }
         let devices = DEVICES.get().lock();
         let node = devices.iter().find(|d| d.name == name)?;
-        let (mode, blksize) = match &node.dev_type {
-            DeviceType::Block(dev) => (0o060660, dev.lock().sector_size()),
-            DeviceType::Char(_) => (0o020660, 1),
+        let (mode, blksize, size, blocks) = match &node.dev_type {
+            DeviceType::Block(dev) => {
+                let dev = dev.lock();
+                let blksize = dev.sector_size();
+                let size = dev.sector_count().saturating_mul(blksize as u64);
+                (0o060660, blksize, size, size.div_ceil(512))
+            }
+            DeviceType::Char(_) => (0o020660, 1, 0, 0),
         };
         Some(Metadata {
             inode: node.inode,
             mode,
             nlink: 1,
             rdev: node.inode as u64,
+            size,
             blksize,
+            blocks,
             ..Metadata::default()
         })
     }
@@ -263,16 +270,23 @@ impl Filesystem for DevFS {
         }
         let devices = DEVICES.get().lock();
         let node = devices.iter().find(|d| d.inode == inode)?;
-        let (mode, blksize) = match &node.dev_type {
-            DeviceType::Block(dev) => (0o060660, dev.lock().sector_size()),
-            DeviceType::Char(_) => (0o020660, 1),
+        let (mode, blksize, size, blocks) = match &node.dev_type {
+            DeviceType::Block(dev) => {
+                let dev = dev.lock();
+                let blksize = dev.sector_size();
+                let size = dev.sector_count().saturating_mul(blksize as u64);
+                (0o060660, blksize, size, size.div_ceil(512))
+            }
+            DeviceType::Char(_) => (0o020660, 1, 0, 0),
         };
         Some(Metadata {
             inode,
             mode,
             nlink: 1,
             rdev: inode as u64,
+            size,
             blksize,
+            blocks,
             ..Metadata::default()
         })
     }

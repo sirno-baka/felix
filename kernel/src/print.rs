@@ -12,7 +12,7 @@ use core::fmt;
 use core::fmt::Write;
 use crate::time::get_timestamp;
 
-pub const LOG_LINES: usize = 70;
+pub const LOG_LINES: usize = 50;
 pub const LOG_WIDTH: usize = 150;
 
 // ---------------------------------------------------------------------------
