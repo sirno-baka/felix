@@ -1,11 +1,10 @@
 //! Intel ICH/i810-style AC'97 playback backend.
 //!
 //! Uses a 32-entry Buffer Descriptor List and keeps eight fragments queued.
-//! IRQ completion is preferred, but the exact same status service routine can
-//! be called from the PIT fallback if legacy shared INTx is unreliable.
+//! The shared IRQ path only acknowledges hardware and records pending work;
+//! actual mixing/refill happens from the PIT audio poll.
 
 use alloc::boxed::Box;
-use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::drivers::audio::Mixer;
@@ -20,7 +19,6 @@ const IDS: &[u16] = &[
     0x2698, 0x7195,
 ];
 
-// Native Audio Mixer registers.
 const AC97_RESET: u16 = 0x00;
 const AC97_MASTER_VOL: u16 = 0x02;
 const AC97_PCM_OUT_VOL: u16 = 0x18;
@@ -32,12 +30,10 @@ const AC97_VENDOR_ID1: u16 = 0x7c;
 const AC97_VENDOR_ID2: u16 = 0x7e;
 const AC97_EXT_VRA: u16 = 1 << 0;
 
-// Native Audio Bus Master registers, PCM out engine.
 const PO_BDBAR: u16 = 0x10;
 const PO_CIV: u16 = 0x14;
 const PO_LVI: u16 = 0x15;
 const PO_SR: u16 = 0x16;
-const PO_PICB: u16 = 0x18;
 const PO_CR: u16 = 0x1b;
 const GLOB_CNT: u16 = 0x2c;
 const GLOB_STA: u16 = 0x30;
@@ -95,6 +91,8 @@ pub struct IchAc97 {
     last_civ: u8,
     lvi: u8,
     idle_appends: usize,
+    pending_completion: bool,
+    pending_fifo_error: bool,
 }
 
 unsafe impl Send for IchAc97 {}
@@ -147,7 +145,6 @@ impl IchAc97 {
     fn nport(&self, reg: u16) -> u16 { self.nam.wrapping_add(reg) }
     #[inline]
     fn bport(&self, reg: u16) -> u16 { self.nabm.wrapping_add(reg) }
-
     #[inline]
     fn codec_read(&self, reg: u16) -> u16 { inw(self.nport(reg)) }
     #[inline]
@@ -167,7 +164,6 @@ impl IchAc97 {
     }
 
     fn init_codec(&self) -> Result<(), &'static str> {
-        // Bring AC-link out of cold reset while keeping interrupt routing quiet.
         let mut gc = inl(self.bport(GLOB_CNT));
         gc |= GLOB_CNT_COLD;
         gc &= !GLOB_CNT_GIE;
@@ -181,27 +177,25 @@ impl IchAc97 {
             }
             io_wait();
         }
-        if !ready {
-            return Err("ICH AC97 primary codec not ready");
-        }
+        if !ready { return Err("ICH AC97 primary codec not ready"); }
 
         self.codec_write(AC97_RESET, 0);
         for _ in 0..2000 { io_wait(); }
         self.codec_write(AC97_POWERDOWN, 0);
-        self.codec_write(AC97_MASTER_VOL, 0x0000);
-        self.codec_write(AC97_PCM_OUT_VOL, 0x0000);
+        self.codec_write(AC97_MASTER_VOL, 0);
+        self.codec_write(AC97_PCM_OUT_VOL, 0);
 
-        // Felix audio core is 48 kHz. AC'97 guarantees 48 kHz even when VRA
-        // is absent; if VRA exists, explicitly select 48 kHz as well.
         if self.codec_read(AC97_EXT_AUDIO_ID) & AC97_EXT_VRA != 0 {
             let e = self.codec_read(AC97_EXT_AUDIO_CTRL);
             self.codec_write(AC97_EXT_AUDIO_CTRL, e | AC97_EXT_VRA);
             self.codec_write(AC97_FRONT_DAC_RATE, 48_000);
         }
 
-        let v1 = self.codec_read(AC97_VENDOR_ID1);
-        let v2 = self.codec_read(AC97_VENDOR_ID2);
-        crate::println!("[audio/ich] AC97 codec {:04x}:{:04x}", v1, v2);
+        crate::println!(
+            "[audio/ich] AC97 codec {:04x}:{:04x}",
+            self.codec_read(AC97_VENDOR_ID1),
+            self.codec_read(AC97_VENDOR_ID2),
+        );
         self.reset_pcm_out()
     }
 
@@ -211,8 +205,7 @@ impl IchAc97 {
     }
 
     fn fill_fragment(&mut self, index: usize, mixer: &mut Mixer) -> bool {
-        let frag = self.fragment_mut(index);
-        mixer.mix_into(frag)
+        mixer.mix_into(self.fragment_mut(index))
     }
 
     fn prepare_bdl(&mut self) -> Result<(), &'static str> {
@@ -228,19 +221,12 @@ impl IchAc97 {
     }
 
     pub fn kick(&mut self, mixer: &mut Mixer) -> Result<(), &'static str> {
-        if self.running || !mixer.has_data() {
-            return Ok(());
-        }
+        if self.running || !mixer.has_data() { return Ok(()); }
 
         self.reset_pcm_out()?;
         self.prepare_bdl()?;
-
-        for i in 0..BDL_COUNT {
-            self.fragment_mut(i).fill(0);
-        }
-        for i in 0..ACTIVE_FRAGS {
-            let _ = self.fill_fragment(i, mixer);
-        }
+        self.dma.samples.fill(0);
+        for i in 0..ACTIVE_FRAGS { let _ = self.fill_fragment(i, mixer); }
 
         let bdl_phys = virt_to_phys(self.bdl.entries.as_ptr())?;
         compiler_fence(Ordering::SeqCst);
@@ -248,11 +234,11 @@ impl IchAc97 {
         self.last_civ = 0;
         self.lvi = (ACTIVE_FRAGS - 1) as u8;
         self.idle_appends = 0;
+        self.pending_completion = false;
+        self.pending_fifo_error = false;
         outb(self.bport(PO_LVI), self.lvi);
         outw(self.bport(PO_SR), SR_W1C);
 
-        // Enable controller-global interrupt routing. If the PIC line is kept
-        // masked, PIT polling still services these same status bits.
         let gc = inl(self.bport(GLOB_CNT)) | GLOB_CNT_GIE | GLOB_CNT_COLD;
         outl(self.bport(GLOB_CNT), gc);
         outb(self.bport(PO_CR), CR_RPBM | CR_FEIE | CR_IOCE);
@@ -265,65 +251,65 @@ impl IchAc97 {
         outw(self.bport(PO_SR), SR_W1C);
         self.running = false;
         self.idle_appends = 0;
+        self.pending_completion = false;
+        self.pending_fifo_error = false;
     }
 
-    /// Inspect and service PCM-out status. Returns false when this controller
-    /// has no pending source, which is mandatory for shared PCI INTx.
-    pub fn service(&mut self, mixer: &mut Mixer) -> bool {
-        if !self.running {
-            return false;
-        }
+    /// Fast IRQ path: inspect/ack only. No mixing, allocation or long loops.
+    pub fn ack_irq(&mut self) -> bool {
+        if !self.running { return false; }
         let sr = inw(self.bport(PO_SR));
         let pending = sr & (SR_BCIS | SR_LVBCI | SR_FIFOE);
-        if pending == 0 {
-            return false;
-        }
-
+        if pending == 0 { return false; }
         outw(self.bport(PO_SR), pending);
+        self.pending_completion |= pending & (SR_BCIS | SR_LVBCI) != 0;
+        self.pending_fifo_error |= pending & SR_FIFOE != 0;
+        true
+    }
 
-        if sr & SR_FIFOE != 0 {
-            crate::println!("[audio/ich] FIFO error SR={:#06x}", sr);
+    /// Bottom half, called by PIT. It also polls status first so playback keeps
+    /// working when the PIC IRQ is masked or storm-protected.
+    pub fn poll(&mut self, mixer: &mut Mixer) {
+        if !self.running { return; }
+        let _ = self.ack_irq();
+        if !self.pending_completion && !self.pending_fifo_error { return; }
+
+        let had_completion = self.pending_completion;
+        let fifo_error = self.pending_fifo_error;
+        self.pending_completion = false;
+        self.pending_fifo_error = false;
+
+        if fifo_error {
+            crate::println!("[audio/ich] PCM FIFO error");
         }
 
         let civ = inb(self.bport(PO_CIV)) & 31;
         let mut completed = 0usize;
         while self.last_civ != civ && completed < BDL_COUNT {
             self.last_civ = (self.last_civ + 1) & 31;
-
             let append = ((self.lvi as usize + 1) & 31) as u8;
             let data = self.fill_fragment(append as usize, mixer);
-            if data {
-                self.idle_appends = 0;
-            } else {
-                self.idle_appends = self.idle_appends.saturating_add(1);
-            }
+            if data { self.idle_appends = 0; } else { self.idle_appends = self.idle_appends.saturating_add(1); }
             compiler_fence(Ordering::SeqCst);
             self.lvi = append;
             outb(self.bport(PO_LVI), self.lvi);
             completed += 1;
         }
 
-        // If hardware reported completion before CIV visibly advanced, still
-        // keep the queue moving by appending one fragment.
-        if completed == 0 && sr & (SR_BCIS | SR_LVBCI) != 0 {
+        if completed == 0 && had_completion {
             let append = ((self.lvi as usize + 1) & 31) as u8;
             let data = self.fill_fragment(append as usize, mixer);
-            if data { self.idle_appends = 0; } else { self.idle_appends += 1; }
+            if data { self.idle_appends = 0; } else { self.idle_appends = self.idle_appends.saturating_add(1); }
             compiler_fence(Ordering::SeqCst);
             self.lvi = append;
             outb(self.bport(PO_LVI), self.lvi);
         }
 
-        // After at least a full queued window of silence, all previously queued
-        // audio has drained. Stop generating pointless IRQs; next write kicks it.
         if self.idle_appends >= ACTIVE_FRAGS + 2 && !mixer.has_data() {
             self.stop();
-        } else if sr & SR_DCH != 0 && mixer.has_data() {
-            // Resume if we briefly starved at LVI before software advanced it.
+        } else if inw(self.bport(PO_SR)) & SR_DCH != 0 && mixer.has_data() {
             outb(self.bport(PO_CR), CR_RPBM | CR_FEIE | CR_IOCE);
         }
-
-        true
     }
 }
 
@@ -331,19 +317,14 @@ pub fn probe_first() -> Result<Option<IchAc97>, &'static str> {
     let Some(dev) = crate::pci::enumerate()
         .into_iter()
         .find(|d| d.vendor_id == INTEL && supported(d.device_id))
-    else {
-        return Ok(None);
-    };
+    else { return Ok(None); };
 
     let nam = io_bar(&dev, 0)?;
     let nabm = io_bar(&dev, 1)?;
     dev.enable_bus_mastering();
 
-    let bdl = Box::new(Bdl {
-        entries: [BdlEntry { addr: 0, control_len: 0 }; BDL_COUNT],
-    });
+    let bdl = Box::new(Bdl { entries: [BdlEntry { addr: 0, control_len: 0 }; BDL_COUNT] });
     let dma = Box::new(DmaBuffer { samples: [0; DMA_SAMPLES] });
-
     let mut card = IchAc97 {
         nam,
         nabm,
@@ -356,6 +337,8 @@ pub fn probe_first() -> Result<Option<IchAc97>, &'static str> {
         last_civ: 0,
         lvi: 0,
         idle_appends: 0,
+        pending_completion: false,
+        pending_fifo_error: false,
     };
     card.init_codec()?;
     card.prepare_bdl()?;
