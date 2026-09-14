@@ -1,12 +1,12 @@
 //! Shared legacy PCI INTx dispatcher.
 //!
 //! Old PCI machines routinely route USB, CardBus, audio and other devices to
-//! the same PIC line (especially IRQ9/10/11).  A handler must therefore first
-//! inspect its own device status and return `false` when the interrupt is not
-//! its own.  The PIC EOI is sent exactly once, after all registered owners have
-//! had a chance to inspect/ack their hardware.
+//! the same PIC line (especially IRQ9/10/11). A handler must inspect its own
+//! status registers and return `false` when the interrupt is not its own. The
+//! PIC EOI is sent exactly once, after every registered owner has been checked.
 
 use core::arch::naked_asm;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::drivers::pic::PICS;
 use crate::spin::KMutex;
@@ -25,36 +25,42 @@ struct Line {
 
 impl Line {
     const fn new() -> Self {
-        Self {
-            handlers: [None; HANDLERS_PER_IRQ],
-            stray: 0,
-        }
+        Self { handlers: [None; HANDLERS_PER_IRQ], stray: 0 }
     }
 }
 
 static LINES: KMutex<[Line; IRQ_LINES]> = KMutex::new([Line::new(); IRQ_LINES]);
-
-/// Install the legacy PCI vectors we currently allow to be shared.
-///
-/// IRQ0/1/12 remain owned by PIT/keyboard/mouse.  IRQ5/9/10/11 cover the
-/// normal legacy PCI routing used by QEMU and the Sony C1M-era hardware.
-pub unsafe fn install(idt: &mut crate::interrupts::idt::InterruptDescriptorTable) {
-    idt.add(32 + 5, irq5 as u32);
-    idt.add(32 + 9, irq9 as u32);
-    idt.add(32 + 10, irq10 as u32);
-    idt.add(32 + 11, irq11 as u32);
-}
+// main.rs currently rewrites the complete PIC masks just before STI. The first
+// PIT tick repairs only the PCI lines that actually acquired an owner.
+static LATE_RESTORED: AtomicBool = AtomicBool::new(false);
 
 fn supported(irq: u8) -> bool {
     matches!(irq, 5 | 9 | 10 | 11)
+}
+
+/// Install or refresh the IDT vector for one supported legacy PCI line.
+/// Registration happens during boot with IF=0, after IDT.load(); changing the
+/// backing table is valid because IDTR keeps pointing at the same table.
+unsafe fn install_vector(irq: u8) -> Result<(), &'static str> {
+    let handler = match irq {
+        5 => irq5 as u32,
+        9 => irq9 as u32,
+        10 => irq10 as u32,
+        11 => irq11 as u32,
+        _ => return Err("shared IRQ line is not supported"),
+    };
+    crate::interrupts::idt::IDT.add((32u8 + irq) as usize, handler);
+    Ok(())
 }
 
 /// Register one status-checking owner for a shared PIC IRQ.
 /// Duplicate registrations are ignored.
 pub fn register(irq: u8, handler: IrqHandler) -> Result<(), &'static str> {
     if !supported(irq) {
-        return Err("shared IRQ line is not installed in IDT");
+        return Err("shared IRQ line is not supported");
     }
+
+    unsafe { install_vector(irq)?; }
 
     {
         let mut lines = LINES.lock();
@@ -69,16 +75,21 @@ pub fn register(irq: u8, handler: IrqHandler) -> Result<(), &'static str> {
         line.stray = 0;
     }
 
-    // Safe during boot (IF=0), and safe later because Pic mask writes are one
-    // byte and this call is not made from the interrupt itself.
+    // This may later be overwritten by main's full-mask write. late_restore_once
+    // repairs it after PIT begins running.
     PICS.unmask_irq(irq);
+    LATE_RESTORED.store(false, Ordering::Release);
     crate::println!("[irq] registered shared IRQ{} owner", irq);
     Ok(())
 }
 
-/// Re-enable all lines that currently have registered owners.  Useful after
-/// code that rewrites complete PIC mask bytes.
-pub fn restore_masks() {
+/// Called from PIT. Exactly once after boot's final mask rewrite, restore only
+/// shared lines that have registered owners. A storm-masked line is not
+/// repeatedly re-enabled because this function becomes a no-op after one pass.
+pub fn late_restore_once() {
+    if LATE_RESTORED.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let lines = LINES.lock();
     for irq in 0..IRQ_LINES {
         if lines[irq].handlers.iter().any(|h| h.is_some()) {
@@ -106,9 +117,8 @@ extern "C" fn shared_irq_dispatch(irq: u32) {
             } else {
                 line.stray = line.stray.saturating_add(1);
                 if line.stray >= STRAY_LIMIT {
-                    // An unclaimed level-triggered INTx source can otherwise
-                    // livelock the CPU forever. Mask first; report below after
-                    // releasing the registry lock.
+                    // A level-triggered unclaimed source can livelock the CPU.
+                    // Mask the line and leave PIT/polling fallbacks operational.
                     line.stray = 0;
                     mask_for_storm = true;
                 }
@@ -118,11 +128,10 @@ extern "C" fn shared_irq_dispatch(irq: u32) {
 
     if mask_for_storm {
         PICS.mask_irq(irq);
-        crate::println!("[irq] IRQ{} storm: no owner claimed it; masked", irq);
     }
 
-    // One EOI for the shared vector, never one EOI per device.
-    PICS.end_interrupt(32 + irq);
+    // Exactly one EOI for the shared vector, never one per device.
+    PICS.end_interrupt(32u8 + irq);
 }
 
 macro_rules! shared_irq_entry {
@@ -146,8 +155,8 @@ macro_rules! shared_irq_entry {
                     concat!("push ", stringify!($irq)),
                     "call shared_irq_dispatch",
                     "add esp, 4",
-                    // Restore DS/ES according to the interrupted CPL without
-                    // clobbering the saved EAX value on the stack.
+                    // CPUState-like stack here: eax..ebp then hardware eip/cs/
+                    // eflags. Select data segments before restoring saved GPRs.
                     "mov ax, [esp + 32]",
                     "and ax, 3",
                     "cmp ax, 3",
