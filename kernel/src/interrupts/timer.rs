@@ -73,6 +73,17 @@ pub extern "C" fn timer() {
 #[unsafe(no_mangle)]
 pub extern "C" fn timer_handler(esp: u32) -> u32 {
     unsafe {
+        // main.rs writes complete legacy PIC masks shortly before STI. Restore
+        // registered PCI INTx lines once, after the system has actually entered
+        // normal interrupt-driven operation.
+        crate::drivers::shared_irq::late_restore_once();
+
+        // Audio bottom half. This is deliberately outside the PCI shared IRQ:
+        // the hard IRQ only reads/acks status and records completion. Mixing and
+        // DMA refill happen here. poll() uses try_lock, so it never blocks the
+        // timer when a syscall currently owns the audio core.
+        crate::drivers::audio::poll();
+
         // === 1. Сетевой полл (неблокирующий) ===
         NET_POLL_COUNTER += 1;
         if NET_POLL_COUNTER >= NET_POLL_EVERY {
