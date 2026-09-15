@@ -276,6 +276,7 @@ debug: all usb-image
                  -device rtl8139,netdev=net0,mac=52:54:00:12:34:56 \
                  -object filter-dump,id=f1,netdev=net0,file=guest.pcap \
                  -device pci-ohci,id=ohci \
+                 -device AC97 \
                  -drive if=none,id=usbstick,format=raw,file=/media/sirno/b68c5baf-cda7-4901-a031-5acf01621548/Torrent/win98drvXP.img \
                  -device usb-storage,bus=ohci.0,drive=usbstick \
 		-m 128M -s -S &

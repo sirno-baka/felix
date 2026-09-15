@@ -1575,6 +1575,22 @@ pub fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usiz
                     if mode == FileMode::ReadOnly {
                         return 0;
                     }
+
+                    if crate::drivers::audio::is_audio_inode(inode) {
+                        let nonblock = current.fd_table.is_nonblock(fd);
+
+                        let owner = if current.pid >= 0 {
+                            current.pid as usize
+                        } else {
+                            0
+                        };
+
+                        return crate::drivers::audio::write_stream_blocking(
+                            owner as i32,
+                            buf,
+                            nonblock,
+                        );
+                    }
                     // O_APPEND is meaningful for seekable regular files, not raw
                     // character/block devices. Device writes use the shared OFD
                     // offset so dup/dup2 still see one position.

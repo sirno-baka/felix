@@ -5,6 +5,7 @@ pub(crate) mod keyboard_buffer;
 pub mod mouse;
 pub(crate) mod net;
 pub mod pic;
+pub mod shared_irq;
 pub mod usb;
 pub mod wm;
 pub(crate) mod wm_flags;
