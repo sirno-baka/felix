@@ -13,7 +13,7 @@
 //! LVDS/FP state and only replaces the timing/PLL values needed for
 //! the native panel mode.
 
-use crate::memory::paging::{PAGING, PTEFlags};
+use crate::memory::paging::{PTEFlags, PAGING};
 use crate::pci::bar::Bar;
 use crate::pci::find_device;
 use core::ptr::{read_volatile, write_volatile};
@@ -157,12 +157,7 @@ fn find_mmio_bar(dev: &crate::pci::device::PciDevice) -> Option<(u32, u32)> {
     let mut first: Option<(u32, u32)> = None;
 
     for i in 0..6 {
-        if let Bar::Memory {
-            address,
-            size,
-            ..
-        } = dev.bars[i]
-        {
+        if let Bar::Memory { address, size, .. } = dev.bars[i] {
             if address == 0 || size == 0 {
                 continue;
             }
@@ -232,10 +227,7 @@ pub fn init_native_lcd() -> Result<(), &'static str> {
             CRTC_EXT_CNTL,
             crtc_ext_before | CRTC_DISPLAY_DIS | CRTC_HSYNC_DIS | CRTC_VSYNC_DIS,
         );
-        mmio.write32(
-            LVDS_GEN_CNTL,
-            lvds_before | LVDS_DISPLAY_DIS,
-        );
+        mmio.write32(LVDS_GEN_CNTL, lvds_before | LVDS_DISPLAY_DIS);
         delay(50_000);
 
         // Disable double-scan/interlace, enable display + CRTC.
@@ -246,24 +238,15 @@ pub fn init_native_lcd() -> Result<(), &'static str> {
 
         // CRTC timings.
         let crtc_h_total_disp =
-            (((HTOTAL / 8 - 1) & 0x3ff) << 0) |
-                (((XRES / 8 - 1) & 0x1ff) << 16);
+            (((HTOTAL / 8 - 1) & 0x3ff) << 0) | (((XRES / 8 - 1) & 0x1ff) << 16);
 
         let hsync_wid = ((HSYNC_END - HSYNC_START) / 8).max(1).min(0x3f);
-        let crtc_h_sync_strt_wid =
-            ((HSYNC_START - 8) & 0x1fff) |
-                (hsync_wid << 16) |
-                HSYNC_NEG;
+        let crtc_h_sync_strt_wid = ((HSYNC_START - 8) & 0x1fff) | (hsync_wid << 16) | HSYNC_NEG;
 
-        let crtc_v_total_disp =
-            ((VTOTAL - 1) & 0xffff) |
-                ((YRES - 1) << 16);
+        let crtc_v_total_disp = ((VTOTAL - 1) & 0xffff) | ((YRES - 1) << 16);
 
         let vsync_wid = (VSYNC_END - VSYNC_START).max(1).min(0x1f);
-        let crtc_v_sync_strt_wid =
-            ((VSYNC_START - 1) & 0xfff) |
-                (vsync_wid << 16) |
-                VSYNC_NEG;
+        let crtc_v_sync_strt_wid = ((VSYNC_START - 1) & 0xfff) | (vsync_wid << 16) | VSYNC_NEG;
 
         mmio.write32(CRTC_H_TOTAL_DISP, crtc_h_total_disp);
         mmio.write32(CRTC_H_SYNC_STRT_WID, crtc_h_sync_strt_wid);
@@ -314,23 +297,15 @@ pub fn init_native_lcd() -> Result<(), &'static str> {
         // are the same.
         mmio.write32(
             FP_CRTC_H_TOTAL_DISP,
-            (((HTOTAL / 8) & 0x3ff) << 0) |
-                (((XRES / 8 - 1) & 0x1ff) << 16),
+            (((HTOTAL / 8) & 0x3ff) << 0) | (((XRES / 8 - 1) & 0x1ff) << 16),
         );
         mmio.write32(
             FP_CRTC_V_TOTAL_DISP,
-            ((VTOTAL - 1) & 0xffff) |
-                ((YRES - 1) << 16),
+            ((VTOTAL - 1) & 0xffff) | ((YRES - 1) << 16),
         );
 
-        let fp_h =
-            (HSYNC_START & 0x1fff) |
-                (hsync_wid << 16) |
-                HSYNC_NEG;
-        let fp_v =
-            (VSYNC_START & 0xfff) |
-                (vsync_wid << 16) |
-                VSYNC_NEG;
+        let fp_h = (HSYNC_START & 0x1fff) | (hsync_wid << 16) | HSYNC_NEG;
+        let fp_v = (VSYNC_START & 0xfff) | (vsync_wid << 16) | VSYNC_NEG;
 
         mmio.write32(FP_H_SYNC_STRT_WID, fp_h);
         mmio.write32(FP_V_SYNC_STRT_WID, fp_v);
@@ -355,15 +330,9 @@ pub fn init_native_lcd() -> Result<(), &'static str> {
         let cur_fb = cur_div3 & 0x7ff;
         let cur_post = (cur_div3 >> 16) & 0x7;
 
-        if (cur_ref & 0x3ff != REF_DIV || cur_fb != FB_DIV || cur_post != POST_DIV_SELECTOR)
-        {
+        if (cur_ref & 0x3ff != REF_DIV || cur_fb != FB_DIV || cur_post != POST_DIV_SELECTOR) {
             // Feed VCLK from CPU clock while touching PPLL.
-            pll_write_mask(
-                mmio,
-                VCLK_ECP_CNTL,
-                VCLK_SRC_SEL_CPUCLK,
-                !((3u32) << 16),
-            );
+            pll_write_mask(mmio, VCLK_ECP_CNTL, VCLK_SRC_SEL_CPUCLK, !((3u32) << 16));
 
             pll_write_mask(
                 mmio,
@@ -373,18 +342,8 @@ pub fn init_native_lcd() -> Result<(), &'static str> {
             );
 
             pll_write_mask(mmio, PPLL_REF_DIV, REF_DIV, !0x3ff);
-            pll_write_mask(
-                mmio,
-                PPLL_DIV_3,
-                FB_DIV,
-                !0x7ff,
-            );
-            pll_write_mask(
-                mmio,
-                PPLL_DIV_3,
-                POST_DIV_SELECTOR << 16,
-                !(0x7u32 << 16),
-            );
+            pll_write_mask(mmio, PPLL_DIV_3, FB_DIV, !0x7ff);
+            pll_write_mask(mmio, PPLL_DIV_3, POST_DIV_SELECTOR << 16, !(0x7u32 << 16));
 
             delay(20_000);
 
@@ -430,10 +389,7 @@ pub fn init_native_lcd() -> Result<(), &'static str> {
         if (h & 0x3ff) != ((HTOTAL / 8 - 1) & 0x3ff)
             || ((h >> 16) & 0x1ff) != ((XRES / 8 - 1) & 0x1ff)
         {
-            crate::println!(
-                "[M6] WARNING: CRTC_H_TOTAL_DISP mismatch (got {:#x})",
-                h
-            );
+            crate::println!("[M6] WARNING: CRTC_H_TOTAL_DISP mismatch (got {:#x})", h);
         }
         {
             let mut fb_guard = crate::drivers::framebuffer::FRAMEBUFFER.lock();
@@ -446,13 +402,11 @@ pub fn init_native_lcd() -> Result<(), &'static str> {
         }
 
         // Синхронизируем и копию framebuffer info в low memory.
-        let info_ptr =
-            crate::drivers::framebuffer::FB_INFO_PHYS
-                as *mut crate::drivers::framebuffer::FramebufferInfo;
+        let info_ptr = crate::drivers::framebuffer::FB_INFO_PHYS
+            as *mut crate::drivers::framebuffer::FramebufferInfo;
 
-        let mut info = read_volatile(
-            info_ptr as *const crate::drivers::framebuffer::FramebufferInfo
-        );
+        let mut info =
+            read_volatile(info_ptr as *const crate::drivers::framebuffer::FramebufferInfo);
 
         info.width = XRES as u16;
         info.height = YRES as u16;
@@ -467,7 +421,6 @@ pub fn init_native_lcd() -> Result<(), &'static str> {
             bytespp * 8,
             pitch_bytes
         );
-
     }
     Ok(())
 }

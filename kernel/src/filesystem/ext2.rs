@@ -3,8 +3,8 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 // fs/ext2.rs
-use crate::disk::PartitionConfig;
 use crate::disk::interface::BlockDevice;
+use crate::disk::PartitionConfig;
 use crate::filesystem::vfs::{DirEntry, Metadata};
 use crate::spin::Mutex;
 use crate::{print, println};
@@ -618,8 +618,7 @@ impl Ext2 {
         if num_blocks > max_blocks {
             println!(
                 "[EXT2] File too big ({} blocks, max {} with single indirect)",
-                num_blocks,
-                max_blocks
+                num_blocks, max_blocks
             );
             return false;
         }
@@ -683,22 +682,14 @@ impl Ext2 {
                     return false;
                 }
 
-                indirect_buf[ptr..ptr + 4]
-                    .copy_from_slice(&block.to_le_bytes());
+                indirect_buf[ptr..ptr + 4].copy_from_slice(&block.to_le_bytes());
             }
 
             let start = i * self.block_size as usize;
-            let end = core::cmp::min(
-                start + self.block_size as usize,
-                data.len(),
-            );
+            let end = core::cmp::min(start + self.block_size as usize, data.len());
 
             unsafe {
-                self.write_blocks(
-                    block,
-                    data[start..end].as_ptr(),
-                    1,
-                );
+                self.write_blocks(block, data[start..end].as_ptr(), 1);
             }
         }
 
@@ -709,8 +700,7 @@ impl Ext2 {
             }
         }
 
-        inode.i_blocks =
-            (num_blocks + if use_indirect { 1 } else { 0 }) * (self.block_size / 512);
+        inode.i_blocks = (num_blocks + if use_indirect { 1 } else { 0 }) * (self.block_size / 512);
 
         self.write_inode(inode_num, &inode);
 
@@ -1515,9 +1505,13 @@ impl Ext2 {
     fn update_dotdot(&self, dir_inode: u32, parent_inode: u32) -> bool {
         let inode = self.read_inode(dir_inode);
         let block = inode.i_block[0];
-        if block == 0 { return false; }
+        if block == 0 {
+            return false;
+        }
         let mut buf = [0u8; 4096];
-        unsafe { self.read_blocks(block, buf.as_mut_ptr(), 1); }
+        unsafe {
+            self.read_blocks(block, buf.as_mut_ptr(), 1);
+        }
         let mut offset = 0usize;
         while offset + 8 <= self.block_size as usize {
             let entry = unsafe {
@@ -1528,12 +1522,17 @@ impl Ext2 {
             }
             let start = offset + 8;
             let end = start + entry.name_len as usize;
-            if end > self.block_size as usize { break; }
+            if end > self.block_size as usize {
+                break;
+            }
             if &buf[start..end] == b".." {
                 let mut changed = entry;
                 changed.inode = parent_inode;
                 unsafe {
-                    core::ptr::write_unaligned(buf.as_mut_ptr().add(offset) as *mut Ext2DirEntry, changed);
+                    core::ptr::write_unaligned(
+                        buf.as_mut_ptr().add(offset) as *mut Ext2DirEntry,
+                        changed,
+                    );
                     self.write_blocks(block, buf.as_ptr(), 1);
                 }
                 return true;
@@ -1544,9 +1543,13 @@ impl Ext2 {
     }
 
     pub fn metadata_by_inode(&self, inode_num: u32) -> Option<Metadata> {
-        if !self.mounted || inode_num == 0 { return None; }
+        if !self.mounted || inode_num == 0 {
+            return None;
+        }
         let inode = self.read_inode(inode_num);
-        if inode.i_mode == 0 { return None; }
+        if inode.i_mode == 0 {
+            return None;
+        }
         Some(Metadata {
             inode: inode_num,
             mode: inode.i_mode as u32,
@@ -1564,15 +1567,30 @@ impl Ext2 {
     }
 
     pub fn rename_path(&mut self, old: &str, new: &str) -> bool {
-        if !self.mounted || old == "/" || new == "/" || old == new { return false; }
-        let Some(inode_num) = self.resolve_path(old) else { return false; };
-        if self.resolve_path(new).is_some() { return false; }
-        let Some((old_parent_path, old_name)) = self.split_path(old) else { return false; };
-        let Some((new_parent_path, new_name)) = self.split_path(new) else { return false; };
-        let Some(old_parent) = self.resolve_path(&old_parent_path) else { return false; };
-        let Some(new_parent) = self.resolve_path(&new_parent_path) else { return false; };
+        if !self.mounted || old == "/" || new == "/" || old == new {
+            return false;
+        }
+        let Some(inode_num) = self.resolve_path(old) else {
+            return false;
+        };
+        if self.resolve_path(new).is_some() {
+            return false;
+        }
+        let Some((old_parent_path, old_name)) = self.split_path(old) else {
+            return false;
+        };
+        let Some((new_parent_path, new_name)) = self.split_path(new) else {
+            return false;
+        };
+        let Some(old_parent) = self.resolve_path(&old_parent_path) else {
+            return false;
+        };
+        let Some(new_parent) = self.resolve_path(&new_parent_path) else {
+            return false;
+        };
         if (self.read_inode(old_parent).i_mode & 0xf000) != 0x4000
-            || (self.read_inode(new_parent).i_mode & 0xf000) != 0x4000 {
+            || (self.read_inode(new_parent).i_mode & 0xf000) != 0x4000
+        {
             return false;
         }
 
@@ -1583,7 +1601,8 @@ impl Ext2 {
             let new_parent_clean = new_parent_path.trim_end_matches('/');
             if new_parent_clean == old_clean
                 || (new_parent_clean.starts_with(old_clean)
-                    && new_parent_clean.as_bytes().get(old_clean.len()) == Some(&b'/')) {
+                    && new_parent_clean.as_bytes().get(old_clean.len()) == Some(&b'/'))
+            {
                 return false;
             }
         }
@@ -1591,7 +1610,9 @@ impl Ext2 {
 
         // Link the existing inode under the new name first; only then remove
         // the old dirent. If the second step fails, roll back the new link.
-        if !self.add_dir_entry(new_parent, &new_name, inode_num, file_type) { return false; }
+        if !self.add_dir_entry(new_parent, &new_name, inode_num, file_type) {
+            return false;
+        }
         if !self.remove_dir_entry(old_parent, &old_name) {
             let _ = self.remove_dir_entry(new_parent, &new_name);
             return false;
@@ -1608,8 +1629,10 @@ impl Ext2 {
             op.i_links_count = op.i_links_count.saturating_sub(1);
             np.i_links_count = np.i_links_count.saturating_add(1);
             let now = (crate::time::realtime_ms() / 1000) as u32;
-            op.i_mtime = now; op.i_ctime = now;
-            np.i_mtime = now; np.i_ctime = now;
+            op.i_mtime = now;
+            op.i_ctime = now;
+            np.i_mtime = now;
+            np.i_ctime = now;
             self.write_inode(old_parent, &op);
             self.write_inode(new_parent, &np);
         }
@@ -1675,8 +1698,7 @@ impl Ext2 {
                     core::ptr::read_unaligned(block_buf.as_ptr().add(offset) as *const Ext2DirEntry)
                 };
 
-                if entry.rec_len == 0
-                    || entry.rec_len as usize > self.block_size as usize - offset
+                if entry.rec_len == 0 || entry.rec_len as usize > self.block_size as usize - offset
                 {
                     break;
                 }

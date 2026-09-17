@@ -1,4 +1,4 @@
-use crate::memory::paging::{PAGING, PTEFlags, PageDirectory, PhysAddr, VirtAddr};
+use crate::memory::paging::{PTEFlags, PageDirectory, PhysAddr, VirtAddr, PAGING};
 use crate::sync::mutex::Mutex;
 use crate::{debugln, println};
 use core::arch::asm;
@@ -279,7 +279,7 @@ pub fn init() {
     }
 }
 
-use embedded_graphics::{Pixel, pixelcolor::Rgb888, prelude::*};
+use embedded_graphics::{pixelcolor::Rgb888, prelude::*, Pixel};
 
 impl OriginDimensions for Framebuffer {
     fn size(&self) -> Size {

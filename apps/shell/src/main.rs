@@ -646,7 +646,8 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
     match name {
         "help" | "exit" | "quit" | "pwd" | "cd" | "ls" | "cat" | "mkdir" | "rmdir" | "rm" | "mv"
         | "path" | "ps" | "jobs" | "fg" | "bg" | "kill" | "wait" | "export" | "unset" | "env"
-        | "set" | "clear" | "echo" | "head" | "lspci" | "ifconfig" | "mount" | "mounts" | "umount" => {}
+        | "set" | "clear" | "echo" | "head" | "lspci" | "ifconfig" | "mount" | "mounts" | "umount"
+        | "audiotest" => {}
         _ => return false,
     }
 
@@ -772,6 +773,14 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
             } else {
                 out.push("Usage: head <file>");
             }
+            if file_fd >= 0 {
+                unsafe {
+                    close(file_fd as u32);
+                }
+            }
+        }
+        "audiotest" => {
+            audio_test(out);
             if file_fd >= 0 {
                 unsafe {
                     close(file_fd as u32);
@@ -1272,6 +1281,59 @@ fn cat_to(filename: &str, file_fd: i32, out: &mut TermBuffer) {
     }
 }
 
+fn audio_test(out: &mut TermBuffer) {
+    let path = b"/dev/audio\0";
+    let fd = unsafe { open(path.as_ptr(), O_WRONLY) };
+    if fd == usize::MAX {
+        out.push("audiotest: cannot open /dev/audio");
+        return;
+    }
+
+    // 1 second, ~440 Hz triangle wave. /dev/audio wants raw S16LE,
+    // stereo, 48 kHz. Keep the buffer small so this also exercises the
+    // kernel's blocking refill path instead of requiring a large allocation.
+    const RATE: usize = 48_000;
+    const PERIOD: usize = 109; // 48000 / 109 ~= 440.37 Hz
+    const FRAMES: usize = 1024;
+    let mut pcm = [0u8; FRAMES * 4];
+    let mut frame = 0usize;
+
+    while frame < RATE {
+        let count = core::cmp::min(FRAMES, RATE - frame);
+        for i in 0..count {
+            let p = (frame + i) % PERIOD;
+            let half = PERIOD / 2;
+            let sample = if p < half {
+                -12_000i32 + (24_000i32 * p as i32) / half as i32
+            } else {
+                12_000i32 - (24_000i32 * (p - half) as i32) / (PERIOD - half) as i32
+            } as i16;
+            let b = sample.to_le_bytes();
+            let o = i * 4;
+            pcm[o] = b[0];
+            pcm[o + 1] = b[1];
+            pcm[o + 2] = b[0];
+            pcm[o + 3] = b[1];
+        }
+
+        let bytes = count * 4;
+        let mut off = 0usize;
+        while off < bytes {
+            let n = unsafe { write(fd as u32, pcm[off..bytes].as_ptr(), bytes - off) };
+            if n == 0 || n == usize::MAX {
+                unsafe { close(fd as u32); }
+                out.push("audiotest: write /dev/audio failed");
+                return;
+            }
+            off += n;
+        }
+        frame += count;
+    }
+
+    unsafe { close(fd as u32); }
+    out.push("audiotest: wrote 1s 440 Hz / 48k stereo S16LE");
+}
+
 fn help_text() -> String {
     String::from(
         "Builtins:\n\
@@ -1291,6 +1353,7 @@ fn help_text() -> String {
   mount /dev/X /mnt/Y - mount ext2/FAT block device\n\
   mounts           - list VFS mount points\n\
   umount <path>    - unmount removable filesystem\n\
+  audiotest        - play 1s 440 Hz test tone via /dev/audio\n\
   clear            - clear terminal\n\
   help / exit\n\n\
 Tab completes commands and paths relative to cwd.\n\

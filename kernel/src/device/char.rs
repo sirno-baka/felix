@@ -1,5 +1,5 @@
-use alloc::vec::Vec;
 use crate::time::jiffies;
+use alloc::vec::Vec;
 
 /// Трейт для символьных устройств (потоки байтов, без секторов)
 pub trait CharDevice: Send + Sync {
@@ -34,7 +34,6 @@ impl CharDevice for ZeroDevice {
     }
 }
 
-
 pub struct RandomDevice;
 
 impl CharDevice for RandomDevice {
@@ -50,7 +49,6 @@ impl CharDevice for RandomDevice {
         }
 
         _buf.len()
-
     }
     fn write(&self, _offset: u64, buf: &[u8]) -> usize {
         0

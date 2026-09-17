@@ -5,6 +5,7 @@
 //! WAV/OGG/MP3 decoding belongs in userspace; `/dev/audio` receives PCM. A
 //! small `play_wav` helper exists only for convenient kernel/hardware tests.
 
+pub mod hda;
 pub mod ich_ac97;
 pub mod trident;
 
@@ -34,7 +35,14 @@ struct Stream {
 
 impl Stream {
     const fn new() -> Self {
-        Self { owner_pid: -1, volume: 256, read: 0, write: 0, len: 0, data: [0; STREAM_SAMPLES] }
+        Self {
+            owner_pid: -1,
+            volume: 256,
+            read: 0,
+            write: 0,
+            len: 0,
+            data: [0; STREAM_SAMPLES],
+        }
     }
 
     fn clear_for(&mut self, owner_pid: i32) {
@@ -45,10 +53,14 @@ impl Stream {
         self.len = 0;
     }
 
-    fn free_samples(&self) -> usize { STREAM_SAMPLES - self.len }
+    fn free_samples(&self) -> usize {
+        STREAM_SAMPLES - self.len
+    }
 
     fn push(&mut self, s: i16) -> bool {
-        if self.len == STREAM_SAMPLES { return false; }
+        if self.len == STREAM_SAMPLES {
+            return false;
+        }
         self.data[self.write] = s;
         self.write = (self.write + 1) % STREAM_SAMPLES;
         self.len += 1;
@@ -56,7 +68,9 @@ impl Stream {
     }
 
     fn pop(&mut self) -> Option<i16> {
-        if self.len == 0 { return None; }
+        if self.len == 0 {
+            return None;
+        }
         let s = self.data[self.read];
         self.read = (self.read + 1) % STREAM_SAMPLES;
         self.len -= 1;
@@ -72,8 +86,14 @@ impl Mixer {
     const fn new() -> Self {
         Self {
             streams: [
-                Stream::new(), Stream::new(), Stream::new(), Stream::new(),
-                Stream::new(), Stream::new(), Stream::new(), Stream::new(),
+                Stream::new(),
+                Stream::new(),
+                Stream::new(),
+                Stream::new(),
+                Stream::new(),
+                Stream::new(),
+                Stream::new(),
+                Stream::new(),
             ],
         }
     }
@@ -83,7 +103,10 @@ impl Mixer {
         if let Some(i) = self.streams.iter().position(|s| s.owner_pid == owner_pid) {
             return Some(&mut self.streams[i]);
         }
-        let idx = self.streams.iter().position(|s| s.owner_pid < 0)
+        let idx = self
+            .streams
+            .iter()
+            .position(|s| s.owner_pid < 0)
             .or_else(|| self.streams.iter().position(|s| s.len == 0))?;
         self.streams[idx].clear_for(owner_pid);
         Some(&mut self.streams[idx])
@@ -91,8 +114,12 @@ impl Mixer {
 
     fn write_pcm16le(&mut self, owner_pid: i32, bytes: &[u8]) -> usize {
         let usable = bytes.len() & !3;
-        if usable == 0 { return 0; }
-        let Some(stream) = self.stream_for(owner_pid) else { return 0; };
+        if usable == 0 {
+            return 0;
+        }
+        let Some(stream) = self.stream_for(owner_pid) else {
+            return 0;
+        };
         let samples = (usable / 2).min(stream.free_samples() & !1) & !1;
         for i in 0..samples {
             let p = i * 2;
@@ -111,7 +138,9 @@ impl Mixer {
             let mut left = 0i32;
             let mut right = 0i32;
             for stream in &mut self.streams {
-                if stream.owner_pid < 0 || stream.len < 2 { continue; }
+                if stream.owner_pid < 0 || stream.len < 2 {
+                    continue;
+                }
                 let vol = stream.volume as i32;
                 left += (stream.pop().unwrap_or(0) as i32 * vol) / 256;
                 right += (stream.pop().unwrap_or(0) as i32 * vol) / 256;
@@ -130,38 +159,66 @@ impl Mixer {
     }
 
     pub fn set_volume(&mut self, owner_pid: i32, volume: u16) -> bool {
-        let Some(stream) = self.streams.iter_mut().find(|s| s.owner_pid == owner_pid.max(0)) else { return false; };
+        let Some(stream) = self
+            .streams
+            .iter_mut()
+            .find(|s| s.owner_pid == owner_pid.max(0))
+        else {
+            return false;
+        };
         stream.volume = volume.min(256);
         true
     }
 }
 
 pub(crate) enum Backend {
+    Hda(hda::Hda),
     Ich(ich_ac97::IchAc97),
     Trident(trident::Trident),
 }
 
 impl Backend {
     fn name(&self) -> &'static str {
-        match self { Self::Ich(v) => v.name(), Self::Trident(v) => v.name() }
+        match self {
+            Self::Hda(v) => v.name(),
+            Self::Ich(v) => v.name(),
+            Self::Trident(v) => v.name(),
+        }
     }
     fn irq(&self) -> u8 {
-        match self { Self::Ich(v) => v.irq(), Self::Trident(v) => v.irq() }
+        match self {
+            Self::Hda(v) => v.irq(),
+            Self::Ich(v) => v.irq(),
+            Self::Trident(v) => v.irq(),
+        }
     }
     fn set_irq_enabled(&mut self, enabled: bool) {
         match self {
+            Self::Hda(v) => v.set_irq_enabled(enabled),
             Self::Ich(v) => v.set_irq_enabled(enabled),
             Self::Trident(v) => v.set_irq_enabled(enabled),
         }
     }
     fn kick(&mut self, mixer: &mut Mixer) -> Result<(), &'static str> {
-        match self { Self::Ich(v) => v.kick(mixer), Self::Trident(v) => v.kick(mixer) }
+        match self {
+            Self::Hda(v) => v.kick(mixer),
+            Self::Ich(v) => v.kick(mixer),
+            Self::Trident(v) => v.kick(mixer),
+        }
     }
     fn ack_irq(&mut self) -> bool {
-        match self { Self::Ich(v) => v.ack_irq(), Self::Trident(v) => v.ack_irq() }
+        match self {
+            Self::Hda(v) => v.ack_irq(),
+            Self::Ich(v) => v.ack_irq(),
+            Self::Trident(v) => v.ack_irq(),
+        }
     }
     fn poll(&mut self, mixer: &mut Mixer) {
-        match self { Self::Ich(v) => v.poll(mixer), Self::Trident(v) => v.poll(mixer) }
+        match self {
+            Self::Hda(v) => v.poll(mixer),
+            Self::Ich(v) => v.poll(mixer),
+            Self::Trident(v) => v.poll(mixer),
+        }
     }
 }
 
@@ -171,7 +228,12 @@ struct AudioManager {
 }
 
 impl AudioManager {
-    const fn new() -> Self { Self { mixer: Mixer::new(), backend: None } }
+    const fn new() -> Self {
+        Self {
+            mixer: Mixer::new(),
+            backend: None,
+        }
+    }
 }
 
 static AUDIO: KMutex<AudioManager> = KMutex::new(AudioManager::new());
@@ -180,7 +242,9 @@ static AUDIO_INODE: AtomicU32 = AtomicU32::new(0);
 pub struct AudioCharDevice;
 
 impl CharDevice for AudioCharDevice {
-    fn read(&self, _offset: u64, _buf: &mut [u8]) -> usize { 0 }
+    fn read(&self, _offset: u64, _buf: &mut [u8]) -> usize {
+        0
+    }
 
     fn write(&self, _offset: u64, buf: &[u8]) -> usize {
         // PID is stable and monotonic in Felix, unlike the scheduler slot. This
@@ -192,19 +256,46 @@ impl CharDevice for AudioCharDevice {
 }
 
 pub fn init() {
-    let backend = match ich_ac97::probe_first() {
-        Ok(Some(v)) => Some(Backend::Ich(v)),
-        Ok(None) => match trident::probe_first() {
-            Ok(Some(v)) => Some(Backend::Trident(v)),
-            Ok(None) => None,
-            Err(e) => { crate::println!("[audio] Trident/SiS/ALi probe failed: {}", e); None }
-        },
-        Err(e) => {
-            crate::println!("[audio] Intel ICH probe failed: {}", e);
-            match trident::probe_first() {
+    let backend = match hda::probe_first() {
+        Ok(Some(v)) => Some(Backend::Hda(v)),
+        Ok(None) => match ich_ac97::probe_first() {
+            Ok(Some(v)) => Some(Backend::Ich(v)),
+            Ok(None) => match trident::probe_first() {
                 Ok(Some(v)) => Some(Backend::Trident(v)),
                 Ok(None) => None,
-                Err(e) => { crate::println!("[audio] Trident/SiS/ALi probe failed: {}", e); None }
+                Err(e) => {
+                    crate::println!("[audio] Trident/SiS/ALi probe failed: {}", e);
+                    None
+                }
+            },
+            Err(e) => {
+                crate::println!("[audio] Intel ICH probe failed: {}", e);
+                match trident::probe_first() {
+                    Ok(Some(v)) => Some(Backend::Trident(v)),
+                    Ok(None) => None,
+                    Err(e) => {
+                        crate::println!("[audio] Trident/SiS/ALi probe failed: {}", e);
+                        None
+                    }
+                }
+            }
+        },
+        Err(e) => {
+            crate::println!("[audio] Intel HDA probe failed: {}", e);
+            match ich_ac97::probe_first() {
+                Ok(Some(v)) => Some(Backend::Ich(v)),
+                Ok(None) => match trident::probe_first() {
+                    Ok(Some(v)) => Some(Backend::Trident(v)),
+                    Ok(None) => None,
+                    Err(e) => {
+                        crate::println!("[audio] Trident/SiS/ALi probe failed: {}", e);
+                        None
+                    }
+                },
+                Err(e) => {
+                    crate::println!("[audio] Intel ICH probe failed: {}", e);
+                    None
+                }
             }
         }
     };
@@ -236,10 +327,15 @@ pub fn init() {
 }
 
 pub fn is_available() -> bool {
-    AUDIO.try_lock().map(|g| g.backend.is_some()).unwrap_or(false)
+    AUDIO
+        .try_lock()
+        .map(|g| g.backend.is_some())
+        .unwrap_or(false)
 }
 
-pub fn device_inode() -> u32 { AUDIO_INODE.load(Ordering::Acquire) }
+pub fn device_inode() -> u32 {
+    AUDIO_INODE.load(Ordering::Acquire)
+}
 
 pub fn is_audio_inode(global_inode: u32) -> bool {
     let local_inode = global_inode & 0x00FF_FFFF;
@@ -250,7 +346,9 @@ pub fn is_audio_inode(global_inode: u32) -> bool {
 
 pub fn write_stream(owner_pid: i32, bytes: &[u8]) -> usize {
     let mut audio = AUDIO.lock();
-    if audio.backend.is_none() { return 0; }
+    if audio.backend.is_none() {
+        return 0;
+    }
     let written = audio.mixer.write_pcm16le(owner_pid, bytes);
     if written != 0 {
         let AudioManager { mixer, backend } = &mut *audio;
@@ -263,12 +361,7 @@ pub fn write_stream(owner_pid: i32, bytes: &[u8]) -> usize {
     written
 }
 
-
-pub fn write_stream_blocking(
-    owner: i32,
-    buf: &[u8],
-    nonblock: bool,
-) -> usize {
+pub fn write_stream_blocking(owner: i32, buf: &[u8], nonblock: bool) -> usize {
     if buf.is_empty() {
         return 0;
     }
@@ -292,11 +385,7 @@ pub fn write_stream_blocking(
         if nonblock {
             // Felix сейчас использует usize::MAX как would-block
             // в pipe_try_write().
-            return if written == 0 {
-                usize::MAX
-            } else {
-                written
-            };
+            return if written == 0 { usize::MAX } else { written };
         }
 
         /*
@@ -310,39 +399,53 @@ pub fn write_stream_blocking(
          * после возврата опять отключаем interrupts и пробуем запись.
          */
         unsafe {
-            asm!(
-            "sti",
-            "hlt",
-            "cli",
-            options(nomem, nostack)
-            );
+            asm!("sti", "hlt", "cli", options(nomem, nostack));
         }
     }
 }
 
 fn irq_entry(irq: u8) -> bool {
-    let Some(mut audio) = AUDIO.try_lock() else { return false; };
-    let Some(backend) = audio.backend.as_mut() else { return false; };
-    if backend.irq() != irq { return false; }
+    let Some(mut audio) = AUDIO.try_lock() else {
+        return false;
+    };
+    let Some(backend) = audio.backend.as_mut() else {
+        return false;
+    };
+    if backend.irq() != irq {
+        return false;
+    }
     backend.ack_irq()
 }
 
 pub fn poll() {
-    let Some(mut audio) = AUDIO.try_lock() else { return; };
+    let Some(mut audio) = AUDIO.try_lock() else {
+        return;
+    };
     let AudioManager { mixer, backend } = &mut *audio;
-    if let Some(backend) = backend.as_mut() { backend.poll(mixer); }
+    if let Some(backend) = backend.as_mut() {
+        backend.poll(mixer);
+    }
 }
 
 #[inline]
 fn wav_u16(data: &[u8], off: usize) -> Result<u16, &'static str> {
-    if off + 2 > data.len() { return Err("truncated WAV"); }
+    if off + 2 > data.len() {
+        return Err("truncated WAV");
+    }
     Ok(u16::from_le_bytes([data[off], data[off + 1]]))
 }
 
 #[inline]
 fn wav_u32(data: &[u8], off: usize) -> Result<u32, &'static str> {
-    if off + 4 > data.len() { return Err("truncated WAV"); }
-    Ok(u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]))
+    if off + 4 > data.len() {
+        return Err("truncated WAV");
+    }
+    Ok(u32::from_le_bytes([
+        data[off],
+        data[off + 1],
+        data[off + 2],
+        data[off + 3],
+    ]))
 }
 
 /// Convenience helper for kernel/hardware tests:
@@ -372,7 +475,9 @@ pub fn play_wav(data: &[u8]) -> Result<usize, &'static str> {
         }
         let chunk = &data[pos..pos + size];
         if id == b"fmt " {
-            if chunk.len() < 16 { return Err("invalid WAV fmt chunk"); }
+            if chunk.len() < 16 {
+                return Err("invalid WAV fmt chunk");
+            }
             format = Some(wav_u16(chunk, 0)?);
             channels = Some(wav_u16(chunk, 2)?);
             rate = Some(wav_u32(chunk, 4)?);
@@ -383,12 +488,22 @@ pub fn play_wav(data: &[u8]) -> Result<usize, &'static str> {
         pos += size + (size & 1);
     }
 
-    if format != Some(1) { return Err("WAV must be uncompressed PCM"); }
-    if channels != Some(CHANNELS as u16) { return Err("WAV must be stereo"); }
-    if rate != Some(SAMPLE_RATE) { return Err("WAV must be 48000 Hz"); }
-    if bits != Some(BITS as u16) { return Err("WAV must be 16-bit"); }
+    if format != Some(1) {
+        return Err("WAV must be uncompressed PCM");
+    }
+    if channels != Some(CHANNELS as u16) {
+        return Err("WAV must be stereo");
+    }
+    if rate != Some(SAMPLE_RATE) {
+        return Err("WAV must be 48000 Hz");
+    }
+    if bits != Some(BITS as u16) {
+        return Err("WAV must be 16-bit");
+    }
     let pcm = pcm.ok_or("WAV has no data chunk")?;
-    if pcm.len() & 3 != 0 { return Err("WAV data is not whole stereo PCM16 frames"); }
+    if pcm.len() & 3 != 0 {
+        return Err("WAV data is not whole stereo PCM16 frames");
+    }
 
     Ok(write_stream(0, pcm))
 }

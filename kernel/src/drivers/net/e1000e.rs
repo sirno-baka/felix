@@ -7,9 +7,9 @@
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering, compiler_fence};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering};
 
-use crate::drivers::net::{RX_RING_SIZE, TX_BUF_SIZE, map_mmio};
+use crate::drivers::net::{map_mmio, RX_RING_SIZE, TX_BUF_SIZE};
 use crate::memory::paging::{KERNEL_OFFSET, PAGE_SIZE, PAGING};
 use crate::pci;
 use crate::println;

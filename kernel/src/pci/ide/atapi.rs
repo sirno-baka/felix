@@ -1,5 +1,5 @@
 use super::ata::{ATACommand, ATAReg, ATAStatus};
-use super::{IDE_IRQ_INVOKED, IDEChannelRegisters, IDEController, IDEDevice, IDEType};
+use super::{IDEChannelRegisters, IDEController, IDEDevice, IDEType, IDE_IRQ_INVOKED};
 
 use crate::io;
 

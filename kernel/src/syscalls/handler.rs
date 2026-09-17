@@ -1,29 +1,32 @@
-use alloc::string::{String, ToString};
-use core::arch::asm;
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::drivers::pic::PICS;
-use crate::filesystem::VFS;
-use crate::filesystem::file::{ClosedFileDescriptor, DeviceKind, FileDescriptor, FileDescriptorTable, FileMode, PipeEnd, PtySide};
+use crate::filesystem::file::{
+    ClosedFileDescriptor, DeviceKind, FileDescriptor, FileDescriptorTable, FileMode, PipeEnd,
+    PtySide,
+};
 use crate::filesystem::vfs::{Metadata, RenameError};
+use crate::filesystem::VFS;
 use crate::memory::allocator::ALLOCATOR;
 use crate::memory::paging::{
-    KERNEL_MMIO_BASE, PAGE_SIZE, PAGING, PDEFlags, PTEFlags, PageDirectory, PhysAddr, VirtAddr,
-    copy_kernel_mappings,
+    copy_kernel_mappings, PDEFlags, PTEFlags, PageDirectory, PhysAddr, VirtAddr, KERNEL_MMIO_BASE,
+    PAGE_SIZE, PAGING,
 };
 use crate::multitasking::task::{
-    CPUState, TASK_MANAGER, Task, MAX_TASKS, USER_HEAP_BASE, USER_THREAD_STACK_BASE,
+    CPUState, Task, MAX_TASKS, TASK_MANAGER, USER_HEAP_BASE, USER_THREAD_STACK_BASE,
     USER_THREAD_STACK_PAGES, USER_THREAD_STACK_STRIDE,
 };
-use crate::net::{AF_INET, SOCK_DGRAM, SOCK_STREAM, SOCKET_TABLE, SockAddrIn, SocketState};
+use crate::net::{SockAddrIn, SocketState, AF_INET, SOCKET_TABLE, SOCK_DGRAM, SOCK_STREAM};
 use crate::{pipe, utils};
 use crate::{print, println};
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
+use core::arch::asm;
 use core::arch::naked_asm;
 use core::ffi::CStr;
 use core::net::Ipv4Addr;
 use core::ops::Deref;
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 pub const SYSCALL_INT: u8 = 0x80;
 
@@ -92,7 +95,9 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
 
     // A detached thread cannot free the kernel stack it is currently using.
     // Reclaim it on the next syscall made from another task instead.
-    unsafe { TASK_MANAGER.reap_detached_threads(); }
+    unsafe {
+        TASK_MANAGER.reap_detached_threads();
+    }
 
     // exit must switch to another task — never return to the dead one.
     // SYS_EXIT is the legacy status=0 form; EXIT_GROUP carries status in ebx.
@@ -175,7 +180,11 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         crate::syscalls::SYS_FSTAT64 => {
             sys_fstat64(current_slot, state.ebx as usize, state.ecx as *mut Stat64)
         }
-        crate::syscalls::SYS_STAT64 => sys_stat64(current_slot, state.ebx as *const u8, state.ecx as *mut Stat64),
+        crate::syscalls::SYS_STAT64 => sys_stat64(
+            current_slot,
+            state.ebx as *const u8,
+            state.ecx as *mut Stat64,
+        ),
         crate::syscalls::SYS_GETDENTS64 => sys_getdents64(
             current_slot,
             state.ebx as usize,
@@ -187,16 +196,17 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         crate::syscalls::SYS_MKDIR => sys_mkdir(current_slot, state.ebx as *const u8),
         crate::syscalls::SYS_RMDIR => sys_rmdir(current_slot, state.ebx as *const u8),
         crate::syscalls::SYS_UNLINK => sys_unlink(current_slot, state.ebx as *const u8),
-        crate::syscalls::SYS_RENAME => sys_rename(
-            current_slot,
-            state.ebx as *const u8,
-            state.ecx as *const u8,
-        ),
+        crate::syscalls::SYS_RENAME => {
+            sys_rename(current_slot, state.ebx as *const u8, state.ecx as *const u8)
+        }
         crate::syscalls::SYS_CHDIR => sys_chdir(current_slot, state.ebx as *const u8),
-        crate::syscalls::SYS_GETCWD => sys_getcwd(current_slot, state.ebx as *mut u8, state.ecx as usize),
+        crate::syscalls::SYS_GETCWD => {
+            sys_getcwd(current_slot, state.ebx as *mut u8, state.ecx as usize)
+        }
         crate::syscalls::SYS_GETPID => sys_getpid(current_slot),
         crate::syscalls::SYS_GETTID => unsafe {
-            TASK_MANAGER.tasks
+            TASK_MANAGER
+                .tasks
                 .get(thread_slot)
                 .and_then(|t| t.as_ref())
                 .map(|t| t.tid as usize)
@@ -206,17 +216,21 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         crate::syscalls::SYS_GETPGRP => sys_getpgrp(current_slot),
         crate::syscalls::SYS_GETPGID => sys_getpgid(current_slot, state.ebx as i32),
         crate::syscalls::SYS_GETSID => sys_getsid(current_slot, state.ebx as i32),
-        crate::syscalls::SYS_SETPGID => sys_setpgid(current_slot, state.ebx as i32, state.ecx as i32),
+        crate::syscalls::SYS_SETPGID => {
+            sys_setpgid(current_slot, state.ebx as i32, state.ecx as i32)
+        }
         crate::syscalls::SYS_SETSID => sys_setsid(current_slot),
         crate::syscalls::SYS_DUP => sys_dup(current_slot, state.ebx as usize),
         crate::syscalls::SYS_GETTIMEOFDAY => sys_gettimeofday(state.ebx as *mut TimeVal),
-        crate::syscalls::SYS_CLOCK_GETTIME => sys_clock_gettime(state.ebx as i32, state.ecx as *mut TimeSpec),
-        crate::syscalls::SYS_GETRANDOM => sys_getrandom(
-            state.ebx as *mut u8,
-            state.ecx as usize,
-            state.edx as u32,
-        ),
-        crate::syscalls::SYS_NANOSLEEP => sys_nanosleep(state.ebx as *const TimeSpec, state.ecx as *mut TimeSpec),
+        crate::syscalls::SYS_CLOCK_GETTIME => {
+            sys_clock_gettime(state.ebx as i32, state.ecx as *mut TimeSpec)
+        }
+        crate::syscalls::SYS_GETRANDOM => {
+            sys_getrandom(state.ebx as *mut u8, state.ecx as usize, state.edx as u32)
+        }
+        crate::syscalls::SYS_NANOSLEEP => {
+            sys_nanosleep(state.ebx as *const TimeSpec, state.ecx as *mut TimeSpec)
+        }
         crate::syscalls::SYS_TTY_SETFG => sys_tty_setfg(current_slot, state.ebx as i32),
         crate::syscalls::SYS_TTY_GETFG => sys_tty_getfg(current_slot),
         crate::syscalls::SYS_MOUNT => sys_mount(
@@ -225,8 +239,12 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
             state.ecx as *const u8,
             state.edx as *const MountArgsUser,
         ),
-        crate::syscalls::SYS_UMOUNT2 => sys_umount2(current_slot, state.ebx as *const u8, state.ecx as u32),
-        crate::syscalls::SYS_MOUNT_LIST => sys_mount_list(state.ebx as *mut MountInfoUser, state.ecx as usize),
+        crate::syscalls::SYS_UMOUNT2 => {
+            sys_umount2(current_slot, state.ebx as *const u8, state.ecx as u32)
+        }
+        crate::syscalls::SYS_MOUNT_LIST => {
+            sys_mount_list(state.ebx as *mut MountInfoUser, state.ecx as usize)
+        }
         crate::syscalls::SYS_SPAWN => {
             let params = read_exec_params(state.edx as *const ExecParamsUser);
             sys_spawn(
@@ -263,13 +281,10 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
             state.ecx as *mut i32,
             state.edx as u32,
         ),
-        crate::syscalls::SYS_TASK_LIST => sys_task_list(
-            state.ebx as *mut TaskInfoUser,
-            state.ecx as usize,
-        ),
-        crate::syscalls::SYS_THREAD_CREATE => {
-            sys_thread_create(current_slot, state.ebx, state.ecx)
+        crate::syscalls::SYS_TASK_LIST => {
+            sys_task_list(state.ebx as *mut TaskInfoUser, state.ecx as usize)
         }
+        crate::syscalls::SYS_THREAD_CREATE => sys_thread_create(current_slot, state.ebx, state.ecx),
         crate::syscalls::SYS_THREAD_JOIN => sys_thread_join(
             current_slot,
             thread_slot,
@@ -278,9 +293,11 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         ),
         crate::syscalls::SYS_THREAD_DETACH => {
             sys_thread_detach(current_slot, thread_slot, state.ebx as i32)
-        },
+        }
         crate::syscalls::SYS_TLS_GET => unsafe {
-            TASK_MANAGER.tasks[thread_slot].as_ref().map_or(0, |task| task.tls_ptr as usize)
+            TASK_MANAGER.tasks[thread_slot]
+                .as_ref()
+                .map_or(0, |task| task.tls_ptr as usize)
         },
         crate::syscalls::SYS_TLS_SET => unsafe {
             if let Some(task) = TASK_MANAGER.tasks[thread_slot].as_mut() {
@@ -546,9 +563,10 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         }
         crate::syscalls::SYS_FB_INFO => sys_fb_info(state.ebx as *mut FbInfoUser),
         crate::syscalls::SYS_FB_BLIT => sys_fb_blit(state.ebx as *const FbBlit),
-        crate::syscalls::SYS_IFCONFIG => {
-            sys_ifconfig(state.ebx as u32, state.ecx as *mut crate::net::stack::IfConfigUser)
-        }
+        crate::syscalls::SYS_IFCONFIG => sys_ifconfig(
+            state.ebx as u32,
+            state.ecx as *mut crate::net::stack::IfConfigUser,
+        ),
 
         crate::syscalls::wasm::SYS_EXECVE_WASM => crate::syscalls::wasm::sys_execve_wasm(
             current_slot,
@@ -570,10 +588,13 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
     // preserving this syscall frame for a later SIGCONT.
     let must_switch = unsafe {
         thread_slot != 0
-            && TASK_MANAGER.tasks
+            && TASK_MANAGER
+                .tasks
                 .get(thread_slot)
                 .and_then(|t| t.as_ref())
-                .map_or(false, |t| !t.running && (t.stopped || t.zombie || t.thread_exited))
+                .map_or(false, |t| {
+                    !t.running && (t.stopped || t.zombie || t.thread_exited)
+                })
     };
     if must_switch {
         return unsafe { TASK_MANAGER.schedule(esp as *mut CPUState) as u32 };
@@ -700,7 +721,9 @@ fn probe_inode_size(inode: u32) -> u64 {
 }
 
 fn path_is_dir(path: &str) -> bool {
-    VFS.get().metadata(path).map_or(false, |m| m.mode & 0o170000 == S_IFDIR)
+    VFS.get()
+        .metadata(path)
+        .map_or(false, |m| m.mode & 0o170000 == S_IFDIR)
 }
 
 fn fill_stat64(st: &mut Stat64, meta: Metadata) {
@@ -743,7 +766,9 @@ fn normalize_path(path: &str) -> String {
     for part in path.split('/') {
         match part {
             "" | "." => {}
-            ".." => { parts.pop(); }
+            ".." => {
+                parts.pop();
+            }
             p => parts.push(p),
         }
     }
@@ -760,7 +785,8 @@ fn resolve_task_path(current_slot: usize, path: &str) -> String {
         return normalize_path(path);
     }
     let cwd = unsafe {
-        TASK_MANAGER.tasks
+        TASK_MANAGER
+            .tasks
             .get(current_slot)
             .and_then(|t| t.as_ref())
             .map(|t| t.cwd.clone())
@@ -803,7 +829,8 @@ pub fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize
     // slave rather than dispatching I/O through a global DevFS device object.
     if path == "/dev/tty" {
         let pty_id = unsafe {
-            TASK_MANAGER.tasks
+            TASK_MANAGER
+                .tasks
                 .get(current_slot)
                 .and_then(|t| t.as_ref())
                 .map(|t| t.pty_id)
@@ -818,7 +845,10 @@ pub fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize
         unsafe {
             if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
                 if let Some(fd) = current.fd_table.alloc_fd() {
-                    if current.fd_table.insert(fd, FileDescriptor::new_pty(pty_id as usize, PtySide::Slave)) {
+                    if current
+                        .fd_table
+                        .insert(fd, FileDescriptor::new_pty(pty_id as usize, PtySide::Slave))
+                    {
                         let status = (flags as u32) & crate::filesystem::file::O_NONBLOCK;
                         let _ = current.fd_table.set_flags(fd, status);
                         return fd;
@@ -852,7 +882,9 @@ pub fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize
                             cookie: 0,
                         },
                     );
-                    let _ = current.fd_table.set_flags(fd, (flags as u32) & crate::filesystem::file::O_NONBLOCK);
+                    let _ = current
+                        .fd_table
+                        .set_flags(fd, (flags as u32) & crate::filesystem::file::O_NONBLOCK);
                     return fd;
                 }
             }
@@ -890,7 +922,10 @@ pub fn sys_open(current_slot: usize, path_ptr: *const u8, flags: usize) -> usize
     };
 
     let offset = if flags & O_APPEND != 0 {
-        VFS.get().metadata_inode(inode).map(|m| m.size).unwrap_or_else(|| probe_inode_size(inode))
+        VFS.get()
+            .metadata_inode(inode)
+            .map(|m| m.size)
+            .unwrap_or_else(|| probe_inode_size(inode))
     } else {
         0
     };
@@ -944,7 +979,11 @@ pub fn sys_lseek(current_slot: usize, fd: usize, offset: i32, whence: u32) -> us
             match current.fd_table.get(fd).copied() {
                 Some(FileDescriptor::File { inode, .. })
                 | Some(FileDescriptor::Device { inode, .. }) => {
-                    let size = VFS.get().metadata_inode(inode).map(|m| m.size).unwrap_or_else(|| probe_inode_size(inode));
+                    let size = VFS
+                        .get()
+                        .metadata_inode(inode)
+                        .map(|m| m.size)
+                        .unwrap_or_else(|| probe_inode_size(inode));
                     let current_off = current.fd_table.get_offset(fd).unwrap_or(0);
                     let base = match whence {
                         SEEK_SET => 0i64,
@@ -966,7 +1005,11 @@ pub fn sys_lseek(current_slot: usize, fd: usize, offset: i32, whence: u32) -> us
                     if whence != SEEK_SET || offset != 0 {
                         return EINVAL;
                     }
-                    return if current.fd_table.set_cookie(fd, 0) { 0 } else { EBADF };
+                    return if current.fd_table.set_cookie(fd, 0) {
+                        0
+                    } else {
+                        EBADF
+                    };
                 }
                 _ => return EBADF,
             }
@@ -1267,35 +1310,62 @@ struct TermiosUser {
 
 pub fn sys_ioctl(current_slot: usize, fd: usize, req: u32, arg: u32) -> usize {
     let desc = unsafe {
-        TASK_MANAGER.tasks
+        TASK_MANAGER
+            .tasks
             .get(current_slot)
             .and_then(|t| t.as_ref())
             .and_then(|t| t.fd_table.get(fd))
             .copied()
     };
-    let Some(FileDescriptor::Pty { pty_id, .. }) = desc else { return ENOTTY; };
+    let Some(FileDescriptor::Pty { pty_id, .. }) = desc else {
+        return ENOTTY;
+    };
 
     if req == TIOCGPGRP {
-        if arg == 0 { return EFAULT; }
-        let Some(pgid) = crate::tty::foreground_pty(pty_id) else { return ENOTTY; };
-        unsafe { *(arg as *mut i32) = pgid; }
+        if arg == 0 {
+            return EFAULT;
+        }
+        let Some(pgid) = crate::tty::foreground_pty(pty_id) else {
+            return ENOTTY;
+        };
+        unsafe {
+            *(arg as *mut i32) = pgid;
+        }
         return 0;
     }
     if req == TIOCSPGRP {
-        if arg == 0 { return EFAULT; }
+        if arg == 0 {
+            return EFAULT;
+        }
         let pgid = unsafe { *(arg as *const i32) };
-        return if crate::tty::set_foreground_pty(current_slot, pty_id, pgid) { 0 } else { EPERM };
+        return if crate::tty::set_foreground_pty(current_slot, pty_id, pgid) {
+            0
+        } else {
+            EPERM
+        };
     }
 
     match req {
         TCGETS => {
-            if arg == 0 { return EFAULT; }
-            let Some(term) = crate::tty::termios(pty_id) else { return ENOTTY; };
+            if arg == 0 {
+                return EFAULT;
+            }
+            let Some(term) = crate::tty::termios(pty_id) else {
+                return ENOTTY;
+            };
             let mut lflag = 0u32;
-            if term.isig { lflag |= LFLAG_ISIG; }
-            if term.canonical { lflag |= LFLAG_ICANON; }
-            if term.echo { lflag |= LFLAG_ECHO; }
-            if term.tostop { lflag |= LFLAG_TOSTOP; }
+            if term.isig {
+                lflag |= LFLAG_ISIG;
+            }
+            if term.canonical {
+                lflag |= LFLAG_ICANON;
+            }
+            if term.echo {
+                lflag |= LFLAG_ECHO;
+            }
+            if term.tostop {
+                lflag |= LFLAG_TOSTOP;
+            }
             unsafe {
                 *(arg as *mut TermiosUser) = TermiosUser {
                     c_iflag: if term.icrnl { IFLAG_ICRNL } else { 0 },
@@ -1310,7 +1380,9 @@ pub fn sys_ioctl(current_slot: usize, fd: usize, req: u32, arg: u32) -> usize {
             0
         }
         TCSETS | TCSETSW | TCSETSF => {
-            if arg == 0 { return EFAULT; }
+            if arg == 0 {
+                return EFAULT;
+            }
             let term = unsafe { *(arg as *const TermiosUser) };
             let state = crate::tty::TermiosState {
                 canonical: term.c_lflag & LFLAG_ICANON != 0,
@@ -1322,7 +1394,9 @@ pub fn sys_ioctl(current_slot: usize, fd: usize, req: u32, arg: u32) -> usize {
                 onlcr: term.c_oflag & OFLAG_ONLCR != 0,
                 cc: term.c_cc,
             };
-            if !crate::tty::set_termios(pty_id, state) { return ENOTTY; }
+            if !crate::tty::set_termios(pty_id, state) {
+                return ENOTTY;
+            }
             if req == TCSETSF {
                 let _ = crate::tty::flush_input(pty_id);
             }
@@ -1351,18 +1425,25 @@ pub fn sys_fstat64(current_slot: usize, fd: usize, st_ptr: *mut Stat64) -> usize
             });
             let meta = match desc {
                 Some(FileDescriptor::File { inode, .. })
-                | Some(FileDescriptor::Device { inode, .. }) => {
-                    VFS.get().metadata_inode(inode).unwrap_or_else(|| synthetic_meta(inode, S_IFREG | 0o644))
-                }
+                | Some(FileDescriptor::Device { inode, .. }) => VFS
+                    .get()
+                    .metadata_inode(inode)
+                    .unwrap_or_else(|| synthetic_meta(inode, S_IFREG | 0o644)),
                 Some(FileDescriptor::Dir { path, path_len, .. }) => {
                     let path = core::str::from_utf8(&path[..path_len as usize]).unwrap_or("/");
-                    VFS.get().metadata(path).unwrap_or_else(|| synthetic_meta(1, S_IFDIR | 0o755))
+                    VFS.get()
+                        .metadata(path)
+                        .unwrap_or_else(|| synthetic_meta(1, S_IFDIR | 0o755))
                 }
                 Some(FileDescriptor::ConsoleIn)
                 | Some(FileDescriptor::ConsoleOut)
                 | Some(FileDescriptor::Pty { .. }) => synthetic_meta(0, S_IFCHR | 0o620),
-                Some(FileDescriptor::Pipe { pipe_id, .. }) => synthetic_meta(pipe_id as u32, 0o010600),
-                Some(FileDescriptor::Socket { socket_id }) => synthetic_meta(socket_id as u32, 0o140600),
+                Some(FileDescriptor::Pipe { pipe_id, .. }) => {
+                    synthetic_meta(pipe_id as u32, 0o010600)
+                }
+                Some(FileDescriptor::Socket { socket_id }) => {
+                    synthetic_meta(socket_id as u32, 0o140600)
+                }
                 None => return EBADF,
             };
             fill_stat64(&mut *st_ptr, meta);
@@ -1383,19 +1464,26 @@ pub fn sys_stat64(current_slot: usize, path_ptr: *const u8, st_ptr: *mut Stat64)
     let path = resolve_task_path(current_slot, &raw);
     if path == "/dev/tty" {
         let has_tty = unsafe {
-            TASK_MANAGER.tasks
+            TASK_MANAGER
+                .tasks
                 .get(current_slot)
                 .and_then(|t| t.as_ref())
                 .map_or(false, |t| t.pty_id >= 0)
         };
-        if !has_tty { return ENXIO; }
-        unsafe { fill_stat64(&mut *st_ptr, synthetic_meta(0, S_IFCHR | 0o620)); }
+        if !has_tty {
+            return ENXIO;
+        }
+        unsafe {
+            fill_stat64(&mut *st_ptr, synthetic_meta(0, S_IFCHR | 0o620));
+        }
         return 0;
     }
     let Some(meta) = VFS.get().metadata(&path) else {
         return ENOENT;
     };
-    unsafe { fill_stat64(&mut *st_ptr, meta); }
+    unsafe {
+        fill_stat64(&mut *st_ptr, meta);
+    }
     0
 }
 
@@ -1717,8 +1805,12 @@ pub fn sys_close(current_slot: usize, fd: usize) -> usize {
 }
 
 pub fn sys_openpty(current_slot: usize, fds: *mut u32) -> usize {
-    if fds.is_null() { return EFAULT; }
-    let Some(pty_id) = crate::tty::alloc_pty(current_slot) else { return ENOMEM; };
+    if fds.is_null() {
+        return EFAULT;
+    }
+    let Some(pty_id) = crate::tty::alloc_pty(current_slot) else {
+        return ENOMEM;
+    };
     unsafe {
         let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] else {
             crate::tty::close_ref(pty_id, PtySide::Master);
@@ -1730,14 +1822,18 @@ pub fn sys_openpty(current_slot: usize, fds: *mut u32) -> usize {
             crate::tty::close_ref(pty_id, PtySide::Slave);
             return ENOMEM;
         };
-        current.fd_table.insert(master_fd, FileDescriptor::new_pty(pty_id, PtySide::Master));
+        current
+            .fd_table
+            .insert(master_fd, FileDescriptor::new_pty(pty_id, PtySide::Master));
         let Some(slave_fd) = current.fd_table.alloc_fd() else {
             let _ = current.fd_table.close(master_fd);
             crate::tty::close_ref(pty_id, PtySide::Master);
             crate::tty::close_ref(pty_id, PtySide::Slave);
             return ENOMEM;
         };
-        current.fd_table.insert(slave_fd, FileDescriptor::new_pty(pty_id, PtySide::Slave));
+        current
+            .fd_table
+            .insert(slave_fd, FileDescriptor::new_pty(pty_id, PtySide::Slave));
         *fds = master_fd as u32;
         *fds.add(1) = slave_fd as u32;
     }
@@ -1808,32 +1904,52 @@ pub fn sys_dup2(current_slot: usize, oldfd: usize, newfd: usize) -> usize {
 
 pub fn sys_mkdir(current_slot: usize, path_ptr: *const u8) -> usize {
     let raw = copy_cstr_from_user(path_ptr);
-    if raw.is_empty() { return EINVAL; }
+    if raw.is_empty() {
+        return EINVAL;
+    }
     let path = resolve_task_path(current_slot, &raw);
     let success = VFS.get().mkdir(&path);
-    if success { 0 } else { usize::MAX }
+    if success {
+        0
+    } else {
+        usize::MAX
+    }
 }
 
 pub fn sys_rmdir(current_slot: usize, path_ptr: *const u8) -> usize {
     let raw = copy_cstr_from_user(path_ptr);
-    if raw.is_empty() { return EINVAL; }
+    if raw.is_empty() {
+        return EINVAL;
+    }
     let path = resolve_task_path(current_slot, &raw);
     let success = VFS.get().rmdir(&path);
-    if success { 0 } else { usize::MAX }
+    if success {
+        0
+    } else {
+        usize::MAX
+    }
 }
 
 pub fn sys_unlink(current_slot: usize, path_ptr: *const u8) -> usize {
     let raw = copy_cstr_from_user(path_ptr);
-    if raw.is_empty() { return EINVAL; }
+    if raw.is_empty() {
+        return EINVAL;
+    }
     let path = resolve_task_path(current_slot, &raw);
     let success = VFS.get().remove_file(&path);
-    if success { 0 } else { usize::MAX }
+    if success {
+        0
+    } else {
+        usize::MAX
+    }
 }
 
 pub fn sys_rename(current_slot: usize, old_ptr: *const u8, new_ptr: *const u8) -> usize {
     let old_raw = copy_cstr_from_user(old_ptr);
     let new_raw = copy_cstr_from_user(new_ptr);
-    if old_raw.is_empty() || new_raw.is_empty() { return EINVAL; }
+    if old_raw.is_empty() || new_raw.is_empty() {
+        return EINVAL;
+    }
     let old = resolve_task_path(current_slot, &old_raw);
     let new = resolve_task_path(current_slot, &new_raw);
     match VFS.get().rename(&old, &new) {
@@ -1858,10 +1974,20 @@ pub fn sys_rename(current_slot: usize, old_ptr: *const u8, new_ptr: *const u8) -
 /// Читает содержимое директории и записывает имена файлов
 /// (разделённые '\n') в пользовательский буфер.
 /// Возвращает количество записанных байт или 0 при ошибке.
-pub fn sys_ls(current_slot: usize, path_ptr: *const u8, buf_ptr: *mut u8, buf_size: usize) -> usize {
+pub fn sys_ls(
+    current_slot: usize,
+    path_ptr: *const u8,
+    buf_ptr: *mut u8,
+    buf_size: usize,
+) -> usize {
     let raw = copy_cstr_from_user(path_ptr);
     let path = if raw.is_empty() {
-        unsafe { TASK_MANAGER.tasks[current_slot].as_ref().map(|t| t.cwd.clone()).unwrap_or_else(|| "/".to_string()) }
+        unsafe {
+            TASK_MANAGER.tasks[current_slot]
+                .as_ref()
+                .map(|t| t.cwd.clone())
+                .unwrap_or_else(|| "/".to_string())
+        }
     } else {
         resolve_task_path(current_slot, &raw)
     };
@@ -1876,11 +2002,16 @@ pub fn sys_ls(current_slot: usize, path_ptr: *const u8, buf_ptr: *mut u8, buf_si
         let name = entry.name.as_bytes();
         let is_dir = entry.file_type == 2;
         let entry_len = name.len() + if is_dir { 1 } else { 0 } + 1;
-        if pos + entry_len > buf_size { break; }
+        if pos + entry_len > buf_size {
+            break;
+        }
         unsafe {
             core::ptr::copy_nonoverlapping(name.as_ptr(), buf_ptr.add(pos), name.len());
             pos += name.len();
-            if is_dir { *buf_ptr.add(pos) = b'/'; pos += 1; }
+            if is_dir {
+                *buf_ptr.add(pos) = b'/';
+                pos += 1;
+            }
             *buf_ptr.add(pos) = b'\n';
             pos += 1;
         }
@@ -1890,9 +2021,13 @@ pub fn sys_ls(current_slot: usize, path_ptr: *const u8, buf_ptr: *mut u8, buf_si
 
 pub fn sys_chdir(current_slot: usize, path_ptr: *const u8) -> usize {
     let raw = copy_cstr_from_user(path_ptr);
-    if raw.is_empty() { return ENOENT; }
+    if raw.is_empty() {
+        return ENOENT;
+    }
     let path = resolve_task_path(current_slot, &raw);
-    if !path_is_dir(&path) { return ENOTDIR; }
+    if !path_is_dir(&path) {
+        return ENOTDIR;
+    }
     unsafe {
         if let Some(ref mut task) = TASK_MANAGER.tasks[current_slot] {
             task.cwd = path;
@@ -1903,16 +2038,21 @@ pub fn sys_chdir(current_slot: usize, path_ptr: *const u8) -> usize {
 }
 
 pub fn sys_getcwd(current_slot: usize, buf: *mut u8, size: usize) -> usize {
-    if buf.is_null() || size == 0 { return EFAULT; }
+    if buf.is_null() || size == 0 {
+        return EFAULT;
+    }
     let cwd = unsafe {
-        TASK_MANAGER.tasks
+        TASK_MANAGER
+            .tasks
             .get(current_slot)
             .and_then(|t| t.as_ref())
             .map(|t| t.cwd.clone())
             .unwrap_or_else(|| "/".to_string())
     };
     let need = cwd.len() + 1;
-    if need > size { return ENOMEM; }
+    if need > size {
+        return ENOMEM;
+    }
     unsafe {
         core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf, cwd.len());
         *buf.add(cwd.len()) = 0;
@@ -1921,51 +2061,102 @@ pub fn sys_getcwd(current_slot: usize, buf: *mut u8, size: usize) -> usize {
 }
 
 pub fn sys_getpid(current_slot: usize) -> usize {
-    unsafe { TASK_MANAGER.tasks[current_slot].as_ref().map(|t| t.pid as usize).unwrap_or(usize::MAX) }
+    unsafe {
+        TASK_MANAGER.tasks[current_slot]
+            .as_ref()
+            .map(|t| t.pid as usize)
+            .unwrap_or(usize::MAX)
+    }
 }
 
 pub fn sys_getppid(current_slot: usize) -> usize {
-    unsafe { TASK_MANAGER.tasks[current_slot].as_ref().map(|t| t.ppid.max(0) as usize).unwrap_or(usize::MAX) }
+    unsafe {
+        TASK_MANAGER.tasks[current_slot]
+            .as_ref()
+            .map(|t| t.ppid.max(0) as usize)
+            .unwrap_or(usize::MAX)
+    }
 }
 
 pub fn sys_getpgrp(current_slot: usize) -> usize {
-    unsafe { TASK_MANAGER.tasks[current_slot].as_ref().map(|t| t.pgid as usize).unwrap_or(usize::MAX) }
+    unsafe {
+        TASK_MANAGER.tasks[current_slot]
+            .as_ref()
+            .map(|t| t.pgid as usize)
+            .unwrap_or(usize::MAX)
+    }
 }
 
 fn process_slot_for(current_slot: usize, pid: i32) -> Option<usize> {
-    if pid == 0 { return Some(current_slot); }
+    if pid == 0 {
+        return Some(current_slot);
+    }
     unsafe { TASK_MANAGER.slot_by_pid(pid) }
 }
 
 pub fn sys_getpgid(current_slot: usize, pid: i32) -> usize {
-    let Some(slot) = process_slot_for(current_slot, pid) else { return usize::MAX; };
-    unsafe { TASK_MANAGER.tasks[slot].as_ref().map(|t| t.pgid as usize).unwrap_or(usize::MAX) }
+    let Some(slot) = process_slot_for(current_slot, pid) else {
+        return usize::MAX;
+    };
+    unsafe {
+        TASK_MANAGER.tasks[slot]
+            .as_ref()
+            .map(|t| t.pgid as usize)
+            .unwrap_or(usize::MAX)
+    }
 }
 
 pub fn sys_getsid(current_slot: usize, pid: i32) -> usize {
-    let Some(slot) = process_slot_for(current_slot, pid) else { return usize::MAX; };
-    unsafe { TASK_MANAGER.tasks[slot].as_ref().map(|t| t.sid as usize).unwrap_or(usize::MAX) }
+    let Some(slot) = process_slot_for(current_slot, pid) else {
+        return usize::MAX;
+    };
+    unsafe {
+        TASK_MANAGER.tasks[slot]
+            .as_ref()
+            .map(|t| t.sid as usize)
+            .unwrap_or(usize::MAX)
+    }
 }
 
 pub fn sys_setpgid(current_slot: usize, pid: i32, pgid: i32) -> usize {
-    let caller_pid = unsafe { TASK_MANAGER.tasks[current_slot].as_ref().map(|t| t.pid).unwrap_or(-1) };
+    let caller_pid = unsafe {
+        TASK_MANAGER.tasks[current_slot]
+            .as_ref()
+            .map(|t| t.pid)
+            .unwrap_or(-1)
+    };
     let target_pid = if pid == 0 { caller_pid } else { pid };
-    let Some(target_slot) = (unsafe { TASK_MANAGER.slot_by_pid(target_pid) }) else { return usize::MAX; };
+    let Some(target_slot) = (unsafe { TASK_MANAGER.slot_by_pid(target_pid) }) else {
+        return usize::MAX;
+    };
     let (caller_sid, target_ppid, target_sid) = unsafe {
-        let caller_sid = TASK_MANAGER.tasks[current_slot].as_ref().map(|t| t.sid).unwrap_or(-1);
+        let caller_sid = TASK_MANAGER.tasks[current_slot]
+            .as_ref()
+            .map(|t| t.sid)
+            .unwrap_or(-1);
         let target = TASK_MANAGER.tasks[target_slot].as_ref().unwrap();
         (caller_sid, target.ppid, target.sid)
     };
     // A process may regroup itself or one of its direct children in its session.
-    if target_pid != caller_pid && target_ppid != caller_pid { return EPERM; }
-    if target_sid != caller_sid { return EPERM; }
+    if target_pid != caller_pid && target_ppid != caller_pid {
+        return EPERM;
+    }
+    if target_sid != caller_sid {
+        return EPERM;
+    }
     let new_pgid = if pgid == 0 { target_pid } else { pgid };
     // Joining an existing group is only allowed inside the same session.
     if new_pgid != target_pid {
         let exists_same_session = unsafe {
-            TASK_MANAGER.tasks.iter().flatten().any(|t| t.pgid == new_pgid && t.sid == target_sid)
+            TASK_MANAGER
+                .tasks
+                .iter()
+                .flatten()
+                .any(|t| t.pgid == new_pgid && t.sid == target_sid)
         };
-        if !exists_same_session { return EPERM; }
+        if !exists_same_session {
+            return EPERM;
+        }
     }
     unsafe {
         if let Some(ref mut target) = TASK_MANAGER.tasks[target_slot] {
@@ -1978,9 +2169,13 @@ pub fn sys_setpgid(current_slot: usize, pid: i32, pgid: i32) -> usize {
 
 pub fn sys_setsid(current_slot: usize) -> usize {
     unsafe {
-        let Some(ref mut task) = TASK_MANAGER.tasks[current_slot] else { return usize::MAX; };
+        let Some(ref mut task) = TASK_MANAGER.tasks[current_slot] else {
+            return usize::MAX;
+        };
         // A process-group leader may not create a new session.
-        if task.pgid == task.pid { return EPERM; }
+        if task.pgid == task.pid {
+            return EPERM;
+        }
         task.sid = task.pid;
         task.pgid = task.pid;
         task.tty_id = -1;
@@ -1991,62 +2186,109 @@ pub fn sys_setsid(current_slot: usize) -> usize {
 
 pub fn sys_dup(current_slot: usize, oldfd: usize) -> usize {
     let newfd = unsafe {
-        let Some(ref mut task) = TASK_MANAGER.tasks[current_slot] else { return EBADF; };
-        if task.fd_table.get(oldfd).is_none() { return EBADF; }
-        match task.fd_table.alloc_fd() { Some(fd) => fd, None => return ENOMEM }
+        let Some(ref mut task) = TASK_MANAGER.tasks[current_slot] else {
+            return EBADF;
+        };
+        if task.fd_table.get(oldfd).is_none() {
+            return EBADF;
+        }
+        match task.fd_table.alloc_fd() {
+            Some(fd) => fd,
+            None => return ENOMEM,
+        }
     };
     sys_dup2(current_slot, oldfd, newfd)
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub struct TimeVal { tv_sec: i32, tv_usec: i32 }
+pub struct TimeVal {
+    tv_sec: i32,
+    tv_usec: i32,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub struct TimeSpec { tv_sec: i32, tv_nsec: i32 }
+pub struct TimeSpec {
+    tv_sec: i32,
+    tv_nsec: i32,
+}
 
-fn monotonic_ms() -> u64 { crate::time::uptime_ms() }
+fn monotonic_ms() -> u64 {
+    crate::time::uptime_ms()
+}
 
 pub fn sys_gettimeofday(tv: *mut TimeVal) -> usize {
-    if tv.is_null() { return EFAULT; }
+    if tv.is_null() {
+        return EFAULT;
+    }
     let ms = crate::time::realtime_ms();
-    unsafe { *tv = TimeVal { tv_sec: (ms / 1000) as i32, tv_usec: ((ms % 1000) * 1000) as i32 }; }
+    unsafe {
+        *tv = TimeVal {
+            tv_sec: (ms / 1000) as i32,
+            tv_usec: ((ms % 1000) * 1000) as i32,
+        };
+    }
     0
 }
 
 pub fn sys_clock_gettime(clock_id: i32, tp: *mut TimeSpec) -> usize {
-    if tp.is_null() { return EFAULT; }
+    if tp.is_null() {
+        return EFAULT;
+    }
     let ms = match clock_id {
         0 => crate::time::realtime_ms(), // CLOCK_REALTIME
         1 => monotonic_ms(),             // CLOCK_MONOTONIC
         _ => return EINVAL,
     };
-    unsafe { *tp = TimeSpec { tv_sec: (ms / 1000) as i32, tv_nsec: ((ms % 1000) * 1_000_000) as i32 }; }
+    unsafe {
+        *tp = TimeSpec {
+            tv_sec: (ms / 1000) as i32,
+            tv_nsec: ((ms % 1000) * 1_000_000) as i32,
+        };
+    }
     0
 }
 
 pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> usize {
-    if req.is_null() { return EFAULT; }
+    if req.is_null() {
+        return EFAULT;
+    }
     let request = unsafe { *req };
-    if request.tv_sec < 0 || request.tv_nsec < 0 || request.tv_nsec >= 1_000_000_000 { return EINVAL; }
+    if request.tv_sec < 0 || request.tv_nsec < 0 || request.tv_nsec >= 1_000_000_000 {
+        return EINVAL;
+    }
     let wait_ms = (request.tv_sec as u64)
         .saturating_mul(1000)
         .saturating_add((request.tv_nsec as u64 + 999_999) / 1_000_000);
     let start = monotonic_ms();
     while monotonic_ms().wrapping_sub(start) < wait_ms {
-        unsafe { asm!("sti"); asm!("hlt"); asm!("cli"); }
+        unsafe {
+            asm!("sti");
+            asm!("hlt");
+            asm!("cli");
+        }
     }
-    if !rem.is_null() { unsafe { *rem = TimeSpec::default(); } }
+    if !rem.is_null() {
+        unsafe {
+            *rem = TimeSpec::default();
+        }
+    }
     0
 }
 
 pub fn sys_tty_setfg(current_slot: usize, pgid: i32) -> usize {
-    if crate::tty::set_foreground(current_slot, pgid) { 0 } else { EPERM }
+    if crate::tty::set_foreground(current_slot, pgid) {
+        0
+    } else {
+        EPERM
+    }
 }
 
 pub fn sys_tty_getfg(current_slot: usize) -> usize {
-    crate::tty::foreground(current_slot).map(|pgid| pgid as usize).unwrap_or(usize::MAX)
+    crate::tty::foreground(current_slot)
+        .map(|pgid| pgid as usize)
+        .unwrap_or(usize::MAX)
 }
 
 #[repr(C)]
@@ -2075,7 +2317,9 @@ pub fn sys_mount_list(out: *mut MountInfoUser, max: usize) -> usize {
         let bytes = mp.as_bytes();
         let len = bytes.len().min(path.len() - 1);
         path[..len].copy_from_slice(&bytes[..len]);
-        unsafe { *out.add(i) = MountInfoUser { path }; }
+        unsafe {
+            *out.add(i) = MountInfoUser { path };
+        }
     }
     n
 }
@@ -2088,7 +2332,9 @@ pub fn sys_mount(
 ) -> usize {
     let source_raw = copy_cstr_from_user(source_ptr);
     let target_raw = copy_cstr_from_user(target_ptr);
-    if source_raw.is_empty() || target_raw.is_empty() { return EINVAL; }
+    if source_raw.is_empty() || target_raw.is_empty() {
+        return EINVAL;
+    }
 
     // Reserved for filesystem-specific mount options. Keep the ABI extensible
     // without consuming ESI/EDI in userspace inline asm on i386.
@@ -2103,15 +2349,23 @@ pub fn sys_mount(
         .strip_prefix("/dev/")
         .unwrap_or(source_raw.as_str())
         .trim_matches('/');
-    if source.is_empty() || source.contains('/') { return EINVAL; }
+    if source.is_empty() || source.contains('/') {
+        return EINVAL;
+    }
     let target = resolve_task_path(current_slot, &target_raw);
 
-    if crate::filesystem::init::mount_device_at(source, &target) { 0 } else { EINVAL }
+    if crate::filesystem::init::mount_device_at(source, &target) {
+        0
+    } else {
+        EINVAL
+    }
 }
 
 pub fn sys_umount2(current_slot: usize, path_ptr: *const u8, _flags: u32) -> usize {
     let raw = copy_cstr_from_user(path_ptr);
-    if raw.is_empty() { return EINVAL; }
+    if raw.is_empty() {
+        return EINVAL;
+    }
     let path = resolve_task_path(current_slot, &raw);
     if path == "/" || path == "/dev" || path == "/proc" {
         // Keep the boot-critical pseudo/root filesystems pinned for now.
@@ -2175,7 +2429,13 @@ pub fn sys_exit(current_slot: usize, esp: u32, status: i32) -> u32 {
 /// becomes waitable after the last live thread exits.
 pub fn sys_thread_exit(thread_slot: usize, esp: u32, value: u32) -> u32 {
     unsafe {
-        if thread_slot == 0 || TASK_MANAGER.tasks.get(thread_slot).and_then(|t| t.as_ref()).is_none() {
+        if thread_slot == 0
+            || TASK_MANAGER
+                .tasks
+                .get(thread_slot)
+                .and_then(|t| t.as_ref())
+                .is_none()
+        {
             return TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
         }
         let leader_slot = TASK_MANAGER.process_slot(thread_slot);
@@ -2224,8 +2484,8 @@ pub fn sys_thread_create(leader_slot: usize, entry: u32, arg: u32) -> usize {
         let pty_id = leader.pty_id;
         let name = leader.name;
 
-        let stack_top = USER_THREAD_STACK_BASE
-            .saturating_sub(slot as u32 * USER_THREAD_STACK_STRIDE);
+        let stack_top =
+            USER_THREAD_STACK_BASE.saturating_sub(slot as u32 * USER_THREAD_STACK_STRIDE);
         let stack_bottom = stack_top - USER_THREAD_STACK_PAGES * PAGE_SIZE as u32;
         for page in 0..USER_THREAD_STACK_PAGES {
             let addr = stack_bottom + page * PAGE_SIZE as u32;
@@ -2295,7 +2555,9 @@ pub fn sys_thread_join(
     }
     loop {
         let target = unsafe { TASK_MANAGER.slot_by_tid(tid) };
-        let Some(slot) = target else { return ESRCH; };
+        let Some(slot) = target else {
+            return ESRCH;
+        };
         if slot == caller_slot {
             return EDEADLK;
         }
@@ -2309,15 +2571,21 @@ pub fn sys_thread_join(
                 )
             })
         };
-        let Some((same_process, joinable, exited, value)) = state else { return ESRCH; };
+        let Some((same_process, joinable, exited, value)) = state else {
+            return ESRCH;
+        };
         if !same_process || !joinable {
             return EINVAL;
         }
         if exited {
             if !value_out.is_null() {
-                unsafe { *value_out = value; }
+                unsafe {
+                    *value_out = value;
+                }
             }
-            unsafe { TASK_MANAGER.reap_thread(slot); }
+            unsafe {
+                TASK_MANAGER.reap_thread(slot);
+            }
             return tid as usize;
         }
         unsafe {
@@ -2332,8 +2600,12 @@ pub fn sys_thread_detach(leader_slot: usize, caller_slot: usize, tid: i32) -> us
     if tid <= 0 {
         return EINVAL;
     }
-    let Some(slot) = (unsafe { TASK_MANAGER.slot_by_tid(tid) }) else { return ESRCH; };
-    let Some(task) = (unsafe { TASK_MANAGER.tasks[slot].as_mut() }) else { return ESRCH; };
+    let Some(slot) = (unsafe { TASK_MANAGER.slot_by_tid(tid) }) else {
+        return ESRCH;
+    };
+    let Some(task) = (unsafe { TASK_MANAGER.tasks[slot].as_mut() }) else {
+        return ESRCH;
+    };
     if slot == caller_slot || task.leader_slot != leader_slot as i8 || !task.is_thread {
         return EINVAL;
     }
@@ -2342,7 +2614,9 @@ pub fn sys_thread_detach(leader_slot: usize, caller_slot: usize, tid: i32) -> us
     }
     task.thread_detached = true;
     if task.thread_exited {
-        unsafe { TASK_MANAGER.reap_thread(slot); }
+        unsafe {
+            TASK_MANAGER.reap_thread(slot);
+        }
     }
     0
 }
@@ -2356,7 +2630,9 @@ pub const WUNTRACED: u32 = 2;
 pub const WCONTINUED: u32 = 8;
 
 fn signal_slot(slot: usize, sig: u32) -> bool {
-    if slot == 0 || slot >= MAX_TASKS as usize { return false; }
+    if slot == 0 || slot >= MAX_TASKS as usize {
+        return false;
+    }
     match sig {
         crate::signal::SIGKILL => crate::signal::force_kill(slot as i8, sig),
         crate::signal::SIGSTOP => crate::signal::stop_task(slot as i8),
@@ -2402,28 +2678,58 @@ fn signal_slot(slot: usize, sig: u32) -> bool {
 /// pid < -1 targets process group -pid. kill(-1, sig) targets every userspace
 /// process except the caller, which is useful for init/shutdown later.
 pub fn sys_kill(current_slot: usize, pid: i32, sig: u32) -> usize {
-    if sig == 0 || sig > 31 { return EINVAL; }
-    let caller_pid = unsafe { TASK_MANAGER.tasks[current_slot].as_ref().map(|t| t.pid).unwrap_or(-1) };
+    if sig == 0 || sig > 31 {
+        return EINVAL;
+    }
+    let caller_pid = unsafe {
+        TASK_MANAGER.tasks[current_slot]
+            .as_ref()
+            .map(|t| t.pid)
+            .unwrap_or(-1)
+    };
     let slots: Vec<usize> = if pid > 0 {
         unsafe { TASK_MANAGER.slot_by_pid(pid).into_iter().collect() }
     } else if pid == 0 {
-        let pgid = unsafe { TASK_MANAGER.tasks[current_slot].as_ref().map(|t| t.pgid).unwrap_or(-1) };
+        let pgid = unsafe {
+            TASK_MANAGER.tasks[current_slot]
+                .as_ref()
+                .map(|t| t.pgid)
+                .unwrap_or(-1)
+        };
         unsafe { TASK_MANAGER.slots_in_pgid(pgid) }
     } else if pid == -1 {
         unsafe {
-            TASK_MANAGER.tasks.iter().enumerate().filter_map(|(slot, t)| {
-                t.as_ref()
-                    .filter(|t| slot != 0 && t.leader_slot == slot as i8 && t.pid != caller_pid && !t.zombie)
-                    .map(|_| slot)
-            }).collect()
+            TASK_MANAGER
+                .tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, t)| {
+                    t.as_ref()
+                        .filter(|t| {
+                            slot != 0
+                                && t.leader_slot == slot as i8
+                                && t.pid != caller_pid
+                                && !t.zombie
+                        })
+                        .map(|_| slot)
+                })
+                .collect()
         }
     } else {
         unsafe { TASK_MANAGER.slots_in_pgid(-pid) }
     };
-    if slots.is_empty() { return usize::MAX; }
+    if slots.is_empty() {
+        return usize::MAX;
+    }
     let mut any = false;
-    for slot in slots { any |= signal_slot(slot, sig); }
-    if any { 0 } else { usize::MAX }
+    for slot in slots {
+        any |= signal_slot(slot, sig);
+    }
+    if any {
+        0
+    } else {
+        usize::MAX
+    }
 }
 
 #[repr(C)]
@@ -2440,11 +2746,7 @@ pub fn sys_sigaction(
     act: *const SigActionUser,
     oldact: *mut SigActionUser,
 ) -> usize {
-    if sig == 0
-        || sig > 31
-        || sig == crate::signal::SIGKILL
-        || sig == crate::signal::SIGSTOP
-    {
+    if sig == 0 || sig > 31 || sig == crate::signal::SIGKILL || sig == crate::signal::SIGSTOP {
         return usize::MAX;
     }
     let idx = (sig - 1) as usize;
@@ -2468,14 +2770,10 @@ pub fn sys_sigaction(
 
 /// waitpid-like syscall that returns the child's actual exit status through
 /// `status_ptr`. The child is reaped only when an exit is observed.
-pub fn sys_wait_status(
-    current_slot: usize,
-    pid: i32,
-    status_ptr: *mut i32,
-    options: u32,
-) -> usize {
+pub fn sys_wait_status(current_slot: usize, pid: i32, status_ptr: *mut i32, options: u32) -> usize {
     let (parent_pid, parent_pgid) = unsafe {
-        TASK_MANAGER.tasks
+        TASK_MANAGER
+            .tasks
             .get(current_slot)
             .and_then(|t| t.as_ref())
             .map(|t| (t.pid, t.pgid))
@@ -2507,12 +2805,23 @@ pub fn sys_wait_status(
         let event = unsafe {
             let mut found = None;
             for (slot, task) in TASK_MANAGER.tasks.iter().enumerate() {
-                if slot == 0 { continue; }
-                let Some(child) = task.as_ref() else { continue; };
-                if !matches_selector(child) { continue; }
+                if slot == 0 {
+                    continue;
+                }
+                let Some(child) = task.as_ref() else {
+                    continue;
+                };
+                if !matches_selector(child) {
+                    continue;
+                }
 
                 if child.zombie {
-                    found = Some(ChildEvent::Exited(slot, child.pid, child.exit_code, child.term_signal));
+                    found = Some(ChildEvent::Exited(
+                        slot,
+                        child.pid,
+                        child.exit_code,
+                        child.term_signal,
+                    ));
                     break;
                 }
                 if options & WUNTRACED != 0 && child.wait_stopped_pending {
@@ -2538,15 +2847,21 @@ pub fn sys_wait_status(
                         } else {
                             (exit_code & 0xff) << 8
                         };
-                        unsafe { *status_ptr = status; }
+                        unsafe {
+                            *status_ptr = status;
+                        }
                     }
-                    unsafe { TASK_MANAGER.reap(slot); }
+                    unsafe {
+                        TASK_MANAGER.reap(slot);
+                    }
                     return child_pid as usize;
                 }
                 ChildEvent::Stopped(slot, child_pid, sig) => {
                     if !status_ptr.is_null() {
                         // POSIX/Linux wait status: low byte 0x7f, stop signal in high byte.
-                        unsafe { *status_ptr = (((sig & 0xff) << 8) | 0x7f) as i32; }
+                        unsafe {
+                            *status_ptr = (((sig & 0xff) << 8) | 0x7f) as i32;
+                        }
                     }
                     unsafe {
                         if let Some(child) = TASK_MANAGER.tasks[slot].as_mut() {
@@ -2557,7 +2872,9 @@ pub fn sys_wait_status(
                 }
                 ChildEvent::Continued(slot, child_pid) => {
                     if !status_ptr.is_null() {
-                        unsafe { *status_ptr = 0xffff; }
+                        unsafe {
+                            *status_ptr = 0xffff;
+                        }
                     }
                     unsafe {
                         if let Some(child) = TASK_MANAGER.tasks[slot].as_mut() {
@@ -2609,9 +2926,15 @@ pub struct TaskInfoUser {
 /// Enumerate the fixed Felix task table for userspace `ps`.
 pub fn sys_task_list(out: *mut TaskInfoUser, max: usize) -> usize {
     let total = unsafe {
-        TASK_MANAGER.tasks.iter().enumerate().filter(|(slot, task)| {
-            task.as_ref().map_or(false, |t| t.leader_slot == *slot as i8)
-        }).count()
+        TASK_MANAGER
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(slot, task)| {
+                task.as_ref()
+                    .map_or(false, |t| t.leader_slot == *slot as i8)
+            })
+            .count()
     };
     if out.is_null() || max == 0 {
         return total;
@@ -2621,7 +2944,9 @@ pub fn sys_task_list(out: *mut TaskInfoUser, max: usize) -> usize {
     unsafe {
         for (slot, task) in TASK_MANAGER.tasks.iter().enumerate() {
             let Some(t) = task.as_ref() else { continue };
-            if t.leader_slot != slot as i8 { continue; }
+            if t.leader_slot != slot as i8 {
+                continue;
+            }
             if written >= max {
                 break;
             }
@@ -2673,13 +2998,19 @@ pub fn sys_fcntl(current_slot: usize, fd: usize, cmd: u32, arg: u32) -> usize {
                             FileMode::WriteOnly => O_WRONLY as u32,
                             FileMode::ReadWrite => O_RDWR as u32,
                         },
-                        Some(FileDescriptor::Pipe { end: PipeEnd::Read, .. })
+                        Some(FileDescriptor::Pipe {
+                            end: PipeEnd::Read, ..
+                        })
                         | Some(FileDescriptor::ConsoleIn)
                         | Some(FileDescriptor::Dir { .. }) => O_RDONLY as u32,
-                        Some(FileDescriptor::Pipe { end: PipeEnd::Write, .. })
+                        Some(FileDescriptor::Pipe {
+                            end: PipeEnd::Write,
+                            ..
+                        })
                         | Some(FileDescriptor::ConsoleOut) => O_WRONLY as u32,
-                        Some(FileDescriptor::Pty { .. })
-                        | Some(FileDescriptor::Socket { .. }) => O_RDWR as u32,
+                        Some(FileDescriptor::Pty { .. }) | Some(FileDescriptor::Socket { .. }) => {
+                            O_RDWR as u32
+                        }
                         None => return EBADF,
                     };
                     return (access | current.fd_table.get_flags(fd)) as usize;
@@ -2742,13 +3073,21 @@ fn fd_poll_revents(current_slot: usize, fd: i32, events: i16) -> i16 {
             }
             Some(FileDescriptor::Pty { pty_id, side }) => {
                 let mut rev = 0i16;
-                if events & POLLIN != 0 && crate::tty::readable(pty_id, side) { rev |= POLLIN; }
-                if events & POLLOUT != 0 && crate::tty::writable(pty_id, side) { rev |= POLLOUT; }
+                if events & POLLIN != 0 && crate::tty::readable(pty_id, side) {
+                    rev |= POLLIN;
+                }
+                if events & POLLOUT != 0 && crate::tty::writable(pty_id, side) {
+                    rev |= POLLOUT;
+                }
                 rev
             }
             Some(FileDescriptor::ConsoleIn) => {
                 // Always report readable for simplicity (stdin may still block on read).
-                if events & POLLIN != 0 { POLLIN } else { 0 }
+                if events & POLLIN != 0 {
+                    POLLIN
+                } else {
+                    0
+                }
             }
             Some(FileDescriptor::ConsoleOut)
             | Some(FileDescriptor::File { .. })
@@ -2812,10 +3151,14 @@ fn fd_poll_revents(current_slot: usize, fd: i32, events: i16) -> i16 {
                                 }
                             } else {
                                 // UDP: always writable, readable when a datagram is queued.
-                                if events & POLLOUT != 0 { rev |= POLLOUT; }
+                                if events & POLLOUT != 0 {
+                                    rev |= POLLOUT;
+                                }
                                 if events & POLLIN != 0 {
                                     let socket = stack.sockets.get::<udp::Socket>(handle);
-                                    if socket.can_recv() { rev |= POLLIN; }
+                                    if socket.can_recv() {
+                                        rev |= POLLIN;
+                                    }
                                 }
                             }
                         }
@@ -3079,18 +3422,26 @@ pub fn install_child_fd(
 
 fn read_cstr_vector(ptr: *const *const u8, max_items: usize, max_len: usize) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    if ptr.is_null() { return out; }
+    if ptr.is_null() {
+        return out;
+    }
     unsafe {
         for i in 0..max_items {
             let item = *ptr.add(i);
-            if item.is_null() { break; }
+            if item.is_null() {
+                break;
+            }
             let mut bytes = Vec::new();
             for j in 0..max_len {
                 let b = *item.add(j);
                 bytes.push(b);
-                if b == 0 { break; }
+                if b == 0 {
+                    break;
+                }
             }
-            if bytes.last() != Some(&0) { bytes.push(0); }
+            if bytes.last() != Some(&0) {
+                bytes.push(0);
+            }
             out.push(bytes);
         }
     }
@@ -3106,12 +3457,18 @@ fn sys_execve_path(
     argv_ptr: *const *const u8,
     envp_ptr: *const *const u8,
 ) -> Option<u32> {
-    if current_slot == 0 || path_ptr.is_null() { return None; }
+    if current_slot == 0 || path_ptr.is_null() {
+        return None;
+    }
     let raw_path = copy_cstr_from_user(path_ptr);
-    if raw_path.is_empty() { return None; }
+    if raw_path.is_empty() {
+        return None;
+    }
     let path = resolve_task_path(current_slot, &raw_path);
     let image = VFS.get().read_file(&path)?;
-    if image.len() < 4 || &image[..4] != b"\x7fELF" { return None; }
+    if image.len() < 4 || &image[..4] != b"\x7fELF" {
+        return None;
+    }
 
     let mut argv = read_cstr_vector(argv_ptr, 64, 256);
     if argv.is_empty() {
@@ -3121,18 +3478,10 @@ fn sys_execve_path(
     }
     let envp = read_cstr_vector(envp_ptr, 64, 512);
 
-    let temporary_pid = sys_spawn_image(
-        current_slot,
-        &image,
-        0,
-        1,
-        2,
-        &argv,
-        &envp,
-        -1,
-        false,
-    );
-    if temporary_pid == usize::MAX { return None; }
+    let temporary_pid = sys_spawn_image(current_slot, &image, 0, 1, 2, &argv, &envp, -1, false);
+    if temporary_pid == usize::MAX {
+        return None;
+    }
 
     unsafe {
         let child_slot = TASK_MANAGER.slot_by_pid(temporary_pid as i32)?;
@@ -3162,7 +3511,11 @@ fn sys_execve_path(
         TASK_MANAGER.task_count -= 1; // discard temporary child slot
         crate::gdt::TSS.esp0 = new_kstack;
         asm!("mov cr3, {}", in(reg) new_cr3);
-        println!("[execve] replaced pid={} path={}", TASK_MANAGER.current_pid(), path);
+        println!(
+            "[execve] replaced pid={} path={}",
+            TASK_MANAGER.current_pid(),
+            path
+        );
         Some(new_esp)
     }
 }
@@ -3190,10 +3543,19 @@ pub fn sys_spawn(
     // allocator/page-table work can make that pointer unsafe to dereference.
     // New code should use SYS_SPAWN_PATH, which reads the ELF exactly once.
     let mut owned = alloc::vec![0u8; count];
-    unsafe { core::ptr::copy_nonoverlapping(buf_ptr, owned.as_mut_ptr(), count); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf_ptr, owned.as_mut_ptr(), count);
+    }
     sys_spawn_image(
-        parent_slot, &owned, stdin_fd, stdout_fd, stderr_fd, argv, envp,
-        requested_pgid, foreground,
+        parent_slot,
+        &owned,
+        stdin_fd,
+        stdout_fd,
+        stderr_fd,
+        argv,
+        envp,
+        requested_pgid,
+        foreground,
     )
 }
 
@@ -3208,9 +3570,13 @@ pub fn sys_spawn_path(
     requested_pgid: i32,
     foreground: bool,
 ) -> usize {
-    if path_ptr.is_null() { return usize::MAX; }
+    if path_ptr.is_null() {
+        return usize::MAX;
+    }
     let raw_path = copy_cstr_from_user(path_ptr);
-    if raw_path.is_empty() { return usize::MAX; }
+    if raw_path.is_empty() {
+        return usize::MAX;
+    }
     let path = resolve_task_path(parent_slot, &raw_path);
     let image = match VFS.get().read_file(&path) {
         Some(image) => image,
@@ -3220,8 +3586,15 @@ pub fn sys_spawn_path(
         return usize::MAX;
     }
     sys_spawn_image(
-        parent_slot, &image, stdin_fd, stdout_fd, stderr_fd, argv, envp,
-        requested_pgid, foreground,
+        parent_slot,
+        &image,
+        stdin_fd,
+        stdout_fd,
+        stderr_fd,
+        argv,
+        envp,
+        requested_pgid,
+        foreground,
     )
 }
 
@@ -3244,25 +3617,39 @@ fn sys_spawn_image(
     let slot = slot_i8 as usize;
     let pid = unsafe { TASK_MANAGER.alloc_pid() };
     let (ppid, inherited_pgid, inherited_sid, inherited_cwd, inherited_tty, inherited_pty) = unsafe {
-        TASK_MANAGER.tasks
+        TASK_MANAGER
+            .tasks
             .get(parent_slot)
             .and_then(|t| t.as_ref())
             .map(|p| (p.pid, p.pgid, p.sid, p.cwd.clone(), p.tty_id, p.pty_id))
             .unwrap_or((0, pid, pid, "/".to_string(), -1, -1))
     };
-    let sid = if parent_slot == 0 || inherited_sid <= 0 { pid } else { inherited_sid };
-    let inherited_group = if parent_slot == 0 || inherited_pgid <= 0 { pid } else { inherited_pgid };
+    let sid = if parent_slot == 0 || inherited_sid <= 0 {
+        pid
+    } else {
+        inherited_sid
+    };
+    let inherited_group = if parent_slot == 0 || inherited_pgid <= 0 {
+        pid
+    } else {
+        inherited_pgid
+    };
     let pgid = match requested_pgid {
         -1 => inherited_group,
         0 => pid,
         requested if requested > 0 => {
             let exists_same_session = unsafe {
-                TASK_MANAGER.tasks.iter().flatten().any(|t| {
-                    t.pgid == requested && t.sid == sid
-                })
+                TASK_MANAGER
+                    .tasks
+                    .iter()
+                    .flatten()
+                    .any(|t| t.pgid == requested && t.sid == sid)
             };
             if !exists_same_session {
-                println!("[spawn] requested pgid {} does not exist in sid {}", requested, sid);
+                println!(
+                    "[spawn] requested pgid {} does not exist in sid {}",
+                    requested, sid
+                );
                 return usize::MAX;
             }
             requested
@@ -3274,7 +3661,7 @@ fn sys_spawn_image(
     // Не зависит от base ELF
     const USER_STACK_TOP: u32 = 0xBFFF_F000;
     const USER_STACK_PAGES: u32 = 32; // 128 KiB
-    // Heap — отдельный регион
+                                      // Heap — отдельный регион
     let heap_start = USER_HEAP_BASE;
 
     unsafe {
@@ -3383,16 +3770,39 @@ fn sys_spawn_image(
         task.signal_handlers = [0; 32];
 
         let mut fd_table = FileDescriptorTable::with_stdio();
-        install_child_fd(parent_slot, &mut fd_table, 0, stdin_fd, FileDescriptor::ConsoleIn);
-        install_child_fd(parent_slot, &mut fd_table, 1, stdout_fd, FileDescriptor::ConsoleOut);
-        install_child_fd(parent_slot, &mut fd_table, 2, stderr_fd, FileDescriptor::ConsoleOut);
+        install_child_fd(
+            parent_slot,
+            &mut fd_table,
+            0,
+            stdin_fd,
+            FileDescriptor::ConsoleIn,
+        );
+        install_child_fd(
+            parent_slot,
+            &mut fd_table,
+            1,
+            stdout_fd,
+            FileDescriptor::ConsoleOut,
+        );
+        install_child_fd(
+            parent_slot,
+            &mut fd_table,
+            2,
+            stderr_fd,
+            FileDescriptor::ConsoleOut,
+        );
         // A terminal-facing spawn gets a concrete controlling PTY from any
         // inherited slave stdio endpoint. Keep it even if fd 0/1/2 are later
         // redirected so /dev/tty remains usable.
-        task.pty_id = (0..3).find_map(|fd| match fd_table.get(fd) {
-            Some(FileDescriptor::Pty { pty_id, side: PtySide::Slave }) => Some(*pty_id as i16),
-            _ => None,
-        }).unwrap_or(task.pty_id);
+        task.pty_id = (0..3)
+            .find_map(|fd| match fd_table.get(fd) {
+                Some(FileDescriptor::Pty {
+                    pty_id,
+                    side: PtySide::Slave,
+                }) => Some(*pty_id as i16),
+                _ => None,
+            })
+            .unwrap_or(task.pty_id);
         task.fd_table = fd_table;
 
         // Publish only a fully initialized runnable task.
@@ -3417,16 +3827,16 @@ fn sys_spawn_image(
     }
 }
 
-use crate::net::stack::{NET_STACK, poll_stack};
-use crate::print::klog_write_str;
-use smoltcp::socket::{tcp, udp};
-use smoltcp::socket::tcp::ConnectError;
-use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 use crate::drivers::wm::WindowListItem;
 use crate::drivers::wm_flags::WindowFlags;
+use crate::net::stack::{poll_stack, NET_STACK};
+use crate::print::klog_write_str;
 use crate::time::sleep;
 use crate::utils::flags::{FlagOp, Flags};
 use crate::utils::rand_int;
+use smoltcp::socket::tcp::ConnectError;
+use smoltcp::socket::{tcp, udp};
+use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 pub fn sys_socket(current_slot: usize, domain: u16, ty: u16, protocol: u8) -> usize {
     let mut stack_guard = match NET_STACK.try_lock() {
@@ -3513,9 +3923,7 @@ pub fn sys_bind(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: us
         IpListenEndpoint { addr: None, port }
     } else {
         IpListenEndpoint {
-            addr: Some(IpAddress::Ipv4(Ipv4Addr::from_bits(
-                addr.sin_addr.s_addr,
-            ))),
+            addr: Some(IpAddress::Ipv4(Ipv4Addr::from_bits(addr.sin_addr.s_addr))),
             port,
         }
     };
@@ -3546,7 +3954,11 @@ pub fn sys_bind(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: us
         }
     }
 
-    if result.is_ok() { 0 } else { usize::MAX }
+    if result.is_ok() {
+        0
+    } else {
+        usize::MAX
+    }
 }
 
 pub fn sys_listen(current_slot: usize, fd: usize, backlog: usize) -> usize {
@@ -3582,7 +3994,9 @@ fn endpoint_to_sockaddr(endpoint: IpEndpoint) -> Option<SockAddrIn> {
     Some(SockAddrIn {
         sin_family: AF_INET,
         sin_port: endpoint.port.to_be(),
-        sin_addr: crate::net::InAddr { s_addr: ip.to_bits() },
+        sin_addr: crate::net::InAddr {
+            s_addr: ip.to_bits(),
+        },
         sin_zero: [0; 8],
     })
 }
@@ -3669,7 +4083,10 @@ pub fn sys_accept4(
 
             let installed = unsafe {
                 if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
-                    if current.fd_table.insert(accepted_fd, FileDescriptor::new_socket(accepted_id)) {
+                    if current
+                        .fd_table
+                        .insert(accepted_fd, FileDescriptor::new_socket(accepted_id))
+                    {
                         if flags & SOCK_NONBLOCK != 0 {
                             let _ = current.fd_table.set_flags(accepted_fd, SOCK_NONBLOCK);
                         }
@@ -3720,7 +4137,6 @@ pub fn sys_accept4(
         }
     }
 }
-
 
 pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: usize) -> usize {
     if addr_ptr.is_null() {
@@ -3805,7 +4221,8 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
 
         let state = stack.sockets.get::<tcp::Socket>(handle).state();
         if state == tcp::State::Established {
-            let local_addr = stack.sockets
+            let local_addr = stack
+                .sockets
                 .get::<tcp::Socket>(handle)
                 .local_endpoint()
                 .and_then(endpoint_to_sockaddr);
@@ -3832,7 +4249,8 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
         }
 
         stack.poll(crate::time::uptime_ms() as i64);
-        let local_addr = stack.sockets
+        let local_addr = stack
+            .sockets
             .get::<tcp::Socket>(handle)
             .local_endpoint()
             .and_then(endpoint_to_sockaddr);
@@ -4160,7 +4578,6 @@ pub fn sys_shutdown(current_slot: usize, fd: usize, _how: u32) -> usize {
 
 // ====================== WINDOW MANAGER ======================
 
-
 #[repr(C)]
 pub struct WmCreateArgs {
     x: i32,
@@ -4168,7 +4585,7 @@ pub struct WmCreateArgs {
     w: u32,
     h: u32,
     title: *const u8,
-    flags: *const u8
+    flags: *const u8,
 }
 
 pub fn sys_wm_create(current_slot: usize, args: *const WmCreateArgs) -> usize {

@@ -1,7 +1,6 @@
-
+use crate::utils::flags::{FlagOp, Flags};
 use core::ops::Deref;
 use core::sync::atomic::AtomicU8;
-use crate::utils::flags::{FlagOp, Flags};
 
 pub struct WindowFlags(Flags<AtomicU8>);
 

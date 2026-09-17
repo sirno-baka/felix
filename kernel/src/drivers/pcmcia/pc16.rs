@@ -115,7 +115,9 @@ impl SocketStatus {
         }
     }
 
-    pub fn card_present(&self) -> bool { self.cd1 && self.cd2 }
+    pub fn card_present(&self) -> bool {
+        self.cd1 && self.cd2
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -124,12 +126,20 @@ pub struct Pc16 {
 }
 
 impl Pc16 {
-    pub const fn new(bar0_virt: u32) -> Self { Self { base: bar0_virt + PC16_OFFSET } }
+    pub const fn new(bar0_virt: u32) -> Self {
+        Self {
+            base: bar0_virt + PC16_OFFSET,
+        }
+    }
 
     #[inline]
-    unsafe fn read8(&self, offset: u32) -> u8 { read_volatile((self.base + offset) as *const u8) }
+    unsafe fn read8(&self, offset: u32) -> u8 {
+        read_volatile((self.base + offset) as *const u8)
+    }
     #[inline]
-    unsafe fn write8(&self, offset: u32, value: u8) { write_volatile((self.base + offset) as *mut u8, value); }
+    unsafe fn write8(&self, offset: u32, value: u8) {
+        write_volatile((self.base + offset) as *mut u8, value);
+    }
     #[inline]
     unsafe fn read16(&self, offset: u32) -> u16 {
         let lo = read_volatile((self.base + offset) as *const u8);
@@ -142,27 +152,69 @@ impl Pc16 {
         write_volatile((self.base + offset + 1) as *mut u8, (value >> 8) as u8);
     }
 
-    pub unsafe fn idrev(&self) -> u8 { self.read8(reg::IDREV) }
-    pub unsafe fn ifstat(&self) -> u8 { self.read8(reg::IFSTAT) }
-    pub unsafe fn status(&self) -> SocketStatus { SocketStatus::from_raw(self.ifstat()) }
-    pub unsafe fn pwctrl(&self) -> u8 { self.read8(reg::PWCTRL) }
-    pub unsafe fn igctrl(&self) -> u8 { self.read8(reg::IGCTRL) }
-    pub unsafe fn cschg(&self) -> u8 { self.read8(reg::CSCHG) }
-    pub unsafe fn cscint(&self) -> u8 { self.read8(reg::CSCINT) }
-    pub unsafe fn awinen(&self) -> u8 { self.read8(reg::AWINEN) }
-    pub unsafe fn ioctrl(&self) -> u8 { self.read8(reg::IOCTRL) }
-    pub unsafe fn write_reg8(&self, offset: u32, value: u8) { self.write8(offset, value) }
-    pub unsafe fn write_reg16(&self, offset: u32, value: u16) { self.write16(offset, value) }
+    pub unsafe fn idrev(&self) -> u8 {
+        self.read8(reg::IDREV)
+    }
+    pub unsafe fn ifstat(&self) -> u8 {
+        self.read8(reg::IFSTAT)
+    }
+    pub unsafe fn status(&self) -> SocketStatus {
+        SocketStatus::from_raw(self.ifstat())
+    }
+    pub unsafe fn pwctrl(&self) -> u8 {
+        self.read8(reg::PWCTRL)
+    }
+    pub unsafe fn igctrl(&self) -> u8 {
+        self.read8(reg::IGCTRL)
+    }
+    pub unsafe fn cschg(&self) -> u8 {
+        self.read8(reg::CSCHG)
+    }
+    pub unsafe fn cscint(&self) -> u8 {
+        self.read8(reg::CSCINT)
+    }
+    pub unsafe fn awinen(&self) -> u8 {
+        self.read8(reg::AWINEN)
+    }
+    pub unsafe fn ioctrl(&self) -> u8 {
+        self.read8(reg::IOCTRL)
+    }
+    pub unsafe fn write_reg8(&self, offset: u32, value: u8) {
+        self.write8(offset, value)
+    }
+    pub unsafe fn write_reg16(&self, offset: u32, value: u16) {
+        self.write16(offset, value)
+    }
 
-    pub unsafe fn power_off(&self) { self.write8(reg::PWCTRL, power::OFF); }
-    pub unsafe fn power_5v(&self) { self.write8(reg::PWCTRL, power::OUTPUT_ENABLE | power::NORESET | power::VCC_5V); }
-    pub unsafe fn power_3v3(&self) { self.write8(reg::PWCTRL, power::OUTPUT_ENABLE | power::NORESET | power::VCC_3V3); }
+    pub unsafe fn power_off(&self) {
+        self.write8(reg::PWCTRL, power::OFF);
+    }
+    pub unsafe fn power_5v(&self) {
+        self.write8(
+            reg::PWCTRL,
+            power::OUTPUT_ENABLE | power::NORESET | power::VCC_5V,
+        );
+    }
+    pub unsafe fn power_3v3(&self) {
+        self.write8(
+            reg::PWCTRL,
+            power::OUTPUT_ENABLE | power::NORESET | power::VCC_3V3,
+        );
+    }
 
-    pub unsafe fn card_reset_assert(&self) { self.write8(reg::IGCTRL, self.read8(reg::IGCTRL) | igctrl::PC_RESET); }
-    pub unsafe fn card_reset_deassert(&self) { self.write8(reg::IGCTRL, self.read8(reg::IGCTRL) & !igctrl::PC_RESET); }
+    pub unsafe fn card_reset_assert(&self) {
+        self.write8(reg::IGCTRL, self.read8(reg::IGCTRL) | igctrl::PC_RESET);
+    }
+    pub unsafe fn card_reset_deassert(&self) {
+        self.write8(reg::IGCTRL, self.read8(reg::IGCTRL) & !igctrl::PC_RESET);
+    }
     pub unsafe fn set_io_card_mode(&self, enabled: bool) {
         let mut v = self.read8(reg::IGCTRL);
-        if enabled { v |= igctrl::PC_IOCARD; } else { v &= !igctrl::PC_IOCARD; }
+        if enabled {
+            v |= igctrl::PC_IOCARD;
+        } else {
+            v &= !igctrl::PC_IOCARD;
+        }
         self.write8(reg::IGCTRL, v);
     }
     pub unsafe fn set_irq(&self, irq: u8) {
@@ -181,8 +233,12 @@ impl Pc16 {
         self.write16(reg::IO_OFFSET0, 0x41E0);
         let mut ioctl = self.read8(reg::IOCTRL);
         ioctl &= !0xFF;
-        ioctl |= ioctrl::IO0_16BIT | ioctrl::IO0_IOCS16 | ioctrl::IO0_WAIT
-            | ioctrl::IO1_16BIT | ioctrl::IO1_IOCS16 | ioctrl::IO1_WAIT;
+        ioctl |= ioctrl::IO0_16BIT
+            | ioctrl::IO0_IOCS16
+            | ioctrl::IO0_WAIT
+            | ioctrl::IO1_16BIT
+            | ioctrl::IO1_IOCS16
+            | ioctrl::IO1_WAIT;
         self.write8(reg::IOCTRL, ioctl);
         // Ricoh 16-bit ATA timing mode (RF5C_MODE_ATA).
         self.write8(reg::ATCTRL, 0x01);
@@ -205,37 +261,106 @@ impl Pc16 {
     pub unsafe fn dump(&self) {
         crate::println!("[PCMCIA] PC16 register dump:");
         for (off, name) in [
-            (reg::IDREV, "IDREV"), (reg::IFSTAT, "IFSTAT"),
-            (reg::PWCTRL, "PWCTRL"), (reg::IGCTRL, "IGCTRL"),
-            (reg::CSCHG, "CSCHG"), (reg::CSCINT, "CSCINT"),
-            (reg::AWINEN, "AWINEN"), (reg::IOCTRL, "IOCTRL"),
+            (reg::IDREV, "IDREV"),
+            (reg::IFSTAT, "IFSTAT"),
+            (reg::PWCTRL, "PWCTRL"),
+            (reg::IGCTRL, "IGCTRL"),
+            (reg::CSCHG, "CSCHG"),
+            (reg::CSCINT, "CSCINT"),
+            (reg::AWINEN, "AWINEN"),
+            (reg::IOCTRL, "IOCTRL"),
         ] {
-            crate::println!("[PCMCIA]   +{:02x} {:<6} = {:02x}", off, name, self.read8(off));
+            crate::println!(
+                "[PCMCIA]   +{:02x} {:<6} = {:02x}",
+                off,
+                name,
+                self.read8(off)
+            );
         }
-        crate::println!("[PCMCIA]   +08 IOWIN0  = {:04x}", self.read16(reg::IOWIN0_START));
-        crate::println!("[PCMCIA]   +0a IOWIN0E = {:04x}", self.read16(reg::IOWIN0_END));
-        crate::println!("[PCMCIA]   +0c IOOFF0  = {:04x}", self.read16(reg::IOWIN0_OFFSET));
-        crate::println!("[PCMCIA]   +10 MEM0S   = {:04x}", self.read16(reg::MEMWIN0_START));
-        crate::println!("[PCMCIA]   +12 MEM0E   = {:04x}", self.read16(reg::MEMWIN0_END));
-        crate::println!("[PCMCIA]   +14 MEM0OFF = {:04x}", self.read16(reg::MEMWIN0_OFFSET));
+        crate::println!(
+            "[PCMCIA]   +08 IOWIN0  = {:04x}",
+            self.read16(reg::IOWIN0_START)
+        );
+        crate::println!(
+            "[PCMCIA]   +0a IOWIN0E = {:04x}",
+            self.read16(reg::IOWIN0_END)
+        );
+        crate::println!(
+            "[PCMCIA]   +0c IOOFF0  = {:04x}",
+            self.read16(reg::IOWIN0_OFFSET)
+        );
+        crate::println!(
+            "[PCMCIA]   +10 MEM0S   = {:04x}",
+            self.read16(reg::MEMWIN0_START)
+        );
+        crate::println!(
+            "[PCMCIA]   +12 MEM0E   = {:04x}",
+            self.read16(reg::MEMWIN0_END)
+        );
+        crate::println!(
+            "[PCMCIA]   +14 MEM0OFF = {:04x}",
+            self.read16(reg::MEMWIN0_OFFSET)
+        );
         crate::println!("[PCMCIA]   +16 CDGENC  = {:02x}", self.read8(reg::CDGENC));
-        crate::println!("[PCMCIA]   +18 MEM1S   = {:04x}", self.read16(reg::MEMWIN1_START));
-        crate::println!("[PCMCIA]   +1a MEM1E   = {:04x}", self.read16(reg::MEMWIN1_END));
-        crate::println!("[PCMCIA]   +1c MEM1OFF = {:04x}", self.read16(reg::MEMWIN1_OFFSET));
+        crate::println!(
+            "[PCMCIA]   +18 MEM1S   = {:04x}",
+            self.read16(reg::MEMWIN1_START)
+        );
+        crate::println!(
+            "[PCMCIA]   +1a MEM1E   = {:04x}",
+            self.read16(reg::MEMWIN1_END)
+        );
+        crate::println!(
+            "[PCMCIA]   +1c MEM1OFF = {:04x}",
+            self.read16(reg::MEMWIN1_OFFSET)
+        );
         crate::println!("[PCMCIA]   +1e GLCTRL  = {:02x}", self.read8(reg::GLCTRL));
         crate::println!("[PCMCIA]   +1f ATCTRL  = {:02x}", self.read8(reg::ATCTRL));
-        crate::println!("[PCMCIA]   +20 MEM2S   = {:04x}", self.read16(reg::MEMWIN2_START));
-        crate::println!("[PCMCIA]   +22 MEM2E   = {:04x}", self.read16(reg::MEMWIN2_END));
-        crate::println!("[PCMCIA]   +24 MEM2OFF = {:04x}", self.read16(reg::MEMWIN2_OFFSET));
-        crate::println!("[PCMCIA]   +28 MEM3S   = {:04x}", self.read16(reg::MEMWIN3_START));
-        crate::println!("[PCMCIA]   +2a MEM3E   = {:04x}", self.read16(reg::MEMWIN3_END));
-        crate::println!("[PCMCIA]   +2c MEM3OFF = {:04x}", self.read16(reg::MEMWIN3_OFFSET));
+        crate::println!(
+            "[PCMCIA]   +20 MEM2S   = {:04x}",
+            self.read16(reg::MEMWIN2_START)
+        );
+        crate::println!(
+            "[PCMCIA]   +22 MEM2E   = {:04x}",
+            self.read16(reg::MEMWIN2_END)
+        );
+        crate::println!(
+            "[PCMCIA]   +24 MEM2OFF = {:04x}",
+            self.read16(reg::MEMWIN2_OFFSET)
+        );
+        crate::println!(
+            "[PCMCIA]   +28 MEM3S   = {:04x}",
+            self.read16(reg::MEMWIN3_START)
+        );
+        crate::println!(
+            "[PCMCIA]   +2a MEM3E   = {:04x}",
+            self.read16(reg::MEMWIN3_END)
+        );
+        crate::println!(
+            "[PCMCIA]   +2c MEM3OFF = {:04x}",
+            self.read16(reg::MEMWIN3_OFFSET)
+        );
         crate::println!("[PCMCIA]   +30 MISCC1  = {:02x}", self.read8(reg::MISCC1));
-        crate::println!("[PCMCIA]   +31 MEM4S   = {:04x}", self.read16(reg::MEMWIN4_START));
-        crate::println!("[PCMCIA]   +33 MEM4E   = {:04x}", self.read16(reg::MEMWIN4_END));
-        crate::println!("[PCMCIA]   +35 MEM4OFF = {:04x}", self.read16(reg::MEMWIN4_OFFSET));
-        crate::println!("[PCMCIA]   +37 IOOFF0  = {:04x}", self.read16(reg::IO_OFFSET0));
-        crate::println!("[PCMCIA]   +39 IOOFF1  = {:04x}", self.read16(reg::IO_OFFSET1));
+        crate::println!(
+            "[PCMCIA]   +31 MEM4S   = {:04x}",
+            self.read16(reg::MEMWIN4_START)
+        );
+        crate::println!(
+            "[PCMCIA]   +33 MEM4E   = {:04x}",
+            self.read16(reg::MEMWIN4_END)
+        );
+        crate::println!(
+            "[PCMCIA]   +35 MEM4OFF = {:04x}",
+            self.read16(reg::MEMWIN4_OFFSET)
+        );
+        crate::println!(
+            "[PCMCIA]   +37 IOOFF0  = {:04x}",
+            self.read16(reg::IO_OFFSET0)
+        );
+        crate::println!(
+            "[PCMCIA]   +39 IOOFF1  = {:04x}",
+            self.read16(reg::IO_OFFSET1)
+        );
         crate::println!("[PCMCIA]   +3b GPIO    = {:02x}", self.read8(reg::GPIO));
         crate::println!("[PCMCIA]   +40 SMPGA0  = {:02x}", self.read8(reg::SMPGA0));
     }

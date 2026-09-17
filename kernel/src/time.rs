@@ -50,7 +50,6 @@ fn read_tsc_asm() -> u64 {
     ((high as u64) << 32) | (low as u64)
 }
 
-
 /// Construct a timestamp from the monotonic PIT-derived uptime.
 #[inline(always)]
 pub fn get_timestamp() -> Time {
@@ -154,14 +153,27 @@ fn read_rtc_once() -> Option<RtcDateTime> {
     // RTC can expose 12-hour mode; normalize it to 0..23.
     if status_b & 0x02 == 0 {
         hour %= 12;
-        if pm { hour = hour.saturating_add(12); }
+        if pm {
+            hour = hour.saturating_add(12);
+        }
     }
 
-    let year = if year >= 70 { 1900 + year as u16 } else { 2000 + year as u16 };
+    let year = if year >= 70 {
+        1900 + year as u16
+    } else {
+        2000 + year as u16
+    };
     if second > 59 || minute > 59 || hour > 23 || day == 0 || day > 31 || month == 0 || month > 12 {
         return None;
     }
-    Some(RtcDateTime { second, minute, hour, day, month, year })
+    Some(RtcDateTime {
+        second,
+        minute,
+        hour,
+        day,
+        month,
+        year,
+    })
 }
 
 fn read_rtc_stable() -> Option<RtcDateTime> {
@@ -169,7 +181,9 @@ fn read_rtc_stable() -> Option<RtcDateTime> {
     for _ in 0..8 {
         let a = read_rtc_once()?;
         let b = read_rtc_once()?;
-        if a == b { return Some(a); }
+        if a == b {
+            return Some(a);
+        }
     }
     None
 }
@@ -180,7 +194,9 @@ fn leap_year(year: u16) -> bool {
 }
 
 fn rtc_to_unix_seconds(t: RtcDateTime) -> Option<u64> {
-    if t.year < 1970 { return None; }
+    if t.year < 1970 {
+        return None;
+    }
     const MONTH_DAYS: [u16; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut days = 0u64;
     for year in 1970..t.year {
@@ -188,10 +204,19 @@ fn rtc_to_unix_seconds(t: RtcDateTime) -> Option<u64> {
     }
     for month in 1..t.month {
         days += MONTH_DAYS[(month - 1) as usize] as u64;
-        if month == 2 && leap_year(t.year) { days += 1; }
+        if month == 2 && leap_year(t.year) {
+            days += 1;
+        }
     }
-    let max_day = MONTH_DAYS[(t.month - 1) as usize] + if t.month == 2 && leap_year(t.year) { 1 } else { 0 };
-    if t.day as u16 > max_day { return None; }
+    let max_day = MONTH_DAYS[(t.month - 1) as usize]
+        + if t.month == 2 && leap_year(t.year) {
+            1
+        } else {
+            0
+        };
+    if t.day as u16 > max_day {
+        return None;
+    }
     days += (t.day - 1) as u64;
     Some(days * 86_400 + t.hour as u64 * 3_600 + t.minute as u64 * 60 + t.second as u64)
 }

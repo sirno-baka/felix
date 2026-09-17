@@ -10,8 +10,8 @@ use crate::disk::interface::BlockDevice;
 use crate::filesystem::file::DeviceKind;
 use crate::filesystem::vfs::{DirEntry, Filesystem, Metadata};
 use crate::spin;
-use crate::sync::MutexLazy;
 use crate::sync::mutex::Mutex;
+use crate::sync::MutexLazy;
 
 pub type SharedBlockDevice = Arc<spin::Mutex<dyn BlockDevice>>;
 
@@ -27,8 +27,12 @@ pub struct DeviceNode {
     pub dev_type: DeviceType,
 }
 
-fn new_devices() -> Mutex<Vec<DeviceNode>> { Mutex::new(Vec::new()) }
-fn new_inode_counter() -> Mutex<u32> { Mutex::new(1) }
+fn new_devices() -> Mutex<Vec<DeviceNode>> {
+    Mutex::new(Vec::new())
+}
+fn new_inode_counter() -> Mutex<u32> {
+    Mutex::new(1)
+}
 
 /// Device nodes outlive the DevFS mount object so hotplug drivers can publish
 /// and withdraw /dev entries at runtime.
@@ -42,7 +46,9 @@ pub const TTY_INODE: u32 = 0x00ff_fffe;
 pub struct DevFS;
 
 impl DevFS {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     fn alloc_inode() -> u32 {
         let mut next = NEXT_INODE.get().lock();
@@ -61,7 +67,11 @@ impl DevFS {
             return existing.inode;
         }
         let inode = Self::alloc_inode();
-        devices.push(DeviceNode { name: name.into(), inode, dev_type: DeviceType::Block(dev) });
+        devices.push(DeviceNode {
+            name: name.into(),
+            inode,
+            dev_type: DeviceType::Block(dev),
+        });
         inode
     }
 
@@ -75,7 +85,11 @@ impl DevFS {
             return existing.inode;
         }
         let inode = Self::alloc_inode();
-        devices.push(DeviceNode { name: name.into(), inode, dev_type: DeviceType::Char(dev) });
+        devices.push(DeviceNode {
+            name: name.into(),
+            inode,
+            dev_type: DeviceType::Char(dev),
+        });
         inode
     }
 
@@ -93,7 +107,9 @@ impl DevFS {
     pub fn block_device(name: &str) -> Option<SharedBlockDevice> {
         let devices = DEVICES.get().lock();
         devices.iter().find_map(|d| {
-            if d.name != name { return None; }
+            if d.name != name {
+                return None;
+            }
             match &d.dev_type {
                 DeviceType::Block(dev) => Some(dev.clone()),
                 DeviceType::Char(_) => None,
@@ -117,10 +133,7 @@ impl DevFS {
 impl Filesystem for DevFS {
     fn resolve_path(&self, path: &str) -> Option<u32> {
         // `/sda`, `sda`, `/dev/sda` → имя узла `sda`
-        let clean_name = path
-            .rsplit('/')
-            .find(|s| !s.is_empty())
-            .unwrap_or(path);
+        let clean_name = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(path);
         if clean_name.is_empty() || clean_name == "dev" {
             return None;
         }
@@ -136,7 +149,9 @@ impl Filesystem for DevFS {
 
     fn read_at(&self, inode: u32, offset: u64, buf: &mut [u8]) -> usize {
         let devices = DEVICES.get().lock();
-        let Some(node) = devices.iter().find(|d| d.inode == inode) else { return 0; };
+        let Some(node) = devices.iter().find(|d| d.inode == inode) else {
+            return 0;
+        };
 
         match &node.dev_type {
             DeviceType::Block(dev_mutex) => {
@@ -149,7 +164,9 @@ impl Filesystem for DevFS {
 
     fn write_at(&mut self, inode: u32, offset: u64, buf: &[u8]) -> usize {
         let devices = DEVICES.get().lock();
-        let Some(node) = devices.iter().find(|d| d.inode == inode) else { return 0; };
+        let Some(node) = devices.iter().find(|d| d.inode == inode) else {
+            return 0;
+        };
 
         match &node.dev_type {
             DeviceType::Block(dev_mutex) => {

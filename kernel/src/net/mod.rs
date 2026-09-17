@@ -22,7 +22,12 @@ impl log::Log for NetLogger {
         if self.enabled(record.metadata()) {
             // debugln goes to the kernel log without touching the framebuffer,
             // so F12 can show the exact smoltcp DHCP state/parse decision.
-            crate::debugln!("[net {} {}] {}", record.level(), record.target(), record.args());
+            crate::debugln!(
+                "[net {} {}] {}",
+                record.level(),
+                record.target(),
+                record.args()
+            );
         }
     }
 

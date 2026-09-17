@@ -11,8 +11,8 @@ mod driver;
 mod pc16;
 
 pub use ata::{AtaPio, IdentifyData};
-pub use pc16::SocketStatus;
 pub use controller::{RicohR5c475, SocketController};
+pub use pc16::SocketStatus;
 
 pub const CF_IO_BASE: u16 = 0xC000;
 pub const CF_IO_END: u16 = 0xC00F;
@@ -33,7 +33,9 @@ pub fn active_card() -> Option<CardInfo> {
 }
 
 pub(crate) fn store_card_cor(base: u32, index: u8) {
-    unsafe { CARD_COR = Some((base, index)); }
+    unsafe {
+        CARD_COR = Some((base, index));
+    }
 }
 
 /// Re-enable PCI I/O + ExCA windows if the task-file port floated (0xFF).
@@ -68,10 +70,10 @@ pub fn rearm_io() {
     }
 }
 
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use crate::drivers::pic::PICS;
-use crate::sync::mutex::Mutex;
 use crate::interrupts::idt::IDT;
+use crate::sync::mutex::Mutex;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 static IRQ_LINE: AtomicU8 = AtomicU8::new(0xFF);
 static PENDING: AtomicU8 = AtomicU8::new(0); // 1=insert 2=remove
@@ -114,7 +116,9 @@ extern "C" fn pcmcia_irq_handler() {
             DEBOUNCE.store(20, Ordering::Relaxed); // ~20 timer ticks
             crate::println!(
                 "[PCMCIA] CSC irq cschg={:02x} ev={:08x} present={}",
-                cschg, ev, present
+                cschg,
+                ev,
+                present
             );
         }
         let irq = IRQ_LINE.load(Ordering::Relaxed);
@@ -263,29 +267,29 @@ pub struct CompactFlash {
 }
 
 impl CompactFlash {
-    pub fn identify(&self) -> IdentifyData { self.identify }
-    pub fn ata(&self) -> AtaPio { self.ata }
-    pub fn sectors(&self) -> u64 { self.identify.sectors }
-    pub fn supports_lba48(&self) -> bool { self.identify.lba48 }
-    pub fn model(&self) -> &[u8; 40] { &self.identify.model }
+    pub fn identify(&self) -> IdentifyData {
+        self.identify
+    }
+    pub fn ata(&self) -> AtaPio {
+        self.ata
+    }
+    pub fn sectors(&self) -> u64 {
+        self.identify.sectors
+    }
+    pub fn supports_lba48(&self) -> bool {
+        self.identify.lba48
+    }
+    pub fn model(&self) -> &[u8; 40] {
+        &self.identify.model
+    }
 }
 
 impl crate::disk::interface::BlockDevice for CompactFlash {
-    fn read_sectors(
-        &self,
-        numsects: u8,
-        lba: u32,
-        buf: u32,
-    ) -> Result<(), u8> {
+    fn read_sectors(&self, numsects: u8, lba: u32, buf: u32) -> Result<(), u8> {
         self.ata.read_sectors(numsects, lba, buf)
     }
 
-    fn write_sectors(
-        &mut self,
-        numsects: u8,
-        lba: u32,
-        buf: u32,
-    ) -> Result<(), u8> {
+    fn write_sectors(&mut self, numsects: u8, lba: u32, buf: u32) -> Result<(), u8> {
         self.ata.write_sectors(numsects, lba, buf)
     }
 
@@ -302,15 +306,22 @@ fn print_socket_status(status: &SocketStatus) {
     crate::println!("[PCMCIA] socket:");
     crate::println!(
         "[PCMCIA]   present={} cd1={} cd2={}",
-        status.card_present(), status.cd1, status.cd2
+        status.card_present(),
+        status.cd1,
+        status.cd2
     );
     crate::println!(
         "[PCMCIA]   ready={} wp={} power_on={} gpi={}",
-        status.ready, status.write_protected, status.power_on, status.gpi
+        status.ready,
+        status.write_protected,
+        status.power_on,
+        status.gpi
     );
     crate::println!(
         "[PCMCIA]   bvd1={} bvd2={} raw={:02x}",
-        status.bvd1, status.bvd2, status.raw
+        status.bvd1,
+        status.bvd2,
+        status.raw
     );
 }
 
@@ -324,10 +335,26 @@ fn prepare_socket(controller: &dyn controller::SocketController) -> bool {
         pc16.write_reg8(pc16::reg::IOCTRL, 0x00);
 
         for (start, end, off) in [
-            (pc16::reg::MEMWIN0_START, pc16::reg::MEMWIN0_END, pc16::reg::MEMWIN0_OFFSET),
-            (pc16::reg::MEMWIN1_START, pc16::reg::MEMWIN1_END, pc16::reg::MEMWIN1_OFFSET),
-            (pc16::reg::MEMWIN2_START, pc16::reg::MEMWIN2_END, pc16::reg::MEMWIN2_OFFSET),
-            (pc16::reg::MEMWIN3_START, pc16::reg::MEMWIN3_END, pc16::reg::MEMWIN3_OFFSET),
+            (
+                pc16::reg::MEMWIN0_START,
+                pc16::reg::MEMWIN0_END,
+                pc16::reg::MEMWIN0_OFFSET,
+            ),
+            (
+                pc16::reg::MEMWIN1_START,
+                pc16::reg::MEMWIN1_END,
+                pc16::reg::MEMWIN1_OFFSET,
+            ),
+            (
+                pc16::reg::MEMWIN2_START,
+                pc16::reg::MEMWIN2_END,
+                pc16::reg::MEMWIN2_OFFSET,
+            ),
+            (
+                pc16::reg::MEMWIN3_START,
+                pc16::reg::MEMWIN3_END,
+                pc16::reg::MEMWIN3_OFFSET,
+            ),
         ] {
             pc16.write_reg16(start, 0);
             pc16.write_reg16(end, 0);
@@ -347,8 +374,16 @@ fn prepare_socket(controller: &dyn controller::SocketController) -> bool {
         }
 
         crate::println!("[PCMCIA] CARD DETECTED");
-        crate::println!("[PCMCIA]   CD1={} CD2={}", pc16.status().cd1, pc16.status().cd2);
-        crate::println!("[PCMCIA]   CSCHG={:02x} CSCINT={:02x}", pc16.cschg(), pc16.cscint());
+        crate::println!(
+            "[PCMCIA]   CD1={} CD2={}",
+            pc16.status().cd1,
+            pc16.status().cd2
+        );
+        crate::println!(
+            "[PCMCIA]   CSCHG={:02x} CSCINT={:02x}",
+            pc16.cschg(),
+            pc16.cscint()
+        );
 
         pc16.write_reg8(pc16::reg::PWCTRL, 0x00);
         pc16.write_reg8(pc16::reg::IGCTRL, 0x00);
@@ -369,7 +404,10 @@ fn prepare_socket(controller: &dyn controller::SocketController) -> bool {
     true
 }
 
-fn init_fixed_disk(controller: &dyn controller::SocketController, info: CardInfo) -> Option<PcmciaDevice> {
+fn init_fixed_disk(
+    controller: &dyn controller::SocketController,
+    info: CardInfo,
+) -> Option<PcmciaDevice> {
     let Some(cfg) = info.config_base.zip(info.config_index) else {
         crate::println!("[PCMCIA] fixed-disk card has no CONFIG tuple");
         return None;
@@ -421,7 +459,9 @@ fn find_controller() -> Option<alloc::boxed::Box<dyn controller::SocketControlle
 pub fn init() -> Option<PcmciaDevice> {
     let controller = find_controller()?;
     crate::println!("[PCMCIA] using {}", controller.name());
-    unsafe { SOCKET = Some(controller); }
+    unsafe {
+        SOCKET = Some(controller);
+    }
     enable_hotplug();
     // unsafe {
     //     crate::println!(
@@ -437,7 +477,9 @@ pub fn init() -> Option<PcmciaDevice> {
     //     print_socket_status(&controller.pc16().status());
     // }
     let controller = unsafe { SOCKET.as_ref().unwrap().as_ref() };
-    unsafe { print_socket_status(&controller.pc16().status()); }
+    unsafe {
+        print_socket_status(&controller.pc16().status());
+    }
     if !prepare_socket(controller) {
         return None;
     }
@@ -447,13 +489,19 @@ pub fn init() -> Option<PcmciaDevice> {
 
     crate::println!(
         "[PCMCIA] CIS card type={:?} FUNCID={:?} CONFIG={:?} CFTABLE={:?}",
-        info.card_type, info.func_id, info.config_base, info.config_index
+        info.card_type,
+        info.func_id,
+        info.config_base,
+        info.config_index
     );
 
     bind_by_cis(controller, info)
 }
 
-fn bind_by_cis(controller: &dyn controller::SocketController, info: CardInfo) -> Option<PcmciaDevice> {
+fn bind_by_cis(
+    controller: &dyn controller::SocketController,
+    info: CardInfo,
+) -> Option<PcmciaDevice> {
     for driver in driver::card_drivers().iter() {
         if !(driver.matches)(&info) {
             continue;
@@ -489,7 +537,9 @@ fn disconnect_card(controller: &dyn controller::SocketController) {
 /// Re-probe CIS and pick a card driver. Socket must already be up.
 pub fn bind_card() -> Option<PcmciaDevice> {
     unsafe {
-        let Some(controller) = SOCKET.as_ref() else { return None };
+        let Some(controller) = SOCKET.as_ref() else {
+            return None;
+        };
         if !controller.pc16().status().card_present() {
             return None;
         }
@@ -498,7 +548,9 @@ pub fn bind_card() -> Option<PcmciaDevice> {
         let info = cis::read_cis()?;
         crate::println!(
             "[PCMCIA] bind CIS type={:?} FUNCID={:?} CFTABLE={:?}",
-            info.card_type, info.func_id, info.config_index
+            info.card_type,
+            info.func_id,
+            info.config_index
         );
         bind_by_cis(controller.as_ref(), info)
     }

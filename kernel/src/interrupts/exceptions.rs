@@ -292,9 +292,12 @@ pub extern "C" fn page_fault_handler(esp: u32) -> u32 {
     if is_user_cs(state.cs) {
         let slot = unsafe { TASK_MANAGER.get_current_slot() as usize };
         let (kstack, heap, mmap) = unsafe {
-            TASK_MANAGER.tasks.get(slot).and_then(|t| t.as_ref()).map(|t| {
-                (t.stack_base, t.heap_next, t.mmap_next)
-            }).unwrap_or((0, 0, 0))
+            TASK_MANAGER
+                .tasks
+                .get(slot)
+                .and_then(|t| t.as_ref())
+                .map(|t| (t.stack_base, t.heap_next, t.mmap_next))
+                .unwrap_or((0, 0, 0))
         };
         println!(
             "PAGE FAULT (user)! CR2={:#x} EIP={:#x} CS={:#x} EFLAGS={:#x}",

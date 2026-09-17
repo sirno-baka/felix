@@ -40,14 +40,38 @@ impl AtaPio {
         Self { base }
     }
 
-    #[inline] fn data(&self) -> u16 { self.base }
-    #[inline] fn error_features(&self) -> u16 { self.base + 1 }
-    #[inline] fn sector_count(&self) -> u16 { self.base + 2 }
-    #[inline] fn lba0(&self) -> u16 { self.base + 3 }
-    #[inline] fn lba1(&self) -> u16 { self.base + 4 }
-    #[inline] fn lba2(&self) -> u16 { self.base + 5 }
-    #[inline] fn device(&self) -> u16 { self.base + 6 }
-    #[inline] fn status_command(&self) -> u16 { self.base + 7 }
+    #[inline]
+    fn data(&self) -> u16 {
+        self.base
+    }
+    #[inline]
+    fn error_features(&self) -> u16 {
+        self.base + 1
+    }
+    #[inline]
+    fn sector_count(&self) -> u16 {
+        self.base + 2
+    }
+    #[inline]
+    fn lba0(&self) -> u16 {
+        self.base + 3
+    }
+    #[inline]
+    fn lba1(&self) -> u16 {
+        self.base + 4
+    }
+    #[inline]
+    fn lba2(&self) -> u16 {
+        self.base + 5
+    }
+    #[inline]
+    fn device(&self) -> u16 {
+        self.base + 6
+    }
+    #[inline]
+    fn status_command(&self) -> u16 {
+        self.base + 7
+    }
 
     #[inline]
     fn io_pause(&self) {
@@ -60,12 +84,16 @@ impl AtaPio {
             let status = inb(self.status_command());
             if status == 0x00 || status == 0xFF {
                 float_hits += 1;
-                if float_hits > 64 { return None; }
+                if float_hits > 64 {
+                    return None;
+                }
                 self.io_pause();
                 continue;
             }
             float_hits = 0;
-            if (status & STATUS_BSY) == 0 { return Some(status); }
+            if (status & STATUS_BSY) == 0 {
+                return Some(status);
+            }
             self.io_pause();
         }
         None
@@ -94,7 +122,9 @@ impl AtaPio {
             if (status & (STATUS_ERR | STATUS_DF)) != 0 {
                 return None;
             }
-            if (status & STATUS_BSY) == 0 && (status & STATUS_DRQ) != 0 { break; }
+            if (status & STATUS_BSY) == 0 && (status & STATUS_DRQ) != 0 {
+                break;
+            }
             self.io_pause();
         }
 
@@ -105,7 +135,9 @@ impl AtaPio {
         }
 
         let mut words = [0u16; 256];
-        for word in words.iter_mut() { *word = inw(self.data()); }
+        for word in words.iter_mut() {
+            *word = inw(self.data());
+        }
 
         let mut model = [b' '; 40];
         for (i, word) in words[27..47].iter().enumerate() {
@@ -123,16 +155,27 @@ impl AtaPio {
 
         crate::print!("[ATA] model: ");
         for byte in model.iter() {
-            let ch = if *byte >= 0x20 && *byte <= 0x7e { *byte as char } else { ' ' };
+            let ch = if *byte >= 0x20 && *byte <= 0x7e {
+                *byte as char
+            } else {
+                ' '
+            };
             crate::print!("{}", ch);
         }
         crate::println!("");
         crate::println!(
             "[ATA] IDENTIFY ok status={:02x} LBA48={} sectors={} capacity={} MiB",
-            status, has_lba48, sectors, sectors / 2048
+            status,
+            has_lba48,
+            sectors,
+            sectors / 2048
         );
 
-        Some(IdentifyData { model, sectors, lba48: has_lba48 })
+        Some(IdentifyData {
+            model,
+            sectors,
+            lba48: has_lba48,
+        })
     }
 
     fn wait_drq(&self) -> Result<(), u8> {
@@ -141,19 +184,32 @@ impl AtaPio {
             let status = inb(self.status_command());
             if status == 0x00 || status == 0xFF {
                 float_hits += 1;
-                if float_hits > 64 { return Err(0xFF); }
+                if float_hits > 64 {
+                    return Err(0xFF);
+                }
                 self.io_pause();
                 continue;
             }
             float_hits = 0;
-            if (status & STATUS_BSY) != 0 { self.io_pause(); continue; }
-            if (status & (STATUS_ERR | STATUS_DF)) != 0 { return Err(inb(self.error_features())); }
-            if (status & STATUS_DRQ) != 0 { return Ok(()); }
+            if (status & STATUS_BSY) != 0 {
+                self.io_pause();
+                continue;
+            }
+            if (status & (STATUS_ERR | STATUS_DF)) != 0 {
+                return Err(inb(self.error_features()));
+            }
+            if (status & STATUS_DRQ) != 0 {
+                return Ok(());
+            }
             self.io_pause();
         }
         let status = inb(self.status_command());
         let error = inb(self.error_features());
-        crate::println!("[ATA] wait_drq timeout status={:02x} error={:02x}", status, error);
+        crate::println!(
+            "[ATA] wait_drq timeout status={:02x} error={:02x}",
+            status,
+            error
+        );
         Err(0xFF)
     }
 
@@ -166,15 +222,19 @@ impl AtaPio {
         self.io_pause();
         self.wait_not_busy()
     }
-
-
 }
 
 impl BlockDevice for AtaPio {
     fn read_sectors(&self, numsects: u8, lba: u32, buf: u32) -> Result<(), u8> {
-        if numsects == 0 || buf == 0 || lba > 0x0FFF_FFFF { return Err(1); }
+        if numsects == 0 || buf == 0 || lba > 0x0FFF_FFFF {
+            return Err(1);
+        }
         if self.select_lba28(lba).is_none() {
-            crate::println!("[ATA] select fail LBA={} st={:02x}", lba, inb(self.status_command()));
+            crate::println!(
+                "[ATA] select fail LBA={} st={:02x}",
+                lba,
+                inb(self.status_command())
+            );
             return Err(33);
         }
         outb(self.sector_count(), numsects);
@@ -189,7 +249,9 @@ impl BlockDevice for AtaPio {
             let ptr = unsafe { dst.add(sector * 256) };
             for i in 0..256usize {
                 let word = inw(self.data());
-                unsafe { core::ptr::write_volatile(ptr.add(i), word); }
+                unsafe {
+                    core::ptr::write_volatile(ptr.add(i), word);
+                }
             }
         }
         let _ = inb(self.status_command());
@@ -197,7 +259,9 @@ impl BlockDevice for AtaPio {
     }
 
     fn write_sectors(&mut self, numsects: u8, lba: u32, buf: u32) -> Result<(), u8> {
-        if numsects == 0 || buf == 0 || lba > 0x0FFF_FFFF { return Err(1); }
+        if numsects == 0 || buf == 0 || lba > 0x0FFF_FFFF {
+            return Err(1);
+        }
         self.select_lba28(lba).ok_or(33)?;
         outb(self.sector_count(), numsects);
         outb(self.lba0(), lba as u8);
@@ -219,7 +283,9 @@ impl BlockDevice for AtaPio {
         for _ in 0..200_000 {
             let status = inb(self.status_command());
             if (status & STATUS_BSY) == 0 {
-                if (status & (STATUS_ERR | STATUS_DF)) != 0 { return Err(inb(self.error_features())); }
+                if (status & (STATUS_ERR | STATUS_DF)) != 0 {
+                    return Err(inb(self.error_features()));
+                }
                 return Ok(());
             }
             self.io_pause();
@@ -227,5 +293,7 @@ impl BlockDevice for AtaPio {
         Err(0xFF)
     }
 
-    fn sector_size(&self) -> u32 { SECTOR_SIZE }
+    fn sector_size(&self) -> u32 {
+        SECTOR_SIZE
+    }
 }

@@ -16,8 +16,8 @@ use crate::filesystem::ext2::Ext2;
 use crate::filesystem::fat32::FatFs;
 use crate::filesystem::procfs::ProcFs;
 use crate::filesystem::vfs::{Filesystem, VFS};
-use crate::memory::paging::{PAGING, phys_to_virt};
-use crate::pci::ide::{IDE, IDEDevice};
+use crate::memory::paging::{phys_to_virt, PAGING};
+use crate::pci::ide::{IDEDevice, IDE};
 use crate::println;
 use crate::spin;
 use crate::sync::mutex::Mutex;
@@ -76,9 +76,16 @@ pub fn mount_device_at(source: &str, target: &str) -> bool {
     if target.is_empty() || target == "/" || VFS.get().is_mounted_at(target) {
         return false;
     }
-    let Some(disk) = DevFS::block_device(source) else { return false; };
-    let Some(probed) = try_mount(disk, source) else { return false; };
-    println!("[VFS] userspace mount /dev/{} ({}) at {}", source, probed.kind, target);
+    let Some(disk) = DevFS::block_device(source) else {
+        return false;
+    };
+    let Some(probed) = try_mount(disk, source) else {
+        return false;
+    };
+    println!(
+        "[VFS] userspace mount /dev/{} ({}) at {}",
+        source, probed.kind, target
+    );
     VFS.get().mount(target, probed.fs);
     if VFS.get().is_mounted_at(target) {
         record_device_mount(source, target);
@@ -118,10 +125,7 @@ pub fn init_rootfs() -> bool {
 
             match try_mount(arc, "ram0") {
                 Some(root) if root.has_userspace => {
-                    println!(
-                        "[VFS] root = {} on /dev/ram0 (userspace=true)",
-                        root.kind
-                    );
+                    println!("[VFS] root = {} on /dev/ram0 (userspace=true)", root.kind);
                     VFS.get().set_root(root.fs);
 
                     // Optional: still register any real IDE disks under /dev + /mnt
@@ -177,7 +181,10 @@ pub fn init_rootfs() -> bool {
         let name = disk_name(i);
         match try_mount(arc, &name) {
             Some(p) => {
-                println!("[init] {} → {} (userspace={})", name, p.kind, p.has_userspace);
+                println!(
+                    "[init] {} → {} (userspace={})",
+                    name, p.kind, p.has_userspace
+                );
                 probed.push(p);
             }
             None => println!("[init] {} → no supported filesystem", name),
@@ -280,7 +287,6 @@ fn collect_ata_disks() -> Vec<IDEDevice> {
     out
 }
 
-
 const PCMCIA_NAME: &str = "pcmcia0";
 const PCMCIA_MOUNT_PREFIX: &str = "pcmcia";
 
@@ -317,7 +323,10 @@ fn mount_pcmcia_device(dev: Option<PcmciaDevice>) {
             }
         }
         Some(other) => {
-            println!("[init] pcmcia card {:?} — no block driver", other.card_type());
+            println!(
+                "[init] pcmcia card {:?} — no block driver",
+                other.card_type()
+            );
         }
         None => {}
     }
@@ -383,10 +392,7 @@ pub fn try_mount(disk: Arc<spin::Mutex<dyn BlockDevice>>, name: &str) -> Option<
 /// Mount a removable block device under `/mnt/<prefix>N`, using the same
 /// filesystem probing as the rest of the system. The caller only supplies a
 /// namespace prefix; filesystem type selection stays here in `try_mount()`.
-pub fn mount_removable(
-    disk: Arc<spin::Mutex<dyn BlockDevice>>,
-    prefix: &str,
-) -> Option<String> {
+pub fn mount_removable(disk: Arc<spin::Mutex<dyn BlockDevice>>, prefix: &str) -> Option<String> {
     mount_removable_named(disk, prefix, prefix)
 }
 
@@ -401,10 +407,7 @@ pub fn mount_removable_named(
         if !VFS.get().is_mounted_at(&mount_point) {
             let name = format!("{}{}", prefix, index);
             let probed = try_mount(disk, &name)?;
-            println!(
-                "[VFS] mount {} ({}) at {}",
-                name, probed.kind, mount_point
-            );
+            println!("[VFS] mount {} ({}) at {}", name, probed.kind, mount_point);
             VFS.get().mount(&mount_point, probed.fs);
             if VFS.get().is_mounted_at(&mount_point) {
                 record_device_mount(source, &mount_point);

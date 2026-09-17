@@ -7,13 +7,13 @@
 //! is unavailable, voice position is polled and controller IRQs remain off.
 
 use alloc::boxed::Box;
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence};
 
+use crate::KERNEL_OFFSET;
 use crate::drivers::audio::Mixer;
 use crate::io::{inl, inw, io_wait, outb, outl, outw};
 use crate::pci::bar::Bar;
 use crate::pci::device::PciDevice;
-use crate::KERNEL_OFFSET;
 
 const VENDOR_TRIDENT: u16 = 0x1023;
 const VENDOR_SIS: u16 = 0x1039;
@@ -167,11 +167,17 @@ impl Trident {
         }
     }
 
-    pub fn irq(&self) -> u8 { self.irq }
-    pub fn set_irq_enabled(&mut self, enabled: bool) { self.irq_enabled = enabled; }
+    pub fn irq(&self) -> u8 {
+        self.irq
+    }
+    pub fn set_irq_enabled(&mut self, enabled: bool) {
+        self.irq_enabled = enabled;
+    }
 
     #[inline]
-    fn p(&self, reg: u16) -> u16 { self.iobase.wrapping_add(reg) }
+    fn p(&self, reg: u16) -> u16 {
+        self.iobase.wrapping_add(reg)
+    }
 
     fn bank_regs(&self) -> (u16, u16, u16, u16) {
         if self.chip == Chip::Ali5451 {
@@ -184,7 +190,9 @@ impl Trident {
     fn ali_tick_delay(&self) -> Result<(), &'static str> {
         let first = inl(self.p(ALI_STIMER));
         for _ in 0..0xffff {
-            if inl(self.p(ALI_STIMER)) != first { return Ok(()); }
+            if inl(self.p(ALI_STIMER)) != first {
+                return Ok(());
+            }
             core::hint::spin_loop();
         }
         Err("ALi system timer not advancing")
@@ -193,19 +201,27 @@ impl Trident {
     fn ac97_write(&self, reg: u8, val: u16) -> Result<(), &'static str> {
         let value = (val as u32) << 16;
         let (addr, mask, busy) = match self.chip {
-            Chip::Sis7018 => (SI_AC97_WRITE, SI_AC97_BUSY_WRITE | SI_AC97_AUDIO_BUSY, SI_AC97_BUSY_WRITE),
+            Chip::Sis7018 => (
+                SI_AC97_WRITE,
+                SI_AC97_BUSY_WRITE | SI_AC97_AUDIO_BUSY,
+                SI_AC97_BUSY_WRITE,
+            ),
             Chip::Dx => (DX_AC97_WRITE, DX_AC97_BUSY, DX_AC97_BUSY),
             Chip::Nx => (NX_AC97_WRITE, NX_AC97_BUSY_WRITE, NX_AC97_BUSY_WRITE),
             Chip::Ali5451 => {
                 let mut m = ALI_AC97_ACTION | ALI_AC97_AUDIO_BUSY;
-                if self.revision == ALI_REV_02 { m |= ALI_AC97_WRITE_MIXER; }
+                if self.revision == ALI_REV_02 {
+                    m |= ALI_AC97_WRITE_MIXER;
+                }
                 (ALI_AC97_WRITE, m, ALI_AC97_BUSY)
             }
         };
 
         for _ in 0..0xffff {
             if (inw(self.p(addr)) as u32 & busy) == 0 {
-                if self.chip == Chip::Ali5451 { self.ali_tick_delay()?; }
+                if self.chip == Chip::Ali5451 {
+                    self.ali_tick_delay()?;
+                }
                 outl(self.p(addr), value | mask | reg as u32);
                 return Ok(());
             }
@@ -216,24 +232,42 @@ impl Trident {
 
     fn ac97_read(&self, reg: u8) -> Result<u16, &'static str> {
         let (addr, mask, busy) = match self.chip {
-            Chip::Sis7018 => (SI_AC97_READ, SI_AC97_BUSY_READ | SI_AC97_AUDIO_BUSY, SI_AC97_BUSY_READ),
+            Chip::Sis7018 => (
+                SI_AC97_READ,
+                SI_AC97_BUSY_READ | SI_AC97_AUDIO_BUSY,
+                SI_AC97_BUSY_READ,
+            ),
             Chip::Dx => (DX_AC97_READ, DX_AC97_BUSY, DX_AC97_BUSY),
-            Chip::Nx => (NX_AC97_READ_PRIMARY, NX_AC97_BUSY_READ, NX_AC97_BUSY_READ | NX_AC97_BUSY_DATA),
+            Chip::Nx => (
+                NX_AC97_READ_PRIMARY,
+                NX_AC97_BUSY_READ,
+                NX_AC97_BUSY_READ | NX_AC97_BUSY_DATA,
+            ),
             Chip::Ali5451 => {
-                let addr = if self.revision == ALI_REV_02 { ALI_AC97_WRITE } else { ALI_AC97_READ };
+                let addr = if self.revision == ALI_REV_02 {
+                    ALI_AC97_WRITE
+                } else {
+                    ALI_AC97_READ
+                };
                 let mut m = ALI_AC97_ACTION | ALI_AC97_AUDIO_BUSY;
-                if self.revision == ALI_REV_02 { m &= ALI_AC97_READ_MIXER_MASK; }
+                if self.revision == ALI_REV_02 {
+                    m &= ALI_AC97_READ_MIXER_MASK;
+                }
                 (addr, m, ALI_AC97_BUSY)
             }
         };
 
         for _ in 0..0xffff {
             if (inw(self.p(addr)) as u32 & busy) == 0 {
-                if self.chip == Chip::Ali5451 { self.ali_tick_delay()?; }
+                if self.chip == Chip::Ali5451 {
+                    self.ali_tick_delay()?;
+                }
                 outl(self.p(addr), mask | reg as u32);
                 for _ in 0..0xffff {
                     let data = inl(self.p(addr));
-                    if data & busy == 0 { return Ok((data >> 16) as u16); }
+                    if data & busy == 0 {
+                        return Ok((data >> 16) as u16);
+                    }
                     core::hint::spin_loop();
                 }
                 break;
@@ -255,8 +289,13 @@ impl Trident {
             }
             Chip::Sis7018 => {
                 outl(self.p(SI_AC97_GPIO), 0);
-                outl(self.p(SI_SERIAL_INTF_CTRL), PCMOUT | SURROUT | CENTEROUT | LFEOUT | SECONDARY_ID);
-                for _ in 0..20_000 { io_wait(); }
+                outl(
+                    self.p(SI_SERIAL_INTF_CTRL),
+                    PCMOUT | SURROUT | CENTEROUT | LFEOUT | SECONDARY_ID,
+                );
+                for _ in 0..20_000 {
+                    io_wait();
+                }
             }
             Chip::Dx => outl(self.p(DX_AC97_COM_STAT), 0x0002),
             Chip::Nx => outl(self.p(NX_AC97_COM_STAT), 0x0002),
@@ -274,11 +313,15 @@ impl Trident {
     fn enable_loop_irqs(&self) {
         let mut gc = inl(self.p(T4D_LFO_GC_CIR));
         gc |= ENDLP_IE | MIDLP_IE;
-        if self.chip == Chip::Sis7018 { gc |= BANK_B_EN; }
+        if self.chip == Chip::Sis7018 {
+            gc |= BANK_B_EN;
+        }
         outl(self.p(T4D_LFO_GC_CIR), gc);
     }
 
-    fn voice_mask(&self) -> u32 { 1u32 << (self.channel & 31) }
+    fn voice_mask(&self) -> u32 {
+        1u32 << (self.channel & 31)
+    }
 
     fn enable_voice_irq(&self) {
         let (_, _, _, ainten) = self.bank_regs();
@@ -306,7 +349,11 @@ impl Trident {
         let eso = (RING_FRAMES - 1) as u32;
         let delta = 0x1000u32; // 48 kHz
         let control = CHANNEL_LOOP | CHANNEL_SIGNED | CHANNEL_STEREO | CHANNEL_16BITS;
-        let attribute = if self.chip == Chip::Sis7018 { PCM_LR } else { 0 };
+        let attribute = if self.chip == Chip::Sis7018 {
+            PCM_LR
+        } else {
+            0
+        };
 
         let mut data = [0u32; 5];
         data[1] = lba;
@@ -336,7 +383,9 @@ impl Trident {
 
         outb(self.p(T4D_LFO_GC_CIR), self.channel);
         for (i, value) in data.iter().enumerate() {
-            if i == 3 && self.chip == Chip::Ali5451 { continue; }
+            if i == 3 && self.chip == Chip::Ali5451 {
+                continue;
+            }
             outl(self.p(CHANNEL_START + (i as u16) * 4), *value);
         }
         Ok(())
@@ -356,7 +405,9 @@ impl Trident {
     }
 
     pub fn kick(&mut self, mixer: &mut Mixer) -> Result<(), &'static str> {
-        if self.running || !mixer.has_data() { return Ok(()); }
+        if self.running || !mixer.has_data() {
+            return Ok(());
+        }
 
         self.dma.samples.fill(0);
         let _ = self.fill_half(0, mixer);
@@ -390,14 +441,20 @@ impl Trident {
     /// Fast shared-IRQ path. Return false if the card did not assert its own
     /// address interrupt. It only ACKs hardware and records a refill request.
     pub fn ack_irq(&mut self) -> bool {
-        if !self.running || !self.irq_enabled { return false; }
+        if !self.running || !self.irq_enabled {
+            return false;
+        }
         let event = inl(self.p(T4D_MISCINT));
-        if event & ADDRESS_IRQ == 0 { return false; }
+        if event & ADDRESS_IRQ == 0 {
+            return false;
+        }
 
         let (_, _, aint, _) = self.bank_regs();
         let active = inl(self.p(aint));
         let ours = active & self.voice_mask();
-        if active != 0 { outl(self.p(aint), active); }
+        if active != 0 {
+            outl(self.p(aint), active);
+        }
         outl(self.p(T4D_MISCINT), MISC_ACK);
 
         if ours != 0 {
@@ -411,7 +468,9 @@ impl Trident {
     /// PIT bottom half. With a registered IRQ it consumes pending address
     /// interrupts. In pure-polling mode it watches CSO cross the half boundary.
     pub fn poll(&mut self, mixer: &mut Mixer) {
-        if !self.running { return; }
+        if !self.running {
+            return;
+        }
 
         if self.irq_enabled {
             // Also inspect status here: if IRQ9 was storm-masked later, playback
@@ -432,13 +491,21 @@ impl Trident {
 
         let pending = self.pending_halves;
         self.pending_halves = 0;
-        if pending == 0 { return; }
+        if pending == 0 {
+            return;
+        }
 
         for half in 0..2usize {
-            if pending & (1u8 << half) == 0 { continue; }
+            if pending & (1u8 << half) == 0 {
+                continue;
+            }
             let data = self.fill_half(half, mixer);
             compiler_fence(Ordering::SeqCst);
-            if data { self.idle_halves = 0; } else { self.idle_halves = self.idle_halves.saturating_add(1); }
+            if data {
+                self.idle_halves = 0;
+            } else {
+                self.idle_halves = self.idle_halves.saturating_add(1);
+            }
         }
 
         if self.idle_halves >= 3 && !mixer.has_data() {
@@ -451,17 +518,25 @@ pub fn probe_first() -> Result<Option<Trident>, &'static str> {
     let Some((dev, chip)) = crate::pci::enumerate()
         .into_iter()
         .find_map(|d| identify(&d).map(|c| (d, c)))
-    else { return Ok(None); };
+    else {
+        return Ok(None);
+    };
 
     let iobase = io_bar0(&dev)?;
     let command = dev.read_u16(0x04);
     dev.write_u16(0x04, command | 0x0005); // I/O + bus master
 
     let channel = if chip == Chip::Ali5451 { 0 } else { 63 };
-    let dma = Box::new(DmaBuffer { samples: [0; RING_SAMPLES] });
+    let dma = Box::new(DmaBuffer {
+        samples: [0; RING_SAMPLES],
+    });
     let phys = virt_to_phys(dma.samples.as_ptr())?;
-    let end = phys.checked_add((RING_SAMPLES * 2 - 1) as u32).ok_or("Trident DMA overflow")?;
-    if end > DMA_MASK_30BIT { return Err("Trident DMA crosses 30-bit limit"); }
+    let end = phys
+        .checked_add((RING_SAMPLES * 2 - 1) as u32)
+        .ok_or("Trident DMA overflow")?;
+    if end > DMA_MASK_30BIT {
+        return Err("Trident DMA crosses 30-bit limit");
+    }
 
     let card = Trident {
         chip,
@@ -480,7 +555,11 @@ pub fn probe_first() -> Result<Option<Trident>, &'static str> {
 
     crate::println!(
         "[audio/trident] {} io={:#06x} irq={} rev={:#04x} channel={}",
-        card.name(), card.iobase, card.irq, card.revision, card.channel
+        card.name(),
+        card.iobase,
+        card.irq,
+        card.revision,
+        card.channel
     );
     Ok(Some(card))
 }

@@ -14,8 +14,7 @@ const PIT_MAX_DIVISOR: u32 = 0xFFFF;
 pub fn init(frequency: u32) {
     assert!(frequency != 0, "PIT frequency must be non-zero");
 
-    let divisor = (PIT_BASE_FREQUENCY / frequency)
-        .clamp(PIT_MIN_DIVISOR, PIT_MAX_DIVISOR);
+    let divisor = (PIT_BASE_FREQUENCY / frequency).clamp(PIT_MIN_DIVISOR, PIT_MAX_DIVISOR);
 
     // Канал 0, lobyte/hibyte, mode 2 (rate generator), binary.
     let command: u8 = 0x34;

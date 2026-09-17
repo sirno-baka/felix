@@ -12,8 +12,8 @@ use crate::drivers::net::rtl8139::NET as RTL_NET;
 use crate::drivers::net::AnyNic;
 use crate::net::socket::{Socket, SocketState, SocketTable};
 use crate::net::types::*;
-use crate::{print, println};
 use crate::sync::mutex::Mutex;
+use crate::{print, println};
 
 pub const IF_MODE_NONE: u32 = 0;
 pub const IF_MODE_STATIC: u32 = 1;
@@ -111,7 +111,12 @@ impl NetStack {
         self.if_state = IF_STATE_DOWN;
     }
 
-    fn apply_ipv4(&mut self, cidr: Ipv4Cidr, gateway: Option<Ipv4Address>, dns: Option<Ipv4Address>) {
+    fn apply_ipv4(
+        &mut self,
+        cidr: Ipv4Cidr,
+        gateway: Option<Ipv4Address>,
+        dns: Option<Ipv4Address>,
+    ) {
         if self.if_ip == cidr.address()
             && self.if_prefix == cidr.prefix_len()
             && self.if_gw == gateway
@@ -173,7 +178,12 @@ impl NetStack {
         }
         crate::println!(
             "net: DHCP start MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
+            self.mac[0],
+            self.mac[1],
+            self.mac[2],
+            self.mac[3],
+            self.mac[4],
+            self.mac[5]
         );
     }
 
@@ -190,7 +200,11 @@ impl NetStack {
                     cfg.router,
                     cfg.dns_servers.first()
                 );
-                (Some(cfg.address), cfg.router, cfg.dns_servers.first().copied())
+                (
+                    Some(cfg.address),
+                    cfg.router,
+                    cfg.dns_servers.first().copied(),
+                )
             }
             Some(dhcpv4::Event::Deconfigured) => {
                 // First poll after Socket::new always emits this. Also lease-loss.
@@ -223,8 +237,14 @@ impl NetStack {
             state: self.if_state,
             ip: u32::from_be_bytes(self.if_ip.octets()),
             prefix: self.if_prefix as u32,
-            gateway: self.if_gw.map(|g| u32::from_be_bytes(g.octets())).unwrap_or(0),
-            dns: self.if_dns.map(|d| u32::from_be_bytes(d.octets())).unwrap_or(0),
+            gateway: self
+                .if_gw
+                .map(|g| u32::from_be_bytes(g.octets()))
+                .unwrap_or(0),
+            dns: self
+                .if_dns
+                .map(|d| u32::from_be_bytes(d.octets()))
+                .unwrap_or(0),
             mac: self.mac,
             _pad: [0; 2],
         }
@@ -309,7 +329,10 @@ impl NetStack {
 
         let (listen_endpoint, local_endpoint, remote_endpoint) = {
             let socket = self.sockets.get::<tcp::Socket>(accepted_handle);
-            if !matches!(socket.state(), tcp::State::Established | tcp::State::CloseWait) {
+            if !matches!(
+                socket.state(),
+                tcp::State::Established | tcp::State::CloseWait
+            ) {
                 return None;
             }
             (

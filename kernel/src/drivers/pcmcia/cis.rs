@@ -2,7 +2,7 @@
 
 use core::ptr::{read_volatile, write_volatile};
 
-use crate::memory::paging::{PAGING, PTEFlags};
+use crate::memory::paging::{PTEFlags, PAGING};
 use crate::time::sleep;
 
 use super::pc16::{addrwin, Pc16};
@@ -15,14 +15,15 @@ const TUPLE_FUNCID: u8 = 0x21;
 const TUPLE_FUNCE: u8 = 0x22;
 const TUPLE_END: u8 = 0xFF;
 
-
 pub fn map_attribute_memory() {
     let flags = PTEFlags::new().present().writable();
     let mut paging = unsafe { PAGING.lock() };
     let _ = paging.map_physical_range(CF_MEM_PHYS, CF_MEM_SIZE, CF_MEM_VIRT, flags);
     crate::println!(
         "[PCMCIA] mapping CF attribute memory phys=0x{:08x} size=0x{:x} -> virt=0x{:08x}",
-        CF_MEM_PHYS, CF_MEM_SIZE, CF_MEM_VIRT
+        CF_MEM_PHYS,
+        CF_MEM_SIZE,
+        CF_MEM_VIRT
     );
 }
 
@@ -37,7 +38,11 @@ unsafe fn attr_write8(offset: u32, value: u8) {
 }
 
 fn parse_cftable_default(raw: u8) -> Option<u8> {
-    if (raw & 0x40) != 0 { Some(raw & 0x3f) } else { None }
+    if (raw & 0x40) != 0 {
+        Some(raw & 0x3f)
+    } else {
+        None
+    }
 }
 
 pub fn read_cis() -> Option<CardInfo> {
@@ -142,12 +147,20 @@ pub fn read_cis() -> Option<CardInfo> {
     }
 
     let base = config_base;
-    let index = if have_cftable_1 { Some(1) } else { first_default };
+    let index = if have_cftable_1 {
+        Some(1)
+    } else {
+        first_default
+    };
     if let Some(idx) = index {
         crate::println!(
             "[PCMCIA] selected CFTABLE index={}{}",
             idx,
-            if have_cftable_1 { " (compatible ATA profile)" } else { " (first default)" }
+            if have_cftable_1 {
+                " (compatible ATA profile)"
+            } else {
+                " (first default)"
+            }
         );
     }
 
@@ -177,12 +190,16 @@ pub fn configure_card(pc16: &Pc16, config_base: u32, config_index: u8) -> bool {
     //     "[PCMCIA] card: writing COR @0x{:x} = 0x{:02x} (CFTABLE={})",
     //     config_base, cor_value, config_index
     // );
-    unsafe { attr_write8(config_base, cor_value); }
+    unsafe {
+        attr_write8(config_base, cor_value);
+    }
     sleep(20);
 
     let cor = unsafe { attr_read8(config_base) };
     // crate::println!("[PCMCIA] card: COR readback={:02x}", cor);
-    if cor == 0xff { return false; }
+    if cor == 0xff {
+        return false;
+    }
 
     unsafe {
         pc16.configure_cf_io();

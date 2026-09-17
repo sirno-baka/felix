@@ -9,9 +9,9 @@ use alloc::vec::Vec;
 use core::arch::asm;
 
 use crate::filesystem::file::PtySide;
-use crate::multitasking::task::{TASK_MANAGER, MAX_TASKS};
-use crate::sync::MutexLazy;
+use crate::multitasking::task::{MAX_TASKS, TASK_MANAGER};
 use crate::sync::mutex::Mutex;
+use crate::sync::MutexLazy;
 
 pub const MAX_TTYS: usize = 4;
 pub const MAX_PTYS: usize = 8;
@@ -30,14 +30,14 @@ pub const VSUSP: usize = 10;
 
 fn default_cc() -> [u8; NCCS] {
     let mut cc = [0u8; NCCS];
-    cc[VINTR] = 0x03;  // ^C
-    cc[VQUIT] = 0x1c;  // ^\\
+    cc[VINTR] = 0x03; // ^C
+    cc[VQUIT] = 0x1c; // ^\\
     cc[VERASE] = 0x7f;
-    cc[VKILL] = 0x15;  // ^U
-    cc[VEOF] = 0x04;   // ^D
+    cc[VKILL] = 0x15; // ^U
+    cc[VEOF] = 0x04; // ^D
     cc[VTIME] = 0;
     cc[VMIN] = 1;
-    cc[VSUSP] = 0x1a;  // ^Z
+    cc[VSUSP] = 0x1a; // ^Z
     cc
 }
 
@@ -50,7 +50,11 @@ pub struct TtyState {
 
 impl TtyState {
     pub const fn empty() -> Self {
-        Self { allocated: false, session_id: -1, foreground_pgid: -1 }
+        Self {
+            allocated: false,
+            session_id: -1,
+            foreground_pgid: -1,
+        }
     }
 }
 
@@ -105,7 +109,9 @@ struct PtyTable {
 }
 
 fn new_pty_table() -> Mutex<PtyTable> {
-    Mutex::new(PtyTable { slots: [const { None }; MAX_PTYS] })
+    Mutex::new(PtyTable {
+        slots: [const { None }; MAX_PTYS],
+    })
 }
 
 static PTYS: MutexLazy<Mutex<PtyTable>> = MutexLazy::new(new_pty_table);
@@ -113,12 +119,18 @@ static PTYS: MutexLazy<Mutex<PtyTable>> = MutexLazy::new(new_pty_table);
 /// Return an existing controlling tty or lazily attach one to the caller's
 /// session. Descendants inherit tty_id from Task during exec.
 fn ensure_controlling_tty(current_slot: usize) -> Option<usize> {
-    if current_slot >= MAX_TASKS as usize { return None; }
+    if current_slot >= MAX_TASKS as usize {
+        return None;
+    }
     unsafe {
         let task = TASK_MANAGER.tasks[current_slot].as_mut()?;
-        if task.tty_id >= 0 { return Some(task.tty_id as usize); }
+        if task.tty_id >= 0 {
+            return Some(task.tty_id as usize);
+        }
         let sid = task.sid;
-        if sid <= 0 { return None; }
+        if sid <= 0 {
+            return None;
+        }
 
         for (id, tty) in TTYS.iter().enumerate() {
             if tty.allocated && tty.session_id == sid {
@@ -142,19 +154,29 @@ fn ensure_controlling_tty(current_slot: usize) -> Option<usize> {
 }
 
 pub fn set_foreground(current_slot: usize, pgid: i32) -> bool {
-    if pgid <= 0 { return false; }
-    let Some(tty_id) = ensure_controlling_tty(current_slot) else { return false; };
+    if pgid <= 0 {
+        return false;
+    }
+    let Some(tty_id) = ensure_controlling_tty(current_slot) else {
+        return false;
+    };
     unsafe {
         let caller_sid = match TASK_MANAGER.tasks[current_slot].as_ref() {
             Some(t) => t.sid,
             None => return false,
         };
-        let group_exists = TASK_MANAGER.tasks.iter().flatten().any(|t| {
-            !t.zombie && t.pgid == pgid && t.sid == caller_sid
-        });
-        if !group_exists { return false; }
+        let group_exists = TASK_MANAGER
+            .tasks
+            .iter()
+            .flatten()
+            .any(|t| !t.zombie && t.pgid == pgid && t.sid == caller_sid);
+        if !group_exists {
+            return false;
+        }
         let tty = &mut TTYS[tty_id];
-        if !tty.allocated || tty.session_id != caller_sid { return false; }
+        if !tty.allocated || tty.session_id != caller_sid {
+            return false;
+        }
         tty.foreground_pgid = pgid;
         true
     }
@@ -174,22 +196,38 @@ pub fn foreground_pty(id: usize) -> Option<i32> {
 }
 
 pub fn set_foreground_pty(current_slot: usize, id: usize, pgid: i32) -> bool {
-    if pgid <= 0 || current_slot >= MAX_TASKS as usize { return false; }
+    if pgid <= 0 || current_slot >= MAX_TASKS as usize {
+        return false;
+    }
     let tty_id = {
         let table = PTYS.get().lock();
-        let Some(pty) = table.slots.get(id).and_then(|p| p.as_ref()) else { return false; };
+        let Some(pty) = table.slots.get(id).and_then(|p| p.as_ref()) else {
+            return false;
+        };
         pty.tty_id
     };
     unsafe {
-        let Some(caller) = TASK_MANAGER.tasks[current_slot].as_ref() else { return false; };
-        if caller.tty_id != tty_id as i16 { return false; }
+        let Some(caller) = TASK_MANAGER.tasks[current_slot].as_ref() else {
+            return false;
+        };
+        if caller.tty_id != tty_id as i16 {
+            return false;
+        }
         let sid = caller.sid;
-        let group_exists = TASK_MANAGER.tasks.iter().flatten().any(|t| {
-            !t.zombie && t.sid == sid && t.pgid == pgid
-        });
-        if !group_exists { return false; }
-        let Some(tty) = TTYS.get_mut(tty_id) else { return false; };
-        if !tty.allocated || tty.session_id != sid { return false; }
+        let group_exists = TASK_MANAGER
+            .tasks
+            .iter()
+            .flatten()
+            .any(|t| !t.zombie && t.sid == sid && t.pgid == pgid);
+        if !group_exists {
+            return false;
+        }
+        let Some(tty) = TTYS.get_mut(tty_id) else {
+            return false;
+        };
+        if !tty.allocated || tty.session_id != sid {
+            return false;
+        }
         tty.foreground_pgid = pgid;
         true
     }
@@ -220,7 +258,9 @@ pub fn alloc_pty(current_slot: usize) -> Option<usize> {
 
 pub fn add_ref(id: usize, side: PtySide) -> bool {
     let mut table = PTYS.get().lock();
-    let Some(pty) = table.slots.get_mut(id).and_then(|p| p.as_mut()) else { return false; };
+    let Some(pty) = table.slots.get_mut(id).and_then(|p| p.as_mut()) else {
+        return false;
+    };
     match side {
         PtySide::Master => pty.master_refs = pty.master_refs.saturating_add(1),
         PtySide::Slave => pty.slave_refs = pty.slave_refs.saturating_add(1),
@@ -232,8 +272,12 @@ pub fn close_ref(id: usize, side: PtySide) {
     let mut hangup_tty = None;
     {
         let mut table = PTYS.get().lock();
-        let Some(slot) = table.slots.get_mut(id) else { return; };
-        let Some(pty) = slot.as_mut() else { return; };
+        let Some(slot) = table.slots.get_mut(id) else {
+            return;
+        };
+        let Some(pty) = slot.as_mut() else {
+            return;
+        };
         match side {
             PtySide::Master => {
                 let was_open = pty.master_refs != 0;
@@ -245,11 +289,15 @@ pub fn close_ref(id: usize, side: PtySide) {
                         let pending = core::mem::take(&mut pty.canonical_input);
                         let mut queued = 0usize;
                         for byte in pending {
-                            if pty.to_slave.len() >= PTY_BUF { break; }
+                            if pty.to_slave.len() >= PTY_BUF {
+                                break;
+                            }
                             pty.to_slave.push_back(byte);
                             queued += 1;
                         }
-                        if queued != 0 { pty.canonical_records.push_back(queued); }
+                        if queued != 0 {
+                            pty.canonical_records.push_back(queued);
+                        }
                     }
                     hangup_tty = Some(pty.tty_id);
                 }
@@ -270,7 +318,9 @@ pub fn close_ref(id: usize, side: PtySide) {
 
 pub fn readable(id: usize, side: PtySide) -> bool {
     let table = PTYS.get().lock();
-    let Some(pty) = table.slots.get(id).and_then(|p| p.as_ref()) else { return false; };
+    let Some(pty) = table.slots.get(id).and_then(|p| p.as_ref()) else {
+        return false;
+    };
     match side {
         PtySide::Master => !pty.to_master.is_empty() || pty.slave_refs == 0,
         PtySide::Slave if pty.canonical => {
@@ -282,7 +332,9 @@ pub fn readable(id: usize, side: PtySide) -> bool {
 
 pub fn writable(id: usize, side: PtySide) -> bool {
     let table = PTYS.get().lock();
-    let Some(pty) = table.slots.get(id).and_then(|p| p.as_ref()) else { return false; };
+    let Some(pty) = table.slots.get(id).and_then(|p| p.as_ref()) else {
+        return false;
+    };
     match side {
         PtySide::Master => pty.slave_refs > 0 && pty.to_slave.len() < PTY_BUF,
         PtySide::Slave => pty.master_refs > 0 && pty.to_master.len() < PTY_BUF,
@@ -291,11 +343,17 @@ pub fn writable(id: usize, side: PtySide) -> bool {
 
 fn try_read_inner(id: usize, side: PtySide, out: &mut [u8]) -> (usize, bool) {
     let mut table = PTYS.get().lock();
-    let Some(pty) = table.slots.get_mut(id).and_then(|p| p.as_mut()) else { return (0, true); };
+    let Some(pty) = table.slots.get_mut(id).and_then(|p| p.as_mut()) else {
+        return (0, true);
+    };
 
     // Canonical ^D on an empty line is a one-shot zero-length read, not a
     // permanent hangup. Consume that marker before looking at peer lifetime.
-    if side == PtySide::Slave && pty.canonical && pty.canonical_records.is_empty() && pty.eof_pending {
+    if side == PtySide::Slave
+        && pty.canonical
+        && pty.canonical_records.is_empty()
+        && pty.eof_pending
+    {
         pty.eof_pending = false;
         return (0, true);
     }
@@ -307,7 +365,9 @@ fn try_read_inner(id: usize, side: PtySide, out: &mut [u8]) -> (usize, bool) {
         let limit = out.len().min(remaining);
         let mut n = 0usize;
         while n < limit {
-            let Some(byte) = pty.to_slave.pop_front() else { break; };
+            let Some(byte) = pty.to_slave.pop_front() else {
+                break;
+            };
             out[n] = byte;
             n += 1;
         }
@@ -325,7 +385,9 @@ fn try_read_inner(id: usize, side: PtySide, out: &mut [u8]) -> (usize, bool) {
     };
     let mut n = 0usize;
     while n < out.len() {
-        let Some(byte) = queue.pop_front() else { break; };
+        let Some(byte) = queue.pop_front() else {
+            break;
+        };
         out[n] = byte;
         n += 1;
     }
@@ -347,7 +409,9 @@ fn signal_group(pgid: i32, sig: u32) {
     for slot in slots {
         let slot_i8 = slot as i8;
         match sig {
-            crate::signal::SIGSTOP => { let _ = crate::signal::stop_task(slot_i8); }
+            crate::signal::SIGSTOP => {
+                let _ = crate::signal::stop_task(slot_i8);
+            }
             crate::signal::SIGTSTP | crate::signal::SIGTTIN | crate::signal::SIGTTOU => {
                 let handler = unsafe {
                     TASK_MANAGER.tasks[slot]
@@ -372,21 +436,36 @@ fn signal_group(pgid: i32, sig: u32) {
                         .unwrap_or(crate::signal::SIG_DFL)
                 };
                 let resumed = crate::signal::continue_task(slot_i8);
-                if resumed && handler != crate::signal::SIG_DFL && handler != crate::signal::SIG_IGN {
+                if resumed && handler != crate::signal::SIG_DFL && handler != crate::signal::SIG_IGN
+                {
                     let _ = crate::signal::send_signal(slot_i8, sig);
                 }
             }
-            crate::signal::SIGKILL => { let _ = crate::signal::force_kill(slot_i8, sig); }
-            _ => { let _ = crate::signal::send_signal(slot_i8, sig); }
+            crate::signal::SIGKILL => {
+                let _ = crate::signal::force_kill(slot_i8, sig);
+            }
+            _ => {
+                let _ = crate::signal::send_signal(slot_i8, sig);
+            }
         }
     }
 }
 
-pub fn read(current_slot: usize, id: usize, side: PtySide, out: &mut [u8], nonblock: bool) -> usize {
-    if out.is_empty() { return 0; }
+pub fn read(
+    current_slot: usize,
+    id: usize,
+    side: PtySide,
+    out: &mut [u8],
+    nonblock: bool,
+) -> usize {
+    if out.is_empty() {
+        return 0;
+    }
 
     let check_background = || -> bool {
-        if side != PtySide::Slave { return false; }
+        if side != PtySide::Slave {
+            return false;
+        }
         if let Some(pgid) = background_slave_group(current_slot, id) {
             signal_group(pgid, crate::signal::SIGTTIN);
             return true;
@@ -394,17 +473,31 @@ pub fn read(current_slot: usize, id: usize, side: PtySide, out: &mut [u8], nonbl
         false
     };
 
-    if check_background() { return usize::MAX; }
+    if check_background() {
+        return usize::MAX;
+    }
 
     // Master reads and canonical slave reads are record/stream blocking reads;
     // VMIN/VTIME only apply to noncanonical slave input.
-    let term = if side == PtySide::Slave { termios(id) } else { None };
+    let term = if side == PtySide::Slave {
+        termios(id)
+    } else {
+        None
+    };
     if side != PtySide::Slave || term.map_or(true, |t| t.canonical) {
         loop {
-            if check_background() { return usize::MAX; }
+            if check_background() {
+                return usize::MAX;
+            }
             let (n, eof) = try_read_inner(id, side, out);
-            if n > 0 || eof || nonblock { return n; }
-            unsafe { asm!("sti"); asm!("hlt"); asm!("cli"); }
+            if n > 0 || eof || nonblock {
+                return n;
+            }
+            unsafe {
+                asm!("sti");
+                asm!("hlt");
+                asm!("cli");
+            }
         }
     }
 
@@ -427,7 +520,9 @@ pub fn read(current_slot: usize, id: usize, side: PtySide, out: &mut [u8], nonbl
     };
 
     loop {
-        if check_background() { return usize::MAX; }
+        if check_background() {
+            return usize::MAX;
+        }
         let (n, eof) = try_read_inner(id, side, &mut out[total..]);
         if n > 0 {
             total += n;
@@ -440,24 +535,38 @@ pub fn read(current_slot: usize, id: usize, side: PtySide, out: &mut [u8], nonbl
                 deadline = Some(crate::time::uptime_ms().saturating_add(vtime_ms));
             }
         }
-        if eof { return total; }
-        if let Some(end) = deadline {
-            if crate::time::uptime_ms() >= end { return total; }
+        if eof {
+            return total;
         }
-        unsafe { asm!("sti"); asm!("hlt"); asm!("cli"); }
+        if let Some(end) = deadline {
+            if crate::time::uptime_ms() >= end {
+                return total;
+            }
+        }
+        unsafe {
+            asm!("sti");
+            asm!("hlt");
+            asm!("cli");
+        }
     }
 }
 
 fn queue_echo(pty: &mut Pty, bytes: &[u8]) {
-    if !pty.echo { return; }
+    if !pty.echo {
+        return;
+    }
     for &b in bytes {
-        if pty.to_master.len() >= PTY_BUF { break; }
+        if pty.to_master.len() >= PTY_BUF {
+            break;
+        }
         pty.to_master.push_back(b);
     }
 }
 
 fn signal_foreground(tty_id: usize, sig: u32) {
-    let Some(pgid) = foreground_for_tty(tty_id) else { return; };
+    let Some(pgid) = foreground_for_tty(tty_id) else {
+        return;
+    };
     signal_group(pgid, sig);
 }
 
@@ -465,7 +574,9 @@ fn commit_canonical(pty: &mut Pty) {
     let pending = core::mem::take(&mut pty.canonical_input);
     let mut queued = 0usize;
     for byte in pending {
-        if pty.to_slave.len() >= PTY_BUF { break; }
+        if pty.to_slave.len() >= PTY_BUF {
+            break;
+        }
         pty.to_slave.push_back(byte);
         queued += 1;
     }
@@ -532,7 +643,11 @@ pub fn write(current_slot: usize, id: usize, side: PtySide, data: &[u8], nonbloc
     if side == PtySide::Slave {
         let tostop = {
             let table = PTYS.get().lock();
-            table.slots.get(id).and_then(|p| p.as_ref()).map_or(false, |p| p.tostop)
+            table
+                .slots
+                .get(id)
+                .and_then(|p| p.as_ref())
+                .map_or(false, |p| p.tostop)
         };
         if tostop {
             if let Some(pgid) = background_slave_group(current_slot, id) {
@@ -547,10 +662,14 @@ pub fn write(current_slot: usize, id: usize, side: PtySide, data: &[u8], nonbloc
         let mut pending_signal = None;
         let progressed = {
             let mut table = PTYS.get().lock();
-            let Some(pty) = table.slots.get_mut(id).and_then(|p| p.as_mut()) else { return written; };
+            let Some(pty) = table.slots.get_mut(id).and_then(|p| p.as_mut()) else {
+                return written;
+            };
             match side {
                 PtySide::Master => {
-                    if pty.slave_refs == 0 { return written; }
+                    if pty.slave_refs == 0 {
+                        return written;
+                    }
                     let before = pty.to_slave.len();
                     pending_signal = master_input_byte(pty, data[written]);
                     // ISIG consumes the byte; otherwise it is accepted when
@@ -562,7 +681,9 @@ pub fn write(current_slot: usize, id: usize, side: PtySide, data: &[u8], nonbloc
                     }
                 }
                 PtySide::Slave => {
-                    if pty.master_refs == 0 { return written; }
+                    if pty.master_refs == 0 {
+                        return written;
+                    }
                     let byte = data[written];
                     if pty.opost && pty.onlcr && byte == b'\n' {
                         if pty.to_master.len().saturating_add(2) > PTY_BUF {
@@ -589,8 +710,14 @@ pub fn write(current_slot: usize, id: usize, side: PtySide, data: &[u8], nonbloc
             written += 1;
             continue;
         }
-        if nonblock { break; }
-        unsafe { asm!("sti"); asm!("hlt"); asm!("cli"); }
+        if nonblock {
+            break;
+        }
+        unsafe {
+            asm!("sti");
+            asm!("hlt");
+            asm!("cli");
+        }
     }
     written
 }
@@ -624,7 +751,9 @@ pub fn termios(id: usize) -> Option<TermiosState> {
 
 pub fn flush_input(id: usize) -> bool {
     let mut table = PTYS.get().lock();
-    let Some(pty) = table.slots.get_mut(id).and_then(|p| p.as_mut()) else { return false; };
+    let Some(pty) = table.slots.get_mut(id).and_then(|p| p.as_mut()) else {
+        return false;
+    };
     pty.to_slave.clear();
     pty.canonical_input.clear();
     pty.canonical_records.clear();
@@ -634,7 +763,9 @@ pub fn flush_input(id: usize) -> bool {
 
 pub fn set_termios(id: usize, state: TermiosState) -> bool {
     let mut table = PTYS.get().lock();
-    let Some(pty) = table.slots.get_mut(id).and_then(|p| p.as_mut()) else { return false; };
+    let Some(pty) = table.slots.get_mut(id).and_then(|p| p.as_mut()) else {
+        return false;
+    };
     let was_canonical = pty.canonical;
     pty.canonical = state.canonical;
     pty.echo = state.echo;
@@ -651,7 +782,9 @@ pub fn set_termios(id: usize, state: TermiosState) -> bool {
         if !pty.canonical_input.is_empty() {
             let pending = core::mem::take(&mut pty.canonical_input);
             for byte in pending {
-                if pty.to_slave.len() >= PTY_BUF { break; }
+                if pty.to_slave.len() >= PTY_BUF {
+                    break;
+                }
                 pty.to_slave.push_back(byte);
             }
         }
@@ -667,7 +800,9 @@ pub fn mode(id: usize) -> Option<(bool, bool, bool)> {
 }
 
 pub fn set_mode(id: usize, canonical: bool, echo: bool, isig: bool) -> bool {
-    let Some(mut t) = termios(id) else { return false; };
+    let Some(mut t) = termios(id) else {
+        return false;
+    };
     t.canonical = canonical;
     t.echo = echo;
     t.isig = isig;

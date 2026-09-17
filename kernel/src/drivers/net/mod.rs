@@ -9,7 +9,7 @@ const RX_BUF_SIZE: usize = 1536;
 const TX_BUF_SIZE: usize = 1536;
 
 use crate::memory::paging::{
-    KERNEL_MMIO_BASE, KERNEL_MMIO_END, PAGE_SIZE, PAGING, PTEFlags, PhysAddr, VirtAddr,
+    PTEFlags, PhysAddr, VirtAddr, KERNEL_MMIO_BASE, KERNEL_MMIO_END, PAGE_SIZE, PAGING,
 };
 use crate::net::ifconfig_dhcp;
 use crate::println;

@@ -1,8 +1,8 @@
-use crate::memory::paging::{KERNEL_MMIO_BASE, PAGE_SIZE, PageDirectory, phys_to_virt};
+use crate::memory::paging::{phys_to_virt, PageDirectory, KERNEL_MMIO_BASE, PAGE_SIZE};
 use crate::println;
-use elf::ElfBytes;
 use elf::abi::{EM_386, ET_EXEC, PT_LOAD};
 use elf::endian::AnyEndian;
+use elf::ElfBytes;
 
 #[derive(Debug)]
 pub enum ElfLoadError {

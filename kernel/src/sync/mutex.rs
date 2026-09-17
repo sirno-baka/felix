@@ -3,9 +3,9 @@ use core::arch::asm;
 use core::ops::{Deref, DerefMut};
 
 use crate::multitasking::task::TASK_MANAGER;
-use crate::print::{PRINTER, printer_new};
+use crate::print::{printer_new, PRINTER};
 use crate::println;
-use interrupt_sync::{SpinMutex, without_interrupts};
+use interrupt_sync::{without_interrupts, SpinMutex};
 
 pub struct Mutex<T: ?Sized> {
     waiters: SpinMutex<VecDeque<i8>>,

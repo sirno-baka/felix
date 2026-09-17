@@ -3,8 +3,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
-use crate::filesystem::VFS;
 use crate::filesystem::vfs::Vfs;
+use crate::filesystem::VFS;
 use crate::multitasking::task::TASK_MANAGER;
 use crate::{print, println};
 use core::arch::asm;
@@ -163,8 +163,8 @@ impl Shell {
                     let result = unsafe {
                         let mut path = app.clone();
                         path.push('\0'); // <-- добавляем нуль-терминатор
-                        // Прямой вызов для отладки (позже сделаем через int 0x80)
-                        // crate::syscalls::handler::sys_execve(path.as_ptr() as *const u8)
+                                         // Прямой вызов для отладки (позже сделаем через int 0x80)
+                                         // crate::syscalls::handler::sys_execve(path.as_ptr() as *const u8)
                     };
                     // if result != 0 {
                     //     println!("Failed to run: {}", app);

@@ -10,7 +10,8 @@ use super::{CardInfo, CardType, PcmciaDevice};
 pub struct ControllerDriver {
     pub name: &'static str,
     pub matches: fn(&crate::pci::device::PciDevice) -> bool,
-    pub attach: fn(crate::pci::device::PciDevice) -> Option<alloc::boxed::Box<dyn SocketController>>,
+    pub attach:
+        fn(crate::pci::device::PciDevice) -> Option<alloc::boxed::Box<dyn SocketController>>,
 }
 
 pub struct CardDriver {
@@ -30,22 +31,17 @@ fn ricoh_attach(
     super::controller::attach(dev)
 }
 
-static CONTROLLERS: &[ControllerDriver] = &[
-    ControllerDriver {
-        name: "ricoh-r5c475",
-        matches: ricoh_matches,
-        attach: ricoh_attach,
-    },
-];
+static CONTROLLERS: &[ControllerDriver] = &[ControllerDriver {
+    name: "ricoh-r5c475",
+    matches: ricoh_matches,
+    attach: ricoh_attach,
+}];
 
 fn fixed_disk_matches(info: &CardInfo) -> bool {
     info.card_type == CardType::FixedDisk
 }
 
-fn fixed_disk_probe(
-    controller: &dyn SocketController,
-    info: CardInfo,
-) -> Option<PcmciaDevice> {
+fn fixed_disk_probe(controller: &dyn SocketController, info: CardInfo) -> Option<PcmciaDevice> {
     super::init_fixed_disk(controller, info)
 }
 
@@ -55,14 +51,12 @@ fn fixed_disk_disconnect(_controller: &dyn SocketController, _info: CardInfo) {
     // handled by the removable-storage layer.
 }
 
-static CARD_DRIVERS: &[CardDriver] = &[
-    CardDriver {
-        name: "compact-flash-ata",
-        matches: fixed_disk_matches,
-        probe: fixed_disk_probe,
-        disconnect: fixed_disk_disconnect,
-    },
-];
+static CARD_DRIVERS: &[CardDriver] = &[CardDriver {
+    name: "compact-flash-ata",
+    matches: fixed_disk_matches,
+    probe: fixed_disk_probe,
+    disconnect: fixed_disk_disconnect,
+}];
 
 pub fn controllers() -> &'static [ControllerDriver] {
     CONTROLLERS

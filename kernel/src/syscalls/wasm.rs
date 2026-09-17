@@ -1,8 +1,8 @@
 pub const SYS_EXECVE_WASM: u32 = crate::syscalls::SYS_EXECVE_WASM;
 
 use crate::filesystem::file::{FileDescriptor, FileDescriptorTable};
-use crate::memory::paging::{PDEFlags, copy_kernel_mappings};
-use crate::multitasking::task::{CPUState, TASK_MANAGER, Task, MAX_TASKS};
+use crate::memory::paging::{copy_kernel_mappings, PDEFlags};
+use crate::multitasking::task::{CPUState, Task, MAX_TASKS, TASK_MANAGER};
 use crate::print::klog_write_str;
 use crate::syscalls::handler::*;
 use crate::wrappers::{cli, hlt, sti};
@@ -381,16 +381,23 @@ fn register_wasi_functions(
                 let slot = TASK_MANAGER.get_current_slot() as usize;
                 WASM_LAUNCH[slot]
                     .as_ref()
-                    .map(|ctx| (ctx.envp.len() as u32, ctx.envp.iter().map(|s| s.len()).sum::<usize>() as u32))
+                    .map(|ctx| {
+                        (
+                            ctx.envp.len() as u32,
+                            ctx.envp.iter().map(|s| s.len()).sum::<usize>() as u32,
+                        )
+                    })
                     .unwrap_or((0, 0))
             };
             let memory = caller
                 .get_export("memory")
                 .and_then(|e| e.into_memory())
                 .ok_or_else(|| wasmi::core::Trap::new("no mem"))?;
-            memory.write(&mut caller, count_ptr as usize, &count.to_le_bytes())
+            memory
+                .write(&mut caller, count_ptr as usize, &count.to_le_bytes())
                 .map_err(|_| wasmi::core::Trap::new("write"))?;
-            memory.write(&mut caller, buf_size_ptr as usize, &size.to_le_bytes())
+            memory
+                .write(&mut caller, buf_size_ptr as usize, &size.to_le_bytes())
                 .map_err(|_| wasmi::core::Trap::new("write"))?;
             Ok(0)
         },
@@ -405,7 +412,10 @@ fn register_wasi_functions(
          -> Result<i32, wasmi::core::Trap> {
             let entries = unsafe {
                 let slot = TASK_MANAGER.get_current_slot() as usize;
-                WASM_LAUNCH[slot].as_ref().map(|ctx| ctx.envp.clone()).unwrap_or_default()
+                WASM_LAUNCH[slot]
+                    .as_ref()
+                    .map(|ctx| ctx.envp.clone())
+                    .unwrap_or_default()
             };
             let memory = caller
                 .get_export("memory")
@@ -413,9 +423,15 @@ fn register_wasi_functions(
                 .ok_or_else(|| wasmi::core::Trap::new("no mem"))?;
             let mut off = environ_buf as usize;
             for (i, entry) in entries.iter().enumerate() {
-                memory.write(&mut caller, environ_ptrs as usize + i * 4, &(off as u32).to_le_bytes())
+                memory
+                    .write(
+                        &mut caller,
+                        environ_ptrs as usize + i * 4,
+                        &(off as u32).to_le_bytes(),
+                    )
                     .map_err(|_| wasmi::core::Trap::new("write env ptr"))?;
-                memory.write(&mut caller, off, entry)
+                memory
+                    .write(&mut caller, off, entry)
                     .map_err(|_| wasmi::core::Trap::new("write env"))?;
                 off += entry.len();
             }
@@ -434,16 +450,23 @@ fn register_wasi_functions(
                 let slot = TASK_MANAGER.get_current_slot() as usize;
                 WASM_LAUNCH[slot]
                     .as_ref()
-                    .map(|ctx| (ctx.argv.len() as u32, ctx.argv.iter().map(|s| s.len()).sum::<usize>() as u32))
+                    .map(|ctx| {
+                        (
+                            ctx.argv.len() as u32,
+                            ctx.argv.iter().map(|s| s.len()).sum::<usize>() as u32,
+                        )
+                    })
                     .unwrap_or((0, 0))
             };
             let memory = caller
                 .get_export("memory")
                 .and_then(|e| e.into_memory())
                 .ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
-            memory.write(&mut caller, argc_ptr as usize, &argc.to_le_bytes())
+            memory
+                .write(&mut caller, argc_ptr as usize, &argc.to_le_bytes())
                 .map_err(|_| wasmi::core::Trap::new("write argc failed"))?;
-            memory.write(&mut caller, argv_buf_size_ptr as usize, &size.to_le_bytes())
+            memory
+                .write(&mut caller, argv_buf_size_ptr as usize, &size.to_le_bytes())
                 .map_err(|_| wasmi::core::Trap::new("write size failed"))?;
             Ok(0)
         },
@@ -458,7 +481,10 @@ fn register_wasi_functions(
          -> Result<i32, wasmi::core::Trap> {
             let entries = unsafe {
                 let slot = TASK_MANAGER.get_current_slot() as usize;
-                WASM_LAUNCH[slot].as_ref().map(|ctx| ctx.argv.clone()).unwrap_or_default()
+                WASM_LAUNCH[slot]
+                    .as_ref()
+                    .map(|ctx| ctx.argv.clone())
+                    .unwrap_or_default()
             };
             let memory = caller
                 .get_export("memory")
@@ -466,9 +492,15 @@ fn register_wasi_functions(
                 .ok_or_else(|| wasmi::core::Trap::new("memory not found"))?;
             let mut off = argv_buf_ptr as usize;
             for (i, entry) in entries.iter().enumerate() {
-                memory.write(&mut caller, argv_ptrs_ptr as usize + i * 4, &(off as u32).to_le_bytes())
+                memory
+                    .write(
+                        &mut caller,
+                        argv_ptrs_ptr as usize + i * 4,
+                        &(off as u32).to_le_bytes(),
+                    )
                     .map_err(|_| wasmi::core::Trap::new("write argv ptr"))?;
-                memory.write(&mut caller, off, entry)
+                memory
+                    .write(&mut caller, off, entry)
                     .map_err(|_| wasmi::core::Trap::new("write argv"))?;
                 off += entry.len();
             }
@@ -713,7 +745,9 @@ static mut WASM_EXEC: [Option<Box<WasmExec>>; MAX_TASKS as usize] =
 /// kernel path (signal kill, forced cleanup, native-style SYS_EXIT). Safe for
 /// non-WASM tasks because both entries are simply None.
 pub(crate) fn clear_task_state(slot: usize) {
-    if slot >= MAX_TASKS as usize { return; }
+    if slot >= MAX_TASKS as usize {
+        return;
+    }
     unsafe {
         WASM_LAUNCH[slot] = None;
         WASM_EXEC[slot] = None;
@@ -740,22 +774,33 @@ pub(crate) fn sys_execve_wasm(
     let slot = slot_i8 as usize;
     let pid = unsafe { TASK_MANAGER.alloc_pid() };
     let (ppid, inherited_pgid, inherited_sid, inherited_cwd, inherited_tty, inherited_pty) = unsafe {
-        TASK_MANAGER.tasks
+        TASK_MANAGER
+            .tasks
             .get(parent_slot)
             .and_then(|t| t.as_ref())
             .map(|p| (p.pid, p.pgid, p.sid, p.cwd.clone(), p.tty_id, p.pty_id))
             .unwrap_or((0, pid, pid, "/".into(), -1, -1))
     };
-    let sid = if parent_slot == 0 || inherited_sid <= 0 { pid } else { inherited_sid };
-    let inherited_group = if parent_slot == 0 || inherited_pgid <= 0 { pid } else { inherited_pgid };
+    let sid = if parent_slot == 0 || inherited_sid <= 0 {
+        pid
+    } else {
+        inherited_sid
+    };
+    let inherited_group = if parent_slot == 0 || inherited_pgid <= 0 {
+        pid
+    } else {
+        inherited_pgid
+    };
     let pgid = match params.pgid {
         -1 => inherited_group,
         0 => pid,
         requested if requested > 0 => {
             let exists_same_session = unsafe {
-                TASK_MANAGER.tasks.iter().flatten().any(|t| {
-                    t.pgid == requested && t.sid == sid
-                })
+                TASK_MANAGER
+                    .tasks
+                    .iter()
+                    .flatten()
+                    .any(|t| t.pgid == requested && t.sid == sid)
             };
             if !exists_same_session {
                 return usize::MAX;
@@ -871,10 +916,15 @@ pub(crate) fn sys_execve_wasm(
             params.stderr,
             FileDescriptor::ConsoleOut,
         );
-        task.pty_id = (0..3).find_map(|fd| match fd_table.get(fd) {
-            Some(FileDescriptor::Pty { pty_id, side: crate::filesystem::file::PtySide::Slave }) => Some(*pty_id as i16),
-            _ => None,
-        }).unwrap_or(task.pty_id);
+        task.pty_id = (0..3)
+            .find_map(|fd| match fd_table.get(fd) {
+                Some(FileDescriptor::Pty {
+                    pty_id,
+                    side: crate::filesystem::file::PtySide::Slave,
+                }) => Some(*pty_id as i16),
+                _ => None,
+            })
+            .unwrap_or(task.pty_id);
         task.fd_table = fd_table;
 
         TASK_MANAGER.tasks[slot] = Some(task);

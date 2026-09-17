@@ -57,7 +57,12 @@ pub fn bind_with_port(hc: &Ohci, port: u8, addr: u8, raw_dev: &[u8; 18]) {
 
     let mut hdr = [0u8; 9];
     if hc
-        .control(addr, &desc::get_descriptor(desc::DT_CONFIG, 0, 9), &mut hdr, true)
+        .control(
+            addr,
+            &desc::get_descriptor(desc::DT_CONFIG, 0, 9),
+            &mut hdr,
+            true,
+        )
         .is_err()
     {
         println!("[usb] GET_DESCRIPTOR config hdr failed");
@@ -102,7 +107,10 @@ pub fn bind_with_port(hc: &Ohci, port: u8, addr: u8, raw_dev: &[u8; 18]) {
             .interfaces
             .iter()
             .cloned()
-            .map(|descriptor| UsbInterface { descriptor, driver: None })
+            .map(|descriptor| UsbInterface {
+                descriptor,
+                driver: None,
+            })
             .collect(),
     };
 
@@ -171,7 +179,9 @@ pub fn disconnect_port(hc: &Ohci, port: u8) -> bool {
         pos.map(|i| devices.swap_remove(i))
     };
 
-    let Some(dev) = removed else { return false; };
+    let Some(dev) = removed else {
+        return false;
+    };
 
     if let Some(name) = dev.device_driver {
         if let Some(drv) = driver::registry().iter().find(|d| d.name == name) {
@@ -180,7 +190,9 @@ pub fn disconnect_port(hc: &Ohci, port: u8) -> bool {
     }
 
     for iface in dev.interfaces.iter() {
-        let Some(name) = iface.driver else { continue; };
+        let Some(name) = iface.driver else {
+            continue;
+        };
         if let Some(drv) = driver::registry().iter().find(|d| d.name == name) {
             (drv.disconnect)(hc, dev.address, iface.descriptor.number);
         }

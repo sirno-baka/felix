@@ -16,10 +16,9 @@ pub mod ohci;
 
 /// Probe every PCI OHCI controller and bind class drivers.
 pub fn init() {
-    // main.rs reaches USB only after rootfs + /dev are mounted. Probe audio
-    // first: its PCI enumeration sizes BARs, and doing that after OHCI is
-    // already operational would briefly disable MMIO decode on a live HCD.
-    crate::drivers::audio::init();
+    // Audio is initialized by main.rs immediately before USB. Do not probe it
+    // again here: HDA controller reset is destructive to an already configured
+    // stream and would also register /dev/audio twice.
 
     // init_all() starts every OHCI controller and enumerates already-connected
     // ports. Root-hub insert/remove remains polling-driven; OHCI interrupt

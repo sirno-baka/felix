@@ -205,7 +205,8 @@ impl BlockDevice for UsbMsc {
         cdb[0] = 0x2A;
         cdb[2..6].copy_from_slice(&lba.to_be_bytes());
         cdb[8] = numsects;
-        self.bot(&self.hc, &cdb, &mut tmp[..bytes], false).map_err(|_| 2u8)
+        self.bot(&self.hc, &cdb, &mut tmp[..bytes], false)
+            .map_err(|_| 2u8)
     }
 
     fn sector_size(&self) -> u32 {
@@ -220,7 +221,10 @@ impl BlockDevice for UsbMsc {
 pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {
     let proto = iface.protocol;
     if proto != PROTO_BBB && proto != PROTO_CBI && proto != PROTO_CB {
-        println!("[usb-msc] unsupported subclass=0x{:02x} proto=0x{:02x}", iface.subclass, iface.protocol);
+        println!(
+            "[usb-msc] unsupported subclass=0x{:02x} proto=0x{:02x}",
+            iface.subclass, iface.protocol
+        );
         return;
     }
     let mut ep_in = None;
@@ -255,13 +259,24 @@ pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {
 
     if proto == PROTO_BBB {
         let mut empty: [u8; 0] = [];
-        let _ = hc.control(addr, &desc::setup(0x21, 0xFF, 0, iface.number as u16, 0), &mut empty, false);
+        let _ = hc.control(
+            addr,
+            &desc::setup(0x21, 0xFF, 0, iface.number as u16, 0),
+            &mut empty,
+            false,
+        );
     }
 
     println!(
         "[usb-msc] addr={} proto={} sub=0x{:02x} bulk {}/{} irq={}/{} mps={}",
         addr,
-        if proto == PROTO_BBB { "BBB" } else if proto == PROTO_CBI { "CBI" } else { "CB" },
+        if proto == PROTO_BBB {
+            "BBB"
+        } else if proto == PROTO_CBI {
+            "CBI"
+        } else {
+            "CB"
+        },
         iface.subclass,
         ep_out,
         ep_in,
@@ -306,8 +321,15 @@ pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {
     DEVICES.lock().push(dev);
 }
 
-fn probe(hc: &Ohci, addr: u8, _device: &crate::drivers::usb::device::UsbDevice, iface: Option<&Interface>) -> Result<(), &'static str> {
-    let Some(iface) = iface else { return Err("MSC: no interface"); };
+fn probe(
+    hc: &Ohci,
+    addr: u8,
+    _device: &crate::drivers::usb::device::UsbDevice,
+    iface: Option<&Interface>,
+) -> Result<(), &'static str> {
+    let Some(iface) = iface else {
+        return Err("MSC: no interface");
+    };
     bind(hc, addr, iface);
 
     let dev = DEVICES
@@ -322,19 +344,21 @@ fn probe(hc: &Ohci, addr: u8, _device: &crate::drivers::usb::device::UsbDevice, 
             println!("[usb-msc] no media, skip mount/devfs");
             (None, None)
         } else {
-            use alloc::sync::Arc;
             use crate::filesystem::devfs::DevFS;
             use crate::filesystem::init::mount_removable_named;
             use crate::spin;
+            use alloc::sync::Arc;
 
             let node_name = alloc::format!("usb{}-{}", addr, iface.number);
-            let arc: Arc<spin::Mutex<dyn BlockDevice>> =
-                Arc::new(spin::Mutex::new(device));
+            let arc: Arc<spin::Mutex<dyn BlockDevice>> = Arc::new(spin::Mutex::new(device));
             let _ = DevFS::unregister(&node_name);
             DevFS::register_block_global(&node_name, arc.clone());
             println!("[usb-msc] /dev/{}", node_name);
 
-            (mount_removable_named(arc, "usb", &node_name), Some(node_name))
+            (
+                mount_removable_named(arc, "usb", &node_name),
+                Some(node_name),
+            )
         }
     };
 

@@ -5,7 +5,7 @@
 //!
 //! ALi/ULi M5237 quirk: never touch HcFmInterval — the chip hard-locks.
 
-use crate::memory::paging::{phys_to_virt, KERNEL_OFFSET, PAGING, PTEFlags};
+use crate::memory::paging::{phys_to_virt, PTEFlags, KERNEL_OFFSET, PAGING};
 use crate::pci::class::{class, subclass};
 use crate::pci::device::PciDevice;
 use crate::pci::{self};
@@ -100,14 +100,15 @@ const ED_SKIP: u32 = 1 << 14;
 const ED_LOWSPEED: u32 = 1 << 13;
 
 fn ed_flags(addr: u8, ep: u8, mps: u16, ls: bool) -> u32 {
-    (addr as u32)
-        | ((ep as u32) << 7)
-        | ((mps as u32) << 16)
-        | if ls { ED_LOWSPEED } else { 0 }
+    (addr as u32) | ((ep as u32) << 7) | ((mps as u32) << 16) | if ls { ED_LOWSPEED } else { 0 }
 }
 
 fn td_toggle(data1: bool) -> u32 {
-    if data1 { TD_T_DATA1 } else { TD_T_DATA0 }
+    if data1 {
+        TD_T_DATA1
+    } else {
+        TD_T_DATA0
+    }
 }
 
 /// DATA0/1 per (addr, ep). Bulk/interrupt only — control toggle is fixed by spec.
@@ -132,7 +133,9 @@ fn set_toggle(addr: u8, ep: u8, data1: bool) {
 static NEXT_ADDR: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
 
 pub fn alloc_addr() -> u8 {
-    NEXT_ADDR.fetch_add(1, core::sync::atomic::Ordering::Relaxed).max(1)
+    NEXT_ADDR
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        .max(1)
 }
 
 static EP0_MPS: Mutex<[u16; 128]> = Mutex::new([8; 128]);
@@ -205,10 +208,20 @@ struct DmaPage {
 }
 
 const fn empty_td() -> Td {
-    Td { flags: 0, cbp: 0, next_td: 0, be: 0 }
+    Td {
+        flags: 0,
+        cbp: 0,
+        next_td: 0,
+        be: 0,
+    }
 }
 const fn empty_ed() -> Ed {
-    Ed { flags: 0, tail_td: 0, head_td: 0, next_ed: 0 }
+    Ed {
+        flags: 0,
+        tail_td: 0,
+        head_td: 0,
+        next_ed: 0,
+    }
 }
 const fn empty_hcca() -> Hcca {
     Hcca {
@@ -376,7 +389,14 @@ impl Ohci {
         // Keep firmware's other command bits and enable only Memory + BusMaster.
         let cmd_before = dev.read_u16(0x04);
         dev.write_u16(0x04, cmd_before | 0x0006);
-        let mmio = Self::map_bar(bar, dev.bars.iter().find(|b| b.is_memory()).map(|b| b.size()).unwrap_or(0x1000))?;
+        let mmio = Self::map_bar(
+            bar,
+            dev.bars
+                .iter()
+                .find(|b| b.is_memory())
+                .map(|b| b.size())
+                .unwrap_or(0x1000),
+        )?;
 
         let skip_fminterval = dev.vendor_id == ALI_VENDOR && dev.device_id == ALI_M5237;
 
@@ -672,7 +692,11 @@ impl Ohci {
         dma.setup_td = Td {
             flags: (TD_CC_NOT_ACCESSED << TD_CC_SHIFT) | TD_DP_SETUP | TD_T_DATA0 | TD_DI_NONE,
             cbp: setup_phys,
-            next_td: if data.is_empty() { status_td_phys } else { data_td_phys },
+            next_td: if data.is_empty() {
+                status_td_phys
+            } else {
+                data_td_phys
+            },
             be: setup_phys + 7,
         };
         dma.ed = Ed {
@@ -799,7 +823,9 @@ impl Ohci {
 
         let (ed, ed_phys, dummy, dummy_phys, first) = {
             let mut eps = BULK_EPS.lock();
-            let pos = eps.iter().position(|e| e.mmio == self.mmio && e.addr == addr && e.ep == ep);
+            let pos = eps
+                .iter()
+                .position(|e| e.mmio == self.mmio && e.addr == addr && e.ep == ep);
             let idx = match pos {
                 Some(i) => i,
                 None => {
@@ -820,7 +846,9 @@ impl Ohci {
                     // BulkHeadED is the head of a linked ED list, not a single
                     // endpoint register. Keep all persistent bulk EDs chained.
                     if let Some(prev) = eps.iter().rev().find(|e| e.mmio == self.mmio) {
-                        unsafe { (*prev.ed).next_ed = ed_phys; }
+                        unsafe {
+                            (*prev.ed).next_ed = ed_phys;
+                        }
                         // println!("[ohci] bulk link ed=0x{:08x} -> ed=0x{:08x}", prev.ed_phys, ed_phys);
                     }
                     eps.push(BulkEp {
@@ -1088,11 +1116,20 @@ impl Ohci {
         match self.address_and_bind_on_port(port, ls) {
             Ok(addr) => {
                 ENUM_FAIL_MASK.fetch_and(!self.enum_fail_bit(port), Ordering::Relaxed);
-                println!("[ohci] port {} addr={}{}", port + 1, addr, if ls { " LS" } else { " FS" });
+                println!(
+                    "[ohci] port {} addr={}{}",
+                    port + 1,
+                    addr,
+                    if ls { " LS" } else { " FS" }
+                );
             }
             Err(e) => {
                 ENUM_FAIL_MASK.fetch_or(self.enum_fail_bit(port), Ordering::Relaxed);
-                println!("[ohci] port {}: {} (retry latched until disconnect)", port + 1, e);
+                println!(
+                    "[ohci] port {}: {} (retry latched until disconnect)",
+                    port + 1,
+                    e
+                );
             }
         }
     }
@@ -1183,14 +1220,28 @@ impl Ohci {
     fn address_and_bind_on_port(&self, port: u8, ls: bool) -> Result<u8, &'static str> {
         let mps8 = 8;
         let mut hdr = [0u8; 8];
-        self.control_ex(0, &[0x80, 6, 0x00, 0x01, 0, 0, 8, 0], &mut hdr, true, mps8, ls)?;
+        self.control_ex(
+            0,
+            &[0x80, 6, 0x00, 0x01, 0, 0, 8, 0],
+            &mut hdr,
+            true,
+            mps8,
+            ls,
+        )?;
         let mps = if hdr[7] == 8 || hdr[7] == 16 || hdr[7] == 32 || hdr[7] == 64 {
             hdr[7] as u16
         } else {
             8
         };
         let mut desc = [0u8; 18];
-        self.control_ex(0, &[0x80, 6, 0x00, 0x01, 0, 0, 18, 0], &mut desc, true, mps, ls)?;
+        self.control_ex(
+            0,
+            &[0x80, 6, 0x00, 0x01, 0, 0, 18, 0],
+            &mut desc,
+            true,
+            mps,
+            ls,
+        )?;
         let vid = u16::from_le_bytes([desc[8], desc[9]]);
         let pid = u16::from_le_bytes([desc[10], desc[11]]);
         println!("[ohci] device {:04x}:{:04x} mps0={}", vid, pid, mps);
@@ -1199,7 +1250,14 @@ impl Ohci {
         set_ep0(0, mps, ls);
         set_ep0(addr, mps, ls);
         let mut empty: [u8; 0] = [];
-        self.control_ex(0, &[0x00, 5, addr, 0, 0, 0, 0, 0], &mut empty, false, mps, ls)?;
+        self.control_ex(
+            0,
+            &[0x00, 5, addr, 0, 0, 0, 0, 0],
+            &mut empty,
+            false,
+            mps,
+            ls,
+        )?;
         self.wait_frames(2);
         crate::drivers::usb::device::bind_with_port(self, port, addr, &desc);
         Ok(addr)
@@ -1270,7 +1328,10 @@ pub fn init_all() {
                 }
                 n += 1;
             }
-            Err(e) => println!("[ohci] probe {:02x}:{:02x}.{}: {}", dev.bus, dev.device, dev.function, e),
+            Err(e) => println!(
+                "[ohci] probe {:02x}:{:02x}.{}: {}",
+                dev.bus, dev.device, dev.function, e
+            ),
         }
     }
     if n == 0 {

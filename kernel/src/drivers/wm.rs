@@ -4,20 +4,20 @@
 //! `wm_flip` copies pixels into the window surface and composes to the LFB.
 //! Title bars are drawn only by the WM. No resize in v1. Max 8 windows.
 
-use crate::drivers::framebuffer::{FRAMEBUFFER, Framebuffer};
+use crate::drivers::framebuffer::{Framebuffer, FRAMEBUFFER};
+use crate::drivers::wm_flags::WindowFlags;
 use crate::sync::mutex::Mutex;
+use crate::utils::flags::{FlagOp, Flags};
 use crate::{debugln, println};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use embedded_graphics::{
-    mono_font::{MonoTextStyle, ascii::FONT_6X10},
+    mono_font::{ascii::FONT_6X10, MonoTextStyle},
     pixelcolor::Rgb888,
     prelude::*,
     text::{Baseline, Text},
 };
-use crate::drivers::wm_flags::WindowFlags;
-use crate::utils::flags::{FlagOp, Flags};
 
 pub const MAX_WINDOWS: usize = 8;
 pub const TITLE_H: u32 = 18;
@@ -124,7 +124,11 @@ pub fn is_ready() -> bool {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct WmFlipRect {
-    pub x: u32, pub y: u32, pub w: u32, pub h: u32, pub pitch: u32,
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+    pub pitch: u32,
     pub pixels: *const u8,
 }
 
@@ -220,15 +224,32 @@ impl Surface {
 
     /// Caller MUST hold interrupts disabled so timer cannot switch CR3
     /// while we touch the user pointer.
-    fn copy_rect_from_user(&mut self, src: *const u8, src_pitch: u32, x: u32, y: u32, w: u32, h: u32) {
-        if src.is_null() || src_pitch < 4 { return; }
-        let w = w.min(self.width.saturating_sub(x)); let h = h.min(self.height.saturating_sub(y));
+    fn copy_rect_from_user(
+        &mut self,
+        src: *const u8,
+        src_pitch: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) {
+        if src.is_null() || src_pitch < 4 {
+            return;
+        }
+        let w = w.min(self.width.saturating_sub(x));
+        let h = h.min(self.height.saturating_sub(y));
         let row = (w as usize).saturating_mul(4);
         for yy in 0..h as usize {
-            let from = unsafe { src.add((y as usize + yy).saturating_mul(src_pitch as usize) + x as usize * 4) };
+            let from = unsafe {
+                src.add((y as usize + yy).saturating_mul(src_pitch as usize) + x as usize * 4)
+            };
             let to = (y as usize + yy).saturating_mul(self.pitch as usize) + x as usize * 4;
-            if to + row > self.pixels.len() { break; }
-            unsafe { core::ptr::copy_nonoverlapping(from, self.pixels.as_mut_ptr().add(to), row); }
+            if to + row > self.pixels.len() {
+                break;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(from, self.pixels.as_mut_ptr().add(to), row);
+            }
         }
     }
 
@@ -279,19 +300,27 @@ struct Window {
 impl Window {
     // Добавь эти методы в начало impl Window
     fn has_title_bar(&self) -> bool {
-        !self.flags.is_enable(WindowFlags::FRAMELESS_WINDOW_HINT) &&
-            self.flags.is_enable(WindowFlags::WINDOW_TITLE_HINT)
+        !self.flags.is_enable(WindowFlags::FRAMELESS_WINDOW_HINT)
+            && self.flags.is_enable(WindowFlags::WINDOW_TITLE_HINT)
     }
 
     fn title_height(&self) -> u32 {
-        if self.has_title_bar() { TITLE_H } else { 0 }
+        if self.has_title_bar() {
+            TITLE_H
+        } else {
+            0
+        }
     }
 
     fn client_rect(&self) -> (i32, i32, u32, u32) {
         let th = self.title_height() as i32;
-        (self.x, self.y + th, self.w, self.h.saturating_sub(th as u32))
+        (
+            self.x,
+            self.y + th,
+            self.w,
+            self.h.saturating_sub(th as u32),
+        )
     }
-
 
     fn title_str(&self) -> &str {
         let end = self
@@ -495,7 +524,9 @@ impl Compositor {
     fn client_at(&self, x: i32, y: i32) -> Option<(u8, i32, i32)> {
         let ids = self.sorted_ids();
         for id in ids.iter().rev().flatten() {
-            let Some(w) = self.find(*id) else { continue; };
+            let Some(w) = self.find(*id) else {
+                continue;
+            };
             let th = w.title_height() as i32;
             let cx = x - w.x;
             let cy = y - (w.y + th);
@@ -624,12 +655,7 @@ impl Compositor {
             // old - new = at most four rectangles.
             let strips = [
                 // top
-                DirtyRect::new(
-                    old.x,
-                    old.y,
-                    old.w,
-                    overlap.y.saturating_sub(old.y) as u32,
-                ),
+                DirtyRect::new(old.x, old.y, old.w, overlap.y.saturating_sub(old.y) as u32),
                 // bottom
                 DirtyRect::new(
                     old.x,
@@ -671,20 +697,25 @@ impl Compositor {
     /// the region to the desktop first: that clear was visible as a flash on
     /// every terminal keystroke.
     pub fn compose_client_rect(&self, id: u8, rx: u32, ry: u32, rw: u32, rh: u32) {
-        let Some(w) = self.find(id) else { return; };
+        let Some(w) = self.find(id) else {
+            return;
+        };
         if !w.visible || rw == 0 || rh == 0 {
             return;
         }
 
         let rect = DirtyRect::new(
             w.x.saturating_add(rx as i32),
-            w.y.saturating_add(w.title_height() as i32).saturating_add(ry as i32),
+            w.y.saturating_add(w.title_height() as i32)
+                .saturating_add(ry as i32),
             rw,
             rh,
         );
 
         let mut guard = FRAMEBUFFER.lock();
-        let Some(fb) = guard.as_mut() else { return; };
+        let Some(fb) = guard.as_mut() else {
+            return;
+        };
         crate::drivers::mouse::hide_cursor(fb);
         self.compose_opaque_region(fb, id, rect);
         crate::drivers::mouse::show_cursor(fb);
@@ -692,13 +723,17 @@ impl Compositor {
 
     /// Compatibility wrapper: compose exactly this window's current rectangle.
     pub fn compose_window(&self, id: u8) {
-        let Some(w) = self.find(id) else { return; };
+        let Some(w) = self.find(id) else {
+            return;
+        };
         if !w.visible {
             return;
         }
 
         let mut guard = FRAMEBUFFER.lock();
-        let Some(fb) = guard.as_mut() else { return; };
+        let Some(fb) = guard.as_mut() else {
+            return;
+        };
         crate::drivers::mouse::hide_cursor(fb);
         self.compose_region(fb, w.rect());
         crate::drivers::mouse::show_cursor(fb);
@@ -735,33 +770,11 @@ impl Compositor {
 
         if th > 0 {
             let title_color = if w.focused { 0x003A_7CA5 } else { 0x0040_4850 };
-            fill_rect_clipped(
-                fb,
-                clip,
-                w.x,
-                w.y,
-                w.w,
-                th,
-                title_color,
-            );
+            fill_rect_clipped(fb, clip, w.x, w.y, w.w, th, title_color);
 
-            fill_rect_clipped(
-                fb,
-                clip,
-                w.x,
-                w.y + th as i32 - 1,
-                w.w,
-                1,
-                0x0010_1010,
-            );
+            fill_rect_clipped(fb, clip, w.x, w.y + th as i32 - 1, w.w, 1, 0x0010_1010);
 
-            draw_title_text_clipped(
-                fb,
-                clip,
-                w.x + 6,
-                w.y + 4,
-                w.title_str(),
-            );
+            draw_title_text_clipped(fb, clip, w.x + 6, w.y + 4, w.title_str());
 
             if w.flags.is_enable(WindowFlags::WINDOW_CLOSE_BUTTON_HINT) {
                 draw_close_button_clipped(fb, clip, w);
@@ -800,11 +813,7 @@ impl Compositor {
     }
 
     fn draw_window(&self, fb: &mut Framebuffer, w: &Window) {
-        self.draw_window_clipped(
-            fb,
-            w,
-            DirtyRect::new(0, 0, self.screen_w, self.screen_h),
-        );
+        self.draw_window_clipped(fb, w, DirtyRect::new(0, 0, self.screen_w, self.screen_h));
     }
 }
 
@@ -824,7 +833,9 @@ fn fill_rect_clipped(
         // The compositor's dirty region is normally screen-clipped, but keep
         // this helper safe for windows partially outside the screen.
         let screen = DirtyRect::new(0, 0, fb.info.width as u32, fb.info.height as u32);
-        let Some(r) = r.intersection(screen) else { return; };
+        let Some(r) = r.intersection(screen) else {
+            return;
+        };
         fb.fill_rect(r.x as u32, r.y as u32, r.w, r.h, color);
         return;
     }
@@ -872,13 +883,7 @@ impl DrawTarget for ClippedFramebuffer<'_> {
     }
 }
 
-fn draw_title_text_clipped(
-    fb: &mut Framebuffer,
-    clip: DirtyRect,
-    x: i32,
-    y: i32,
-    text: &str,
-) {
+fn draw_title_text_clipped(fb: &mut Framebuffer, clip: DirtyRect, x: i32, y: i32, text: &str) {
     let style = MonoTextStyle::new(&FONT_6X10, Rgb888::new(0xF0, 0xF0, 0xF0));
     let pos = Point::new(x, y);
     let mut target = ClippedFramebuffer { fb, clip };
@@ -949,15 +954,38 @@ fn put_pixel_clipped(fb: &mut Framebuffer, clip: DirtyRect, x: i32, y: i32, colo
     }
 }
 
-fn blit_surface_rect(fb: &mut Framebuffer, dx: u32, dy: u32, sx: u32, sy: u32, w: u32, h: u32, surf: &Surface) {
-    if sx >= surf.width || sy >= surf.height || dx >= fb.info.width as u32 || dy >= fb.info.height as u32 { return; }
+fn blit_surface_rect(
+    fb: &mut Framebuffer,
+    dx: u32,
+    dy: u32,
+    sx: u32,
+    sy: u32,
+    w: u32,
+    h: u32,
+    surf: &Surface,
+) {
+    if sx >= surf.width
+        || sy >= surf.height
+        || dx >= fb.info.width as u32
+        || dy >= fb.info.height as u32
+    {
+        return;
+    }
     let w = w.min(surf.width - sx).min(fb.info.width as u32 - dx);
     let h = h.min(surf.height - sy).min(fb.info.height as u32 - dy);
-    let dst_pitch = fb.info.pitch as usize; let src_pitch = surf.pitch as usize; let row = w as usize * 4;
+    let dst_pitch = fb.info.pitch as usize;
+    let src_pitch = surf.pitch as usize;
+    let row = w as usize * 4;
     for y in 0..h as usize {
         let src = (sy as usize + y) * src_pitch + sx as usize * 4;
         let dst = (dy as usize + y) * dst_pitch + dx as usize * 4;
-        unsafe { core::ptr::copy_nonoverlapping(surf.pixels.as_ptr().add(src), (fb.virt_base as *mut u8).add(dst), row); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                surf.pixels.as_ptr().add(src),
+                (fb.virt_base as *mut u8).add(dst),
+                row,
+            );
+        }
     }
 }
 
@@ -1142,7 +1170,15 @@ pub fn init() {
     debugln!("[wm] ready {}x{}", sw, sh);
 }
 
-pub fn create_window(x: i32, y: i32, client_w: u32, client_h: u32, title: &str, flags: WindowFlags, owner_slot: i8) -> Option<u32> {
+pub fn create_window(
+    x: i32,
+    y: i32,
+    client_w: u32,
+    client_h: u32,
+    title: &str,
+    flags: WindowFlags,
+    owner_slot: i8,
+) -> Option<u32> {
     // Минимальный размер клиентской области
     if client_w < 40 || client_h < 40 {
         return None;
@@ -1154,8 +1190,8 @@ pub fn create_window(x: i32, y: i32, client_w: u32, client_h: u32, title: &str, 
     title_buf[..n].copy_from_slice(&tbytes[..n]);
 
     // Вычисляем итоговые размеры окна на основе флагов
-    let has_title = !flags.is_enable(WindowFlags::FRAMELESS_WINDOW_HINT) &&
-        flags.is_enable(WindowFlags::WINDOW_TITLE_HINT);
+    let has_title = !flags.is_enable(WindowFlags::FRAMELESS_WINDOW_HINT)
+        && flags.is_enable(WindowFlags::WINDOW_TITLE_HINT);
 
     let total_w = client_w;
     let total_h = client_h + if has_title { TITLE_H } else { 0 };
@@ -1172,7 +1208,10 @@ pub fn create_window(x: i32, y: i32, client_w: u32, client_h: u32, title: &str, 
         let z = wm.next_z;
         wm.next_z = wm.next_z.wrapping_add(1);
 
-        let old_focus_rect = wm.windows.iter().flatten()
+        let old_focus_rect = wm
+            .windows
+            .iter()
+            .flatten()
             .find(|win| win.focused)
             .map(|win| win.rect());
 
@@ -1188,8 +1227,8 @@ pub fn create_window(x: i32, y: i32, client_w: u32, client_h: u32, title: &str, 
             id,
             x,
             y,
-            w: total_w,       // Сохраняем ОБЩУЮ ширину
-            h: total_h,       // Сохраняем ОБЩУЮ высоту
+            w: total_w, // Сохраняем ОБЩУЮ ширину
+            h: total_h, // Сохраняем ОБЩУЮ высоту
             z,
             focused: true,
             visible: true,
@@ -1211,10 +1250,17 @@ pub fn destroy_window(id: u32) -> bool {
         let id = id as u8;
         for slot in wm.windows.iter_mut() {
             if slot.as_ref().map(|w| w.id) == Some(id) {
-                let rect = slot.as_ref().map(|w| w.rect()).unwrap_or(DirtyRect::new(0, 0, 0, 0));
+                let rect = slot
+                    .as_ref()
+                    .map(|w| w.rect())
+                    .unwrap_or(DirtyRect::new(0, 0, 0, 0));
                 *slot = None;
-                if wm.hovered_client == Some(id) { wm.hovered_client = None; }
-                if wm.mouse_capture == Some(id) { wm.mouse_capture = None; }
+                if wm.hovered_client == Some(id) {
+                    wm.hovered_client = None;
+                }
+                if wm.mouse_capture == Some(id) {
+                    wm.mouse_capture = None;
+                }
                 wm.mark_dirty(rect);
                 wm.compose_dirty();
                 return true;
@@ -1256,8 +1302,12 @@ pub fn destroy_windows_of(owner_slot: i8) {
         for rect in dirty_rects.iter().take(n).flatten() {
             wm.mark_dirty(*rect);
         }
-        if hovered_removed { wm.hovered_client = None; }
-        if capture_removed { wm.mouse_capture = None; }
+        if hovered_removed {
+            wm.hovered_client = None;
+        }
+        if capture_removed {
+            wm.mouse_capture = None;
+        }
 
         if any {
             wm.drag = None;
@@ -1306,10 +1356,20 @@ pub fn flip(id: u32, user_pixels: *const u8, len: usize) -> bool {
         if !user_pixels.is_null() && len > 0 {
             without_interrupts(|| {
                 if len == usize::MAX {
-                    let desc = unsafe { core::ptr::read_unaligned(user_pixels as *const WmFlipRect) };
-                    w.surface.copy_rect_from_user(desc.pixels, desc.pitch, desc.x, desc.y, desc.w, desc.h);
+                    let desc =
+                        unsafe { core::ptr::read_unaligned(user_pixels as *const WmFlipRect) };
+                    w.surface.copy_rect_from_user(
+                        desc.pixels,
+                        desc.pitch,
+                        desc.x,
+                        desc.y,
+                        desc.w,
+                        desc.h,
+                    );
                     partial = Some((desc.x, desc.y, desc.w, desc.h));
-                } else { w.surface.copy_from_user(user_pixels, len); }
+                } else {
+                    w.surface.copy_from_user(user_pixels, len);
+                }
             });
         }
         drop(wm);
@@ -1327,7 +1387,9 @@ pub fn flip(id: u32, user_pixels: *const u8, len: usize) -> bool {
             }
         });
         true
-    } else { false }
+    } else {
+        false
+    }
 }
 
 pub fn focus_window(id: u32) -> bool {
@@ -1402,8 +1464,7 @@ fn apply_resize(w: &mut Window, new_w: u32, new_h: u32) {
                 let s = y.saturating_mul(src_pitch);
                 let d = y.saturating_mul(dst_pitch);
                 if s + row <= w.surface.pixels.len() && d + row <= surf.pixels.len() {
-                    surf.pixels[d..d + row]
-                        .copy_from_slice(&w.surface.pixels[s..s + row]);
+                    surf.pixels[d..d + row].copy_from_slice(&w.surface.pixels[s..s + row]);
                 }
             }
             w.surface = surf;
@@ -1466,7 +1527,10 @@ pub fn on_mouse_down(x: i32, y: i32) {
             let orig_w = w.w;
             let orig_h = w.h;
             let old_rect = wm.find(target).map(|w| w.rect());
-            let old_focus_rect = wm.windows.iter().flatten()
+            let old_focus_rect = wm
+                .windows
+                .iter()
+                .flatten()
                 .find(|w| w.focused && w.id != target)
                 .map(|w| w.rect());
 
@@ -1504,7 +1568,10 @@ pub fn on_mouse_down(x: i32, y: i32) {
 
         // Focus + raise + optional client click / title drag
         let old_target_rect = w.rect();
-        let old_focus_rect = wm.windows.iter().flatten()
+        let old_focus_rect = wm
+            .windows
+            .iter()
+            .flatten()
             .find(|win| win.focused && win.id != target)
             .map(|win| win.rect());
 
@@ -1514,12 +1581,7 @@ pub fn on_mouse_down(x: i32, y: i32) {
         let cx = x - w.x;
         let cy = y - (w.y + w.title_height() as i32);
         let client_h = w.h.saturating_sub(w.title_height()) as i32;
-        let in_client =
-            !in_title &&
-                cx >= 0 &&
-                cy >= 0 &&
-                cx < w.w as i32 &&
-                cy < client_h;
+        let in_client = !in_title && cx >= 0 && cy >= 0 && cx < w.w as i32 && cy < client_h;
 
         let mut grab_dx = 0;
         let mut grab_dy = 0;
@@ -1620,11 +1682,17 @@ pub fn on_mouse_down(x: i32, y: i32) {
 /// resize; it is delivered to the top-most client so userspace can open a
 /// context menu. `c=2` is the right-button code in the userspace WM ABI.
 pub fn on_mouse_right_down(x: i32, y: i32) {
-    let Some(mut wm) = WM.try_lock() else { return; };
+    let Some(mut wm) = WM.try_lock() else {
+        return;
+    };
     let ids = wm.sorted_ids();
     for id in ids.iter().rev().flatten() {
-        let Some(w) = wm.find_mut(*id) else { continue; };
-        if !w.visible { continue; }
+        let Some(w) = wm.find_mut(*id) else {
+            continue;
+        };
+        if !w.visible {
+            continue;
+        }
         let th = w.title_height() as i32;
         let cx = x - w.x;
         let cy = y - (w.y + th);
@@ -1648,11 +1716,17 @@ pub fn on_mouse_right_down(x: i32, y: i32) {
 /// Right button up. Kept in the ABI even though PopUI currently opens context
 /// menus on the down edge.
 pub fn on_mouse_right_up(x: i32, y: i32) {
-    let Some(mut wm) = WM.try_lock() else { return; };
+    let Some(mut wm) = WM.try_lock() else {
+        return;
+    };
     let ids = wm.sorted_ids();
     for id in ids.iter().rev().flatten() {
-        let Some(w) = wm.find_mut(*id) else { continue; };
-        if !w.visible { continue; }
+        let Some(w) = wm.find_mut(*id) else {
+            continue;
+        };
+        if !w.visible {
+            continue;
+        }
         let th = w.title_height() as i32;
         let cx = x - w.x;
         let cy = y - (w.y + th);
@@ -1685,7 +1759,8 @@ pub fn on_mouse_move(x: i32, y: i32) {
             let dw = x - drag.grab_dx;
             let dh = y - drag.grab_dy;
             let nw = (drag.orig_w as i32 + dw).clamp(80, wm.screen_w as i32) as u32;
-            let nh = (drag.orig_h as i32 + dh).clamp((TITLE_H as i32) + 40, wm.screen_h as i32) as u32;
+            let nh =
+                (drag.orig_h as i32 + dh).clamp((TITLE_H as i32) + 40, wm.screen_h as i32) as u32;
             let old_rect = wm.find(id).map(|w| w.rect());
             if let Some(w) = wm.find_mut(id) {
                 if w.w != nw || w.h != nh {
@@ -1736,7 +1811,13 @@ pub fn on_mouse_move(x: i32, y: i32) {
         if let Some(w) = wm.find_mut(id) {
             let cx = x - w.x;
             let cy = y - (w.y + w.title_height() as i32);
-            w.events.push(WmEvent { kind: EV_MOUSE_MOVE, a: cx, b: cy, c: 0, d: 0 });
+            w.events.push(WmEvent {
+                kind: EV_MOUSE_MOVE,
+                a: cx,
+                b: cy,
+                c: 0,
+                d: 0,
+            });
         } else {
             wm.mouse_capture = None;
         }
@@ -1748,14 +1829,26 @@ pub fn on_mouse_move(x: i32, y: i32) {
     if wm.hovered_client != next_hover {
         if let Some(old) = wm.hovered_client {
             if let Some(w) = wm.find_mut(old) {
-                w.events.push(WmEvent { kind: EV_MOUSE_LEAVE, a: 0, b: 0, c: 0, d: 0 });
+                w.events.push(WmEvent {
+                    kind: EV_MOUSE_LEAVE,
+                    a: 0,
+                    b: 0,
+                    c: 0,
+                    d: 0,
+                });
             }
         }
         wm.hovered_client = next_hover;
     }
     if let Some((id, cx, cy)) = target {
         if let Some(w) = wm.find_mut(id) {
-            w.events.push(WmEvent { kind: EV_MOUSE_MOVE, a: cx, b: cy, c: 0, d: 0 });
+            w.events.push(WmEvent {
+                kind: EV_MOUSE_MOVE,
+                a: cx,
+                b: cy,
+                c: 0,
+                d: 0,
+            });
         }
     }
 }
@@ -1787,25 +1880,49 @@ pub fn on_mouse_up(x: i32, y: i32) {
         if let Some(w) = wm.find_mut(id) {
             let cx = x - w.x;
             let cy = y - (w.y + w.title_height() as i32);
-            w.events.push(WmEvent { kind: EV_MOUSE_UP, a: cx, b: cy, c: 1, d: 0 });
+            w.events.push(WmEvent {
+                kind: EV_MOUSE_UP,
+                a: cx,
+                b: cy,
+                c: 1,
+                d: 0,
+            });
         }
         return;
     }
 
     if let Some((id, cx, cy)) = wm.client_at(x, y) {
         if let Some(w) = wm.find_mut(id) {
-            w.events.push(WmEvent { kind: EV_MOUSE_UP, a: cx, b: cy, c: 1, d: 0 });
+            w.events.push(WmEvent {
+                kind: EV_MOUSE_UP,
+                a: cx,
+                b: cy,
+                c: 1,
+                d: 0,
+            });
         }
     }
 }
 
 /// Deliver signed wheel steps to the top-most client below the pointer.
 pub fn on_mouse_wheel(x: i32, y: i32, delta: i32) {
-    if delta == 0 { return; }
-    let Some(mut wm) = WM.try_lock() else { return; };
-    let Some((id, cx, cy)) = wm.client_at(x, y) else { return; };
+    if delta == 0 {
+        return;
+    }
+    let Some(mut wm) = WM.try_lock() else {
+        return;
+    };
+    let Some((id, cx, cy)) = wm.client_at(x, y) else {
+        return;
+    };
     if let Some(w) = wm.find_mut(id) {
-        w.events.push(WmEvent { kind: EV_MOUSE_WHEEL, a: cx, b: cy, c: delta, d: 0 });
+        w.events.push(WmEvent {
+            kind: EV_MOUSE_WHEEL,
+            a: cx,
+            b: cy,
+            c: delta,
+            d: 0,
+        });
     }
 }
 

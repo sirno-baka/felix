@@ -59,7 +59,9 @@ impl<T: ?Sized, const INT: bool> RawMutex<T, INT> {
         }
         let was_enabled = (eflags & (1 << 9)) != 0;
         if was_enabled {
-            unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+            unsafe {
+                core::arch::asm!("cli", options(nomem, nostack));
+            }
         }
         was_enabled
     }
@@ -67,7 +69,9 @@ impl<T: ?Sized, const INT: bool> RawMutex<T, INT> {
     #[inline]
     fn leave_irq_guard(restore_interrupts: bool) {
         if INT && restore_interrupts {
-            unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+            unsafe {
+                core::arch::asm!("sti", options(nomem, nostack));
+            }
         }
     }
 

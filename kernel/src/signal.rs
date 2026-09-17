@@ -8,7 +8,7 @@
 //! Signal numbers intentionally mirror Linux where practical.
 
 use crate::filesystem::file::{FileDescriptor, PipeEnd};
-use crate::multitasking::task::{CPUState, TASK_MANAGER, MAX_TASKS};
+use crate::multitasking::task::{CPUState, MAX_TASKS, TASK_MANAGER};
 use crate::net::SocketState;
 use crate::println;
 
@@ -88,7 +88,9 @@ pub fn stop_task_with_signal(slot: i8, sig: u32) -> bool {
         let members = TASK_MANAGER.thread_slots(leader);
         for member in members {
             if let Some(ref mut t) = TASK_MANAGER.tasks[member] {
-                if t.thread_exited { continue; }
+                if t.thread_exited {
+                    continue;
+                }
                 t.running = false;
                 t.stopped = true;
             }
@@ -122,7 +124,9 @@ pub fn continue_task(slot: i8) -> bool {
         let members = TASK_MANAGER.thread_slots(leader);
         for member in members {
             if let Some(ref mut thread) = TASK_MANAGER.tasks[member] {
-                if thread.thread_exited { continue; }
+                if thread.thread_exited {
+                    continue;
+                }
                 thread.stopped = false;
                 thread.running = true;
             }
@@ -167,18 +171,22 @@ pub fn force_kill(slot: i8, sig: u32) -> bool {
         let members = TASK_MANAGER.thread_slots(leader);
         for member in members {
             if let Some(ref mut t) = TASK_MANAGER.tasks[member] {
-            t.pending_signals = 0;
-            t.running = false;
-            t.stopped = false;
-            t.thread_exited = true;
-            t.term_signal = if sig == 0 { SIGKILL } else { sig };
-            t.exit_code = 128 + t.term_signal as i32;
+                t.pending_signals = 0;
+                t.running = false;
+                t.stopped = false;
+                t.thread_exited = true;
+                t.term_signal = if sig == 0 { SIGKILL } else { sig };
+                t.exit_code = 128 + t.term_signal as i32;
             }
         }
-        if let Some(ref mut t) = TASK_MANAGER.tasks[leader] { t.zombie = true; }
+        if let Some(ref mut t) = TASK_MANAGER.tasks[leader] {
+            t.zombie = true;
+        }
         (leader, dead_pid)
     };
-    unsafe { TASK_MANAGER.reparent_children_of(dead_pid); }
+    unsafe {
+        TASK_MANAGER.reparent_children_of(dead_pid);
+    }
     close_task_fds(leader as i8);
     crate::syscalls::wasm::clear_task_state(leader);
     crate::drivers::wm::destroy_windows_of(leader as i8);

@@ -161,12 +161,12 @@ floppy-image:
 image:
 	@echo "=== Creating 32 MiB bootable disk (MBR | bootloader | ext2) ==="
 	@rm -f build/disk.img build/rootfs.img
-	@dd if=/dev/zero of=build/disk.img bs=1M count=32 status=none
+	@dd if=/dev/zero of=build/disk.img bs=1M count=64 status=none
 	@$(SFDISK) build/disk.img < disk.layout
 	@$(SFDISK) --list build/disk.img
 	@dd if=build/boot.bin of=build/disk.img bs=512 conv=notrunc status=none
 	@dd if=build/bootloader.bin of=build/disk.img bs=512 seek=1 conv=notrunc status=none
-	@dd if=/dev/zero of=build/rootfs.img bs=512 count=63488 status=none
+	@dd if=/dev/zero of=build/rootfs.img bs=512 count=128488 status=none
 	@$(E2MKFS) -I 128 -O ^64bit,^metadata_csum,^dir_index,^ext_attr,^resize_inode build/rootfs.img
 	$(call populate_ext2,build/rootfs.img)
 	@dd if=build/rootfs.img of=build/disk.img bs=512 seek=2048 conv=notrunc status=none

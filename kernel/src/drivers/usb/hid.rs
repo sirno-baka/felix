@@ -55,12 +55,29 @@ pub fn bind(hc: &Ohci, addr: u8, iface: &Interface) {
 
 fn boot_setup(hc: &Ohci, addr: u8, iface: u8) {
     let mut empty: [u8; 0] = [];
-    let _ = hc.control(addr, &desc::setup(0x21, SET_PROTOCOL, PROTOCOL_BOOT, iface as u16, 0), &mut empty, false);
-    let _ = hc.control(addr, &desc::setup(0x21, SET_IDLE, 0, iface as u16, 0), &mut empty, false);
+    let _ = hc.control(
+        addr,
+        &desc::setup(0x21, SET_PROTOCOL, PROTOCOL_BOOT, iface as u16, 0),
+        &mut empty,
+        false,
+    );
+    let _ = hc.control(
+        addr,
+        &desc::setup(0x21, SET_IDLE, 0, iface as u16, 0),
+        &mut empty,
+        false,
+    );
 }
 
-fn probe(hc: &Ohci, addr: u8, _device: &crate::drivers::usb::device::UsbDevice, iface: Option<&Interface>) -> Result<(), &'static str> {
-    let Some(iface) = iface else { return Err("HID: no interface"); };
+fn probe(
+    hc: &Ohci,
+    addr: u8,
+    _device: &crate::drivers::usb::device::UsbDevice,
+    iface: Option<&Interface>,
+) -> Result<(), &'static str> {
+    let Some(iface) = iface else {
+        return Err("HID: no interface");
+    };
     bind(hc, addr, iface);
     Ok(())
 }

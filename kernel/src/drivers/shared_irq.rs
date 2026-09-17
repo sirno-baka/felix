@@ -25,7 +25,10 @@ struct Line {
 
 impl Line {
     const fn new() -> Self {
-        Self { handlers: [None; HANDLERS_PER_IRQ], stray: 0 }
+        Self {
+            handlers: [None; HANDLERS_PER_IRQ],
+            stray: 0,
+        }
     }
 }
 
@@ -60,12 +63,19 @@ pub fn register(irq: u8, handler: IrqHandler) -> Result<(), &'static str> {
         return Err("shared IRQ line is not supported");
     }
 
-    unsafe { install_vector(irq)?; }
+    unsafe {
+        install_vector(irq)?;
+    }
 
     {
         let mut lines = LINES.lock();
         let line = &mut lines[irq as usize];
-        if line.handlers.iter().flatten().any(|&h| h as usize == handler as usize) {
+        if line
+            .handlers
+            .iter()
+            .flatten()
+            .any(|&h| h as usize == handler as usize)
+        {
             return Ok(());
         }
         let Some(slot) = line.handlers.iter_mut().find(|h| h.is_none()) else {

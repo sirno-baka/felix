@@ -41,7 +41,6 @@ pub extern "C" fn timer() {
             "call timer_handler",
             "add esp, 4",
             "mov esp, eax",
-
             // CPUState layout at the selected task's ESP:
             // eax,ebx,ecx,edx,esi,edi,ebp,eip,cs,eflags,esp,ss.
             // Pick DS/ES BEFORE restoring EAX/ECX; the previous code changed

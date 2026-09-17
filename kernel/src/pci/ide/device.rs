@@ -1,7 +1,7 @@
-use super::IDEType;
-use super::ata::{self, ATA, ATADirection, ATAError, ATAReg};
+use super::ata::{self, ATADirection, ATAError, ATAReg, ATA};
 use super::atapi::{self, ATAPI};
 pub use super::channel::IDEChannelRegisters;
+use super::IDEType;
 use crate::disk::interface::BlockDevice;
 use crate::println;
 use crate::utils::arcm::Arcm;

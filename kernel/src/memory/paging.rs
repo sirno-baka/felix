@@ -592,10 +592,8 @@ impl PageManager {
             // Treating a large-page PDE as a table writes PTE values into RAM
             // while the CPU continues using the original RAM mapping.
             let old_pde = self.dir.entries[pd_idx];
-            let need_table = {
-                old_pde & PDEFlags::PRESENT == 0
-                    || old_pde & PDEFlags::DIR_PAGE_SIZE != 0
-            };
+            let need_table =
+                { old_pde & PDEFlags::PRESENT == 0 || old_pde & PDEFlags::DIR_PAGE_SIZE != 0 };
 
             if need_table {
                 let pt_frame = self.alloc_frame(); // возвращает номер фрейма
@@ -682,7 +680,9 @@ impl PageManager {
         if pages > 0 {
             let mut run = 0usize;
             for i in 0..self.free_frames.len() {
-                if i == 0 || self.free_frames[i] != self.free_frames[i - 1] + 1 { run = i; }
+                if i == 0 || self.free_frames[i] != self.free_frames[i - 1] + 1 {
+                    run = i;
+                }
                 if i - run + 1 == pages as usize {
                     let first = self.free_frames[run];
                     self.free_frames.drain(run..=i);
@@ -691,7 +691,9 @@ impl PageManager {
             }
         }
         let first = self.next_free_page;
-        let end = first.checked_add(pages).expect("physical frame range overflow");
+        let end = first
+            .checked_add(pages)
+            .expect("physical frame range overflow");
         let max_page = detected_ram_bytes() >> 12;
         if end > max_page {
             panic!(

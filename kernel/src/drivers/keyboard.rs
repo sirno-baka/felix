@@ -68,7 +68,6 @@ pub extern "C" fn keyboard() {
             "mov ds, ax",
             "mov es, ax",
             "call keyboard_handler",
-
             // Restore the proper data selectors BEFORE popa.  AX is safe to
             // use here because the interrupted EAX is still saved at [esp+28].
             // The old code did this after popa with CX and therefore corrupted

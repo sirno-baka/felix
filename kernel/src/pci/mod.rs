@@ -8,7 +8,7 @@ pub mod floppy;
 pub mod class;
 
 use alloc::vec::Vec;
-use device::{PciDevice, read_device};
+use device::{read_device, PciDevice};
 
 /// Enumerate all PCI devices on the system
 pub fn enumerate() -> Vec<PciDevice> {

@@ -7,7 +7,7 @@
 use core::ptr;
 
 use crate::disk::interface::BlockDevice;
-use crate::memory::paging::{PAGE_SIZE, PAGING, phys_to_virt};
+use crate::memory::paging::{phys_to_virt, PAGE_SIZE, PAGING};
 use crate::println;
 
 pub const SECTOR_SIZE: u32 = 512;

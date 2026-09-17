@@ -85,9 +85,7 @@ impl Allocator {
 
         // Then merge it into its predecessor; `block` already includes the
         // successor, so this also joins all three ranges in one pass.
-        if !previous.is_null()
-            && (previous as usize + (*previous).size) == block as usize
-        {
+        if !previous.is_null() && (previous as usize + (*previous).size) == block as usize {
             (*previous).size += (*block).size;
             (*previous).next = (*block).next;
         }

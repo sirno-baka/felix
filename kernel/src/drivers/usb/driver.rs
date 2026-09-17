@@ -35,9 +35,14 @@ pub enum UsbMatch {
 impl UsbMatch {
     pub fn score(&self, dev: &DeviceDesc, iface: Option<&Interface>) -> Option<u8> {
         match *self {
-            UsbMatch::InterfaceClass { class, subclass, protocol } => {
+            UsbMatch::InterfaceClass {
+                class,
+                subclass,
+                protocol,
+            } => {
                 let i = iface?;
-                if i.class != class || subclass.map_or(false, |v| i.subclass != v)
+                if i.class != class
+                    || subclass.map_or(false, |v| i.subclass != v)
                     || protocol.map_or(false, |v| i.protocol != v)
                 {
                     return None;
@@ -49,7 +54,11 @@ impl UsbMatch {
                     (None, None) => 120,
                 })
             }
-            UsbMatch::DeviceClass { class, subclass, protocol } => {
+            UsbMatch::DeviceClass {
+                class,
+                subclass,
+                protocol,
+            } => {
                 if dev.class != class
                     || subclass.map_or(false, |v| dev.subclass != v)
                     || protocol.map_or(false, |v| dev.protocol != v)
@@ -63,11 +72,23 @@ impl UsbMatch {
                 })
             }
             UsbMatch::VidPid { vid, pid } => {
-                if dev.vid == vid && dev.pid == pid { Some(255) } else { None }
+                if dev.vid == vid && dev.pid == pid {
+                    Some(255)
+                } else {
+                    None
+                }
             }
-            UsbMatch::VidPidInterface { vid, pid, class, subclass, protocol } => {
+            UsbMatch::VidPidInterface {
+                vid,
+                pid,
+                class,
+                subclass,
+                protocol,
+            } => {
                 let i = iface?;
-                if dev.vid != vid || dev.pid != pid || i.class != class
+                if dev.vid != vid
+                    || dev.pid != pid
+                    || i.class != class
                     || subclass.map_or(false, |v| i.subclass != v)
                     || protocol.map_or(false, |v| i.protocol != v)
                 {
@@ -83,7 +104,12 @@ impl UsbMatch {
 pub struct UsbDriver {
     pub name: &'static str,
     pub matches: &'static [UsbMatch],
-    pub probe: fn(&Ohci, u8, &crate::drivers::usb::device::UsbDevice, Option<&Interface>) -> Result<(), &'static str>,
+    pub probe: fn(
+        &Ohci,
+        u8,
+        &crate::drivers::usb::device::UsbDevice,
+        Option<&Interface>,
+    ) -> Result<(), &'static str>,
     pub disconnect: fn(&Ohci, u8, u8),
 }
 

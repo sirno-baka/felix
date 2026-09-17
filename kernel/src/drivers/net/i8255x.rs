@@ -1,8 +1,8 @@
 //! Intel 8255x (82557/82558/82559) driver with proper Rx/Tx rings
 //! Uses Felix PCI subsystem + PageManager for DMA buffers
 
-use crate::drivers::net::{RX_BUF_SIZE, RX_RING_SIZE, TX_BUF_SIZE, TX_RING_SIZE, map_mmio};
-use crate::memory::paging::{KERNEL_OFFSET, PAGE_SIZE, PAGING, PhysAddr};
+use crate::drivers::net::{map_mmio, RX_BUF_SIZE, RX_RING_SIZE, TX_BUF_SIZE, TX_RING_SIZE};
+use crate::memory::paging::{PhysAddr, KERNEL_OFFSET, PAGE_SIZE, PAGING};
 use crate::pci::{self, device::PciDevice};
 use crate::println;
 use crate::sync::mutex::Mutex;
@@ -554,7 +554,11 @@ impl I8255x {
                 let _ = self.start_ru();
             }
 
-            if valid { Some(count) } else { None }
+            if valid {
+                Some(count)
+            } else {
+                None
+            }
         }
     }
 

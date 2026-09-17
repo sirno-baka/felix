@@ -22,6 +22,7 @@ mod multitasking;
 mod net;
 mod pci;
 mod pipe;
+mod pit;
 mod print;
 mod random;
 mod shell;
@@ -30,11 +31,10 @@ mod spin;
 mod sync;
 mod syscalls;
 mod time;
-mod tty;
 mod tss;
+mod tty;
 mod utils;
 mod wrappers;
-mod pit;
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -46,7 +46,7 @@ use core::ptr::{read_volatile, write_volatile};
 use core::str::FromStr;
 use drivers::pic::PICS;
 use filesystem::ext2::Ext2;
-use gdt::{GDT, GlobalDescriptorTable};
+use gdt::{GlobalDescriptorTable, GDT};
 use interrupts::idt::IDT;
 use memory::paging::PAGING;
 use print::PRINTER;
@@ -60,20 +60,20 @@ use crate::disk::interface::BlockDevice;
 use crate::disk::ramdisk::RamDisk;
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::drivers::net::i8255x::SCB_STATUS;
-use crate::filesystem::devfs::DevFS;
-use crate::filesystem::fat32::{FatDisk, FatFs, find_fat_partition_config};
-use crate::filesystem::{Filesystem, VFS};
-use crate::io::outb;
-use crate::pci::ide::{IDE, IDEDevice};
-use crate::pci::print_devices;
-use crate::sync::mutex::Mutex;
-use crate::utils::queue::Queue;
-use multitasking::task::TASK_MANAGER;
 use crate::drivers::pcmcia;
 use crate::drivers::pcmcia::PcmciaDevice;
+use crate::filesystem::devfs::DevFS;
+use crate::filesystem::fat32::{find_fat_partition_config, FatDisk, FatFs};
 use crate::filesystem::init::init_usb;
+use crate::filesystem::{Filesystem, VFS};
+use crate::io::outb;
+use crate::pci::ide::{IDEDevice, IDE};
+use crate::pci::print_devices;
 use crate::pit::init;
+use crate::sync::mutex::Mutex;
+use crate::utils::queue::Queue;
 use crate::wrappers::_cli;
+use multitasking::task::TASK_MANAGER;
 
 static mut TEST_WRITE: [u32; 128] = [0; 128];
 static mut TEST_READ: [u32; 128] = [0; 128];
@@ -137,7 +137,7 @@ pub extern "C" fn _start() -> ! {
         // ---------------------------------------------------------------
         const TEMP_PD_PHYS: u32 = 0x0020_0000;
         const TEMP_PT0_PHYS: u32 = 0x0020_1000; // covers 0–4 MiB identity + higher
-        // More PTs can be added if needed.
+                                                // More PTs can be added if needed.
 
         // Zero PD
         let pd = TEMP_PD_PHYS as *mut u32;
@@ -152,7 +152,7 @@ pub extern "C" fn _start() -> ! {
         for i in 0..16u32 {
             let phys = i * 0x400000;
             let flags = 0x83u32; // Present + Writable + Large page
-            // Identity
+                                 // Identity
             *pd.add(i as usize) = phys | flags;
             // Higher-half (PDE index for 0xC0000000 is 768)
             *pd.add(768 + i as usize) = phys | flags;
@@ -189,67 +189,6 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
-const POPUG: [u8; 1327] = [
-    0, 1, 1, 0, 0, 175, 0, 24, 0, 0, 0, 0, 28, 0, 28, 0, 8, 32, 0, 0, 0, 1, 9, 9, 11, 13, 14, 0,
-    22, 22, 0, 25, 26, 13, 17, 22, 19, 13, 13, 1, 35, 37, 13, 35, 36, 0, 47, 50, 15, 35, 53, 0, 51,
-    53, 0, 58, 60, 43, 37, 37, 4, 73, 76, 0, 76, 80, 2, 81, 85, 5, 87, 92, 29, 87, 90, 4, 95, 100,
-    17, 69, 119, 0, 96, 100, 5, 112, 118, 51, 79, 105, 60, 82, 103, 76, 33, 29, 67, 91, 114, 122,
-    85, 82, 99, 101, 101, 29, 43, 233, 31, 39, 233, 29, 60, 234, 31, 50, 234, 33, 33, 232, 33, 57,
-    235, 3, 124, 130, 32, 90, 152, 47, 99, 151, 62, 109, 154, 49, 113, 167, 51, 121, 190, 23, 93,
-    238, 27, 71, 235, 20, 106, 235, 28, 105, 240, 27, 126, 240, 41, 122, 200, 83, 107, 130, 70,
-    121, 172, 64, 127, 203, 7, 129, 134, 2, 141, 147, 5, 144, 151, 3, 156, 163, 10, 154, 163, 14,
-    168, 174, 3, 172, 179, 6, 175, 184, 9, 171, 180, 24, 128, 243, 0, 188, 196, 22, 162, 196, 17,
-    191, 197, 11, 167, 236, 4, 176, 230, 28, 188, 243, 46, 135, 206, 39, 133, 222, 63, 135, 202,
-    60, 141, 221, 55, 136, 215, 49, 152, 207, 42, 141, 235, 39, 136, 228, 38, 150, 237, 59, 142,
-    224, 37, 179, 213, 44, 172, 245, 3, 196, 205, 9, 196, 206, 1, 207, 216, 14, 204, 212, 9, 201,
-    212, 0, 210, 220, 13, 210, 220, 17, 200, 207, 16, 201, 209, 3, 200, 230, 1, 219, 229, 4, 222,
-    233, 13, 214, 225, 11, 217, 228, 10, 221, 233, 3, 214, 225, 16, 207, 226, 16, 216, 227, 5, 214,
-    249, 0, 226, 227, 2, 226, 235, 12, 225, 237, 15, 234, 238, 5, 229, 241, 2, 233, 244, 2, 237,
-    249, 11, 229, 242, 11, 233, 245, 11, 237, 250, 1, 241, 252, 13, 240, 253, 16, 231, 235, 19,
-    238, 236, 16, 239, 251, 26, 236, 248, 19, 240, 252, 30, 241, 252, 45, 209, 244, 38, 199, 243,
-    35, 234, 244, 47, 241, 252, 51, 232, 237, 50, 233, 243, 57, 239, 249, 92, 143, 145, 67, 182,
-    188, 76, 138, 199, 72, 142, 208, 65, 142, 219, 79, 145, 202, 83, 157, 231, 86, 166, 242, 110,
-    166, 221, 112, 170, 211, 125, 183, 241, 74, 237, 246, 73, 245, 249, 92, 234, 236, 94, 236, 244,
-    87, 237, 248, 92, 244, 249, 85, 242, 250, 104, 204, 221, 108, 238, 244, 106, 240, 247, 106,
-    241, 249, 98, 242, 251, 115, 233, 241, 127, 234, 240, 116, 240, 247, 114, 241, 248, 129, 108,
-    106, 139, 99, 96, 144, 155, 155, 169, 182, 182, 141, 237, 242, 149, 239, 244, 166, 214, 227,
-    201, 199, 199, 193, 220, 221, 202, 223, 224, 195, 223, 226, 204, 224, 225, 199, 229, 230, 199,
-    235, 243, 223, 231, 229, 217, 231, 232, 214, 236, 240, 223, 246, 247, 213, 246, 246, 225, 242,
-    243, 225, 247, 248, 228, 252, 253, 238, 255, 255, 246, 255, 255, 254, 254, 254, 246, 246, 246,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 53, 35, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 56, 103, 91, 52, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 3, 12, 1, 16, 107, 88, 84, 92, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 21, 103, 54, 35, 102, 101, 90, 90, 35, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 12, 98, 89, 57, 98, 107, 89, 90, 58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 55, 103, 91, 103, 107, 91, 90, 58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 3, 80, 98, 101, 107, 90, 90, 35, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 7, 14, 51, 83, 105, 92, 101, 84, 90, 51, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 8, 18, 123, 136, 139, 114, 107, 103, 103, 102, 99, 89, 91, 79, 17, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 6, 151, 152, 122, 145, 154, 141, 144, 148, 144, 113, 103, 108, 108, 108, 108, 106, 99,
-    91, 21, 0, 0, 0, 0, 0, 0, 0, 0, 25, 152, 167, 156, 170, 168, 157, 146, 143, 147, 134, 108, 108,
-    108, 108, 108, 108, 108, 99, 86, 7, 0, 0, 0, 0, 0, 0, 13, 149, 165, 149, 150, 173, 166, 160,
-    161, 145, 138, 118, 108, 113, 108, 108, 108, 108, 108, 106, 104, 22, 0, 1, 0, 0, 1, 0, 28, 170,
-    167, 27, 156, 172, 166, 160, 158, 153, 120, 103, 106, 108, 108, 113, 108, 113, 108, 108, 105,
-    54, 0, 0, 0, 0, 0, 5, 26, 155, 162, 174, 172, 171, 169, 160, 161, 145, 117, 103, 108, 108, 108,
-    106, 108, 106, 108, 106, 106, 78, 1, 0, 0, 2, 47, 130, 126, 46, 127, 170, 172, 169, 164, 161,
-    145, 137, 121, 114, 106, 106, 108, 106, 105, 106, 106, 106, 108, 93, 3, 0, 0, 24, 132, 128, 70,
-    69, 46, 131, 165, 163, 155, 135, 134, 138, 143, 143, 133, 111, 106, 105, 106, 105, 105, 106,
-    108, 89, 4, 0, 0, 48, 48, 48, 124, 70, 75, 66, 124, 140, 119, 115, 77, 65, 99, 120, 142, 138,
-    111, 105, 105, 105, 105, 105, 106, 108, 11, 0, 0, 23, 129, 69, 125, 124, 40, 46, 66, 95, 116,
-    34, 29, 31, 64, 97, 92, 112, 111, 105, 105, 105, 105, 105, 106, 106, 11, 0, 0, 1, 37, 73, 72,
-    73, 46, 36, 61, 110, 45, 30, 31, 31, 63, 97, 88, 103, 106, 105, 104, 99, 104, 105, 106, 103,
-    11, 0, 0, 0, 0, 20, 67, 73, 72, 72, 94, 99, 44, 29, 31, 42, 87, 98, 101, 106, 106, 104, 92, 99,
-    99, 105, 106, 108, 15, 0, 0, 0, 0, 0, 10, 39, 124, 71, 90, 100, 59, 33, 32, 43, 88, 83, 104,
-    111, 104, 99, 109, 99, 99, 105, 106, 108, 15, 0, 0, 0, 0, 1, 0, 17, 76, 76, 90, 100, 96, 43,
-    43, 87, 88, 89, 106, 104, 99, 92, 92, 99, 99, 105, 108, 105, 9, 0, 0, 0, 0, 0, 0, 56, 91, 93,
-    84, 91, 107, 107, 107, 98, 80, 101, 106, 99, 92, 92, 95, 99, 99, 105, 108, 93, 3, 0, 0, 0, 0,
-    0, 4, 84, 90, 90, 91, 91, 99, 102, 107, 107, 98, 98, 104, 95, 95, 99, 95, 92, 99, 105, 106, 82,
-    1, 0, 0, 0, 0, 0, 16, 84, 84, 91, 91, 91, 91, 91, 99, 98, 92, 91, 90, 90, 90, 91, 91, 92, 92,
-    104, 106, 78, 1, 0, 0, 0, 1, 0, 50, 95, 84, 95, 95, 90, 91, 90, 84, 95, 90, 90, 90, 90, 90, 90,
-    91, 91, 104, 104, 106, 60, 0, 0, 0, 0, 0, 0, 55, 84, 90, 91, 90, 91, 91, 90, 91, 91, 91, 91,
-    91, 91, 91, 90, 90, 94, 91, 89, 103, 60, 0, 0, 0, 0, 0, 4, 79, 90, 92, 92, 84, 81, 84, 84, 95,
-    84, 84, 86, 84, 81, 86, 85, 86, 86, 86, 85, 84, 51, 0, 0,
-];
 
 /// Continues kernel initialisation after we are running in higher-half.
 #[unsafe(no_mangle)]
@@ -305,7 +244,7 @@ pub extern "C" fn higher_half_entry() -> ! {
         );
         IDT.add(6, irq6 as u32);
         IDT.load(); // ← ПЕРЕМЕСТИТЬ СЮДА
-        // После полной инициализации paging
+                    // После полной инициализации paging
 
         // VESA framebuffer (mode set by bootloader, info at 0x5000).
         // After graphics mode VGA text is gone — software console + mini-WM.
@@ -391,6 +330,16 @@ pub extern "C" fn higher_half_entry() -> ! {
         );
         println!("[!] Enabling interrupts — entering idle");
         init(200);
+
+        // Persist the complete pre-STI kernel log for this boot.  The print
+        // path has been collecting into the fixed panic-safe KLOG from the
+        // beginning; only this one-shot snapshot allocates.
+        let _ = VFS.get().mkdir("/var");
+        let boot_log = crate::print::klog_snapshot();
+        if !VFS.get().write_file("/var/system.log", &boot_log) {
+            let _ = VFS.get().create_file("/var/system.log", &boot_log);
+        }
+
         // Enable interrupts. Boot used nested wrappers::_cli() above, while
         // this point intentionally releases *all* boot-time interrupt guards.
         // Keep the software nesting counter synchronized with the real IF.
@@ -398,128 +347,6 @@ pub extern "C" fn higher_half_entry() -> ! {
         asm!("sti");
         loop {
             asm!("hlt");
-        }
-    }
-}
-fn init_network_stack() {
-    use smoltcp::iface::{Config, Interface, SocketSet};
-    use smoltcp::socket::udp;
-    use smoltcp::time::Instant;
-    use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
-
-    let mut nic = {
-        let mut guard = crate::drivers::net::i8255x::NET.lock();
-        guard.take().expect("NIC not initialized")
-    };
-
-    // --- Интерфейс ---
-    let config = Config::new(EthernetAddress(nic.mac()).into());
-    let mut iface = Interface::new(config, &mut nic, Instant::from_millis(0));
-
-    // IP для QEMU user networking
-    // Гость: 10.0.2.15/24, шлюз: 10.0.2.2
-    iface.update_ip_addrs(|addrs| {
-        addrs
-            .push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24))
-            .unwrap();
-    });
-
-    iface
-        .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2))
-        .unwrap();
-
-    // --- Сокеты ---
-    let mut sockets = SocketSet::new(vec![]);
-
-    // UDP-сокет (слушаем)
-    let udp_rx_buffer =
-        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 4096]);
-    let udp_tx_buffer =
-        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 4096]);
-    let mut udp_socket = udp::Socket::new(udp_rx_buffer, udp_tx_buffer);
-
-    udp_socket
-        .bind(IpEndpoint::new(IpAddress::v4(10, 0, 2, 15), 1234))
-        .expect("bind failed");
-    let udp_handle = sockets.add(udp_socket);
-
-    println!("smoltcp: listening UDP on 10.0.2.15:1234");
-    // минимальный ethernet broadcast (можно даже мусор)
-    let dummy = [0xffu8; 64];
-    match nic.send(&dummy) {
-        Ok(()) => println!("TX submitted"),
-        Err(e) => println!("TX error: {}", e),
-    }
-
-    // немного подождать
-    for _ in 0..100000 {
-        core::hint::spin_loop();
-    }
-
-    nic.dump_scb(); // смотри, появился ли bit CX (0x80)
-    // --- Главный цикл ---
-    let mut timestamp_ms: i64 = 0;
-    println!("smoltcp: listening UDP on 10.0.2.15:1234");
-
-    // даём стеку «устаканиться»
-    for _ in 0..50 {
-        let ts = Instant::from_millis(timestamp_ms);
-        iface.poll(ts, &mut nic, &mut sockets);
-        timestamp_ms += 10;
-    }
-    let mut i = 0;
-    loop {
-        // TODO: замени на настоящий таймер (pit / rdtsc)
-        timestamp_ms += 10; // грубо 10 мс на итерацию
-        let timestamp = Instant::from_millis(timestamp_ms);
-
-        // Обработка сетевого стека
-        iface.poll(timestamp, &mut nic, &mut sockets);
-
-        // --- Обработка UDP ---
-        {
-            let socket = sockets.get_mut::<udp::Socket>(udp_handle);
-            i = i + 1;
-            // if i % 10000 == 0 {
-            //     unsafe {
-            //         // ACK все статусные биты
-            //         let st = read_volatile((nic.mmio + SCB_STATUS) as *const u16);
-            //         write_volatile((nic.mmio + SCB_STATUS) as *mut u16, st & 0xFF00);
-            //     }
-            //     nic.dump_scb();
-            //     nic.dump_rfds();
-            // }
-
-            if socket.can_recv() {
-                match socket.recv() {
-                    Ok((data, endpoint)) => {
-                        // Копируем данные, чтобы снять borrow
-                        let payload = data.to_vec();
-                        let endpoint = endpoint; // IpEndpoint — Copy
-
-                        println!(
-                            "UDP from {}:{}  len={}  data={:02x?}",
-                            endpoint.endpoint.addr,
-                            endpoint.endpoint.port,
-                            payload.len(),
-                            &String::from_utf8_lossy(&payload)
-                        );
-                        let reply = String::from_str("Ксюшечка жепа").unwrap();
-                        if socket.can_send() {
-                            let _ = socket.send_slice(&reply.into_bytes(), endpoint);
-                        }
-                    }
-                    Err(e) => {
-                        println!("UDP recv error: {:?}", e);
-                    }
-                }
-            }
-        }
-
-        // Небольшая пауза (можно заменить на hlt + таймер)
-        for _ in 0..1000 {
-            core::hint::spin_loop();
         }
     }
 }

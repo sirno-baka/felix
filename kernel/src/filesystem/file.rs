@@ -1,7 +1,7 @@
+use crate::spin::Mutex;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use crate::spin::Mutex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileMode {
@@ -71,7 +71,11 @@ pub enum FileDescriptor {
 
 impl FileDescriptor {
     pub fn new_file(inode: u32, mode: FileMode) -> Self {
-        Self::File { inode, offset: 0, mode }
+        Self::File {
+            inode,
+            offset: 0,
+            mode,
+        }
     }
 
     pub fn new_socket(socket_id: usize) -> Self {
@@ -191,7 +195,9 @@ impl FileDescriptorTable {
     }
 
     pub fn set_offset(&self, fd: usize, offset: u64) -> bool {
-        let Some(ofd) = self.ofds.get(fd).and_then(|v| v.as_ref()) else { return false; };
+        let Some(ofd) = self.ofds.get(fd).and_then(|v| v.as_ref()) else {
+            return false;
+        };
         ofd.lock().offset = offset;
         true
     }
@@ -208,7 +214,9 @@ impl FileDescriptorTable {
     }
 
     pub fn set_cookie(&self, fd: usize, cookie: u32) -> bool {
-        let Some(ofd) = self.ofds.get(fd).and_then(|v| v.as_ref()) else { return false; };
+        let Some(ofd) = self.ofds.get(fd).and_then(|v| v.as_ref()) else {
+            return false;
+        };
         ofd.lock().dir_cookie = cookie;
         true
     }
@@ -272,7 +280,12 @@ impl FileDescriptorTable {
         self.fds[fd].replace(desc)
     }
 
-    pub fn set_shared(&mut self, fd: usize, desc: FileDescriptor, ofd: SharedOpenFile) -> Option<FileDescriptor> {
+    pub fn set_shared(
+        &mut self,
+        fd: usize,
+        desc: FileDescriptor,
+        ofd: SharedOpenFile,
+    ) -> Option<FileDescriptor> {
         if fd >= self.fds.len() {
             return None;
         }
@@ -291,7 +304,10 @@ impl FileDescriptorTable {
             .map(|o| Arc::strong_count(o) == 1)
             .unwrap_or(true);
         drop(ofd);
-        Some(ClosedFileDescriptor { desc, last_open_ref })
+        Some(ClosedFileDescriptor {
+            desc,
+            last_open_ref,
+        })
     }
 
     pub fn take_all(&mut self) -> Vec<ClosedFileDescriptor> {
@@ -314,8 +330,12 @@ impl FileDescriptorTable {
             alloc::format!("{}/", old.trim_end_matches('/'))
         };
         for slot in &mut self.fds {
-            let Some(FileDescriptor::Dir { path, path_len, .. }) = slot.as_mut() else { continue; };
-            let Ok(current) = core::str::from_utf8(&path[..*path_len as usize]) else { continue; };
+            let Some(FileDescriptor::Dir { path, path_len, .. }) = slot.as_mut() else {
+                continue;
+            };
+            let Ok(current) = core::str::from_utf8(&path[..*path_len as usize]) else {
+                continue;
+            };
             let suffix = if current == old {
                 Some("")
             } else {
@@ -325,7 +345,9 @@ impl FileDescriptorTable {
                     s
                 })
             };
-            let Some(suffix) = suffix else { continue; };
+            let Some(suffix) = suffix else {
+                continue;
+            };
             let replacement = if suffix.is_empty() {
                 new.to_string()
             } else if new == "/" {
@@ -334,7 +356,9 @@ impl FileDescriptorTable {
                 alloc::format!("{}/{}", new.trim_end_matches('/'), suffix)
             };
             let bytes = replacement.as_bytes();
-            if bytes.len() >= path.len() { continue; }
+            if bytes.len() >= path.len() {
+                continue;
+            }
             *path = [0; 96];
             path[..bytes.len()].copy_from_slice(bytes);
             *path_len = bytes.len() as u8;
@@ -347,8 +371,12 @@ impl FileDescriptorTable {
         if old >= self.fds.len() || new >= self.fds.len() {
             return false;
         }
-        let Some(desc) = self.fds[old] else { return false; };
-        let Some(ofd) = self.ofds[old].as_ref().cloned() else { return false; };
+        let Some(desc) = self.fds[old] else {
+            return false;
+        };
+        let Some(ofd) = self.ofds[old].as_ref().cloned() else {
+            return false;
+        };
         if old == new {
             return true;
         }

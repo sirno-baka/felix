@@ -1,7 +1,7 @@
 // kernel/src/filesystem/vfs.rs
 use crate::println;
-use crate::sync::MutexLazy;
 use crate::sync::mutex::Mutex;
+use crate::sync::MutexLazy;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -52,12 +52,18 @@ pub trait Filesystem: Send + Sync {
     fn is_mounted(&self) -> bool;
 
     /// Backend metadata. Mode includes both file type and permission bits.
-    fn metadata(&self, _path: &str) -> Option<Metadata> { None }
-    fn metadata_inode(&self, _inode: u32) -> Option<Metadata> { None }
+    fn metadata(&self, _path: &str) -> Option<Metadata> {
+        None
+    }
+    fn metadata_inode(&self, _inode: u32) -> Option<Metadata> {
+        None
+    }
 
     /// Rename within one filesystem. VFS rejects cross-mount renames before
     /// reaching the backend.
-    fn rename(&mut self, _old: &str, _new: &str) -> bool { false }
+    fn rename(&mut self, _old: &str, _new: &str) -> bool {
+        false
+    }
 }
 
 pub struct Vfs {
@@ -120,7 +126,11 @@ impl Vfs {
             println!("[VFS] No free filesystem id for {}", mount_point);
             return;
         };
-        inner.mounts.push(Mount { point: mount_point.to_string(), fs_id, fs });
+        inner.mounts.push(Mount {
+            point: mount_point.to_string(),
+            fs_id,
+            fs,
+        });
         let count = inner.mounts.len();
         drop(inner);
         let mut mounts = MOUNT_REGISTRY.get().lock();
@@ -250,7 +260,12 @@ impl Vfs {
         let mut meta = if fs_id == 0 {
             inner.root_fs.as_ref()?.metadata_inode(local_inode)?
         } else {
-            inner.mounts.iter().find(|m| m.fs_id == fs_id)?.fs.metadata_inode(local_inode)?
+            inner
+                .mounts
+                .iter()
+                .find(|m| m.fs_id == fs_id)?
+                .fs
+                .metadata_inode(local_inode)?
         };
         meta.inode = global_inode;
         Some(meta)
@@ -277,16 +292,27 @@ impl Vfs {
         }
 
         let fs: &mut dyn Filesystem = if old_id == 0 {
-            inner.root_fs.as_mut().ok_or(RenameError::NotFound)?.as_mut()
+            inner
+                .root_fs
+                .as_mut()
+                .ok_or(RenameError::NotFound)?
+                .as_mut()
         } else {
-            inner.mounts.iter_mut().find(|m| m.fs_id == old_id)
-                .ok_or(RenameError::NotFound)?.fs.as_mut()
+            inner
+                .mounts
+                .iter_mut()
+                .find(|m| m.fs_id == old_id)
+                .ok_or(RenameError::NotFound)?
+                .fs
+                .as_mut()
         };
-        let old_exists = fs.resolve_path(&old_rel).is_some() || fs.list_directory_entries(&old_rel).is_some();
+        let old_exists =
+            fs.resolve_path(&old_rel).is_some() || fs.list_directory_entries(&old_rel).is_some();
         if !old_exists {
             return Err(RenameError::NotFound);
         }
-        let new_exists = fs.resolve_path(&new_rel).is_some() || fs.list_directory_entries(&new_rel).is_some();
+        let new_exists =
+            fs.resolve_path(&new_rel).is_some() || fs.list_directory_entries(&new_rel).is_some();
         if new_exists {
             return Err(RenameError::Exists);
         }
@@ -363,7 +389,11 @@ fn normalize_dir_path(path: &str) -> String {
         return "/".to_string();
     }
     let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() }
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Add the immediate directory components implied by deeper mountpoints.
@@ -374,8 +404,7 @@ fn has_mount_descendant(inner: &VfsInner, path: &str) -> bool {
         if path == "/" {
             mount.point != "/"
         } else {
-            mount.point.starts_with(path)
-                && mount.point.as_bytes().get(path.len()) == Some(&b'/')
+            mount.point.starts_with(path) && mount.point.as_bytes().get(path.len()) == Some(&b'/')
         }
     })
 }
@@ -387,17 +416,28 @@ fn add_mount_children(inner: &VfsInner, path: &str, entries: &mut Vec<DirEntry>)
             continue;
         }
         let rest = if path == "/" {
-            mount.point.strip_prefix('/').unwrap_or(mount.point.as_str())
+            mount
+                .point
+                .strip_prefix('/')
+                .unwrap_or(mount.point.as_str())
         } else {
-            let Some(rest) = mount.point.strip_prefix(path) else { continue; };
-            let Some(rest) = rest.strip_prefix('/') else { continue; };
+            let Some(rest) = mount.point.strip_prefix(path) else {
+                continue;
+            };
+            let Some(rest) = rest.strip_prefix('/') else {
+                continue;
+            };
             rest
         };
         if rest.is_empty() {
             continue;
         }
         let child = rest.split('/').next().unwrap_or(rest);
-        if child.is_empty() || entries.iter().any(|e| e.name.trim_end_matches('/') == child) {
+        if child.is_empty()
+            || entries
+                .iter()
+                .any(|e| e.name.trim_end_matches('/') == child)
+        {
             continue;
         }
         entries.push(DirEntry {
@@ -413,7 +453,11 @@ fn add_mount_children(inner: &VfsInner, path: &str, entries: &mut Vec<DirEntry>)
 
 fn alloc_mount_id(inner: &mut VfsInner) -> Option<u8> {
     for _ in 0..255 {
-        let id = if inner.next_fs_id == 0 { 1 } else { inner.next_fs_id };
+        let id = if inner.next_fs_id == 0 {
+            1
+        } else {
+            inner.next_fs_id
+        };
         inner.next_fs_id = id.wrapping_add(1);
         if !inner.mounts.iter().any(|m| m.fs_id == id) {
             return Some(id);

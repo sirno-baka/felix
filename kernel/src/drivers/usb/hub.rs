@@ -36,7 +36,12 @@ pub fn bind(hc: &Ohci, addr: u8) {
     }
 }
 
-fn probe(hc: &Ohci, addr: u8, _device: &crate::drivers::usb::device::UsbDevice, _iface: Option<&super::desc::Interface>) -> Result<(), &'static str> {
+fn probe(
+    hc: &Ohci,
+    addr: u8,
+    _device: &crate::drivers::usb::device::UsbDevice,
+    _iface: Option<&super::desc::Interface>,
+) -> Result<(), &'static str> {
     bind(hc, addr);
     Ok(())
 }
@@ -62,7 +67,12 @@ fn scan_ports(hc: &Ohci, addr: u8, nports: u8) {
     for port in 1..=nports {
         let mut st = [0u8; 4];
         if hc
-            .control(addr, &desc::setup(0xA3, GET_STATUS, 0, port as u16, 4), &mut st, true)
+            .control(
+                addr,
+                &desc::setup(0xA3, GET_STATUS, 0, port as u16, 4),
+                &mut st,
+                true,
+            )
             .is_err()
         {
             continue;
@@ -80,7 +90,12 @@ fn scan_ports(hc: &Ohci, addr: u8, nports: u8) {
         );
         crate::time::sleep(20);
         let mut st = [0u8; 4];
-        let _ = hc.control(addr, &desc::setup(0xA3, GET_STATUS, 0, port as u16, 4), &mut st, true);
+        let _ = hc.control(
+            addr,
+            &desc::setup(0xA3, GET_STATUS, 0, port as u16, 4),
+            &mut st,
+            true,
+        );
         let status = u16::from_le_bytes([st[0], st[1]]);
         let ls = status & (1 << 9) != 0;
         match hc.address_and_bind(ls) {

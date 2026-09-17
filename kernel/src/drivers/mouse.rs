@@ -6,10 +6,10 @@
 use crate::drivers::framebuffer::FRAMEBUFFER;
 use crate::drivers::pic::PICS;
 use crate::io::{inb, io_wait, outb};
-use crate::{debugln, println};
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
-use core::arch::{asm, naked_asm};
 use crate::time::jiffies;
+use crate::{debugln, println};
+use core::arch::{asm, naked_asm};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 /// IRQ12 remapped: 32 + 12 = 44
 pub const MOUSE_INT: u8 = 44;
@@ -133,12 +133,18 @@ fn mouse_write(val: u8) {
 }
 
 fn mouse_read() -> u8 {
-    if wait_output_full() { inb(PS2_DATA) } else { 0 }
+    if wait_output_full() {
+        inb(PS2_DATA)
+    } else {
+        0
+    }
 }
 
 fn set_sample_rate(rate: u8) -> bool {
     mouse_write(0xF3);
-    if mouse_read() != 0xFA { return false; }
+    if mouse_read() != 0xFA {
+        return false;
+    }
     mouse_write(rate);
     mouse_read() == 0xFA
 }
@@ -188,11 +194,18 @@ pub fn init() {
     // after the 200/100/80 sample-rate sequence (Explorer mice may report 4).
     let wheel_id = if set_sample_rate(200) && set_sample_rate(100) && set_sample_rate(80) {
         mouse_write(0xF2);
-        if mouse_read() == 0xFA { mouse_read() } else { 0 }
+        if mouse_read() == 0xFA {
+            mouse_read()
+        } else {
+            0
+        }
     } else {
         0
     };
-    PACKET_LEN.store(if wheel_id == 3 || wheel_id == 4 { 4 } else { 3 }, Ordering::Relaxed);
+    PACKET_LEN.store(
+        if wheel_id == 3 || wheel_id == 4 { 4 } else { 3 },
+        Ordering::Relaxed,
+    );
 
     // Enable data reporting
     mouse_write(0xF4);
@@ -341,7 +354,11 @@ fn process_packet() {
         }
         if PACKET_LEN.load(Ordering::Relaxed) == 4 {
             let nibble = (b3 & 0x0F) as i8;
-            let wheel = if nibble & 0x08 != 0 { nibble | !0x0F } else { nibble };
+            let wheel = if nibble & 0x08 != 0 {
+                nibble | !0x0F
+            } else {
+                nibble
+            };
             if wheel != 0 {
                 crate::drivers::wm::on_mouse_wheel(x, y, wheel as i32);
             }
@@ -379,12 +396,15 @@ pub fn redraw_cursor() {
 /// The compositor already owns the framebuffer lock when calling this.
 pub fn hide_cursor(fb: &mut crate::drivers::framebuffer::Framebuffer) {
     unsafe {
-        if !CUR_DRAWN { return; }
+        if !CUR_DRAWN {
+            return;
+        }
         for row in 0..CUR_H {
             for col in 0..CUR_W {
                 let px = CUR_OX + col as i32;
                 let py = CUR_OY + row as i32;
-                if px >= 0 && py >= 0
+                if px >= 0
+                    && py >= 0
                     && (px as u32) < fb.info.width as u32
                     && (py as u32) < fb.info.height as u32
                 {

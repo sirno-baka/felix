@@ -7,18 +7,17 @@
 //! disabled and the same status registers are polled from PIT.
 
 use alloc::boxed::Box;
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence};
 
+use crate::KERNEL_OFFSET;
 use crate::drivers::audio::Mixer;
 use crate::io::{inb, inl, inw, io_wait, outb, outl, outw};
 use crate::pci::bar::Bar;
 use crate::pci::device::PciDevice;
-use crate::KERNEL_OFFSET;
 
 const INTEL: u16 = 0x8086;
 const IDS: &[u16] = &[
-    0x2415, 0x2425, 0x2445, 0x2485, 0x24c5, 0x24d5, 0x25a6, 0x266e, 0x27de,
-    0x2698, 0x7195,
+    0x2415, 0x2425, 0x2445, 0x2485, 0x24c5, 0x24d5, 0x25a6, 0x266e, 0x27de, 0x2698, 0x7195,
 ];
 
 const AC97_RESET: u16 = 0x00;
@@ -141,21 +140,39 @@ fn virt_to_phys<T>(p: *const T) -> Result<u32, &'static str> {
 }
 
 impl IchAc97 {
-    pub fn name(&self) -> &'static str { chip_name(self.device_id) }
-    pub fn irq(&self) -> u8 { self.irq }
-    pub fn set_irq_enabled(&mut self, enabled: bool) { self.irq_enabled = enabled; }
+    pub fn name(&self) -> &'static str {
+        chip_name(self.device_id)
+    }
+    pub fn irq(&self) -> u8 {
+        self.irq
+    }
+    pub fn set_irq_enabled(&mut self, enabled: bool) {
+        self.irq_enabled = enabled;
+    }
 
     #[inline]
-    fn nport(&self, reg: u16) -> u16 { self.nam.wrapping_add(reg) }
+    fn nport(&self, reg: u16) -> u16 {
+        self.nam.wrapping_add(reg)
+    }
     #[inline]
-    fn bport(&self, reg: u16) -> u16 { self.nabm.wrapping_add(reg) }
+    fn bport(&self, reg: u16) -> u16 {
+        self.nabm.wrapping_add(reg)
+    }
     #[inline]
-    fn codec_read(&self, reg: u16) -> u16 { inw(self.nport(reg)) }
+    fn codec_read(&self, reg: u16) -> u16 {
+        inw(self.nport(reg))
+    }
     #[inline]
-    fn codec_write(&self, reg: u16, value: u16) { outw(self.nport(reg), value); }
+    fn codec_write(&self, reg: u16, value: u16) {
+        outw(self.nport(reg), value);
+    }
 
     fn run_control(&self) -> u8 {
-        if self.irq_enabled { CR_RPBM | CR_FEIE | CR_IOCE } else { CR_RPBM }
+        if self.irq_enabled {
+            CR_RPBM | CR_FEIE | CR_IOCE
+        } else {
+            CR_RPBM
+        }
     }
 
     fn reset_pcm_out(&self) -> Result<(), &'static str> {
@@ -185,10 +202,14 @@ impl IchAc97 {
             }
             io_wait();
         }
-        if !ready { return Err("ICH AC97 primary codec not ready"); }
+        if !ready {
+            return Err("ICH AC97 primary codec not ready");
+        }
 
         self.codec_write(AC97_RESET, 0);
-        for _ in 0..2000 { io_wait(); }
+        for _ in 0..2000 {
+            io_wait();
+        }
         self.codec_write(AC97_POWERDOWN, 0);
         self.codec_write(AC97_MASTER_VOL, 0);
         self.codec_write(AC97_PCM_OUT_VOL, 0);
@@ -229,12 +250,16 @@ impl IchAc97 {
     }
 
     pub fn kick(&mut self, mixer: &mut Mixer) -> Result<(), &'static str> {
-        if self.running || !mixer.has_data() { return Ok(()); }
+        if self.running || !mixer.has_data() {
+            return Ok(());
+        }
 
         self.reset_pcm_out()?;
         self.prepare_bdl()?;
         self.dma.samples.fill(0);
-        for i in 0..ACTIVE_FRAGS { let _ = self.fill_fragment(i, mixer); }
+        for i in 0..ACTIVE_FRAGS {
+            let _ = self.fill_fragment(i, mixer);
+        }
 
         let bdl_phys = virt_to_phys(self.bdl.entries.as_ptr())?;
         compiler_fence(Ordering::SeqCst);
@@ -248,7 +273,11 @@ impl IchAc97 {
         outw(self.bport(PO_SR), SR_W1C);
 
         let mut gc = inl(self.bport(GLOB_CNT)) | GLOB_CNT_COLD;
-        if self.irq_enabled { gc |= GLOB_CNT_GIE; } else { gc &= !GLOB_CNT_GIE; }
+        if self.irq_enabled {
+            gc |= GLOB_CNT_GIE;
+        } else {
+            gc &= !GLOB_CNT_GIE;
+        }
         outl(self.bport(GLOB_CNT), gc);
         outb(self.bport(PO_CR), self.run_control());
         self.running = true;
@@ -266,29 +295,43 @@ impl IchAc97 {
 
     /// Fast IRQ path: inspect/ack only. No mixing, allocation or long loops.
     pub fn ack_irq(&mut self) -> bool {
-        if !self.running { return false; }
+        if !self.running {
+            return false;
+        }
         let sr = inw(self.bport(PO_SR));
         let pending = sr & (SR_BCIS | SR_LVBCI | SR_FIFOE);
-        if pending == 0 { return false; }
+        if pending == 0 {
+            return false;
+        }
         outw(self.bport(PO_SR), pending);
-        if pending & (SR_BCIS | SR_LVBCI) != 0 { self.pending_completion = true; }
-        if pending & SR_FIFOE != 0 { self.pending_fifo_error = true; }
+        if pending & (SR_BCIS | SR_LVBCI) != 0 {
+            self.pending_completion = true;
+        }
+        if pending & SR_FIFOE != 0 {
+            self.pending_fifo_error = true;
+        }
         true
     }
 
     /// Bottom half, called by PIT. It polls status too, so pure-polling mode and
     /// storm-masked legacy IRQs use the same refill path.
     pub fn poll(&mut self, mixer: &mut Mixer) {
-        if !self.running { return; }
+        if !self.running {
+            return;
+        }
         let _ = self.ack_irq();
-        if !self.pending_completion && !self.pending_fifo_error { return; }
+        if !self.pending_completion && !self.pending_fifo_error {
+            return;
+        }
 
         let had_completion = self.pending_completion;
         let fifo_error = self.pending_fifo_error;
         self.pending_completion = false;
         self.pending_fifo_error = false;
 
-        if fifo_error { crate::println!("[audio/ich] PCM FIFO error"); }
+        if fifo_error {
+            crate::println!("[audio/ich] PCM FIFO error");
+        }
 
         let civ = inb(self.bport(PO_CIV)) & 31;
         let mut completed = 0usize;
@@ -296,7 +339,11 @@ impl IchAc97 {
             self.last_civ = (self.last_civ + 1) & 31;
             let append = ((self.lvi as usize + 1) & 31) as u8;
             let data = self.fill_fragment(append as usize, mixer);
-            if data { self.idle_appends = 0; } else { self.idle_appends = self.idle_appends.saturating_add(1); }
+            if data {
+                self.idle_appends = 0;
+            } else {
+                self.idle_appends = self.idle_appends.saturating_add(1);
+            }
             compiler_fence(Ordering::SeqCst);
             self.lvi = append;
             outb(self.bport(PO_LVI), self.lvi);
@@ -306,7 +353,11 @@ impl IchAc97 {
         if completed == 0 && had_completion {
             let append = ((self.lvi as usize + 1) & 31) as u8;
             let data = self.fill_fragment(append as usize, mixer);
-            if data { self.idle_appends = 0; } else { self.idle_appends = self.idle_appends.saturating_add(1); }
+            if data {
+                self.idle_appends = 0;
+            } else {
+                self.idle_appends = self.idle_appends.saturating_add(1);
+            }
             compiler_fence(Ordering::SeqCst);
             self.lvi = append;
             outb(self.bport(PO_LVI), self.lvi);
@@ -324,14 +375,23 @@ pub fn probe_first() -> Result<Option<IchAc97>, &'static str> {
     let Some(dev) = crate::pci::enumerate()
         .into_iter()
         .find(|d| d.vendor_id == INTEL && supported(d.device_id))
-    else { return Ok(None); };
+    else {
+        return Ok(None);
+    };
 
     let nam = io_bar(&dev, 0)?;
     let nabm = io_bar(&dev, 1)?;
     dev.enable_bus_mastering();
 
-    let bdl = Box::new(Bdl { entries: [BdlEntry { addr: 0, control_len: 0 }; BDL_COUNT] });
-    let dma = Box::new(DmaBuffer { samples: [0; DMA_SAMPLES] });
+    let bdl = Box::new(Bdl {
+        entries: [BdlEntry {
+            addr: 0,
+            control_len: 0,
+        }; BDL_COUNT],
+    });
+    let dma = Box::new(DmaBuffer {
+        samples: [0; DMA_SAMPLES],
+    });
     let mut card = IchAc97 {
         nam,
         nabm,
@@ -353,7 +413,11 @@ pub fn probe_first() -> Result<Option<IchAc97>, &'static str> {
 
     crate::println!(
         "[audio/ich] {} NAM={:#06x} NABM={:#06x} irq={} rev={:#04x}",
-        card.name(), card.nam, card.nabm, card.irq, card.revision
+        card.name(),
+        card.nam,
+        card.nabm,
+        card.irq,
+        card.revision
     );
     Ok(Some(card))
 }

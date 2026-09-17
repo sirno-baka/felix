@@ -3,16 +3,20 @@
 // klog is a lock-free (cli-only) ring of recent lines so fb_panic / exceptions
 // can dump history even when PRINTER's Mutex is held by the faulting context.
 
+use crate::sync::mutex::Mutex;
+use crate::time::get_timestamp;
 use alloc::fmt::format;
 use alloc::format;
 use alloc::string::String;
-use crate::sync::mutex::Mutex;
+use alloc::vec::Vec;
 use core::arch::asm;
 use core::fmt;
 use core::fmt::Write;
-use crate::time::get_timestamp;
 
-pub const LOG_LINES: usize = 50;
+// Keep the whole pre-STI boot log in memory. 4096 * 150 bytes is ~600 KiB,
+// large enough for verbose PCI/USB/network probing while still remaining a
+// fixed panic-safe buffer (no allocation in the print path).
+pub const LOG_LINES: usize = 8192;
 pub const LOG_WIDTH: usize = 150;
 
 // ---------------------------------------------------------------------------
@@ -22,8 +26,8 @@ pub const LOG_WIDTH: usize = 150;
 struct Klog {
     lines: [[u8; LOG_WIDTH]; LOG_LINES],
     lens: [u8; LOG_LINES],
-    head: u8,
-    count: u8,
+    head: usize,
+    count: usize,
     cur: [u8; LOG_WIDTH],
     cur_len: u8,
 }
@@ -73,13 +77,13 @@ fn klog_feed_char(c: char) {
 }
 
 fn klog_commit_line(k: &mut Klog) {
-    let i = k.head as usize % LOG_LINES;
+    let i = k.head % LOG_LINES;
     let n = k.cur_len as usize;
     k.lines[i] = [0; LOG_WIDTH];
     k.lines[i][..n].copy_from_slice(&k.cur[..n]);
     k.lens[i] = k.cur_len;
-    k.head = k.head.wrapping_add(1);
-    if (k.count as usize) < LOG_LINES {
+    k.head = (k.head + 1) % LOG_LINES;
+    if k.count < LOG_LINES {
         k.count += 1;
     }
     k.cur_len = 0;
@@ -99,14 +103,14 @@ pub fn klog_write_str(s: &str) {
 pub fn klog_for_each_line(mut f: impl FnMut(&[u8])) {
     interrupt_sync::without_interrupts(|| {
         let k = unsafe { &*core::ptr::addr_of!(KLOG) };
-        let count = k.count as usize;
+        let count = k.count;
         if count == 0 && k.cur_len == 0 {
             return;
         }
         let start = if count < LOG_LINES {
             0
         } else {
-            k.head as usize % LOG_LINES
+            k.head % LOG_LINES
         };
         for idx in 0..count {
             let i = (start + idx) % LOG_LINES;
@@ -117,6 +121,18 @@ pub fn klog_for_each_line(mut f: impl FnMut(&[u8])) {
             f(&k.cur[..k.cur_len as usize]);
         }
     });
+}
+
+/// Copy the current kernel log oldest -> newest, adding a newline after every
+/// stored line. Intended for the one-shot pre-STI dump to /var/system.log.
+/// Allocation happens only here, never in the normal print/panic path.
+pub fn klog_snapshot() -> Vec<u8> {
+    let mut out = Vec::new();
+    klog_for_each_line(|line| {
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    });
+    out
 }
 
 // ---------------------------------------------------------------------------

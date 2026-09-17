@@ -3,10 +3,10 @@
 use crate::drivers::pic::wait;
 use crate::filesystem::file::FileDescriptorTable;
 use crate::memory::paging::{
-    KERNEL_OFFSET, PDEFlags, PageDirectory, PhysAddr, VirtAddr, alloc_kernel_stack,
-    alloc_task_page_dir, copy_kernel_mappings,
+    alloc_kernel_stack, alloc_task_page_dir, copy_kernel_mappings, PDEFlags, PageDirectory,
+    PhysAddr, VirtAddr, KERNEL_OFFSET,
 };
-use crate::{gdt, init_network_stack, print, println};
+use crate::{gdt, print, println};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::arch::asm;
@@ -179,12 +179,16 @@ impl Task {
                 if entry & PDEFlags::PRESENT == 0 || entry & PDEFlags::DIR_PAGE_SIZE != 0 {
                     continue;
                 }
-                if entry & PDEFlags::USER == 0 { continue; }
+                if entry & PDEFlags::USER == 0 {
+                    continue;
+                }
                 let table_phys = entry & 0xffff_f000;
                 let table = phys_to_virt(table_phys) as *const u32;
                 for slot in 0..1024 {
                     let page = *table.add(slot);
-                    if page & 1 != 0 { paging.free_phys_frame((page & 0xffff_f000) >> 12); }
+                    if page & 1 != 0 {
+                        paging.free_phys_frame((page & 0xffff_f000) >> 12);
+                    }
                 }
                 paging.free_phys_frame(table_phys >> 12);
                 (*self.page_dir).entries[index] = 0;
@@ -450,16 +454,19 @@ impl TaskManager {
     }
 
     pub(crate) fn reparent_children_of(&mut self, dead_pid: i32) {
-        if dead_pid <= 0 { return; }
+        if dead_pid <= 0 {
+            return;
+        }
         let init_slot = if dead_pid != 1 {
-            self.slot_by_pid(1).filter(|slot| {
-                self.tasks[*slot].as_ref().map_or(false, |t| !t.zombie)
-            })
+            self.slot_by_pid(1)
+                .filter(|slot| self.tasks[*slot].as_ref().map_or(false, |t| !t.zombie))
         } else {
             None
         };
         for task in self.tasks.iter_mut().flatten() {
-            if task.ppid != dead_pid { continue; }
+            if task.ppid != dead_pid {
+                continue;
+            }
             if let Some(slot) = init_slot {
                 task.ppid = 1;
                 task.parent = slot as i8;
@@ -602,14 +609,11 @@ impl TaskManager {
     }
 
     pub fn slot_by_pid(&self, pid: i32) -> Option<usize> {
-        self.tasks
-            .iter()
-            .enumerate()
-            .find_map(|(slot, task)| {
-                task.as_ref()
-                    .filter(|t| t.pid == pid && t.leader_slot == slot as i8)
-                    .map(|_| slot)
-            })
+        self.tasks.iter().enumerate().find_map(|(slot, task)| {
+            task.as_ref()
+                .filter(|t| t.pid == pid && t.leader_slot == slot as i8)
+                .map(|_| slot)
+        })
     }
 
     pub fn slot_by_tid(&self, tid: i32) -> Option<usize> {
@@ -623,7 +627,13 @@ impl TaskManager {
         self.tasks
             .get(slot)
             .and_then(|t| t.as_ref())
-            .map(|t| if t.leader_slot >= 0 { t.leader_slot as usize } else { slot })
+            .map(|t| {
+                if t.leader_slot >= 0 {
+                    t.leader_slot as usize
+                } else {
+                    slot
+                }
+            })
             .unwrap_or(slot)
     }
 
@@ -690,9 +700,9 @@ impl TaskManager {
             if slot as i8 == current {
                 continue;
             }
-            let reap = self.tasks[slot]
-                .as_ref()
-                .map_or(false, |task| task.is_thread && task.thread_exited && task.thread_detached);
+            let reap = self.tasks[slot].as_ref().map_or(false, |task| {
+                task.is_thread && task.thread_exited && task.thread_detached
+            });
             if reap {
                 self.reap_thread(slot);
             }
@@ -707,15 +717,17 @@ impl TaskManager {
     /// reap(), which reparents children to PID 1. This path mainly covers old
     /// tasks created before that parent was tracked or forced slot removal.
     pub fn reap_orphans(&mut self) {
-        let init_slot = self.slot_by_pid(1).filter(|slot| {
-            self.tasks[*slot].as_ref().map_or(false, |t| !t.zombie)
-        });
+        let init_slot = self
+            .slot_by_pid(1)
+            .filter(|slot| self.tasks[*slot].as_ref().map_or(false, |t| !t.zombie));
         let mut unreapable_zombies = Vec::new();
         for i in 1..MAX_TASKS as usize {
             let missing_parent = self.tasks[i]
                 .as_ref()
                 .map_or(false, |t| t.pid != 1 && self.parent_gone(t.ppid));
-            if !missing_parent { continue; }
+            if !missing_parent {
+                continue;
+            }
             if let Some(slot) = init_slot {
                 if let Some(ref mut task) = self.tasks[i] {
                     task.ppid = 1;
@@ -767,7 +779,9 @@ impl TaskManager {
         // their private stacks before releasing the shared address space.
         let members = self.thread_slots(id);
         for slot in members {
-            if slot == id { continue; }
+            if slot == id {
+                continue;
+            }
             if let Some(task) = self.tasks[slot].as_mut() {
                 task.release_memory();
             }
