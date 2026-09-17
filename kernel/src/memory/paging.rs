@@ -92,6 +92,11 @@ const VIRT_PT_BASE: u32 = 0xFFC00000;
 const VIRT_PD_BASE: u32 = 0xFFFFF000;
 
 pub const KERNEL_OFFSET: u32 = 0xC000_0000;
+/// Kernel-only MMIO window immediately below the higher half.
+/// Keeping MMIO out of `KERNEL_OFFSET + phys` prevents device mappings from
+/// replacing direct-mapped RAM pages that may later be used for DMA.
+pub const KERNEL_MMIO_BASE: u32 = 0xBF00_0000;
+pub const KERNEL_MMIO_END: u32 = KERNEL_OFFSET;
 pub const KERNEL_PHYS: u32 = 0x0100_0000;
 pub const KERNEL_VIRT: u32 = KERNEL_PHYS + KERNEL_OFFSET; // 0xC100_0000
 
@@ -217,6 +222,8 @@ impl PTEFlags {
     pub const PRESENT: u32 = 1 << 0;
     pub const WRITABLE: u32 = 1 << 1;
     pub const USER: u32 = 1 << 2;
+    pub const WRITE_THROUGH: u32 = 1 << 3;
+    pub const CACHE_DISABLE: u32 = 1 << 4;
     pub const ACCESSED: u32 = 1 << 5;
     pub const DIRTY: u32 = 1 << 6;
 
@@ -236,6 +243,16 @@ impl PTEFlags {
 
     pub fn user(mut self) -> Self {
         self.0 |= Self::USER;
+        self
+    }
+
+    pub fn write_through(mut self) -> Self {
+        self.0 |= Self::WRITE_THROUGH;
+        self
+    }
+
+    pub fn cache_disable(mut self) -> Self {
+        self.0 |= Self::CACHE_DISABLE;
         self
     }
 
@@ -571,10 +588,13 @@ impl PageManager {
             let pd_idx = (vpage >> 10) as usize;
             let pt_idx = (vpage & 0x3FF) as usize;
 
-            // Создаём Page Table, если нужно
+            // Split an existing 4 MiB mapping before installing 4 KiB PTEs.
+            // Treating a large-page PDE as a table writes PTE values into RAM
+            // while the CPU continues using the original RAM mapping.
+            let old_pde = self.dir.entries[pd_idx];
             let need_table = {
-                let pde = self.dir.entries[pd_idx];
-                pde == 0 || (pde & PDEFlags::PRESENT) == 0
+                old_pde & PDEFlags::PRESENT == 0
+                    || old_pde & PDEFlags::DIR_PAGE_SIZE != 0
             };
 
             if need_table {
@@ -583,13 +603,21 @@ impl PageManager {
 
                 let pde_flags = PDEFlags::new().present().writable().bits(); // kernel-only
 
-                self.dir.entries[pd_idx] = pt_phys | pde_flags;
-                PageDirectory::flush_page((pd_idx as u32) << 22);
-
-                let pt_ptr = PageDirectory::pt_from_pde(self.dir.entries[pd_idx]);
+                let pt_ptr = PageDirectory::pt_from_pde(pt_phys);
                 unsafe {
                     write_bytes(pt_ptr as *mut u8, 0, 4096);
+                    if old_pde & PDEFlags::PRESENT != 0 {
+                        let base = old_pde & 0xffc0_0000;
+                        // Preserve access/cache attributes; large-page PAT
+                        // bit 12 becomes the 4 KiB PTE PAT bit 7.
+                        let inherited = (old_pde & 0x17f) | ((old_pde & (1 << 12)) >> 5);
+                        for index in 0..ENTRIES {
+                            (*pt_ptr)[index] = (base + index as u32 * PAGE_SIZE as u32) | inherited;
+                        }
+                    }
                 }
+                self.dir.entries[pd_idx] = pt_phys | pde_flags | (old_pde & PDEFlags::USER);
+                PageDirectory::flush_page((pd_idx as u32) << 22);
             }
 
             // Маппим страницу
@@ -649,7 +677,7 @@ impl PageManager {
     ///
     /// Callers access this range through the contiguous higher-half mapping;
     /// arbitrary successive entries from the free list cannot be used.
-    fn alloc_contiguous_frames(&mut self, pages: u32) -> u32 {
+    pub(crate) fn alloc_contiguous_frames(&mut self, pages: u32) -> u32 {
         self.free_frames.sort_unstable();
         if pages > 0 {
             let mut run = 0usize;
@@ -887,10 +915,11 @@ pub static mut KERNEL_END_PAGE: u32 = 0; // physical page number
 /// missing or stale when a user task's CR3 is active during a syscall.
 ///
 /// Shared:
-///   1. Identity large pages 0–32 MiB          (PDE 0..7)
-///   2. Entire higher-half kernel (PDE 768..1022) including MMIO
+///   1. Identity large pages 0–32 MiB
+///   2. Kernel-only MMIO window below 0xC0000000
+///   3. Entire higher-half kernel (PDE 768..1022)
 /// Own:
-///   3. Recursive mapping → this task's PD phys
+///   4. Recursive mapping → this task's PD phys
 pub fn copy_kernel_mappings(task_dir: &mut PageDirectory, task_pd_phys: u32) {
     unsafe {
         let kernel_pd_phys = KERNEL_PD_PHYS;
@@ -909,7 +938,19 @@ pub fn copy_kernel_mappings(task_dir: &mut PageDirectory, task_pd_phys: u32) {
             }
         }
 
-        // 2. Kernel higher-half + MMIO: SHARE the same page tables.
+        // 2. Kernel-only MMIO window.  It lives below KERNEL_OFFSET so it
+        //    cannot alias `KERNEL_OFFSET + phys`, but syscalls/network polling
+        //    still need it while a user task's CR3 is active.
+        let mmio_first = (KERNEL_MMIO_BASE >> 22) as usize;
+        let mmio_end = (KERNEL_MMIO_END >> 22) as usize;
+        for pd_idx in mmio_first..mmio_end {
+            let pde = (*kernel_pd)[pd_idx];
+            if (pde & PDEFlags::PRESENT) != 0 {
+                task_dir.entries[pd_idx] = pde;
+            }
+        }
+
+        // 3. Kernel higher-half: SHARE the same page tables.
         //    Do NOT deep-copy — deep copy was the source of page faults
         //    (CR2 like 0xc520ae28) when poll/recv ran under a user CR3.
         for pd_idx in 768usize..1023 {
@@ -919,7 +960,7 @@ pub fn copy_kernel_mappings(task_dir: &mut PageDirectory, task_pd_phys: u32) {
             }
         }
 
-        // 3. Recursive mapping → this task's own PD
+        // 4. Recursive mapping → this task's own PD
         task_dir.entries[1023] = task_pd_phys | PDEFlags::PRESENT | PDEFlags::WRITABLE;
     }
 }

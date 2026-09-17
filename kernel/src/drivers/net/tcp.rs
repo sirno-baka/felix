@@ -1,9 +1,9 @@
 use crate::drivers::net::i8255x::I8255x;
 use crate::drivers::net::{AnyNic, RX_BUF_SIZE, TX_BUF_SIZE};
+use crate::println;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 use smoltcp::wire::EthernetAddress;
-use crate::println;
 // ===================== smoltcp integration =====================
 
 pub struct I8255xRxToken {
@@ -24,7 +24,6 @@ impl RxToken for I8255xRxToken {
         f(&self.data[..self.len])
     }
 }
-
 
 impl TxToken for I8255xTxToken {
     fn consume<R, F>(self, len: usize, f: F) -> R

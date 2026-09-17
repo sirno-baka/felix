@@ -534,10 +534,8 @@ impl I8255x {
             }
 
             let count = (read_volatile(&desc.count) & 0x3FFF) as usize;
-            let valid = count >= 14
-                && count <= buf.len()
-                && count <= RX_BUF_SIZE
-                && (status & CMD_OK) != 0;
+            let valid =
+                count >= 14 && count <= buf.len() && count <= RX_BUF_SIZE && (status & CMD_OK) != 0;
 
             if valid {
                 core::ptr::copy_nonoverlapping(desc.data.as_ptr(), buf.as_mut_ptr(), count);
@@ -556,11 +554,7 @@ impl I8255x {
                 let _ = self.start_ru();
             }
 
-            if valid {
-                Some(count)
-            } else {
-                None
-            }
+            if valid { Some(count) } else { None }
         }
     }
 

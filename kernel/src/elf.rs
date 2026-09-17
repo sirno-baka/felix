@@ -1,4 +1,4 @@
-use crate::memory::paging::{PAGE_SIZE, PageDirectory, phys_to_virt};
+use crate::memory::paging::{KERNEL_MMIO_BASE, PAGE_SIZE, PageDirectory, phys_to_virt};
 use crate::println;
 use elf::ElfBytes;
 use elf::abi::{EM_386, ET_EXEC, PT_LOAD};
@@ -63,10 +63,10 @@ pub fn load_elf(binary: &[u8], page_dir: &mut PageDirectory) -> Result<u32, ElfL
     }
 
     let entry = header.e_entry as u32;
-    println!(
-        "[elf] loaded, entry={:#x} min={:#x} max={:#x}",
-        entry, min_addr, max_addr
-    );
+    // println!(
+    //     "[elf] loaded, entry={:#x} min={:#x} max={:#x}",
+    //     entry, min_addr, max_addr
+    // );
     Ok(entry)
 }
 
@@ -80,20 +80,20 @@ fn load_segment(
     let filesz = ph.p_filesz as u32;
     let offset = ph.p_offset as usize;
 
-    // Не даём грузить сегменты в kernel half
-    const KERNEL_OFFSET: u32 = 0xC000_0000;
-    if vaddr >= KERNEL_OFFSET || vaddr.saturating_add(memsz) > KERNEL_OFFSET {
-        println!(
-            "[elf] reject segment vaddr={:#x} memsz={:#x} (kernel range)",
-            vaddr, memsz
-        );
+    // Keep the top of the user address space reserved for kernel-only MMIO
+    // as well as the normal higher half.
+    if vaddr >= KERNEL_MMIO_BASE || vaddr.saturating_add(memsz) > KERNEL_MMIO_BASE {
+        // println!(
+        //     "[elf] reject segment vaddr={:#x} memsz={:#x} (kernel range)",
+        //     vaddr, memsz
+        // );
         return Err(ElfLoadError::InvalidAddress);
     }
 
-    println!(
-        "[elf] segment vaddr={:#x} filesz={:#x} memsz={:#x}",
-        vaddr, filesz, memsz
-    );
+    // println!(
+    //     "[elf] segment vaddr={:#x} filesz={:#x} memsz={:#x}",
+    //     vaddr, filesz, memsz
+    // );
 
     // Мапим все страницы, которые занимает сегмент (включая bss)
     let start_page = vaddr & !(PAGE_SIZE as u32 - 1);

@@ -15,12 +15,14 @@ struct NetLogger;
 
 impl log::Log for NetLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Debug
+        metadata.level() <= log::Level::Debug && metadata.target().contains("dhcp")
     }
 
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
-            crate::debugln!("[net {}] {}", record.level(), record.args());
+            // debugln goes to the kernel log without touching the framebuffer,
+            // so F12 can show the exact smoltcp DHCP state/parse decision.
+            crate::debugln!("[net {} {}] {}", record.level(), record.target(), record.args());
         }
     }
 

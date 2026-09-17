@@ -43,6 +43,20 @@ After booting Felix, run the example from its shell:
 /bin/hello first second
 ```
 
+## Twitch radio
+
+`twitch-radio` plays the audio-only HLS rendition of a public live Twitch
+channel directly in Felix:
+
+```text
+/bin/twitch-radio monstercat
+```
+
+Enter `+` or `-` followed by Return to change the volume, and `q` to stop.
+The first version supports the usual Twitch MPEG-TS/ADTS AAC-LC stream at
+48 kHz and writes PCM16 stereo to `/dev/audio`. It reconnects automatically
+after network and offline errors.
+
 ## Rhai system scripts
 
 The `rhai` application is the system script runtime. It supports script files,

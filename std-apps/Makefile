@@ -2,7 +2,7 @@ TARGET := i686-unknown-popugos
 CARGO ?= cargo
 PROFILE ?= release
 ROOTFS ?= ../rootfs
-APPS := hello thread-smoke tokio-smoke reqwest-smoke ui-smoke filemanager rhai rhai-ide
+APPS := hello thread-smoke tokio-smoke reqwest-smoke ui-smoke filemanager rhai rhai-ide twitch-radio
 LOCAL_CARGO_CONFIG := .cargo/config.local.toml
 CARGO_CONFIG_ARG := $(if $(wildcard $(LOCAL_CARGO_CONFIG)),--config "$(LOCAL_CARGO_CONFIG)",)
 

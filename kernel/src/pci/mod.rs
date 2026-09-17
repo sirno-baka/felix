@@ -63,6 +63,7 @@ fn device_name(vendor_id: u16, device_id: u16) -> &'static str {
         (0x8086, 0x100E) => "82540EM Gigabit Ethernet",
         (0x8086, 0x100F) => "82545EM Gigabit Ethernet",
         (0x8086, 0x10D3) => "82574L Gigabit Ethernet",
+        (0x8086, 0x1502) => "82579LM Gigabit Ethernet",
 
         // === Intel AC'97 audio ===
         (0x8086, 0x2415) => "82801AA ICH AC'97 Audio",

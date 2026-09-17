@@ -6,6 +6,7 @@ use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr};
 
+use crate::drivers::net::e1000e::NET as E1000E_NET;
 use crate::drivers::net::i8255x::NET as I8255X_NET;
 use crate::drivers::net::rtl8139::NET as RTL_NET;
 use crate::drivers::net::AnyNic;
@@ -170,7 +171,10 @@ impl NetStack {
         } else if let Some(h) = self.dhcp_handle {
             self.sockets.get_mut::<dhcpv4::Socket>(h).reset();
         }
-        log::debug!("DHCP start");
+        crate::println!(
+            "net: DHCP start MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
+        );
     }
 
     fn process_dhcp(&mut self) {
@@ -180,7 +184,7 @@ impl NetStack {
         let event = self.sockets.get_mut::<dhcpv4::Socket>(h).poll();
         let (addr, router, dns) = match event {
             Some(dhcpv4::Event::Configured(cfg)) => {
-                log::debug!(
+                crate::println!(
                     "DHCP Configured {} gw={:?} dns={:?}",
                     cfg.address,
                     cfg.router,
@@ -348,6 +352,14 @@ pub fn init() {
     bring_up(AnyNic::I8255x(device));
 }
 
+pub fn init_e1000e() {
+    let device = {
+        let mut guard = E1000E_NET.lock();
+        guard.take().expect("82579LM not initialized")
+    };
+    bring_up(AnyNic::E1000e(device));
+}
+
 pub fn init_rtl8139() {
     let device = {
         let mut guard = RTL_NET.lock();
@@ -357,7 +369,7 @@ pub fn init_rtl8139() {
 }
 
 fn bring_up(device: AnyNic) {
-    // crate::net::init_logger();
+    crate::net::init_logger();
     let stack = NetStack::new(device);
     *NET_STACK.lock() = Some(stack);
     log::debug!("stack up (no address — ifconfig static|dhcp)");

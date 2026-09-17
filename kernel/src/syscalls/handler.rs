@@ -7,7 +7,8 @@ use crate::filesystem::file::{ClosedFileDescriptor, DeviceKind, FileDescriptor, 
 use crate::filesystem::vfs::{Metadata, RenameError};
 use crate::memory::allocator::ALLOCATOR;
 use crate::memory::paging::{
-    PAGE_SIZE, PAGING, PDEFlags, PTEFlags, PageDirectory, PhysAddr, VirtAddr, copy_kernel_mappings,
+    KERNEL_MMIO_BASE, PAGE_SIZE, PAGING, PDEFlags, PTEFlags, PageDirectory, PhysAddr, VirtAddr,
+    copy_kernel_mappings,
 };
 use crate::multitasking::task::{
     CPUState, TASK_MANAGER, Task, MAX_TASKS, USER_HEAP_BASE, USER_THREAD_STACK_BASE,
@@ -1124,8 +1125,8 @@ pub fn sys_mmap2(
             }
         };
 
-        // Don't map into kernel half
-        if va >= 0xC000_0000 || va.saturating_add(len_u) > 0xC000_0000 {
+        // Don't map into the reserved kernel MMIO window or higher half.
+        if va >= KERNEL_MMIO_BASE || va.saturating_add(len_u) > KERNEL_MMIO_BASE {
             return EINVAL;
         }
 
@@ -1178,13 +1179,13 @@ pub fn sys_munmap(current_slot: usize, addr: u32, len: usize) -> usize {
     let page_size = PAGE_SIZE as u32;
     let start = addr & !(page_size - 1);
     let end = (addr.saturating_add(len as u32) + page_size - 1) & !(page_size - 1);
-    if start >= 0xC000_0000 {
+    if start >= KERNEL_MMIO_BASE {
         return EINVAL;
     }
     unsafe {
         if let Some(ref mut task) = TASK_MANAGER.tasks[current_slot] {
             let mut p = start;
-            while p < end && p < 0xC000_0000 {
+            while p < end && p < KERNEL_MMIO_BASE {
                 let should = task.page_refcounts.dec(p);
                 if should {
                     // Capture the physical frame before clearing the PTE. The
