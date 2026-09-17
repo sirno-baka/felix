@@ -55,23 +55,12 @@ fn kill_current_task(esp: u32, reason: &str, exit_code: i32) -> u32 {
             }
         }
 
-        if let Some(ref mut t) = TASK_MANAGER.tasks[slot] {
-            let fds: alloc::vec::Vec<_> = t.fd_table.take_all().into_iter().collect();
-            for desc in fds {
-                close_descriptor(desc);
-            }
-            t.running = false;
-            t.zombie = true;
-            t.exit_code = exit_code;
-            t.pending_signals = 0;
-        }
-
         println!(
             "[exc] task {} killed: {} (exit={})",
             slot, reason, exit_code
         );
-
-        TASK_MANAGER.schedule(esp as *mut CPUState) as u32
+        let leader = TASK_MANAGER.process_slot(slot);
+        crate::syscalls::handler::sys_exit(leader, esp, exit_code)
     }
 }
 

@@ -25,6 +25,9 @@ pub const SYS_GETTIMEOFDAY: u32 = 78;
 pub const SYS_GETPGID: u32 = 132;
 pub const SYS_GETSID: u32 = 147;
 pub const SYS_NANOSLEEP: u32 = 162;
+/// Linux i386 scheduler/thread identity numbers.
+pub const SYS_SCHED_YIELD: u32 = 158;
+pub const SYS_GETTID: u32 = 224;
 pub const SYS_GETCWD: u32 = 183;
 pub const SYS_CLOCK_GETTIME: u32 = 265;
 /// getrandom(buf, len, flags) — Linux i386 #355
@@ -75,6 +78,13 @@ pub const SYS_MALLOC: u32 = 0xF010;
 pub const SYS_FREE: u32 = 0xF011;
 pub const SYS_REALLOC: u32 = 0xF012;
 pub const SYS_LS: u32 = 0xF013;
+/// Felix thread ABI: create(entry, arg), exit(value), join/detach and TLS.
+pub const SYS_THREAD_CREATE: u32 = 0xF020;
+pub const SYS_THREAD_EXIT: u32 = 0xF021;
+pub const SYS_THREAD_JOIN: u32 = 0xF022;
+pub const SYS_THREAD_DETACH: u32 = 0xF023;
+pub const SYS_TLS_GET: u32 = 0xF024;
+pub const SYS_TLS_SET: u32 = 0xF025;
 
 // Socket syscalls (Linux i386 numbers)
 pub const SYS_SOCKET: u32 = 359;

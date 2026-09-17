@@ -3,11 +3,16 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use libfelix::prelude::*;
+use libfelix::mutex::Mutex;
 use libfelix::syscall::{
-    close, execve, getcwd, getpid, getppid, mount_list, openpty, pipe, read, task_list, write,
+    close, execve, getcwd, getpid, getppid, gettid, mount_list, openpty, pipe, read, task_list, write,
     MountInfo, TaskInfo,
 };
+use core::sync::atomic::{AtomicU32, Ordering};
+
+static THREAD_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 fn fail(name: &str) -> i32 {
     println!("selftest: FAIL {}", name);
@@ -112,6 +117,71 @@ fn test_mounts() -> bool {
         .all(|want| mounts.iter().any(|m| mount_path(m) == *want))
 }
 
+fn test_threads() -> bool {
+    let pid = unsafe { getpid() };
+    let leader_tid = unsafe { gettid() };
+    if pid != leader_tid {
+        return false;
+    }
+    THREAD_COUNTER.store(0, Ordering::SeqCst);
+    let protected = Arc::new(Mutex::new(0u32));
+    let mut shared_pipe = [0u32; 2];
+    if unsafe { pipe(shared_pipe.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let pipe_writer = shared_pipe[1];
+    let mut handles = Vec::new();
+    for worker in 0..3u32 {
+        let protected = protected.clone();
+        let handle = match thread::spawn(move || {
+            // Exercise shared heap allocation as well as shared atomics.
+            let data = alloc::vec![worker as u8; 2048 + worker as usize * 31];
+            for _ in 0..1000 {
+                THREAD_COUNTER.fetch_add(1, Ordering::SeqCst);
+                *protected.lock() += 1;
+            }
+            if worker == 0 {
+                let byte = [b'T'];
+                let _ = unsafe { write(pipe_writer, byte.as_ptr(), byte.len()) };
+            }
+            (unsafe { getpid() }, unsafe { gettid() }, data.len())
+        }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                println!("selftest: thread spawn failed {:?}", error);
+                return false;
+            }
+        };
+        handles.push(handle);
+    }
+    // TIDs consume scheduler slots but must not appear as duplicate processes.
+    let total = unsafe { task_list(core::ptr::null_mut(), 0) };
+    let mut tasks = alloc::vec![TaskInfo::default(); total];
+    let listed = unsafe { task_list(tasks.as_mut_ptr(), tasks.len()) };
+    if listed > tasks.len() || tasks[..listed].iter().filter(|t| t.pid == pid).count() != 1 {
+        return false;
+    }
+    for handle in handles {
+        let expected_tid = handle.tid();
+        let Ok((thread_pid, thread_tid, len)) = handle.join() else {
+            return false;
+        };
+        if thread_pid != pid || thread_tid != expected_tid || thread_tid == leader_tid || len < 2048 {
+            return false;
+        }
+    }
+    let mut byte = [0u8; 1];
+    let read_count = unsafe { read(shared_pipe[0], byte.as_mut_ptr(), byte.len()) };
+    unsafe {
+        close(shared_pipe[0]);
+        close(shared_pipe[1]);
+    }
+    THREAD_COUNTER.load(Ordering::SeqCst) == 3000
+        && *protected.lock() == 3000
+        && read_count == 1
+        && byte[0] == b'T'
+}
+
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
     // The first image execs itself at the end of the suite. Reaching this
@@ -130,6 +200,7 @@ pub extern "C" fn main() -> i32 {
     if !test_pipe() { return fail("pipe"); }
     if !test_pty() { return fail("pty"); }
     if !test_mounts() { return fail("mounts"); }
+    if !test_threads() { return fail("threads"); }
 
     let path = b"/bin/selftest\0";
     let arg0 = b"/bin/selftest\0";

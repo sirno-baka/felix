@@ -9,6 +9,7 @@ use crate::syscall::{SYS_FREE, SYS_MALLOC};
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::asm;
 use core::ptr::{self, null_mut};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// In-block header while the region is on the free list.
 #[repr(C)]
@@ -22,6 +23,28 @@ const HEADER_ALIGN: usize = core::mem::align_of::<FreeBlock>();
 
 /// Process-local free list head. Single-threaded userspace for now — no lock.
 static mut FREE_HEAD: *mut FreeBlock = null_mut();
+
+static HEAP_LOCK: AtomicBool = AtomicBool::new(false);
+
+struct HeapGuard;
+
+impl HeapGuard {
+    fn lock() -> Self {
+        while HEAP_LOCK
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        Self
+    }
+}
+
+impl Drop for HeapGuard {
+    fn drop(&mut self) {
+        HEAP_LOCK.store(false, Ordering::Release);
+    }
+}
 
 fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
@@ -100,6 +123,7 @@ pub struct SyscallAllocator;
 
 unsafe impl GlobalAlloc for SyscallAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let _guard = HeapGuard::lock();
         let layout = adjust_layout(layout);
         let size = layout.size();
         let align = layout.align();
@@ -115,6 +139,7 @@ unsafe impl GlobalAlloc for SyscallAllocator {
         if ptr.is_null() {
             return;
         }
+        let _guard = HeapGuard::lock();
         let layout = adjust_layout(layout);
         free_list_add(ptr, layout.size());
         // Optional notify kernel (no-op today).

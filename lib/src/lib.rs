@@ -10,6 +10,7 @@ pub mod fs;
 pub mod mutex;
 pub mod print;
 pub mod signal;
+pub mod thread;
 pub mod sys_alloc;
 pub mod syscall;
 pub mod ui;
@@ -34,6 +35,8 @@ pub mod prelude {
         self, default, exit, exit_on_terminate, ignore, on, SIGCONT, SIGINT, SIGKILL, SIGSTOP,
         SIGTERM, SIGTSTP, SIGTTIN, SIGTTOU,
     };
+    pub use crate::thread::{self, JoinHandle};
+    pub use crate::mutex::{Mutex, MutexGuard};
     pub use crate::ui::{
         self, Button, Constraints, EventResult, FileItem, FileKind, FileView, FileViewIcons,
         FileViewMode, Icon, IconImage, IconImageError, Label, NodeId, Rect, ScrollViewId,

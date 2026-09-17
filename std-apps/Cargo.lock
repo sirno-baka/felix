@@ -450,7 +450,7 @@ dependencies = [
  "serde_json",
  "taffy",
  "url",
- "webpki-roots 1.0.9",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -492,7 +492,6 @@ checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
 dependencies = [
  "crc32fast",
  "miniz_oxide 0.9.1",
- "zlib-rs",
 ]
 
 [[package]]
@@ -593,8 +592,14 @@ dependencies = [
 name = "hello"
 version = "0.1.0"
 dependencies = [
+ "getrandom",
+ "reqwest",
+ "rustls",
+ "rustls-rustcrypto",
  "serde",
- "ureq",
+ "serde_json",
+ "tokio",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -915,7 +920,6 @@ dependencies = [
 [[package]]
 name = "mio"
 version = "1.2.3"
-source = "git+https://github.com/sirno-baka/mio?branch=master#ddd29c8e1089639c4b24a7a5128c5f22da0852c0"
 dependencies = [
  "libc",
  "wasi",
@@ -1291,7 +1295,7 @@ dependencies = [
  "rustls",
  "rustls-rustcrypto",
  "tokio",
- "webpki-roots 1.0.9",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1394,9 +1398,7 @@ version = "0.23.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6725596c3f2c3a0aef021139e145d4eafe314a6623e4680ca83852b2c67ab2ba"
 dependencies = [
- "log",
  "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki 0.103.15",
  "subtle",
@@ -1634,7 +1636,6 @@ dependencies = [
 [[package]]
 name = "socket2"
 version = "0.6.5"
-source = "git+https://github.com/sirno-baka/socket2?branch=master#87153e4d2346314a6027f9fa856d1ff6364fe490"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -1734,6 +1735,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79def32ffcd477db1ff26f76dab9e3a91f0bd42a85ca96577089b24623056f9d"
 
 [[package]]
+name = "thread-smoke"
+version = "0.1.0"
+
+[[package]]
 name = "tiny-keccak"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1755,7 +1760,6 @@ dependencies = [
 [[package]]
 name = "tokio"
 version = "1.53.1"
-source = "git+https://github.com/sirno-baka/tokio?branch=popugos#c44ccdb310c022b436339b237a1a893243b51575"
 dependencies = [
  "bytes",
  "libc",
@@ -1901,24 +1905,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
-name = "ureq"
-version = "2.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
-dependencies = [
- "base64",
- "flate2",
- "log",
- "once_cell",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "url",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2030,15 +2016,6 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -2271,12 +2248,6 @@ dependencies = [
  "quote",
  "syn 3.0.5",
 ]
-
-[[package]]
-name = "zlib-rs"
-version = "0.6.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34b31d188d9d685a4f9c7b46d6e36631b07058d2cfe190267adce54dc230bf12"
 
 [[package]]
 name = "zmij"

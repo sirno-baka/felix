@@ -9,7 +9,10 @@ use crate::memory::allocator::ALLOCATOR;
 use crate::memory::paging::{
     PAGE_SIZE, PAGING, PDEFlags, PTEFlags, PageDirectory, PhysAddr, VirtAddr, copy_kernel_mappings,
 };
-use crate::multitasking::task::{CPUState, TASK_MANAGER, Task, MAX_TASKS, USER_HEAP_BASE};
+use crate::multitasking::task::{
+    CPUState, TASK_MANAGER, Task, MAX_TASKS, USER_HEAP_BASE, USER_THREAD_STACK_BASE,
+    USER_THREAD_STACK_PAGES, USER_THREAD_STACK_STRIDE,
+};
 use crate::net::{AF_INET, SOCK_DGRAM, SOCK_STREAM, SOCKET_TABLE, SockAddrIn, SocketState};
 use crate::{pipe, utils};
 use crate::{print, println};
@@ -81,17 +84,40 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
     let syscall_num = state.eax;
 
     // Фиксируем текущий таск ОДИН раз (чтобы таймер не успел переключить)
-    let current_slot = unsafe { TASK_MANAGER.get_current_slot() } as usize;
+    let thread_slot = unsafe { TASK_MANAGER.get_current_slot() } as usize;
+    // Most syscalls operate on process-wide state.  Non-leader threads are
+    // redirected to their group leader, while scheduling/exit use thread_slot.
+    let current_slot = unsafe { TASK_MANAGER.process_slot(thread_slot) };
+
+    // A detached thread cannot free the kernel stack it is currently using.
+    // Reclaim it on the next syscall made from another task instead.
+    unsafe { TASK_MANAGER.reap_detached_threads(); }
 
     // exit must switch to another task — never return to the dead one.
     // SYS_EXIT is the legacy status=0 form; EXIT_GROUP carries status in ebx.
     if syscall_num == crate::syscalls::SYS_EXIT {
-        return sys_exit(current_slot, esp, 0);
+        return sys_thread_exit(thread_slot, esp, 0);
     }
     if syscall_num == crate::syscalls::SYS_EXIT_GROUP {
         return sys_exit(current_slot, esp, state.ebx as i32);
     }
+    if syscall_num == crate::syscalls::SYS_THREAD_EXIT {
+        return sys_thread_exit(thread_slot, esp, state.ebx);
+    }
+    if syscall_num == crate::syscalls::SYS_SCHED_YIELD {
+        state.eax = 0;
+        return unsafe { TASK_MANAGER.schedule(esp as *mut CPUState) as u32 };
+    }
     if syscall_num == crate::syscalls::SYS_EXECVE {
+        // Replacing an address space while sibling threads can still execute in
+        // it is unsafe.  Match the useful Linux rule incrementally: only a
+        // single-threaded leader may exec until sibling teardown is wired in.
+        if thread_slot != current_slot
+            || unsafe { TASK_MANAGER.live_thread_count(current_slot) } != 1
+        {
+            state.eax = EBUSY as u32;
+            return esp;
+        }
         return match sys_execve_path(
             current_slot,
             state.ebx as *const u8,
@@ -168,6 +194,13 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         crate::syscalls::SYS_CHDIR => sys_chdir(current_slot, state.ebx as *const u8),
         crate::syscalls::SYS_GETCWD => sys_getcwd(current_slot, state.ebx as *mut u8, state.ecx as usize),
         crate::syscalls::SYS_GETPID => sys_getpid(current_slot),
+        crate::syscalls::SYS_GETTID => unsafe {
+            TASK_MANAGER.tasks
+                .get(thread_slot)
+                .and_then(|t| t.as_ref())
+                .map(|t| t.tid as usize)
+                .unwrap_or(usize::MAX)
+        },
         crate::syscalls::SYS_GETPPID => sys_getppid(current_slot),
         crate::syscalls::SYS_GETPGRP => sys_getpgrp(current_slot),
         crate::syscalls::SYS_GETPGID => sys_getpgid(current_slot, state.ebx as i32),
@@ -233,6 +266,29 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
             state.ebx as *mut TaskInfoUser,
             state.ecx as usize,
         ),
+        crate::syscalls::SYS_THREAD_CREATE => {
+            sys_thread_create(current_slot, state.ebx, state.ecx)
+        }
+        crate::syscalls::SYS_THREAD_JOIN => sys_thread_join(
+            current_slot,
+            thread_slot,
+            state.ebx as i32,
+            state.ecx as *mut u32,
+        ),
+        crate::syscalls::SYS_THREAD_DETACH => {
+            sys_thread_detach(current_slot, thread_slot, state.ebx as i32)
+        },
+        crate::syscalls::SYS_TLS_GET => unsafe {
+            TASK_MANAGER.tasks[thread_slot].as_ref().map_or(0, |task| task.tls_ptr as usize)
+        },
+        crate::syscalls::SYS_TLS_SET => unsafe {
+            if let Some(task) = TASK_MANAGER.tasks[thread_slot].as_mut() {
+                task.tls_ptr = state.ebx;
+                0
+            } else {
+                ESRCH
+            }
+        },
         crate::syscalls::SYS_KILL => sys_kill(current_slot, state.ebx as i32, state.ecx as u32),
         crate::syscalls::SYS_SIGACTION => sys_sigaction(
             current_slot,
@@ -512,11 +568,11 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
     // task that the operation just made unrunnable; switch immediately while
     // preserving this syscall frame for a later SIGCONT.
     let must_switch = unsafe {
-        current_slot != 0
+        thread_slot != 0
             && TASK_MANAGER.tasks
-                .get(current_slot)
+                .get(thread_slot)
                 .and_then(|t| t.as_ref())
-                .map_or(false, |t| !t.running && (t.stopped || t.zombie))
+                .map_or(false, |t| !t.running && (t.stopped || t.zombie || t.thread_exited))
     };
     if must_switch {
         return unsafe { TASK_MANAGER.schedule(esp as *mut CPUState) as u32 };
@@ -545,11 +601,14 @@ const SEEK_END: u32 = 2;
 // Linux errno (returned as -errno in eax)
 const EPERM: usize = (-1isize) as usize;
 const ENOENT: usize = (-2isize) as usize;
+const ESRCH: usize = (-3isize) as usize;
 const ENXIO: usize = (-6isize) as usize;
 const EBADF: usize = (-9isize) as usize;
 const EAGAIN: usize = (-11isize) as usize;
 const ENOMEM: usize = (-12isize) as usize;
 const EFAULT: usize = (-14isize) as usize;
+const EBUSY: usize = (-16isize) as usize;
+const EDEADLK: usize = (-35isize) as usize;
 const EEXIST: usize = (-17isize) as usize;
 const EXDEV: usize = (-18isize) as usize;
 const EINVAL: usize = (-22isize) as usize;
@@ -2066,32 +2125,225 @@ pub fn sys_umount2(current_slot: usize, path_ptr: *const u8, _flags: u32) -> usi
 }
 
 // ====================== EXIT ======================
+fn finish_process(leader_slot: usize, status: i32, term_signal: u32) {
+    unsafe {
+        let dead_pid = TASK_MANAGER.tasks[leader_slot]
+            .as_ref()
+            .map(|t| t.pid)
+            .unwrap_or(-1);
+        crate::drivers::wm::destroy_windows_of(leader_slot as i8);
+        if let Some(ref mut leader) = TASK_MANAGER.tasks[leader_slot] {
+            let fds = leader.fd_table.take_all();
+            for desc in fds {
+                close_descriptor(desc);
+            }
+            leader.running = false;
+            leader.stopped = false;
+            leader.thread_exited = true;
+            leader.zombie = true;
+            leader.term_signal = term_signal;
+            leader.exit_code = status;
+        }
+        crate::syscalls::wasm::clear_task_state(leader_slot);
+        TASK_MANAGER.reparent_children_of(dead_pid);
+    }
+}
+
 /// Mark current task as zombie and switch to another task.
 /// Returns the new task's CPU-state pointer so the syscall iretd
 /// resumes a different task (never the dead one).
 pub fn sys_exit(current_slot: usize, esp: u32, status: i32) -> u32 {
     unsafe {
         if current_slot != 0 {
-            crate::drivers::wm::destroy_windows_of(current_slot as i8);
-            let mut dead_pid = -1;
-            if let Some(ref mut t) = TASK_MANAGER.tasks[current_slot] {
-                dead_pid = t.pid;
-                // Close all fds so pipe writers release EOF to readers.
-                let fds = t.fd_table.take_all();
-                for desc in fds {
-                    close_descriptor(desc);
+            let members = TASK_MANAGER.thread_slots(current_slot);
+            for slot in members {
+                if let Some(ref mut thread) = TASK_MANAGER.tasks[slot] {
+                    thread.running = false;
+                    thread.stopped = false;
+                    thread.thread_exited = true;
+                    thread.thread_exit_value = status as u32;
                 }
-                t.running = false;
-                t.stopped = false;
-                t.zombie = true;
-                t.term_signal = 0;
-                t.exit_code = status;
             }
-            crate::syscalls::wasm::clear_task_state(current_slot);
-            TASK_MANAGER.reparent_children_of(dead_pid);
+            finish_process(current_slot, status, 0);
         }
         TASK_MANAGER.schedule(esp as *mut CPUState) as u32
     }
+}
+
+/// Linux `exit(2)` semantics: terminate only the calling thread.  The process
+/// becomes waitable after the last live thread exits.
+pub fn sys_thread_exit(thread_slot: usize, esp: u32, value: u32) -> u32 {
+    unsafe {
+        if thread_slot == 0 || TASK_MANAGER.tasks.get(thread_slot).and_then(|t| t.as_ref()).is_none() {
+            return TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
+        }
+        let leader_slot = TASK_MANAGER.process_slot(thread_slot);
+        if let Some(ref mut thread) = TASK_MANAGER.tasks[thread_slot] {
+            thread.running = false;
+            thread.stopped = false;
+            thread.thread_exited = true;
+            thread.thread_exit_value = value;
+        }
+        if TASK_MANAGER.live_thread_count(leader_slot) == 0 {
+            finish_process(leader_slot, value as i32, 0);
+        }
+        TASK_MANAGER.schedule(esp as *mut CPUState) as u32
+    }
+}
+
+/// Create a thread in `leader_slot`'s address space.  `entry` is a cdecl
+/// function taking one pointer-sized argument; returning from it is invalid,
+/// so libfelix always terminates through SYS_THREAD_EXIT.
+pub fn sys_thread_create(leader_slot: usize, entry: u32, arg: u32) -> usize {
+    if leader_slot == 0 || entry == 0 {
+        return EINVAL;
+    }
+    unsafe {
+        let slot_i8 = TASK_MANAGER.get_free_slot();
+        if slot_i8 < 0 {
+            return EAGAIN;
+        }
+        let slot = slot_i8 as usize;
+        let tid = TASK_MANAGER.alloc_pid();
+        let Some(leader) = TASK_MANAGER.tasks[leader_slot].as_ref() else {
+            return EINVAL;
+        };
+        if leader.zombie {
+            return EINVAL;
+        }
+
+        let page_dir = leader.page_dir;
+        let page_dir_phys = leader.page_dir_phys;
+        let pid = leader.pid;
+        let ppid = leader.ppid;
+        let pgid = leader.pgid;
+        let sid = leader.sid;
+        let parent = leader.parent;
+        let tty_id = leader.tty_id;
+        let pty_id = leader.pty_id;
+        let name = leader.name;
+
+        let stack_top = USER_THREAD_STACK_BASE
+            .saturating_sub(slot as u32 * USER_THREAD_STACK_STRIDE);
+        let stack_bottom = stack_top - USER_THREAD_STACK_PAGES * PAGE_SIZE as u32;
+        for page in 0..USER_THREAD_STACK_PAGES {
+            let addr = stack_bottom + page * PAGE_SIZE as u32;
+            if (*page_dir).translate(addr).is_some() {
+                return EBUSY;
+            }
+            (*page_dir).alloc_and_map_user_page(addr);
+        }
+
+        let mut thread = Task::new_thread(page_dir, page_dir_phys);
+        let kernel_stack_top = thread.stack_base + crate::multitasking::task::STACK_SIZE as u32;
+        thread.kernel_stack = kernel_stack_top;
+        let state_ptr = (kernel_stack_top as usize
+            - crate::multitasking::task::HEADROOM
+            - core::mem::size_of::<CPUState>()) as *mut CPUState;
+
+        // Model a cdecl call frame.  The fake return address is never used by
+        // the libfelix trampoline; keeping it zero makes accidental returns
+        // fail deterministically instead of jumping into arbitrary memory.
+        let user_esp = (stack_top & !15).saturating_sub(20);
+        *(user_esp as *mut u32) = 0;
+        *((user_esp + 4) as *mut u32) = arg;
+        *state_ptr = CPUState {
+            eax: 0,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+            esi: 0,
+            edi: 0,
+            ebp: 0,
+            eip: entry,
+            cs: 0x1B,
+            eflags: 0x202,
+            esp: user_esp,
+            ss: 0x23,
+        };
+
+        thread.cpu_state_ptr = state_ptr as u32;
+        thread.running = true;
+        thread.pid = pid;
+        thread.tid = tid;
+        thread.leader_slot = leader_slot as i8;
+        thread.ppid = ppid;
+        thread.pgid = pgid;
+        thread.sid = sid;
+        thread.parent = parent;
+        thread.tty_id = tty_id;
+        thread.pty_id = pty_id;
+        thread.name = name;
+        thread.user_stack_bottom = stack_bottom;
+        thread.user_stack_top = stack_top;
+        TASK_MANAGER.tasks[slot] = Some(thread);
+        TASK_MANAGER.task_count += 1;
+        println!("[thread] create pid={} tid={} slot={}", pid, tid, slot);
+        tid as usize
+    }
+}
+
+pub fn sys_thread_join(
+    leader_slot: usize,
+    caller_slot: usize,
+    tid: i32,
+    value_out: *mut u32,
+) -> usize {
+    if tid <= 0 {
+        return EINVAL;
+    }
+    loop {
+        let target = unsafe { TASK_MANAGER.slot_by_tid(tid) };
+        let Some(slot) = target else { return ESRCH; };
+        if slot == caller_slot {
+            return EDEADLK;
+        }
+        let state = unsafe {
+            TASK_MANAGER.tasks[slot].as_ref().map(|t| {
+                (
+                    t.leader_slot == leader_slot as i8,
+                    t.is_thread && !t.thread_detached,
+                    t.thread_exited,
+                    t.thread_exit_value,
+                )
+            })
+        };
+        let Some((same_process, joinable, exited, value)) = state else { return ESRCH; };
+        if !same_process || !joinable {
+            return EINVAL;
+        }
+        if exited {
+            if !value_out.is_null() {
+                unsafe { *value_out = value; }
+            }
+            unsafe { TASK_MANAGER.reap_thread(slot); }
+            return tid as usize;
+        }
+        unsafe {
+            asm!("sti");
+            asm!("hlt");
+            asm!("cli");
+        }
+    }
+}
+
+pub fn sys_thread_detach(leader_slot: usize, caller_slot: usize, tid: i32) -> usize {
+    if tid <= 0 {
+        return EINVAL;
+    }
+    let Some(slot) = (unsafe { TASK_MANAGER.slot_by_tid(tid) }) else { return ESRCH; };
+    let Some(task) = (unsafe { TASK_MANAGER.tasks[slot].as_mut() }) else { return ESRCH; };
+    if slot == caller_slot || task.leader_slot != leader_slot as i8 || !task.is_thread {
+        return EINVAL;
+    }
+    if task.thread_detached {
+        return EINVAL;
+    }
+    task.thread_detached = true;
+    if task.thread_exited {
+        unsafe { TASK_MANAGER.reap_thread(slot); }
+    }
+    0
 }
 
 // ====================== WAIT ======================
@@ -2159,7 +2411,9 @@ pub fn sys_kill(current_slot: usize, pid: i32, sig: u32) -> usize {
     } else if pid == -1 {
         unsafe {
             TASK_MANAGER.tasks.iter().enumerate().filter_map(|(slot, t)| {
-                t.as_ref().filter(|t| slot != 0 && t.pid != caller_pid && !t.zombie).map(|_| slot)
+                t.as_ref()
+                    .filter(|t| slot != 0 && t.leader_slot == slot as i8 && t.pid != caller_pid && !t.zombie)
+                    .map(|_| slot)
             }).collect()
         }
     } else {
@@ -2353,7 +2607,11 @@ pub struct TaskInfoUser {
 
 /// Enumerate the fixed Felix task table for userspace `ps`.
 pub fn sys_task_list(out: *mut TaskInfoUser, max: usize) -> usize {
-    let total = unsafe { TASK_MANAGER.tasks.iter().filter(|t| t.is_some()).count() };
+    let total = unsafe {
+        TASK_MANAGER.tasks.iter().enumerate().filter(|(slot, task)| {
+            task.as_ref().map_or(false, |t| t.leader_slot == *slot as i8)
+        }).count()
+    };
     if out.is_null() || max == 0 {
         return total;
     }
@@ -2362,6 +2620,7 @@ pub fn sys_task_list(out: *mut TaskInfoUser, max: usize) -> usize {
     unsafe {
         for (slot, task) in TASK_MANAGER.tasks.iter().enumerate() {
             let Some(t) = task.as_ref() else { continue };
+            if t.leader_slot != slot as i8 { continue; }
             if written >= max {
                 break;
             }
@@ -2883,6 +3142,8 @@ fn sys_execve_path(
         // dispositions were initialized to defaults by sys_spawn; pending
         // signals remain pending across exec.
         replacement.pid = old.pid;
+        replacement.tid = old.pid;
+        replacement.leader_slot = current_slot as i8;
         replacement.ppid = old.ppid;
         replacement.parent = old.parent;
         replacement.pgid = old.pgid;
@@ -3098,6 +3359,8 @@ fn sys_spawn_image(
         task.heap_next = heap_start;
         task.mmap_next = 0x6000_0000;
         task.pid = pid;
+        task.tid = pid;
+        task.leader_slot = slot as i8;
         task.ppid = ppid;
         task.pgid = pgid;
         task.sid = sid;

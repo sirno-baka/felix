@@ -54,7 +54,7 @@ The project is developed against both **QEMU** and real legacy hardware, especia
 | RAM detection | BootInfo / BIOS E801 / CMOS fallback, clamped to 64 MiB..1 GiB |
 | Scheduler | Preemptive round-robin |
 | PIT frequency | Currently 200 Hz |
-| Task limit | 8 task slots, slot 0 is idle |
+| Task limit | 32 scheduler slots, slot 0 is idle; processes may contain native threads |
 | Userspace | Ring 3 native i386 ELF executables |
 | Syscalls | `int 0x80` |
 | VFS | Mount table with longest-prefix routing |
@@ -479,16 +479,20 @@ USB and PCMCIA hotplug therefore use polling rather than their shared hardware i
 
 Felix has a small preemptive round-robin scheduler.
 
-## Task model
+## Task and thread model
 
-- maximum task slots: **8**
+- maximum scheduler slots: **32**
 - slot 0: kernel idle task
 - native applications: ring 3
-- each task has its own page directory
-- each task has a 64 KiB kernel stack
+- each process has its own page directory, fd table, heap, cwd and signal dispositions
+- threads in a process share its PID/address space/resources and have distinct TIDs
+- each scheduled thread has a 64 KiB kernel stack and a private guarded userspace stack
 - TSS `esp0` is updated when switching into a user task
-- tasks track parent, zombie state and exit code
+- processes track parent, zombie state and exit code
 - `wait()` / `WNOHANG` are supported
+- libfelix exposes `thread::spawn`, `JoinHandle::join`, `gettid` and `sched_yield`
+- the PopugOS Rust target exposes the same kernel threads through `std::thread`,
+  with per-thread key-based TLS and cooperative `std::sync` waits
 
 Native user context uses standard Felix GDT selectors:
 
@@ -606,7 +610,9 @@ The syscall entry disables interrupts, saves general-purpose registers, calls th
 | 195 | `stat64` | Linux-like stat layout |
 | 197 | `fstat64` | Linux-like stat layout |
 | 220 | `getdents64` | directory iteration |
-| 252 | `exit_group` | currently equivalent to exit |
+| 158 | `sched_yield` | yield the current thread's time slice |
+| 224 | `gettid` | return the calling thread id |
+| 252 | `exit_group` | terminate the complete thread group |
 
 ## Felix custom syscalls
 
@@ -617,6 +623,11 @@ The syscall entry disables interrupts, saves general-purpose registers, calls th
 | 202 | `realloc` |
 | 302 | `ls` convenience syscall |
 | 1000 | `execve_wasm` |
+
+The current private thread ABI also provides `thread_create`, `thread_exit`,
+`thread_join`, `thread_detach`, `tls_get` and `tls_set`; libfelix and the
+PopugOS standard library wrap these rather than treating their numeric values
+as a stable application ABI.
 
 ## Socket syscalls
 
@@ -1574,7 +1585,7 @@ Felix is an actively developed hobby/research OS. The following are deliberate c
 ## Core / memory
 
 - uniprocessor only; no SMP scheduler
-- maximum 8 task slots
+- maximum 32 scheduler slots shared by processes and threads
 - frame allocator does not recycle physical frames
 - userspace malloc is bump-style and `free()` is currently a no-op
 - kernel heap is a fixed 16 MiB window
@@ -1607,6 +1618,10 @@ Felix is an actively developed hobby/research OS. The following are deliberate c
 - ext2/FAT implementations cover Felix's current needs, not every filesystem feature
 - `ioctl` is largely a stub
 - syscall compatibility is Linux-inspired but incomplete
+- thread create/join/detach, key-based TLS and Linux-like PID/TID/exit-group
+  semantics are present; `std::sync` waits cooperatively yield because kernel
+  futex wait queues are not implemented yet
+- `execve` currently requires a single-threaded process
 - shell `ps` is currently a placeholder
 
 ## Networking

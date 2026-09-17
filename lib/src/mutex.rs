@@ -1,45 +1,74 @@
+//! Small userspace mutex for Felix native threads.
+//!
+//! This is a preemptible uniprocessor spin mutex. Contention still makes
+//! progress because the PIT scheduler can preempt a waiter. A future futex
+//! syscall can replace only the slow path without changing this API.
+
+use core::cell::UnsafeCell;
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
-/*
-    This is a oversimplified mutex created from scratch. Meant to be used for global, static definitions of objects, visible for all active threads. Once a thread acquires the target object, all other threads trying to do so will wait until it is freed.
 
-    There is plenty of room for improvements, since there are no mechanisms for e.g. creating a queue of threads that requested access to an object and giving it to the first that needs it.
-
-    TODO: Improve it
-*/
-pub struct Mutex<T> {
-    target: T,
-    free: AtomicBool,
+pub struct Mutex<T: ?Sized> {
+    locked: AtomicBool,
+    value: UnsafeCell<T>,
 }
+
+unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
+unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
 
 impl<T> Mutex<T> {
     pub const fn new(value: T) -> Self {
         Self {
-            target: value,
-            free: AtomicBool::new(true),
+            locked: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
         }
     }
 
-    //WARNING: You MUST call free()  after using acquire() or acquire_mut() when the target is no longer needed. Not doing so can, and will, lead to problems.
-    pub fn acquire_mut(&mut self) -> &mut T {
-        while !self.free.load(Ordering::SeqCst) {} // Wait until free is true
-        self.free.store(false, Ordering::SeqCst); // Set free to false
-        return &mut self.target;
-    }
-
-    //WARNING: You MUST call free()  after using acquire() or acquire_mut() when the target is no longer needed. Not doing so can, and will, lead to problems.
-    pub fn acquire(&mut self) -> &T {
-        while !self.free.load(Ordering::SeqCst) {} // Wait until free is true
-        self.free.store(false, Ordering::SeqCst); // Set free to false
-        return &self.target;
-    }
-
-    pub fn free(&self) {
-        self.free.store(true, Ordering::SeqCst); // Set free to true
+    pub fn into_inner(self) -> T {
+        self.value.into_inner()
     }
 }
 
-impl<T> Drop for Mutex<T> {
+impl<T: ?Sized> Mutex<T> {
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        loop {
+            if let Some(guard) = self.try_lock() {
+                return guard;
+            }
+            while self.locked.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| MutexGuard { mutex: self })
+    }
+}
+
+pub struct MutexGuard<'a, T: ?Sized> {
+    mutex: &'a Mutex<T>,
+}
+
+impl<T: ?Sized> Deref for MutexGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe { &*self.mutex.value.get() }
+    }
+}
+
+impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.mutex.value.get() }
+    }
+}
+
+impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
-        self.free = AtomicBool::from(true);
+        self.mutex.locked.store(false, Ordering::Release);
     }
 }

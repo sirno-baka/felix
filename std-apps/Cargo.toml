@@ -1,6 +1,6 @@
 [workspace]
-members = ["hello", "tokio-smoke", "reqwest-smoke", "ui-smoke", "filemanager", "rhai", "rhai-ide"]
-default-members = ["tokio-smoke", "reqwest-smoke", "ui-smoke", "filemanager", "rhai", "rhai-ide"]
+members = ["hello", "thread-smoke", "tokio-smoke", "reqwest-smoke", "ui-smoke", "filemanager", "rhai", "rhai-ide"]
+default-members = ["hello", "tokio-smoke", "reqwest-smoke", "ui-smoke", "filemanager", "rhai", "rhai-ide"]
 resolver = "2"
 
 [workspace.package]

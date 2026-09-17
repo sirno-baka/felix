@@ -30,6 +30,8 @@ pub const SYS_GETTIMEOFDAY: u32 = 78;
 pub const SYS_GETPGID: u32 = 132;
 pub const SYS_GETSID: u32 = 147;
 pub const SYS_NANOSLEEP: u32 = 162;
+pub const SYS_SCHED_YIELD: u32 = 158;
+pub const SYS_GETTID: u32 = 224;
 pub const SYS_GETCWD: u32 = 183;
 pub const SYS_CLOCK_GETTIME: u32 = 265;
 pub const SYS_GETRANDOM: u32 = 355;
@@ -262,6 +264,12 @@ pub const SYS_FREE: u32 = 0xF011;
 pub const SYS_REALLOC: u32 = 0xF012;
 
 pub const SYS_LS: u32 = 0xF013;
+pub const SYS_THREAD_CREATE: u32 = 0xF020;
+pub const SYS_THREAD_EXIT: u32 = 0xF021;
+pub const SYS_THREAD_JOIN: u32 = 0xF022;
+pub const SYS_THREAD_DETACH: u32 = 0xF023;
+pub const SYS_TLS_GET: u32 = 0xF024;
+pub const SYS_TLS_SET: u32 = 0xF025;
 
 // ====================== WRAPPERS ======================
 
@@ -279,6 +287,69 @@ pub unsafe fn exit_status(status: i32) -> ! {
         options(noreturn)
     );
     loop {}
+}
+
+pub unsafe fn gettid() -> i32 {
+    let ret: u32;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_GETTID => ret,
+        options(nostack, preserves_flags)
+    );
+    ret as i32
+}
+
+pub unsafe fn sched_yield() {
+    asm!(
+        "int 0x80",
+        in("eax") SYS_SCHED_YIELD,
+        options(nostack, preserves_flags)
+    );
+}
+
+pub unsafe fn thread_create(entry: u32, arg: *mut u8) -> i32 {
+    let ret: u32;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_THREAD_CREATE => ret,
+        in("ebx") entry,
+        in("ecx") arg as u32,
+        options(nostack, preserves_flags)
+    );
+    ret as i32
+}
+
+pub unsafe fn thread_exit(value: u32) -> ! {
+    asm!(
+        "int 0x80",
+        in("eax") SYS_THREAD_EXIT,
+        in("ebx") value,
+        options(noreturn)
+    );
+    loop {}
+}
+
+pub unsafe fn thread_join(tid: i32, value_out: *mut u32) -> i32 {
+    let ret: u32;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_THREAD_JOIN => ret,
+        in("ebx") tid as u32,
+        in("ecx") value_out as u32,
+        options(nostack, preserves_flags)
+    );
+    ret as i32
+}
+
+pub unsafe fn thread_detach(tid: i32) -> i32 {
+    let ret: u32;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_THREAD_DETACH => ret,
+        in("ebx") tid as u32,
+        options(nostack, preserves_flags)
+    );
+    ret as i32
 }
 
 pub unsafe fn write(fd: u32, buf: *const u8, len: usize) -> usize {

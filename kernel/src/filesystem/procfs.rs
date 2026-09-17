@@ -155,7 +155,9 @@ impl Filesystem for ProcFs {
             out.push(DirEntry { inode: INO_UPTIME, name: "uptime".to_string(), file_type: 1, size: 0 });
             out.push(DirEntry { inode: INO_MOUNTS, name: "mounts".to_string(), file_type: 1, size: 0 });
             unsafe {
-                for task in TASK_MANAGER.tasks.iter().flatten() {
+                for (slot, task) in TASK_MANAGER.tasks.iter().enumerate() {
+                    let Some(task) = task.as_ref() else { continue; };
+                    if task.leader_slot != slot as i8 { continue; }
                     if task.pid < 0 { continue; }
                     if let Some(ino) = Self::pid_inode(task.pid, 0) {
                         out.push(DirEntry {

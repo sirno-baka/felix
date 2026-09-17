@@ -52,7 +52,8 @@ pub fn send_signal(slot: i8, sig: u32) -> bool {
         return false;
     }
     unsafe {
-        if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
+        let leader = TASK_MANAGER.process_slot(slot as usize);
+        if let Some(ref mut t) = TASK_MANAGER.tasks[leader] {
             if t.zombie {
                 return false;
             }
@@ -77,12 +78,25 @@ pub fn stop_task_with_signal(slot: i8, sig: u32) -> bool {
         return false;
     }
     unsafe {
-        if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
-            if t.zombie || t.stopped {
+        let leader = TASK_MANAGER.process_slot(slot as usize);
+        let already_stopped = TASK_MANAGER.tasks[leader]
+            .as_ref()
+            .map_or(true, |t| t.zombie || t.stopped);
+        if already_stopped {
+            return false;
+        }
+        let members = TASK_MANAGER.thread_slots(leader);
+        for member in members {
+            if let Some(ref mut t) = TASK_MANAGER.tasks[member] {
+                if t.thread_exited { continue; }
+                t.running = false;
+                t.stopped = true;
+            }
+        }
+        if let Some(ref mut t) = TASK_MANAGER.tasks[leader] {
+            if t.zombie {
                 return false;
             }
-            t.running = false;
-            t.stopped = true;
             t.stop_signal = sig;
             t.wait_stopped_pending = true;
             // POSIX: generating a stop signal discards a pending SIGCONT.
@@ -101,13 +115,22 @@ pub fn continue_task(slot: i8) -> bool {
         return false;
     }
     unsafe {
-        if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
+        let leader = TASK_MANAGER.process_slot(slot as usize);
+        let was_stopped = TASK_MANAGER.tasks[leader]
+            .as_ref()
+            .map_or(false, |t| t.stopped);
+        let members = TASK_MANAGER.thread_slots(leader);
+        for member in members {
+            if let Some(ref mut thread) = TASK_MANAGER.tasks[member] {
+                if thread.thread_exited { continue; }
+                thread.stopped = false;
+                thread.running = true;
+            }
+        }
+        if let Some(ref mut t) = TASK_MANAGER.tasks[leader] {
             if t.zombie {
                 return false;
             }
-            let was_stopped = t.stopped;
-            t.stopped = false;
-            t.running = true;
             if was_stopped {
                 t.wait_continued_pending = true;
             }
@@ -131,31 +154,38 @@ pub fn force_kill(slot: i8, sig: u32) -> bool {
     if slot <= 0 {
         return false;
     }
-    let dead_pid = unsafe {
-        if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
+    let (leader, dead_pid) = unsafe {
+        let leader = TASK_MANAGER.process_slot(slot as usize);
+        let dead_pid = if let Some(ref t) = TASK_MANAGER.tasks[leader] {
             if t.zombie {
                 return false;
             }
-            let pid = t.pid;
+            t.pid
+        } else {
+            return false;
+        };
+        let members = TASK_MANAGER.thread_slots(leader);
+        for member in members {
+            if let Some(ref mut t) = TASK_MANAGER.tasks[member] {
             t.pending_signals = 0;
             t.running = false;
             t.stopped = false;
-            t.zombie = true;
+            t.thread_exited = true;
             t.term_signal = if sig == 0 { SIGKILL } else { sig };
             t.exit_code = 128 + t.term_signal as i32;
-            pid
-        } else {
-            return false;
+            }
         }
+        if let Some(ref mut t) = TASK_MANAGER.tasks[leader] { t.zombie = true; }
+        (leader, dead_pid)
     };
     unsafe { TASK_MANAGER.reparent_children_of(dead_pid); }
-    close_task_fds(slot);
-    crate::syscalls::wasm::clear_task_state(slot as usize);
-    crate::drivers::wm::destroy_windows_of(slot);
+    close_task_fds(leader as i8);
+    crate::syscalls::wasm::clear_task_state(leader);
+    crate::drivers::wm::destroy_windows_of(leader as i8);
     unsafe {
         TASK_MANAGER.reap_orphans();
     }
-    println!("[signal] task {} force-killed ({})", slot, sig);
+    println!("[signal] process {} force-killed ({})", dead_pid, sig);
     true
 }
 
@@ -204,10 +234,11 @@ pub fn deliver_pending(esp: u32) -> u32 {
     unsafe {
         // Loop in case the newly scheduled task also has fatal signals.
         for _ in 0..MAX_TASKS_GUARD {
-            let slot = TASK_MANAGER.get_current_slot();
-            if slot <= 0 {
+            let thread_slot = TASK_MANAGER.get_current_slot();
+            if thread_slot <= 0 {
                 return esp_or_current(esp);
             }
+            let slot = TASK_MANAGER.process_slot(thread_slot as usize) as i8;
 
             let pending = match TASK_MANAGER.tasks[slot as usize].as_ref() {
                 Some(t) if t.pending_signals != 0 && t.running && !t.zombie => t.pending_signals,
@@ -251,21 +282,7 @@ pub fn deliver_pending(esp: u32) -> u32 {
 
                 // Default action
                 if (DEFAULT_TERMINATE & sigbit(sig)) != 0 {
-                    let mut dead_pid = -1;
-                    if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
-                        dead_pid = t.pid;
-                        t.pending_signals &= !sigbit(sig);
-                        t.running = false;
-                        t.stopped = false;
-                        t.zombie = true;
-                        t.term_signal = sig;
-                        t.exit_code = 128 + sig as i32;
-                    }
-                    TASK_MANAGER.reparent_children_of(dead_pid);
-                    close_task_fds(slot);
-                    crate::syscalls::wasm::clear_task_state(slot as usize);
-                    crate::drivers::wm::destroy_windows_of(slot);
-                    println!("[signal] task {} killed by signal {}", slot, sig);
+                    let _ = force_kill(slot, sig);
                     let new_esp = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
                     return deliver_pending_after_switch(new_esp);
                 }
@@ -285,10 +302,11 @@ pub fn deliver_pending(esp: u32) -> u32 {
 /// current task once more (avoid deep recursion).
 fn deliver_pending_after_switch(esp: u32) -> u32 {
     unsafe {
-        let slot = TASK_MANAGER.get_current_slot();
-        if slot <= 0 {
+        let thread_slot = TASK_MANAGER.get_current_slot();
+        if thread_slot <= 0 {
             return esp;
         }
+        let slot = TASK_MANAGER.process_slot(thread_slot as usize) as i8;
         let pending = match TASK_MANAGER.tasks[slot as usize].as_ref() {
             Some(t) if t.pending_signals != 0 && t.running && !t.zombie => t.pending_signals,
             _ => return esp,
@@ -296,16 +314,7 @@ fn deliver_pending_after_switch(esp: u32) -> u32 {
         let fatal = pending & DEFAULT_TERMINATE;
         if fatal != 0 {
             let sig = lowest_sig(fatal).unwrap_or(SIGINT);
-            if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {
-                t.pending_signals &= !fatal;
-                t.running = false;
-                t.stopped = false;
-                t.zombie = true;
-                t.term_signal = sig;
-                t.exit_code = 128 + sig as i32;
-            }
-            close_task_fds(slot);
-            crate::drivers::wm::destroy_windows_of(slot);
+            let _ = force_kill(slot, sig);
             return TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
         }
         if let Some(ref mut t) = TASK_MANAGER.tasks[slot as usize] {

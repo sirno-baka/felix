@@ -829,6 +829,8 @@ pub(crate) fn sys_execve_wasm(
 
         task.running = true;
         task.pid = pid;
+        task.tid = pid;
+        task.leader_slot = slot as i8;
         task.ppid = ppid;
         task.pgid = pgid;
         task.sid = sid;

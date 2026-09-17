@@ -19,6 +19,11 @@ pub const HEADROOM: usize = 256;
 /// 32 keeps the scheduler simple on i386 while removing the old 8-process limit.
 pub const MAX_TASKS: i8 = 32;
 pub const USER_HEAP_BASE: u32 = 0x4000_0000;
+/// Per-thread userspace stacks live below the main process stack.  A slot gets
+/// a fixed 256 KiB arena: 128 KiB mapped stack followed by an unmapped guard.
+pub const USER_THREAD_STACK_BASE: u32 = 0xB000_0000;
+pub const USER_THREAD_STACK_STRIDE: u32 = 256 * 1024;
+pub const USER_THREAD_STACK_PAGES: u32 = 32;
 
 /// Отслеживает сколько выделений памяти используют каждую страницу.
 /// Страница размапливается только когда счётчик достигает 0.
@@ -114,6 +119,22 @@ pub struct Task {
     pub pending_signals: u32,
     /// Per-signal handlers: 0=SIG_DFL, 1=SIG_IGN, else userspace addr.
     pub signal_handlers: [u32; 32],
+    /// Linux-like thread id.  For a process leader `tid == pid`.
+    pub tid: i32,
+    /// Scheduler slot containing the process leader and shared process state.
+    pub leader_slot: i8,
+    /// Non-leaders borrow the leader's address space and only own their kernel
+    /// stack.  Process resources are released exactly once by the leader.
+    pub is_thread: bool,
+    /// A joined thread is reaped independently from the process leader.
+    pub thread_exited: bool,
+    pub thread_exit_value: u32,
+    /// Detached threads are reclaimed after switching away from their kernel stack.
+    pub thread_detached: bool,
+    /// Userspace-owned pointer used by the standard library's TLS key table.
+    pub tls_ptr: u32,
+    pub user_stack_bottom: u32,
+    pub user_stack_top: u32,
 }
 
 #[repr(C)]
@@ -138,6 +159,20 @@ impl Task {
         use crate::memory::paging::{phys_to_virt, PAGING};
         interrupt_sync::without_interrupts(|| unsafe {
             let mut paging = PAGING.lock();
+            if self.is_thread {
+                let mut addr = self.user_stack_bottom;
+                while addr < self.user_stack_top {
+                    if let Some(phys) = (*self.page_dir).translate(addr) {
+                        (*self.page_dir).unmap(addr);
+                        paging.free_phys_frame(phys >> 12);
+                    }
+                    addr += 4096;
+                }
+                for offset in (0..STACK_SIZE).step_by(4096) {
+                    paging.free_phys_frame((self.stack_base - KERNEL_OFFSET + offset as u32) >> 12);
+                }
+                return;
+            }
             for index in 0..768 {
                 let entry = (*self.page_dir).entries[index];
                 // Identity large pages are borrowed kernel mappings.
@@ -204,6 +239,60 @@ impl Task {
             name: [0; 32],
             pending_signals: 0,
             signal_handlers: [0; 32],
+            tid: -1,
+            leader_slot: -1,
+            is_thread: false,
+            thread_exited: false,
+            thread_exit_value: 0,
+            thread_detached: false,
+            tls_ptr: 0,
+            user_stack_bottom: 0,
+            user_stack_top: 0,
+        }
+    }
+
+    /// Construct a schedulable context borrowing an existing process address
+    /// space.  It deliberately does not allocate a second page directory.
+    pub fn new_thread(page_dir: *mut PageDirectory, page_dir_phys: u32) -> Self {
+        Task {
+            stack_base: alloc_kernel_stack(STACK_SIZE),
+            page_dir,
+            page_dir_phys,
+            cpu_state_ptr: 0,
+            running: false,
+            fd_table: FileDescriptorTable::new(),
+            kernel_stack: 0,
+            heap_next: 0,
+            mmap_next: 0,
+            mmap_free: Vec::new(),
+            page_refcounts: PageRefcounts::new(),
+            pid: -1,
+            ppid: -1,
+            pgid: -1,
+            sid: -1,
+            parent: -1,
+            cwd: "/".to_string(),
+            tty_id: -1,
+            pty_id: -1,
+            zombie: false,
+            stopped: false,
+            stop_signal: 0,
+            wait_stopped_pending: false,
+            wait_continued_pending: false,
+            term_signal: 0,
+            exit_code: 0,
+            name: [0; 32],
+            pending_signals: 0,
+            signal_handlers: [0; 32],
+            tid: -1,
+            leader_slot: -1,
+            is_thread: true,
+            thread_exited: false,
+            thread_exit_value: 0,
+            thread_detached: false,
+            tls_ptr: 0,
+            user_stack_bottom: 0,
+            user_stack_top: 0,
         }
     }
 
@@ -303,6 +392,8 @@ impl TaskManager {
             task.kernel_stack = stack_top;
             task.running = true;
             task.pid = 0;
+            task.tid = 0;
+            task.leader_slot = 0;
             task.ppid = -1;
             task.pgid = 0;
             task.sid = 0;
@@ -346,6 +437,8 @@ impl TaskManager {
         let mut task = Task::new_task();
         task.init(entry_point, user_stack_top, heap_start);
         task.pid = pid;
+        task.tid = pid;
+        task.leader_slot = free_slot;
         task.ppid = 0;
         task.pgid = pid;
         task.sid = pid;
@@ -512,7 +605,46 @@ impl TaskManager {
         self.tasks
             .iter()
             .enumerate()
-            .find_map(|(slot, task)| task.as_ref().filter(|t| t.pid == pid).map(|_| slot))
+            .find_map(|(slot, task)| {
+                task.as_ref()
+                    .filter(|t| t.pid == pid && t.leader_slot == slot as i8)
+                    .map(|_| slot)
+            })
+    }
+
+    pub fn slot_by_tid(&self, tid: i32) -> Option<usize> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .find_map(|(slot, task)| task.as_ref().filter(|t| t.tid == tid).map(|_| slot))
+    }
+
+    pub fn process_slot(&self, slot: usize) -> usize {
+        self.tasks
+            .get(slot)
+            .and_then(|t| t.as_ref())
+            .map(|t| if t.leader_slot >= 0 { t.leader_slot as usize } else { slot })
+            .unwrap_or(slot)
+    }
+
+    pub fn thread_slots(&self, leader_slot: usize) -> Vec<usize> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, task)| {
+                task.as_ref()
+                    .filter(|t| t.leader_slot == leader_slot as i8)
+                    .map(|_| slot)
+            })
+            .collect()
+    }
+
+    pub fn live_thread_count(&self, leader_slot: usize) -> usize {
+        self.tasks
+            .iter()
+            .flatten()
+            .filter(|t| t.leader_slot == leader_slot as i8 && !t.thread_exited)
+            .count()
     }
 
     pub fn current_pid(&self) -> i32 {
@@ -531,13 +663,14 @@ impl TaskManager {
             .enumerate()
             .filter_map(|(slot, task)| {
                 task.as_ref()
-                    .filter(|t| t.pgid == pgid && !t.zombie)
+                    .filter(|t| t.pgid == pgid && !t.zombie && t.leader_slot == slot as i8)
                     .map(|_| slot)
             })
             .collect()
     }
 
     pub fn get_free_slot(&mut self) -> i8 {
+        self.reap_detached_threads();
         self.reap_orphans();
         for i in 0..MAX_TASKS {
             if self.tasks[i as usize].is_none() {
@@ -547,6 +680,23 @@ impl TaskManager {
         // Do not steal a zombie that still belongs to a live parent: doing so
         // destroys waitpid semantics. PID 1 is responsible for orphan reaping.
         -1
+    }
+
+    /// Reclaim detached threads only after execution has moved to another
+    /// kernel stack. The currently executing slot is deliberately skipped.
+    pub fn reap_detached_threads(&mut self) {
+        let current = self.current_task;
+        for slot in 1..MAX_TASKS as usize {
+            if slot as i8 == current {
+                continue;
+            }
+            let reap = self.tasks[slot]
+                .as_ref()
+                .map_or(false, |task| task.is_thread && task.thread_exited && task.thread_detached);
+            if reap {
+                self.reap_thread(slot);
+            }
+        }
     }
 
     fn parent_gone(&self, ppid: i32) -> bool {
@@ -613,6 +763,35 @@ impl TaskManager {
             return false;
         };
         self.reparent_children_of(dead_pid);
+        // A process zombie owns every unjoined thread in its group. Reclaim
+        // their private stacks before releasing the shared address space.
+        let members = self.thread_slots(id);
+        for slot in members {
+            if slot == id { continue; }
+            if let Some(task) = self.tasks[slot].as_mut() {
+                task.release_memory();
+            }
+            self.tasks[slot] = None;
+            self.task_count -= 1;
+        }
+        if let Some(task) = self.tasks[id].as_mut() {
+            task.release_memory();
+        }
+        self.tasks[id] = None;
+        self.task_count -= 1;
+        true
+    }
+
+    pub fn reap_thread(&mut self, id: usize) -> bool {
+        if id == 0 || id >= self.tasks.len() {
+            return false;
+        }
+        let can_reap = self.tasks[id]
+            .as_ref()
+            .map_or(false, |t| t.is_thread && t.thread_exited);
+        if !can_reap {
+            return false;
+        }
         if let Some(task) = self.tasks[id].as_mut() {
             task.release_memory();
         }

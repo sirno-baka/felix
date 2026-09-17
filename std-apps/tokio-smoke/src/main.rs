@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
+static WORKERS_STARTED: AtomicUsize = AtomicUsize::new(0);
 
 async fn write_all(stream: &tokio::net::TcpStream, data: &[u8]) -> io::Result<()> {
     let mut written = 0usize;
@@ -114,13 +115,23 @@ fn spawn_client(stream: tokio::net::TcpStream, peer: std::net::SocketAddr) {
 
 fn main() -> io::Result<()> {
     println!("tokio: creating runtime");
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(3)
+        .on_thread_start(|| {
+            let worker = WORKERS_STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+            println!("tokio: worker #{worker} started as {:?}", std::thread::current().id());
+        })
         .enable_io()
         .enable_time()
         .build()?;
     println!("tokio: runtime ready");
 
     runtime.block_on(async {
+        while WORKERS_STARTED.load(Ordering::Acquire) < 3 {
+            tokio::task::yield_now().await;
+        }
+        println!("tokio: multithread runtime ready workers=3");
+
         if std::env::args().nth(1).as_deref() == Some("client") {
             return run_http_client().await;
         }

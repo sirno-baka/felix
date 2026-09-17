@@ -5,6 +5,8 @@ UNAME := $(shell uname)
 # instead of in .cargo/config.toml so std-apps can use the prebuilt PopugOS std.
 BUILD_STD_FLAGS := -Z build-std=core,compiler_builtins,alloc \
 	-Z build-std-features=compiler-builtins-mem
+STD_APPS_LOCAL_CONFIG := std-apps/.cargo/config.local.toml
+STD_APPS_CONFIG_ARG := $(if $(wildcard $(STD_APPS_LOCAL_CONFIG)),--config "$(STD_APPS_LOCAL_CONFIG)",)
 
 # Every cargo invocation needs both the custom getrandom backend selected by
 # Felix and warning suppression. Recipe-local `export` commands do not persist
@@ -228,8 +230,20 @@ run: all usb-image
 		-no-reboot -no-shutdown -vga std -m 128M \
 		-debugcon file:debug.log -serial stdio
 
+.PHONY: std-thread-smoke
+std-thread-smoke:
+	@cargo +popugos $(STD_APPS_CONFIG_ARG) build --manifest-path std-apps/Cargo.toml --target i686-unknown-popugos --release -p thread-smoke
+	@mkdir -p rootfs/bin
+	@cp -f std-apps/target/i686-unknown-popugos/release/thread-smoke rootfs/bin/thread-smoke
+
+.PHONY: std-tokio-smoke
+std-tokio-smoke:
+	@cargo +popugos $(STD_APPS_CONFIG_ARG) build --manifest-path std-apps/Cargo.toml --target i686-unknown-popugos --release -p tokio-smoke
+	@mkdir -p rootfs/bin
+	@cp -f std-apps/target/i686-unknown-popugos/release/tokio-smoke rootfs/bin/tokio-smoke
+
 .PHONY: smoke
-smoke: all usb-image
+smoke: std-thread-smoke std-tokio-smoke all usb-image
 	@echo "Running Felix smoke test..."
 	@rm -f build/smoke.log
 	@set +e; \
@@ -260,6 +274,9 @@ smoke: all usb-image
 	@grep -q 'Felix init: service manager pid=1' build/smoke.log || { echo "smoke: userspace init did not run as PID 1"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'selftest: PASS' build/smoke.log || { echo "smoke: userspace selftest failed"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'init: boot selftest pid=.* status=0' build/smoke.log || { echo "smoke: PID 1 did not reap selftest cleanly"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'std::thread smoke: PASS' build/smoke.log || { echo "smoke: std::thread test failed"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'tokio: multithread runtime ready workers=3' build/smoke.log || { echo "smoke: Tokio multi-thread runtime failed"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'tokio: poll timeout works' build/smoke.log || { echo "smoke: Tokio Mio/timer test failed"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'init: started pid=.* /bin/shell' build/smoke.log || { echo "smoke: shell was not spawned"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'shell: userspace main started pid=' build/smoke.log || { echo "smoke: shell did not reach main"; tail -n 160 build/smoke.log; exit 1; }
 	@echo "smoke: PASS"
