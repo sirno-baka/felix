@@ -10,6 +10,7 @@ use crate::{gdt, print, println};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::arch::asm;
+use core::sync::atomic::{AtomicI8, AtomicU32, Ordering};
 use core::u32::MAX;
 
 pub const STACK_SIZE: usize = 64 * 1024;
@@ -362,6 +363,12 @@ pub static mut TASK_MANAGER: TaskManager = TaskManager {
     next_pid: 1,
 };
 
+pub static SMP_KERNEL_LOCK: interrupt_sync::SpinMutex<()> =
+    interrupt_sync::SpinMutex::new(());
+static TASK_OWNER: [AtomicI8; MAX_TASKS as usize] =
+    [const { AtomicI8::new(-1) }; MAX_TASKS as usize];
+static AP_USER_SEEN: AtomicU32 = AtomicU32::new(0);
+
 const fn init_tasks_array() -> [Option<Task>; MAX_TASKS as usize] {
     [const { None }; MAX_TASKS as usize]
 }
@@ -418,6 +425,8 @@ impl TaskManager {
 
         self.task_count = 1;
         self.current_task = 0;
+        TASK_OWNER[0].store(0, Ordering::Release);
+        crate::smp::set_current_task_slot(0);
         self.first_switch = true;
         self.next_pid = 1;
 
@@ -479,7 +488,10 @@ impl TaskManager {
 
     //remove task
     pub fn remove_task(&mut self, id: usize) {
-        if id != 0 && id < self.tasks.len() {
+        if id != 0
+            && id < self.tasks.len()
+            && TASK_OWNER[id].load(Ordering::Acquire) < 0
+        {
             if let Some(pid) = self.tasks[id].as_ref().map(|t| t.pid) {
                 self.reparent_children_of(pid);
                 self.tasks[id] = None;
@@ -489,11 +501,18 @@ impl TaskManager {
     }
 
     pub fn remove_current_task(&mut self) {
-        self.remove_task(self.current_task as usize);
+        let current = crate::smp::current_task_slot();
+        if current >= 0 {
+            self.remove_task(current as usize);
+        }
     }
 
     //CPU SCHEDULER LOGIC
     pub fn schedule(&mut self, cpu_state: *mut CPUState) -> *mut CPUState {
+        let cpu = crate::smp::current_cpu_index();
+        if cpu != 0 {
+            return self.schedule_ap(cpu, cpu_state);
+        }
         if self.tasks[0].is_none() {
             return cpu_state;
         }
@@ -504,10 +523,11 @@ impl TaskManager {
             // first tick always entered idle and pid=1 waited for IRQ0 #2.
             // On real PIC/APIC that second tick is often missing.
             self.current_task = 0;
-            let next = self.get_next_task();
+            let next = self.claim_next_task(0, 0);
             if next != 0 {
                 self.current_task = next;
             }
+            crate::smp::set_current_task_slot(self.current_task);
             // PIC policy belongs to boot/device code, not the scheduler. In
             // particular, do not overwrite main.rs masks here: IRQ9 must remain
             // masked while OHCI/ToPIC share the legacy line and use polling.
@@ -527,10 +547,13 @@ impl TaskManager {
             if let Some(ref mut task) = self.tasks[self.current_task as usize] {
                 task.cpu_state_ptr = cpu_state as u32;
             }
+            if self.current_task > 0 {
+                TASK_OWNER[self.current_task as usize].store(-1, Ordering::Release);
+            }
         }
 
         // Выбираем следующую задачу
-        self.current_task = self.get_next_task();
+        self.current_task = self.claim_next_task(0, self.current_task);
 
         if self.current_task < 0
             || self.tasks[self.current_task as usize].is_none()
@@ -541,6 +564,7 @@ impl TaskManager {
         {
             self.current_task = 0;
         }
+        crate::smp::set_current_task_slot(self.current_task);
 
         let task = unsafe { self.tasks[self.current_task as usize].as_ref().unwrap() };
         // println!("[SCHEDULE] switching to task {} | pd_phys={:#x} | eip={:#x}",
@@ -580,6 +604,63 @@ impl TaskManager {
         new_cpustate
     }
 
+    fn schedule_ap(&mut self, cpu: usize, cpu_state: *mut CPUState) -> *mut CPUState {
+        let previous = crate::smp::current_task_slot();
+        if previous < 0 {
+            crate::smp::set_idle_esp(cpu, cpu_state as u32);
+        } else if let Some(task) = self.tasks[previous as usize].as_mut() {
+            task.cpu_state_ptr = cpu_state as u32;
+            TASK_OWNER[previous as usize].store(-1, Ordering::Release);
+        }
+
+        let next = self.claim_next_task(cpu as i8, previous);
+        if next <= 0 {
+            crate::smp::set_current_task_slot(-1);
+            let idle = crate::smp::idle_esp(cpu);
+            return if idle != 0 { idle as *mut CPUState } else { cpu_state };
+        }
+
+        crate::smp::set_current_task_slot(next);
+        let task = self.tasks[next as usize].as_ref().unwrap();
+        let cpu_bit = 1u32 << cpu;
+        if AP_USER_SEEN.fetch_or(cpu_bit, Ordering::Relaxed) & cpu_bit == 0 {
+            println!(
+                "[smp] CPU {} entered userspace: pid={} slot={}",
+                cpu, task.pid, next
+            );
+        }
+        unsafe {
+            crate::smp::set_cpu_kernel_stack(cpu, task.kernel_stack);
+            task.switch_address_space();
+        }
+        task.cpu_state_ptr as *mut CPUState
+    }
+
+    fn claim_next_task(&self, cpu: i8, after: i8) -> i8 {
+        let mut slot = if after < 1 { 1 } else { (after + 1) % MAX_TASKS };
+        for _ in 1..MAX_TASKS {
+            if slot == 0 {
+                slot = 1;
+            }
+            if self.tasks[slot as usize].as_ref().is_some_and(|task| {
+                task.running
+                    && !task.zombie
+                    && !task.thread_exited
+                    // Shared address spaces still need TLB shootdown support.
+                    // Until then APs run process leaders; threads stay on BSP.
+                    && (cpu == 0 || !task.is_thread)
+            })
+                && TASK_OWNER[slot as usize]
+                    .compare_exchange(-1, cpu, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return slot;
+            }
+            slot = (slot + 1) % MAX_TASKS;
+        }
+        0
+    }
+
     pub fn get_next_task(&self) -> i8 {
         if self.task_count <= 0 {
             return 0;
@@ -588,7 +669,7 @@ impl TaskManager {
         let mut i = (self.current_task + 1) % MAX_TASKS;
         for _ in 0..MAX_TASKS {
             if let Some(ref task) = self.tasks[i as usize] {
-                if task.running {
+                if task.running && TASK_OWNER[i as usize].load(Ordering::Acquire) < 0 {
                     return i;
                 }
             }
@@ -658,10 +739,11 @@ impl TaskManager {
     }
 
     pub fn current_pid(&self) -> i32 {
-        if self.current_task < 0 {
+        let current = crate::smp::current_task_slot();
+        if current < 0 {
             return -1;
         }
-        self.tasks[self.current_task as usize]
+        self.tasks[current as usize]
             .as_ref()
             .map(|t| t.pid)
             .unwrap_or(-1)
@@ -695,9 +777,8 @@ impl TaskManager {
     /// Reclaim detached threads only after execution has moved to another
     /// kernel stack. The currently executing slot is deliberately skipped.
     pub fn reap_detached_threads(&mut self) {
-        let current = self.current_task;
         for slot in 1..MAX_TASKS as usize {
-            if slot as i8 == current {
+            if TASK_OWNER[slot].load(Ordering::Acquire) >= 0 {
                 continue;
             }
             let reap = self.tasks[slot].as_ref().map_or(false, |task| {
@@ -743,7 +824,7 @@ impl TaskManager {
     }
 
     pub fn get_current_slot(&self) -> i8 {
-        self.current_task
+        crate::smp::current_task_slot()
     }
 
     /// Find a zombie child by stable PID. `want_pid == -1` means any child.
@@ -763,7 +844,7 @@ impl TaskManager {
 
     /// Reap (free) a zombie task slot. Returns true on success.
     pub fn reap(&mut self, id: usize) -> bool {
-        if id == 0 {
+        if id == 0 || TASK_OWNER[id].load(Ordering::Acquire) >= 0 {
             return false;
         }
         let dead_pid = if let Some(ref t) = self.tasks[id] {
@@ -798,6 +879,9 @@ impl TaskManager {
 
     pub fn reap_thread(&mut self, id: usize) -> bool {
         if id == 0 || id >= self.tasks.len() {
+            return false;
+        }
+        if TASK_OWNER[id].load(Ordering::Acquire) >= 0 {
             return false;
         }
         let can_reap = self.tasks[id]

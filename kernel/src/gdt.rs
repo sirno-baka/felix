@@ -72,27 +72,62 @@ pub static mut GDT: GlobalDescriptorTable = GlobalDescriptorTable {
     entries: [GdtEntry { entry: 0 }; GDT_ENTRIES],
 };
 
+/// GDT and TSS owned by one application processor. The descriptor table must
+/// stay alive for as long as that CPU can take interrupts.
+#[repr(C, align(16))]
+pub struct PerCpuGdt {
+    gdt: GlobalDescriptorTable,
+    tss: TaskStateSegment,
+}
+
+impl PerCpuGdt {
+    pub const fn new() -> Self {
+        Self {
+            gdt: GlobalDescriptorTable {
+                entries: [GdtEntry { entry: 0 }; GDT_ENTRIES],
+            },
+            tss: TaskStateSegment::new(),
+        }
+    }
+
+    /// Install this CPU's descriptor table and load its private TSS.
+    pub unsafe fn init_and_load(&mut self, kernel_stack: u32) {
+        self.tss.esp0 = kernel_stack;
+        self.tss.ss0 = 0x10;
+        self.gdt.entries = common_entries(make_tss_descriptor_for(&self.tss));
+        self.gdt.load();
+        self.gdt.load_tss();
+    }
+
+    pub unsafe fn set_kernel_stack(&mut self, kernel_stack: u32) {
+        self.tss.esp0 = kernel_stack;
+    }
+}
+
+fn common_entries(tss_desc: GdtEntry) -> [GdtEntry; GDT_ENTRIES] {
+    [
+        GdtEntry { entry: 0 },
+        GdtEntry {
+            entry: 0x00CF9A000000FFFF,
+        },
+        GdtEntry {
+            entry: 0x00CF92000000FFFF,
+        },
+        GdtEntry {
+            entry: 0x00CFFA000000FFFF,
+        },
+        GdtEntry {
+            entry: 0x00CFF2000000FFFF,
+        },
+        tss_desc,
+        GdtEntry { entry: 0 },
+    ]
+}
+
 impl GlobalDescriptorTable {
     pub fn init() {
         unsafe {
-            let zero = GdtEntry { entry: 0 };
-
-            // Стандартные flat 4 GiB дескрипторы (проверены тысячами осей)
-            let kcode = GdtEntry {
-                entry: 0x00CF9A000000FFFF,
-            }; // kernel code   (0x08)
-            let kdata = GdtEntry {
-                entry: 0x00CF92000000FFFF,
-            }; // kernel data   (0x10)
-            let ucode = GdtEntry {
-                entry: 0x00CFFA000000FFFF,
-            }; // user code     (0x18 → 0x1B)
-            let udata = GdtEntry {
-                entry: 0x00CFF2000000FFFF,
-            }; // user data     (0x20 → 0x23)
-            let tss_desc = make_tss_descriptor();
-
-            GDT.entries = [zero, kcode, kdata, ucode, udata, tss_desc, zero];
+            GDT.entries = common_entries(make_tss_descriptor_for(&TSS));
         }
     }
 
@@ -121,8 +156,8 @@ impl GlobalDescriptorTable {
     }
 }
 
-fn make_tss_descriptor() -> GdtEntry {
-    let base = unsafe { &TSS as *const TaskStateSegment as u32 };
+fn make_tss_descriptor_for(tss: &TaskStateSegment) -> GdtEntry {
+    let base = tss as *const TaskStateSegment as u32;
     let limit = (size_of::<TaskStateSegment>() - 1) as u32;
 
     let mut desc: u64 = 0;

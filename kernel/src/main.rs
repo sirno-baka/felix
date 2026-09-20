@@ -27,6 +27,7 @@ mod print;
 mod random;
 mod shell;
 mod signal;
+mod smp;
 mod spin;
 mod sync;
 mod syscalls;
@@ -232,6 +233,14 @@ pub extern "C" fn higher_half_entry() -> ! {
             interrupts::timer::TIMER_INT as usize,
             interrupts::timer::timer as u32,
         );
+        IDT.add(
+            smp::AP_TIMER_VECTOR as usize,
+            smp::ap_timer_interrupt as u32,
+        );
+        IDT.add(
+            smp::WORK_IPI_VECTOR as usize,
+            smp::work_ipi_interrupt as u32,
+        );
         IDT.add_user_interrupt(
             syscalls::handler::SYSCALL_INT as usize,
             syscalls::handler::syscall as u32,
@@ -247,6 +256,10 @@ pub extern "C" fn higher_half_entry() -> ! {
         IDT.add(6, irq6 as u32);
         IDT.load(); // ← ПЕРЕМЕСТИТЬ СЮДА
                     // После полной инициализации paging
+
+        // Bring up application processors after the final page tables and IDT
+        // exist. APs use private stacks and remain in kernel idle for now.
+        smp::init();
 
         // VESA framebuffer (mode set by bootloader, info at 0x5000).
         // After graphics mode VGA text is gone — software console + mini-WM.
@@ -316,6 +329,7 @@ pub extern "C" fn higher_half_entry() -> ! {
             }
         }
         println!("[!] init spawned as pid={}", init_pid);
+        crate::smp::enable_user_scheduling();
 
         // Enable only the IRQs with real handlers here:
         //   master IRQ0 = PIT, IRQ1 = keyboard, IRQ2 = slave cascade

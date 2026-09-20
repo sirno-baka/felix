@@ -89,11 +89,15 @@ pub extern "C" fn timer_handler(esp: u32) -> u32 {
             poll_network(now_ms as i64);
         }
 
-        // === 2. Планировщик ===
-        let mut new_esp = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
-
-        // === 3. Pending signals on the task about to run ===
-        new_esp = crate::signal::deliver_pending(new_esp);
+        // TaskManager and the process-wide kernel structures are shared by all
+        // processors. Keep this first SMP version simple: only one CPU may be
+        // inside the scheduler/syscall core at a time.
+        let new_esp = {
+            let _kernel = crate::multitasking::task::SMP_KERNEL_LOCK.lock();
+            let mut selected = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
+            selected = crate::signal::deliver_pending(selected);
+            selected
+        };
 
         // === 4. EOI ===
         PICS.end_interrupt(TIMER_INT);
