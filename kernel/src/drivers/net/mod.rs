@@ -8,9 +8,7 @@ const RX_RING_SIZE: usize = 128;
 const RX_BUF_SIZE: usize = 1536;
 const TX_BUF_SIZE: usize = 1536;
 
-use crate::memory::paging::{
-    PTEFlags, PhysAddr, VirtAddr, KERNEL_MMIO_BASE, KERNEL_MMIO_END, PAGE_SIZE, PAGING,
-};
+use crate::memory::resources::{ResourceKind, reserve_and_ioremap};
 use crate::net::ifconfig_dhcp;
 use crate::println;
 
@@ -51,40 +49,14 @@ impl AnyNic {
 }
 
 fn map_mmio(phys: u32, size: u32) -> Result<usize, &'static str> {
-    // Keep NIC registers outside the higher-half direct map.  Mapping BAR0 at
-    // 0xE0000000 used to replace the direct-map alias of physical 0x20000000
-    // on machines with >= 512 MiB RAM; the frame allocator could then hand
-    // that RAM to DMA and `phys + KERNEL_OFFSET` would point at MMIO instead.
-    const MMIO_VIRT_BASE: u32 = KERNEL_MMIO_BASE;
-
-    let map_size = size.max(PAGE_SIZE as u32);
-    let map_end = MMIO_VIRT_BASE
-        .checked_add(map_size)
-        .ok_or("NIC MMIO range overflow")?;
-    if map_end > KERNEL_MMIO_END {
-        return Err("NIC MMIO BAR does not fit reserved window");
-    }
-
-    // Device registers must be uncached on real hardware. Volatile accesses
-    // alone do not prevent the CPU cache from retaining an MMIO cache line.
-    let flags = PTEFlags::new()
-        .present()
-        .writable()
-        .write_through()
-        .cache_disable();
-
-    let mut paging = unsafe { PAGING.lock() };
-    paging.map_physical_range(phys, map_size, MMIO_VIRT_BASE, flags)?;
-    let actual = paging.dir.translate(MMIO_VIRT_BASE);
-    println!(
-        "net: MMIO phys={:#010x} size={:#x} -> virt={:#010x} actual={:?}",
-        phys, map_size, MMIO_VIRT_BASE, actual
-    );
-    if actual != Some(phys) {
-        return Err("NIC MMIO mapping verification failed");
-    }
-
-    Ok(MMIO_VIRT_BASE as usize)
+    let virt = reserve_and_ioremap(
+        phys as u64,
+        size.max(4096) as usize,
+        ResourceKind::Mmio,
+        "nic-mmio",
+    )
+    .map_err(|_| "NIC MMIO resource/map failed")?;
+    Ok(virt.0 as usize)
 }
 
 /// Optional network bring-up (does not fail boot).

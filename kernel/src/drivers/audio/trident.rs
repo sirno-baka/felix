@@ -6,11 +6,10 @@
 //! and mixing happen later from the PIT bottom half. If a safe shared PIC line
 //! is unavailable, voice position is polled and controller IRQs remain off.
 
-use alloc::boxed::Box;
 use core::sync::atomic::{Ordering, compiler_fence};
 
-use crate::KERNEL_OFFSET;
 use crate::drivers::audio::Mixer;
+use crate::memory::resources::{DmaBuffer as DmaAllocation, dma_alloc_for};
 use crate::io::{inl, inw, io_wait, outb, outl, outw};
 use crate::pci::bar::Bar;
 use crate::pci::device::PciDevice;
@@ -119,7 +118,8 @@ pub struct Trident {
     irq: u8,
     revision: u8,
     channel: u8,
-    dma: Box<DmaBuffer>,
+    dma: *mut DmaBuffer,
+    dma_mem: DmaAllocation,
     running: bool,
     irq_enabled: bool,
     idle_halves: usize,
@@ -145,16 +145,6 @@ fn io_bar0(dev: &PciDevice) -> Result<u16, &'static str> {
         Some(Bar::Io { .. }) => Err("Trident I/O BAR outside 16-bit port space"),
         _ => Err("Trident missing I/O BAR0"),
     }
-}
-
-fn virt_to_phys<T>(p: *const T) -> Result<u32, &'static str> {
-    let v = p as usize;
-    let off = KERNEL_OFFSET as usize;
-    let phys = if v >= off { v - off } else { v };
-    if phys > DMA_MASK_30BIT as usize {
-        return Err("Trident DMA buffer above 30-bit bus-master limit");
-    }
-    Ok(phys as u32)
 }
 
 impl Trident {
@@ -345,7 +335,7 @@ impl Trident {
     }
 
     fn program_voice(&self) -> Result<(), &'static str> {
-        let lba = virt_to_phys(self.dma.samples.as_ptr())?;
+        let lba = self.dma_mem.phys.0;
         let eso = (RING_FRAMES - 1) as u32;
         let delta = 0x1000u32; // 48 kHz
         let control = CHANNEL_LOOP | CHANNEL_SIGNED | CHANNEL_STEREO | CHANNEL_16BITS;
@@ -401,7 +391,10 @@ impl Trident {
 
     fn fill_half(&mut self, half: usize, mixer: &mut Mixer) -> bool {
         let start = (half & 1) * HALF_SAMPLES;
-        mixer.mix_into(&mut self.dma.samples[start..start + HALF_SAMPLES])
+        unsafe {
+            let samples = &mut (*self.dma).samples;
+            mixer.mix_into(&mut samples[start..start + HALF_SAMPLES])
+        }
     }
 
     pub fn kick(&mut self, mixer: &mut Mixer) -> Result<(), &'static str> {
@@ -409,7 +402,7 @@ impl Trident {
             return Ok(());
         }
 
-        self.dma.samples.fill(0);
+        unsafe { (*self.dma).samples.fill(0); }
         let _ = self.fill_half(0, mixer);
         let _ = self.fill_half(1, mixer);
         compiler_fence(Ordering::SeqCst);
@@ -527,16 +520,9 @@ pub fn probe_first() -> Result<Option<Trident>, &'static str> {
     dev.write_u16(0x04, command | 0x0005); // I/O + bus master
 
     let channel = if chip == Chip::Ali5451 { 0 } else { 63 };
-    let dma = Box::new(DmaBuffer {
-        samples: [0; RING_SAMPLES],
-    });
-    let phys = virt_to_phys(dma.samples.as_ptr())?;
-    let end = phys
-        .checked_add((RING_SAMPLES * 2 - 1) as u32)
-        .ok_or("Trident DMA overflow")?;
-    if end > DMA_MASK_30BIT {
-        return Err("Trident DMA crosses 30-bit limit");
-    }
+    let dma_mem = dma_alloc_for("trident PCM", core::mem::size_of::<DmaBuffer>(), core::mem::align_of::<DmaBuffer>(), DMA_MASK_30BIT as u64)
+        .map_err(|_| "Trident DMA allocation below 30-bit limit failed")?;
+    let dma = dma_mem.as_mut_ptr() as *mut DmaBuffer;
 
     let card = Trident {
         chip,
@@ -545,6 +531,7 @@ pub fn probe_first() -> Result<Option<Trident>, &'static str> {
         revision: dev.revision_id,
         channel,
         dma,
+        dma_mem,
         running: false,
         irq_enabled: false,
         idle_halves: 0,

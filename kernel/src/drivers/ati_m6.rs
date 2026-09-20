@@ -13,7 +13,7 @@
 //! LVDS/FP state and only replaces the timing/PLL values needed for
 //! the native panel mode.
 
-use crate::memory::paging::{PTEFlags, PAGING};
+use crate::memory::resources::{ResourceKind, reserve_and_ioremap};
 use crate::pci::bar::Bar;
 use crate::pci::find_device;
 use core::ptr::{read_volatile, write_volatile};
@@ -187,25 +187,16 @@ pub fn init_native_lcd() -> Result<(), &'static str> {
 
     let (mmio_phys, mmio_size) = find_mmio_bar(&dev).ok_or("ATI M6 MMIO BAR not found")?;
 
-    // Map the Radeon MMIO aperture into the kernel's higher-half.
-    // Keep this outside the normal framebuffer VA window.
-    const MMIO_VIRT: u32 = 0xD100_0000;
-
-    unsafe {
-        let mut paging = PAGING.lock();
-        paging
-            .map_physical_range(
-                mmio_phys,
-                mmio_size.max(0x1000),
-                MMIO_VIRT,
-                PTEFlags::new().present().writable(),
-            )
-            .map_err(|_| "failed to map ATI MMIO")?;
-        crate::memory::paging::PageDirectory::flush_all();
-    }
+    let mmio_virt = reserve_and_ioremap(
+        mmio_phys as u64,
+        mmio_size.max(0x1000) as usize,
+        ResourceKind::Mmio,
+        "ati-m6-mmio",
+    )
+    .map_err(|_| "failed to reserve/map ATI MMIO")?;
 
     let mmio = Mmio {
-        base: MMIO_VIRT as *mut u8,
+        base: mmio_virt.0 as *mut u8,
     };
 
     unsafe {

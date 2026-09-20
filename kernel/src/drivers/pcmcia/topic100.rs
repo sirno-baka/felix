@@ -7,7 +7,7 @@
 
 use core::ptr::{read_volatile, write_volatile};
 
-use crate::memory::paging::{PAGING, PTEFlags};
+use crate::memory::resources::{ResourceKind, reserve_and_ioremap};
 use crate::pci;
 
 use super::{CF_IO_BASE, CF_IO_END};
@@ -51,7 +51,6 @@ const TOPIC97_MISC2: u8 = 0xae;
 
 pub const BAR0_SIZE: u32 = 0x1000;
 pub const BAR0_PHYS_FALLBACK: u32 = 0xF000_0000;
-pub const BAR0_VIRT: u32 = 0xE000_0000;
 
 #[derive(Copy, Clone)]
 pub struct ToshibaTopic100 {
@@ -87,11 +86,11 @@ impl ToshibaTopic100 {
         self.pci.write_u32(PCI_BAR0, self.bar0_phys);
         self.pci.write_u32(
             PCI_CB_MEMORY_BASE_0,
-            super::CF_MEM_PHYS & 0xffff_fff0,
+            super::cf_mem_phys() & 0xffff_fff0,
         );
         self.pci.write_u32(
             PCI_CB_MEMORY_LIMIT_0,
-            (super::CF_MEM_PHYS + super::CF_MEM_SIZE - 1) | 0x0f,
+            (super::cf_mem_phys() + super::CF_MEM_SIZE - 1) | 0x0f,
         );
         self.pci.write_u32(
             PCI_CB_IO_BASE_0,
@@ -211,11 +210,16 @@ fn probe_bar_size(dev: &pci::device::PciDevice, original: u32) -> u32 {
     if size_mask == 0 { 0 } else { (!size_mask).wrapping_add(1) }
 }
 
-fn map_bar0(phys: u32, size: u32) {
+fn map_bar0(phys: u32, size: u32) -> Option<u32> {
     let map_size = ((size as usize) + 0xfff) & !0xfff;
-    let flags = PTEFlags::new().present().writable();
-    let mut paging = unsafe { PAGING.lock() };
-    let _ = paging.map_physical_range(phys, map_size as u32, BAR0_VIRT, flags);
+    reserve_and_ioremap(
+        phys as u64,
+        map_size,
+        ResourceKind::Mmio,
+        "pcmcia-topic100-bar0",
+    )
+    .ok()
+    .map(|v| v.0)
 }
 
 pub fn setup(dev: pci::device::PciDevice) -> Option<ToshibaTopic100> {
@@ -244,15 +248,15 @@ pub fn setup(dev: pci::device::PciDevice) -> Option<ToshibaTopic100> {
     let slot = dev.read_u8(TOPIC_SLOT_CONTROL);
     dev.write_u8(TOPIC_SLOT_CONTROL, slot | TOPIC_SLOT_SLOTON | TOPIC_SLOT_SLOTEN);
 
-    map_bar0(bar0_phys, size);
+    let bar0_virt = map_bar0(bar0_phys, size)?;
 
-    let controller = ToshibaTopic100::new(dev, bar0_phys, BAR0_VIRT, size);
+    let controller = ToshibaTopic100::new(dev, bar0_phys, bar0_virt, size);
     controller.restore_host_decode();
 
     crate::println!(
         "[PCMCIA] ToPIC100 BAR0 phys={:08x} virt={:08x} size={:x} irq={}",
         bar0_phys,
-        BAR0_VIRT,
+        bar0_virt,
         size,
         controller.irq_line(),
     );

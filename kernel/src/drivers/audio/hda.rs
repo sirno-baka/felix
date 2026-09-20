@@ -9,21 +9,16 @@
 //! - INTCTL and stream interrupt-enable bits stay disabled
 //! - one cyclic output stream, PCM S16LE / stereo / 48 kHz
 
-use alloc::boxed::Box;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, compiler_fence};
 
-use crate::KERNEL_OFFSET;
 use crate::drivers::audio::Mixer;
-use crate::memory::paging::{PAGING, PTEFlags};
+use crate::memory::resources::{DmaBuffer as DmaAllocation, ResourceKind, dma_alloc_for, dma_free, reserve_and_ioremap};
 use crate::pci::bar::Bar;
 use crate::pci::device::PciDevice;
 
 const INTEL: u16 = 0x8086;
 const COUGAR_POINT_HDA: u16 = 0x1c20;
-
-// Fixed kernel-only virtual window for this small MMIO BAR.
-const HDA_MMIO_VIRT: u32 = 0xBF80_0000;
 
 // Global HDA registers.
 const GCAP: usize = 0x00;
@@ -123,8 +118,10 @@ pub struct Hda {
     codec: u8,
     codec_vendor: u32,
     stream: usize,
-    bdl: Box<Bdl>,
-    dma: Box<DmaBuffer>,
+    bdl: *mut Bdl,
+    dma: *mut DmaBuffer,
+    bdl_mem: DmaAllocation,
+    dma_mem: DmaAllocation,
     running: bool,
     last_frag: usize,
     idle_refills: usize,
@@ -133,17 +130,6 @@ pub struct Hda {
 }
 
 unsafe impl Send for Hda {}
-
-#[inline]
-fn virt_to_phys<T>(p: *const T) -> Result<u32, &'static str> {
-    let v = p as usize;
-    let off = KERNEL_OFFSET as usize;
-    let phys = if v >= off { v - off } else { v };
-    if phys > u32::MAX as usize {
-        return Err("HDA DMA address above 4GiB");
-    }
-    Ok(phys as u32)
-}
 
 impl Hda {
     pub fn name(&self) -> &'static str {
@@ -203,13 +189,9 @@ impl Hda {
             _ => return Err("HDA missing BAR0"),
         };
 
-        let flags = PTEFlags::new().present().writable().cache_disable();
-        let mut paging = unsafe { PAGING.lock() };
-        paging
-            .map_physical_range(phys, size, HDA_MMIO_VIRT, flags)
+        let virt = reserve_and_ioremap(phys as u64, size as usize, ResourceKind::Mmio, "hda-mmio")
             .map_err(|_| "HDA MMIO mapping failed")?;
-        crate::memory::paging::PageDirectory::flush_all();
-        Ok((HDA_MMIO_VIRT as usize, phys, size))
+        Ok((virt.0 as usize, phys, size))
     }
 
     fn controller_reset(&self) -> Result<u16, &'static str> {
@@ -432,21 +414,24 @@ impl Hda {
     }
 
     fn prepare_bdl(&mut self) -> Result<(), &'static str> {
-        let dma_phys = virt_to_phys(self.dma.samples.as_ptr())?;
+        let dma_phys = self.dma_mem.phys.0;
         for i in 0..BDL_COUNT {
-            self.bdl.entries[i] = BdlEntry {
+            unsafe { (*self.bdl).entries[i] = BdlEntry {
                 addr_lo: dma_phys.wrapping_add((i * BYTES_PER_FRAG) as u32),
                 addr_hi: 0,
                 length: BYTES_PER_FRAG as u32,
                 flags: 0, // polling only: no IOC
-            };
+            }; }
         }
         Ok(())
     }
 
     fn fragment_mut(&mut self, index: usize) -> &mut [i16] {
         let start = (index % BDL_COUNT) * SAMPLES_PER_FRAG;
-        &mut self.dma.samples[start..start + SAMPLES_PER_FRAG]
+        unsafe {
+            let samples = &mut (*self.dma).samples;
+            &mut samples[start..start + SAMPLES_PER_FRAG]
+        }
     }
 
     fn fill_fragment(&mut self, index: usize, mixer: &mut Mixer) -> bool {
@@ -456,7 +441,7 @@ impl Hda {
     fn program_stream(&mut self) -> Result<(), &'static str> {
         self.reset_stream()?;
         self.prepare_bdl()?;
-        let bdl_phys = virt_to_phys(self.bdl.entries.as_ptr())?;
+        let bdl_phys = self.bdl_mem.phys.0;
 
         self.w32(self.sr(SD_BDLPL), bdl_phys);
         self.w32(self.sr(SD_BDLPU), 0);
@@ -477,7 +462,7 @@ impl Hda {
         }
 
         self.reset_stream()?;
-        self.dma.samples.fill(0);
+        unsafe { (*self.dma).samples.fill(0); }
         self.idle_refills = 0;
         for i in 0..BDL_COUNT {
             if self.fill_fragment(i, mixer) {
@@ -497,8 +482,8 @@ impl Hda {
         self.w8(self.sr(SD_CTL0), self.r8(self.sr(SD_CTL0)) | SD_CTL_RUN);
         self.running = true;
 
-        let dma_phys = virt_to_phys(self.dma.samples.as_ptr())?;
-        let bdl_phys = virt_to_phys(self.bdl.entries.as_ptr())?;
+        let dma_phys = self.dma_mem.phys.0;
+        let bdl_phys = self.bdl_mem.phys.0;
         crate::println!(
             "[audio/hda] RUN stream={:#x} dma={:#010x} bdl={:#010x} CBL={} LVI={} FMT={:#06x} CTL={:02x}:{:02x}:{:02x} STS={:#04x} LPIB={}",
             self.stream,
@@ -613,17 +598,17 @@ pub fn probe_first() -> Result<Option<Hda>, &'static str> {
     dev.write_u16(0x04, cmd | 0x0006);
 
     let (mmio, phys, size) = Hda::map_bar(&dev)?;
-    let bdl = Box::new(Bdl {
-        entries: [BdlEntry {
-            addr_lo: 0,
-            addr_hi: 0,
-            length: 0,
-            flags: 0,
-        }; BDL_COUNT],
-    });
-    let dma = Box::new(DmaBuffer {
-        samples: [0; DMA_SAMPLES],
-    });
+    let bdl_mem = dma_alloc_for("hda BDL", core::mem::size_of::<Bdl>(), core::mem::align_of::<Bdl>(), u32::MAX as u64)
+        .map_err(|_| "HDA BDL DMA allocation failed")?;
+    let dma_mem = match dma_alloc_for("hda PCM", core::mem::size_of::<DmaBuffer>(), core::mem::align_of::<DmaBuffer>(), u32::MAX as u64) {
+        Ok(mem) => mem,
+        Err(_) => {
+            let _ = dma_free(bdl_mem);
+            return Err("HDA PCM DMA allocation failed");
+        }
+    };
+    let bdl = bdl_mem.as_mut_ptr() as *mut Bdl;
+    let dma = dma_mem.as_mut_ptr() as *mut DmaBuffer;
 
     let mut card = Hda {
         mmio,
@@ -633,6 +618,8 @@ pub fn probe_first() -> Result<Option<Hda>, &'static str> {
         stream: 0,
         bdl,
         dma,
+        bdl_mem,
+        dma_mem,
         running: false,
         last_frag: 0,
         idle_refills: 0,

@@ -1,4 +1,5 @@
-use crate::memory::paging::{PTEFlags, PageDirectory, PhysAddr, VirtAddr, PAGING};
+use crate::memory::paging::VirtAddr;
+use crate::memory::resources::{ResourceKind, ioremap, iounmap, release_range, reserve_range};
 use crate::sync::mutex::Mutex;
 use crate::{debugln, println};
 use core::arch::asm;
@@ -36,37 +37,106 @@ pub struct FramebufferInfo {
 
 pub const FB_INFO_PHYS: u32 = 0x0000_5000;
 
-/// Виртуальный адрес, куда мы замапим LFB
-pub const FB_VIRT_BASE: u32 = 0xD000_0000;
-
 pub static mut LFB_PHYS: u32 = 0;
 pub static mut LFB_SIZE: u32 = 0;
+pub static mut LFB_VIRT: u32 = 0;
+static mut LFB_OWNER: &'static str = "";
 
-/// Map LFB as 4 MiB large pages — shared via copy_kernel_mappings, no fragile 4K PT.
-pub fn map_lfb_large(dir: &mut crate::memory::paging::PageDirectory) {
-    use crate::memory::paging::PDEFlags;
-    let phys = unsafe { LFB_PHYS };
-    let size = unsafe { LFB_SIZE };
+pub fn current_lfb_virt() -> u32 {
+    unsafe { LFB_VIRT }
+}
+
+/// Install or replace the kernel mapping for the physical framebuffer.
+/// The physical address comes from firmware/GPU state; only the virtual address
+/// is allocated here. This is the single owner of framebuffer VA selection.
+pub fn map_framebuffer_resource(
+    phys: u32,
+    size: u32,
+    owner: &'static str,
+) -> Result<u32, &'static str> {
     if phys == 0 || size == 0 {
-        return;
+        return Err("invalid framebuffer range");
     }
-    let phys_al = phys & 0xFFC0_0000;
-    let extra = phys - phys_al;
-    let n = ((extra + size + 0x3F_FFFF) / 0x40_0000).max(1);
-    for i in 0..n {
-        dir.map_large(
-            FB_VIRT_BASE + i * 0x400000,
-            phys_al + i * 0x400000,
-            PDEFlags::new().present().writable().accessed().large_page(),
-        );
+
+    let (old_phys, old_size, old_virt, old_owner) = unsafe {
+        (LFB_PHYS, LFB_SIZE, LFB_VIRT, LFB_OWNER)
+    };
+    if old_phys == phys && old_size >= size && old_virt != 0 {
+        return Ok(old_virt);
     }
+
+    let old_end = old_phys.checked_add(old_size).unwrap_or(u32::MAX);
+    let new_end = phys.checked_add(size).ok_or("framebuffer range overflow")?;
+    let overlaps_old = old_virt != 0 && phys < old_end && old_phys < new_end;
+
+    if overlaps_old {
+        let _ = iounmap(VirtAddr(old_virt));
+        let _ = release_range(old_phys as u64, old_size as u64);
+        unsafe {
+            LFB_PHYS = 0;
+            LFB_SIZE = 0;
+            LFB_VIRT = 0;
+            LFB_OWNER = "";
+        }
+    }
+
+    if reserve_range(phys as u64, size as u64, ResourceKind::Framebuffer, owner).is_err() {
+        if overlaps_old && old_virt != 0 {
+            let _ = restore_framebuffer_resource(old_phys, old_size, old_owner);
+        }
+        return Err("framebuffer physical range is already owned");
+    }
+    let virt = match ioremap(phys as u64, size as usize, owner) {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = release_range(phys as u64, size as u64);
+            if overlaps_old && old_virt != 0 {
+                let _ = restore_framebuffer_resource(old_phys, old_size, old_owner);
+            }
+            return Err("framebuffer ioremap failed");
+        }
+    };
+
+    if old_virt != 0 && !overlaps_old {
+        let _ = iounmap(VirtAddr(old_virt));
+        let _ = release_range(old_phys as u64, old_size as u64);
+    }
+
+    unsafe {
+        LFB_PHYS = phys;
+        LFB_SIZE = size;
+        LFB_VIRT = virt.0;
+        LFB_OWNER = owner;
+    }
+    Ok(virt.0)
+}
+
+fn restore_framebuffer_resource(phys: u32, size: u32, owner: &'static str) -> Result<u32, ()> {
+    reserve_range(phys as u64, size as u64, ResourceKind::Framebuffer, owner).map_err(|_| ())?;
+    let virt = match ioremap(phys as u64, size as usize, owner) {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = release_range(phys as u64, size as u64);
+            return Err(());
+        }
+    };
+    unsafe {
+        LFB_PHYS = phys;
+        LFB_SIZE = size;
+        LFB_VIRT = virt.0;
+        LFB_OWNER = owner;
+    }
+    Ok(virt.0)
 }
 
 pub fn lfb_pde() -> u32 {
     unsafe {
+        if LFB_VIRT == 0 || crate::memory::paging::KERNEL_PD_PHYS == 0 {
+            return 0;
+        }
         let pd = crate::memory::paging::phys_to_virt(crate::memory::paging::KERNEL_PD_PHYS)
             as *const [u32; 1024];
-        (*pd)[(FB_VIRT_BASE >> 22) as usize]
+        (*pd)[(LFB_VIRT >> 22) as usize]
     }
 }
 
@@ -103,17 +173,15 @@ impl Framebuffer {
         let bytes_per_line = info.pitch as u32;
         let height_u = info.height as u32;
         let size = bytes_per_line * height_u;
-        let start_offset = info.address & 0xFFF;
-        let total_size = size + start_offset + 0x10000;
-        let virt_base = FB_VIRT_BASE + start_offset;
-        println!("[FB] mapping LFB large pages (≈ {} KB)", total_size / 1024);
-        unsafe {
-            LFB_PHYS = info.address;
-            LFB_SIZE = total_size;
-            let mut paging = PAGING.lock();
-            map_lfb_large(&mut paging.dir);
-        }
-        crate::memory::paging::PageDirectory::flush_all();
+        let total_size = size.checked_add(0x10000)?;
+        println!("[FB] mapping LFB through resource manager (≈ {} KB)", total_size / 1024);
+        let virt_base = match map_framebuffer_resource(info.address, total_size, "vesa-framebuffer") {
+            Ok(v) => v,
+            Err(e) => {
+                println!("[FB] mapping failed: {}", e);
+                return None;
+            }
+        };
         println!(
             "[FB] ready {}x{} {}bpp pitch={} virt={:#x} phys={:#x} PDE={:#x}",
             width,

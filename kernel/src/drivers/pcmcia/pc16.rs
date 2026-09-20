@@ -2,7 +2,7 @@
 
 use core::ptr::{read_volatile, write_volatile};
 
-use super::{CF_IO_BASE, CF_IO_END, CF_MEM_PHYS};
+use super::{CF_IO_BASE, CF_IO_END, cf_mem_phys};
 
 const PC16_OFFSET: u32 = 0x800;
 
@@ -246,11 +246,15 @@ impl Pc16 {
     }
 
     pub unsafe fn configure_cf_attribute_window(&self) {
+        let phys = cf_mem_phys();
+        if phys == 0 {
+            return;
+        }
         let mut awinen = self.read8(reg::AWINEN) & !addrwin::MEM0;
         self.write8(reg::AWINEN, awinen);
         self.write8(reg::MISCC1, 0x01);
-        self.write8(reg::CB_MEM_PAGE0, (CF_MEM_PHYS >> 24) as u8);
-        let page = ((CF_MEM_PHYS >> 12) & 0x0fff) as u16;
+        self.write8(reg::CB_MEM_PAGE0, (phys >> 24) as u8);
+        let page = ((phys >> 12) & 0x0fff) as u16;
         self.write16(reg::MEMWIN0_START, page);
         self.write16(reg::MEMWIN0_END, page | 0x8000);
         self.write16(reg::MEMWIN0_OFFSET, 0x4000);

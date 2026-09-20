@@ -2,11 +2,11 @@
 
 use core::ptr::{read_volatile, write_volatile};
 
-use crate::memory::paging::{PTEFlags, PAGING};
+use crate::memory::resources::ioremap;
 use crate::time::sleep;
 
 use super::pc16::{addrwin, Pc16};
-use super::{CardInfo, CardType, CF_MEM_PHYS, CF_MEM_SIZE, CF_MEM_VIRT};
+use super::{CardInfo, CardType, CF_MEM_SIZE, cf_mem_phys, cf_mem_virt, set_cf_mem_virt};
 
 const TUPLE_VERS1: u8 = 0x15;
 const TUPLE_CONFIG: u8 = 0x1A;
@@ -16,25 +16,43 @@ const TUPLE_FUNCE: u8 = 0x22;
 const TUPLE_END: u8 = 0xFF;
 
 pub fn map_attribute_memory() {
-    let flags = PTEFlags::new().present().writable();
-    let mut paging = unsafe { PAGING.lock() };
-    let _ = paging.map_physical_range(CF_MEM_PHYS, CF_MEM_SIZE, CF_MEM_VIRT, flags);
-    crate::println!(
-        "[PCMCIA] mapping CF attribute memory phys=0x{:08x} size=0x{:x} -> virt=0x{:08x}",
-        CF_MEM_PHYS,
-        CF_MEM_SIZE,
-        CF_MEM_VIRT
-    );
+    if cf_mem_virt() != 0 {
+        return;
+    }
+    let phys = cf_mem_phys();
+    if phys == 0 {
+        crate::println!("[PCMCIA] CF attribute window has no physical address");
+        return;
+    }
+    match ioremap(phys as u64, CF_MEM_SIZE as usize, "pcmcia-cf-attribute") {
+        Ok(virt) => {
+            set_cf_mem_virt(virt.0);
+            crate::println!(
+                "[PCMCIA] mapping CF attribute memory phys=0x{:08x} size=0x{:x} -> virt=0x{:08x}",
+                phys,
+                CF_MEM_SIZE,
+                virt.0
+            );
+        }
+        Err(_) => crate::println!("[PCMCIA] failed to map CF attribute memory"),
+    }
 }
 
 #[inline]
 unsafe fn attr_read8(offset: u32) -> u8 {
-    read_volatile((CF_MEM_VIRT + offset) as *const u8)
+    let base = cf_mem_virt();
+    if base == 0 {
+        return 0xff;
+    }
+    read_volatile((base + offset) as *const u8)
 }
 
 #[inline]
 unsafe fn attr_write8(offset: u32, value: u8) {
-    write_volatile((CF_MEM_VIRT + offset) as *mut u8, value);
+    let base = cf_mem_virt();
+    if base != 0 {
+        write_volatile((base + offset) as *mut u8, value);
+    }
 }
 
 fn parse_cftable_default(raw: u8) -> Option<u8> {

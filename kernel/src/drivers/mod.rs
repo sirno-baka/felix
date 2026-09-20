@@ -1,6 +1,7 @@
 pub(crate) mod ati_m6;
 pub mod audio;
 pub mod framebuffer;
+pub(crate) mod intel_snb;
 pub mod keyboard;
 pub(crate) mod keyboard_buffer;
 pub mod mouse;

@@ -5,7 +5,9 @@
 //!
 //! ALi/ULi M5237 quirk: never touch HcFmInterval — the chip hard-locks.
 
-use crate::memory::paging::{phys_to_virt, PTEFlags, KERNEL_OFFSET, PAGING};
+use crate::memory::resources::{
+    DmaBuffer, ResourceKind, dma_alloc_for, dma_free, reserve_and_ioremap,
+};
 use crate::pci::class::{class, subclass};
 use crate::pci::device::PciDevice;
 use crate::pci::{self};
@@ -20,10 +22,6 @@ use core::sync::atomic::{AtomicU32, Ordering};
 const PROG_IF_OHCI: u8 = 0x10;
 const ALI_VENDOR: u16 = 0x10B9;
 const ALI_M5237: u16 = 0x5237;
-
-// ——— MMIO window (NIC already uses 0xE000_0000) ———
-const OHCI_MMIO_BASE: u32 = 0xE010_0000;
-const OHCI_MMIO_STRIDE: u32 = 0x2000;
 
 // ——— Operational registers ———
 const HC_REVISION: usize = 0x00;
@@ -185,15 +183,6 @@ impl Td {
     }
 }
 
-fn virt_to_phys(ptr: *const u8) -> u32 {
-    let v = ptr as u32;
-    if v >= KERNEL_OFFSET {
-        v - KERNEL_OFFSET
-    } else {
-        v
-    }
-}
-
 /// HCCA must be 256-aligned; ED/TD 16-aligned. Heap Box does not guarantee that.
 #[repr(C, align(4096))]
 struct DmaPage {
@@ -233,42 +222,33 @@ const fn empty_hcca() -> Hcca {
     }
 }
 
-static DMA: Mutex<[DmaPage; 2]> = Mutex::new([
-    DmaPage {
-        hcca: empty_hcca(),
-        ed: empty_ed(),
-        dummy: empty_td(),
-        setup_td: empty_td(),
-        data_td: empty_td(),
-        status_td: empty_td(),
-        setup: [0; 8],
-        data: [0; 512],
-    },
-    DmaPage {
-        hcca: empty_hcca(),
-        ed: empty_ed(),
-        dummy: empty_td(),
-        setup_td: empty_td(),
-        data_td: empty_td(),
-        status_td: empty_td(),
-        setup: [0; 8],
-        data: [0; 512],
-    },
-]);
-static DMA_SLOT: Mutex<usize> = Mutex::new(0);
+#[repr(C, align(16))]
+struct BulkDma {
+    ed: Ed,
+    td: [Td; 2],
+}
+
+#[repr(C, align(16))]
+struct InterruptDma {
+    ed: Ed,
+    td: Td,
+    dummy: Td,
+}
 
 /// Persistent bulk endpoint state. OHCI expects bulk EDs to remain scheduled;
-/// individual TDs are queued behind the endpoint's dummy tail.
+/// individual TDs are queued behind the endpoint's dummy tail.  The ED and both
+/// TD slots live in one centrally-owned DMA allocation.
 struct BulkEp {
     mmio: usize,
     addr: u8,
     ep: u8,
-    mps: u16,
+    dma: DmaBuffer,
     ed: *mut Ed,
     ed_phys: u32,
     dummy: *mut Td,
     dummy_phys: u32,
-    next_data1: bool,
+    spare: *mut Td,
+    spare_phys: u32,
 }
 
 unsafe impl Send for BulkEp {}
@@ -294,6 +274,7 @@ pub struct Ohci {
     irq: u8,
     vendor: u16,
     device: u16,
+    instance: u8,
     skip_fminterval: bool,
     nports: u8,
     port_ls: u16,
@@ -305,7 +286,9 @@ unsafe impl Send for Ohci {}
 unsafe impl Sync for Ohci {}
 
 pub(crate) static CONTROLLERS: Mutex<Vec<Ohci>> = Mutex::new(Vec::new());
-static MMIO_SLOT: Mutex<u32> = Mutex::new(0);
+/// Owns the physical DMA pages referenced by the lightweight/copyable Ohci handles.
+static CONTROLLER_DMA: Mutex<Vec<DmaBuffer>> = Mutex::new(Vec::new());
+static OHCI_INSTANCE: AtomicU32 = AtomicU32::new(0);
 
 // USB transfers in this HCD are already completion-polled. On the C1M
 // generation IRQ9 is a heavily shared legacy PCI INTx line (CardBus, USB,
@@ -319,6 +302,23 @@ static ROOT_HUB_POLL_DIV: AtomicU32 = AtomicU32::new(0);
 static ENUM_FAIL_MASK: AtomicU32 = AtomicU32::new(0);
 
 impl Ohci {
+    fn dma_page_phys(&self, ptr: *const u8, len: usize) -> Result<u32, &'static str> {
+        let base = self.hcca as usize;
+        let addr = ptr as usize;
+        let offset = addr
+            .checked_sub(base)
+            .ok_or("OHCI: DMA pointer below page")?;
+        let end = offset
+            .checked_add(len)
+            .ok_or("OHCI: DMA pointer range overflow")?;
+        if end > core::mem::size_of::<DmaPage>() {
+            return Err("OHCI: DMA pointer outside controller page");
+        }
+        self.hcca_phys
+            .checked_add(offset as u32)
+            .ok_or("OHCI: DMA physical address overflow")
+    }
+
     fn r32(&self, off: usize) -> u32 {
         unsafe { read_volatile((self.mmio + off) as *const u32) }
     }
@@ -361,20 +361,20 @@ impl Ohci {
 
     #[inline]
     fn enum_fail_bit(&self, port: u8) -> u32 {
-        let slot = ((self.mmio as u32).wrapping_sub(OHCI_MMIO_BASE) / OHCI_MMIO_STRIDE).min(1);
+        let slot = (self.instance as u32).min(1);
         1u32 << (slot * 16 + (port as u32 & 0x0f))
     }
 
     fn map_bar(phys: u32, size: u32) -> Result<usize, &'static str> {
-        let mut slot = MMIO_SLOT.lock();
-        let virt = OHCI_MMIO_BASE + *slot * OHCI_MMIO_STRIDE;
-        *slot += 1;
-        drop(slot);
-
-        let flags = PTEFlags::new().present().writable();
-        let mut paging = unsafe { PAGING.lock() };
-        paging.map_physical_range(phys, size.max(0x1000), virt, flags)?;
-        Ok(virt as usize)
+        let map_size = size.max(0x1000);
+        let virt = reserve_and_ioremap(
+            phys as u64,
+            map_size as usize,
+            ResourceKind::Mmio,
+            "ohci-mmio",
+        )
+        .map_err(|_| "OHCI: MMIO resource/map failed")?;
+        Ok(virt.0 as usize)
     }
 
     pub fn probe(dev: &PciDevice) -> Result<Self, &'static str> {
@@ -399,23 +399,44 @@ impl Ohci {
         )?;
 
         let skip_fminterval = dev.vendor_id == ALI_VENDOR && dev.device_id == ALI_M5237;
+        let instance = OHCI_INSTANCE.fetch_add(1, Ordering::Relaxed) as u8;
 
-        let hcca = {
-            let mut slot = DMA_SLOT.lock();
-            let i = *slot;
-            *slot = i + 1;
-            drop(slot);
-            let g = DMA.lock();
-            let i = i.min(1);
-            &g[i].hcca as *const Hcca as *mut Hcca
-        };
-        let hcca_phys = virt_to_phys(hcca as *const u8);
+        // OHCI bus-master pointers are 32-bit. Allocate the complete HCCA/ED/TD
+        // working page through the central DMA allocator instead of relying on
+        // a static kernel object and virt-KERNEL_OFFSET arithmetic.
+        let dma = dma_alloc_for(
+            "ohci HCCA/ED/TD",
+            core::mem::size_of::<DmaPage>(),
+            core::mem::align_of::<DmaPage>(),
+            u32::MAX as u64,
+        )
+        .map_err(|_| "OHCI: DMA allocation failed")?;
+        let page = dma.virt.0 as *mut DmaPage;
+        unsafe {
+            core::ptr::write(
+                page,
+                DmaPage {
+                    hcca: empty_hcca(),
+                    ed: empty_ed(),
+                    dummy: empty_td(),
+                    setup_td: empty_td(),
+                    data_td: empty_td(),
+                    status_td: empty_td(),
+                    setup: [0; 8],
+                    data: [0; 512],
+                },
+            );
+        }
+        let hcca = unsafe { &mut (*page).hcca as *mut Hcca };
+        let hcca_phys = dma.phys.0;
+        CONTROLLER_DMA.lock().push(dma);
 
         Ok(Self {
             mmio,
             irq: dev.interrupt_line,
             vendor: dev.vendor_id,
             device: dev.device_id,
+            instance,
             skip_fminterval,
             nports: 0,
             port_ls: 0,
@@ -652,13 +673,28 @@ impl Ohci {
             dma.data[..data.len()].copy_from_slice(data);
         }
 
-        let ed_phys = virt_to_phys((&dma.ed as *const Ed).cast::<u8>());
-        let dummy_phys = virt_to_phys((&dma.dummy as *const Td).cast::<u8>());
-        let setup_td_phys = virt_to_phys((&dma.setup_td as *const Td).cast::<u8>());
-        let data_td_phys = virt_to_phys((&dma.data_td as *const Td).cast::<u8>());
-        let status_td_phys = virt_to_phys((&dma.status_td as *const Td).cast::<u8>());
-        let setup_phys = virt_to_phys(dma.setup.as_ptr());
-        let data_phys = virt_to_phys(dma.data.as_ptr());
+        let ed_phys = self.dma_page_phys(
+            (&dma.ed as *const Ed).cast::<u8>(),
+            core::mem::size_of::<Ed>(),
+        )?;
+        let dummy_phys = self.dma_page_phys(
+            (&dma.dummy as *const Td).cast::<u8>(),
+            core::mem::size_of::<Td>(),
+        )?;
+        let setup_td_phys = self.dma_page_phys(
+            (&dma.setup_td as *const Td).cast::<u8>(),
+            core::mem::size_of::<Td>(),
+        )?;
+        let data_td_phys = self.dma_page_phys(
+            (&dma.data_td as *const Td).cast::<u8>(),
+            core::mem::size_of::<Td>(),
+        )?;
+        let status_td_phys = self.dma_page_phys(
+            (&dma.status_td as *const Td).cast::<u8>(),
+            core::mem::size_of::<Td>(),
+        )?;
+        let setup_phys = self.dma_page_phys(dma.setup.as_ptr(), dma.setup.len())?;
+        let data_phys = self.dma_page_phys(dma.data.as_ptr(), dma.data.len())?;
 
         dma.dummy = Td {
             flags: TD_CC_NOT_ACCESSED << TD_CC_SHIFT,
@@ -813,15 +849,19 @@ impl Ohci {
             return Ok(0);
         }
         let n = data.len();
-        // The transfer buffer itself is DMA-visible. Linux's OHCI HCD maps the
-        // URB buffer and puts that DMA address directly in TD.hwCBP/hwBE.
-        // Do the same here instead of bouncing every bulk transfer through one
-        // shared DMA[0].data buffer. The latter is especially wrong with two
-        // OHCI controllers and also adds an unnecessary copy on every IN.
-        let data_phys = virt_to_phys(data.as_mut_ptr());
-        let last = data_phys + (n as u32) - 1;
+        let data_dma = dma_alloc_for("ohci bulk data", n, 16, u32::MAX as u64)
+            .map_err(|_| "OHCI: bulk DMA allocation failed")?;
+        if !in_dir {
+            unsafe {
+                core::ptr::copy_nonoverlapping(data.as_ptr(), data_dma.as_mut_ptr(), n);
+            }
+        }
+        let data_phys = data_dma.phys.0;
+        let last = data_phys
+            .checked_add((n as u32).saturating_sub(1))
+            .ok_or("OHCI: bulk DMA range overflow")?;
 
-        let (ed, ed_phys, dummy, dummy_phys, first) = {
+        let (ed, ed_phys, td) = {
             let mut eps = BULK_EPS.lock();
             let pos = eps
                 .iter()
@@ -829,105 +869,109 @@ impl Ohci {
             let idx = match pos {
                 Some(i) => i,
                 None => {
-                    let dummy = Box::leak(Box::new(Td {
-                        flags: TD_CC_NOT_ACCESSED << TD_CC_SHIFT,
-                        cbp: 0,
-                        next_td: 0,
-                        be: 0,
-                    }));
-                    let dummy_phys = virt_to_phys(dummy as *mut Td as *const u8);
-                    let ed = Box::leak(Box::new(Ed {
-                        flags: (addr as u32) | ((ep as u32) << 7) | ((mps as u32) << 16),
-                        tail_td: dummy_phys,
-                        head_td: dummy_phys,
-                        next_ed: 0,
-                    }));
-                    let ed_phys = virt_to_phys(ed as *mut Ed as *const u8);
-                    // BulkHeadED is the head of a linked ED list, not a single
-                    // endpoint register. Keep all persistent bulk EDs chained.
+                    let dma = dma_alloc_for(
+                        "ohci bulk ED/TD",
+                        core::mem::size_of::<BulkDma>(),
+                        core::mem::align_of::<BulkDma>(),
+                        u32::MAX as u64,
+                    )
+                    .map_err(|_| "OHCI: bulk descriptor DMA allocation failed")?;
+                    let block = dma.as_mut_ptr() as *mut BulkDma;
+                    unsafe {
+                        core::ptr::write(
+                            block,
+                            BulkDma {
+                                ed: empty_ed(),
+                                td: [empty_td(), empty_td()],
+                            },
+                        );
+                    }
+                    let ed = unsafe { &mut (*block).ed as *mut Ed };
+                    let td0 = unsafe { &mut (*block).td[0] as *mut Td };
+                    let td1 = unsafe { &mut (*block).td[1] as *mut Td };
+                    let ed_phys = dma
+                        .phys_of(ed.cast::<u8>(), core::mem::size_of::<Ed>())
+                        .map_err(|_| "OHCI: bulk ED outside DMA allocation")?
+                        .0;
+                    let td0_phys = dma
+                        .phys_of(td0.cast::<u8>(), core::mem::size_of::<Td>())
+                        .map_err(|_| "OHCI: bulk TD0 outside DMA allocation")?
+                        .0;
+                    let td1_phys = dma
+                        .phys_of(td1.cast::<u8>(), core::mem::size_of::<Td>())
+                        .map_err(|_| "OHCI: bulk TD1 outside DMA allocation")?
+                        .0;
+                    unsafe {
+                        (*ed).flags = (addr as u32) | ((ep as u32) << 7) | ((mps as u32) << 16);
+                        (*ed).tail_td = td0_phys;
+                        (*ed).head_td = td0_phys;
+                        (*ed).next_ed = 0;
+                        (*td0).flags = TD_CC_NOT_ACCESSED << TD_CC_SHIFT;
+                        (*td1).flags = TD_CC_NOT_ACCESSED << TD_CC_SHIFT;
+                    }
                     if let Some(prev) = eps.iter().rev().find(|e| e.mmio == self.mmio) {
                         unsafe {
                             (*prev.ed).next_ed = ed_phys;
                         }
-                        // println!("[ohci] bulk link ed=0x{:08x} -> ed=0x{:08x}", prev.ed_phys, ed_phys);
                     }
                     eps.push(BulkEp {
                         mmio: self.mmio,
                         addr,
                         ep,
-                        mps,
+                        dma,
                         ed,
                         ed_phys,
-                        dummy,
-                        dummy_phys,
-                        next_data1: false,
+                        dummy: td0,
+                        dummy_phys: td0_phys,
+                        spare: td1,
+                        spare_phys: td1_phys,
                     });
                     eps.len() - 1
                 }
             };
-            let state = &mut eps[idx];
-            let dummy = state.dummy;
-            let dummy_phys = state.dummy_phys;
 
-            // OHCI's queue is advanced by converting the current dummy TD into
-            // the real TD, then installing a fresh dummy tail. This is the same
-            // queue invariant used by Linux's OHCI HCD.
-            let new_dummy = Box::leak(Box::new(Td {
-                flags: TD_CC_NOT_ACCESSED << TD_CC_SHIFT,
-                cbp: 0,
-                next_td: 0,
-                be: 0,
-            }));
-            let new_dummy_phys = virt_to_phys(new_dummy as *mut Td as *const u8);
+            let state = &mut eps[idx];
+            let td = state.dummy;
+            let new_dummy = state.spare;
+            let new_dummy_phys = state.spare_phys;
             unsafe {
-                (*dummy).flags = (TD_CC_NOT_ACCESSED << TD_CC_SHIFT)
+                *new_dummy = Td {
+                    flags: TD_CC_NOT_ACCESSED << TD_CC_SHIFT,
+                    cbp: 0,
+                    next_td: 0,
+                    be: 0,
+                };
+                (*td).flags = (TD_CC_NOT_ACCESSED << TD_CC_SHIFT)
                     | if in_dir { TD_DP_IN } else { TD_DP_OUT }
                     | TD_DI_NONE
                     | TD_R;
-                (*dummy).cbp = data_phys;
-                (*dummy).next_td = new_dummy_phys;
-                (*dummy).be = last;
+                (*td).cbp = data_phys;
+                (*td).next_td = new_dummy_phys;
+                (*td).be = last;
                 (*state.ed).tail_td = new_dummy_phys;
             }
-            state.dummy = new_dummy;
-            state.dummy_phys = new_dummy_phys;
-            (state.ed, state.ed_phys, dummy, dummy_phys, dummy_phys)
+            core::mem::swap(&mut state.dummy, &mut state.spare);
+            core::mem::swap(&mut state.dummy_phys, &mut state.spare_phys);
+            (state.ed, state.ed_phys, td)
         };
 
-        // println!(
-        //     "[ohci] bulk begin addr={} ep={} {} len={} mps={} ed=0x{:08x} td=0x{:08x} buf=0x{:08x} head=0x{:08x}",
-        //     addr, ep, if in_dir { "IN" } else { "OUT" }, n, mps, ed_phys, first, data_phys,
-        //     unsafe { read_volatile(&(*ed).head_td) }
-        // );
-
-        // Schedule the persistent ED if it is not already the bulk-list head.
         let head = self.r32(HC_BULKHEADED) & !0xF;
         if head == 0 {
             self.w32(HC_BULKHEADED, ed_phys);
             self.w32(HC_BULKCURRENTED, 0);
-            // println!("[ohci] bulk list head=0x{:08x}", ed_phys);
-        } else {
-            // println!("[ohci] bulk list existing head=0x{:08x}, ED=0x{:08x} already linked", head, ed_phys);
         }
         let ctrl = self.r32(HC_CONTROL);
         self.w32(
             HC_CONTROL,
             (ctrl & !CTRL_HCFS_MASK) | CTRL_HCFS_OPERATIONAL | CTRL_CLE | CTRL_BLE,
         );
-        // Linux kicks the bulk list after the TD has been linked and memory is visible.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.w32(HC_CMDSTATUS, CMD_BLF);
-        // println!(
-        //     "[ohci] bulk kick head=0x{:08x} current=0x{:08x} ctrl={:08x} cmd={:08x} ed_head=0x{:08x} ed_tail=0x{:08x}",
-        //     self.r32(HC_BULKHEADED), self.r32(HC_BULKCURRENTED), self.r32(HC_CONTROL),
-        //     self.r32(HC_CMDSTATUS), unsafe { read_volatile(&(*ed).head_td) },
-        //     unsafe { read_volatile(&(*ed).tail_td) }
-        // );
 
         let mut ok = false;
         let wait_start = self.frame_number();
         while self.frames_since(wait_start) < 2000 {
-            if unsafe { read_volatile(&(*dummy).flags) } >> TD_CC_SHIFT != TD_CC_NOT_ACCESSED {
+            if unsafe { read_volatile(&(*td).flags) } >> TD_CC_SHIFT != TD_CC_NOT_ACCESSED {
                 ok = true;
                 break;
             }
@@ -937,31 +981,33 @@ impl Ohci {
         if !ok {
             println!(
                 "[ohci] bulk TIMEOUT cc={} ctrl={:08x} cmd={:08x} int={:08x} done={:08x} head=0x{:08x} current=0x{:08x} ed_head=0x{:08x} ed_tail=0x{:08x}",
-                unsafe { read_volatile(&(*dummy).flags) } >> TD_CC_SHIFT,
-                self.r32(HC_CONTROL), self.r32(HC_CMDSTATUS), self.r32(HC_INTSTATUS),
-                self.r32(HC_DONEHEAD), self.r32(HC_BULKHEADED), self.r32(HC_BULKCURRENTED),
-                unsafe { read_volatile(&(*ed).head_td) }, unsafe { read_volatile(&(*ed).tail_td) }
+                unsafe { read_volatile(&(*td).flags) } >> TD_CC_SHIFT,
+                self.r32(HC_CONTROL),
+                self.r32(HC_CMDSTATUS),
+                self.r32(HC_INTSTATUS),
+                self.r32(HC_DONEHEAD),
+                self.r32(HC_BULKHEADED),
+                self.r32(HC_BULKCURRENTED),
+                unsafe { read_volatile(&(*ed).head_td) },
+                unsafe { read_volatile(&(*ed).tail_td) }
             );
+            let _ = dma_free(data_dma);
             return Err("OHCI: bulk timeout");
         }
 
-        let cc = unsafe { read_volatile(&(*dummy).flags) } >> TD_CC_SHIFT;
-        // println!(
-        //     // "[ohci] bulk done cc={} td_flags={:08x} cbp=0x{:08x} be=0x{:08x} ed_head=0x{:08x} ed_tail=0x{:08x}",
-        //     cc,
-        //     unsafe { read_volatile(&(*dummy).flags) },
-        //     unsafe { read_volatile(&(*dummy).cbp) },
-        //     unsafe { read_volatile(&(*dummy).be) },
-        //     unsafe { read_volatile(&(*ed).head_td) },
-        //     unsafe { read_volatile(&(*ed).tail_td) }
-        // );
+        let cc = unsafe { read_volatile(&(*td).flags) } >> TD_CC_SHIFT;
         if cc != 0 && cc != 9 {
             println!("[ohci] bulk cc={}", cc);
+            let _ = dma_free(data_dma);
             return Err("OHCI: bulk failed");
         }
 
-        // println!("[ohci] bulk return n={}", n);
-        let _ = dummy_phys;
+        if in_dir {
+            unsafe {
+                core::ptr::copy_nonoverlapping(data_dma.as_mut_ptr(), data.as_mut_ptr(), n);
+            }
+        }
+        let _ = dma_free(data_dma);
         Ok(n)
     }
 
@@ -978,38 +1024,71 @@ impl Ohci {
         if data.is_empty() {
             return Ok(0);
         }
-        let dummy = Box::leak(Box::new(Td {
-            flags: TD_CC_NOT_ACCESSED << TD_CC_SHIFT,
-            cbp: 0,
-            next_td: 0,
-            be: 0,
-        }));
-        let dummy_phys = virt_to_phys(dummy as *mut Td as *const u8);
-        let data_phys = virt_to_phys(data.as_mut_ptr());
-        let last = data_phys + (data.len() as u32) - 1;
+        let n = data.len();
+        let desc_dma = dma_alloc_for(
+            "ohci intr ED/TD",
+            core::mem::size_of::<InterruptDma>(),
+            core::mem::align_of::<InterruptDma>(),
+            u32::MAX as u64,
+        )
+        .map_err(|_| "OHCI: interrupt descriptor DMA allocation failed")?;
+        let data_dma = match dma_alloc_for("ohci intr data", n, 16, u32::MAX as u64) {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = dma_free(desc_dma);
+                return Err("OHCI: interrupt data DMA allocation failed");
+            }
+        };
+        if !in_dir {
+            unsafe {
+                core::ptr::copy_nonoverlapping(data.as_ptr(), data_dma.as_mut_ptr(), n);
+            }
+        }
+
+        let block = desc_dma.as_mut_ptr() as *mut InterruptDma;
+        let ed = unsafe { &mut (*block).ed as *mut Ed };
+        let td = unsafe { &mut (*block).td as *mut Td };
+        let dummy = unsafe { &mut (*block).dummy as *mut Td };
+        let ed_phys = desc_dma
+            .phys_of(ed.cast::<u8>(), core::mem::size_of::<Ed>())
+            .map_err(|_| "OHCI: interrupt ED outside DMA allocation")?
+            .0;
+        let td_phys = desc_dma
+            .phys_of(td.cast::<u8>(), core::mem::size_of::<Td>())
+            .map_err(|_| "OHCI: interrupt TD outside DMA allocation")?
+            .0;
+        let dummy_phys = desc_dma
+            .phys_of(dummy.cast::<u8>(), core::mem::size_of::<Td>())
+            .map_err(|_| "OHCI: interrupt dummy TD outside DMA allocation")?
+            .0;
+        let data_phys = data_dma.phys.0;
+        let last = data_phys
+            .checked_add((n as u32).saturating_sub(1))
+            .ok_or("OHCI: interrupt DMA range overflow")?;
         let data1 = toggle_of(addr, ep);
-        let td = Box::leak(Box::new(Td {
-            flags: (TD_CC_NOT_ACCESSED << TD_CC_SHIFT)
-                | if in_dir { TD_DP_IN } else { TD_DP_OUT }
-                | td_toggle(data1)
-                | TD_DI_NONE
-                | TD_R,
-            cbp: data_phys,
-            next_td: dummy_phys,
-            be: last,
-        }));
-        let td_phys = virt_to_phys(td as *mut Td as *const u8);
-        let ed = Box::leak(Box::new(Ed {
-            // Interrupt endpoints may legitimately have very small packets
-            // (CBI command-completion is two bytes). Use the descriptor's
-            // wMaxPacketSize; the >=8 rule applies to EP0, not periodic EDs.
-            flags: ed_flags(addr, ep, mps.max(1), ls),
-            tail_td: dummy_phys,
-            head_td: td_phys,
-            next_ed: 0,
-        }));
-        let ed_phys = virt_to_phys(ed as *mut Ed as *const u8);
         unsafe {
+            *dummy = Td {
+                flags: TD_CC_NOT_ACCESSED << TD_CC_SHIFT,
+                cbp: 0,
+                next_td: 0,
+                be: 0,
+            };
+            *td = Td {
+                flags: (TD_CC_NOT_ACCESSED << TD_CC_SHIFT)
+                    | if in_dir { TD_DP_IN } else { TD_DP_OUT }
+                    | td_toggle(data1)
+                    | TD_DI_NONE
+                    | TD_R,
+                cbp: data_phys,
+                next_td: dummy_phys,
+                be: last,
+            };
+            *ed = Ed {
+                flags: ed_flags(addr, ep, mps.max(1), ls),
+                tail_td: dummy_phys,
+                head_td: td_phys,
+                next_ed: 0,
+            };
             let hcca = &mut *self.hcca;
             for slot in hcca.int_table.iter_mut() {
                 *slot = ed_phys;
@@ -1021,25 +1100,36 @@ impl Ohci {
         let mut ok = false;
         let wait_start = self.frame_number();
         while self.frames_since(wait_start) < 200 {
-            if td.cc() != TD_CC_NOT_ACCESSED {
+            if unsafe { (*td).cc() } != TD_CC_NOT_ACCESSED {
                 ok = true;
                 break;
             }
             core::hint::spin_loop();
         }
-        ed.flags |= ED_SKIP;
         unsafe {
+            (*ed).flags |= ED_SKIP;
             (*self.hcca).int_table = [0; 32];
         }
         if !ok {
+            let _ = dma_free(data_dma);
+            let _ = dma_free(desc_dma);
             return Err("OHCI: interrupt timeout");
         }
-        if td.cc() != 0 && td.cc() != 9 {
+        let cc = unsafe { (*td).cc() };
+        if cc != 0 && cc != 9 {
+            let _ = dma_free(data_dma);
+            let _ = dma_free(desc_dma);
             return Err("OHCI: interrupt failed");
         }
-        set_toggle(addr, ep, (ed.head_td & 2) != 0);
-        let _ = dummy;
-        Ok(data.len())
+        set_toggle(addr, ep, unsafe { ((*ed).head_td & 2) != 0 });
+        if in_dir {
+            unsafe {
+                core::ptr::copy_nonoverlapping(data_dma.as_mut_ptr(), data.as_mut_ptr(), n);
+            }
+        }
+        let _ = dma_free(data_dma);
+        let _ = dma_free(desc_dma);
+        Ok(n)
     }
 
     /// Drop host-controller endpoint state belonging to a physically removed
@@ -1053,9 +1143,17 @@ impl Ohci {
         self.w32(HC_CONTROLHEADED, 0);
         self.w32(HC_CONTROLCURRENTED, 0);
 
-        let first_phys = {
+        let (first_phys, removed) = {
             let mut eps = BULK_EPS.lock();
-            eps.retain(|e| !(e.mmio == self.mmio && e.addr == addr));
+            let mut removed = Vec::new();
+            let mut i = 0usize;
+            while i < eps.len() {
+                if eps[i].mmio == self.mmio && eps[i].addr == addr {
+                    removed.push(eps.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
 
             let indices: Vec<usize> = eps
                 .iter()
@@ -1073,8 +1171,14 @@ impl Ohci {
                 }
             }
 
-            indices.first().map(|&i| eps[i].ed_phys).unwrap_or(0)
+            (
+                indices.first().map(|&i| eps[i].ed_phys).unwrap_or(0),
+                removed,
+            )
         };
+        for ep in removed {
+            let _ = dma_free(ep.dma);
+        }
 
         self.w32(HC_BULKHEADED, first_phys);
         self.w32(HC_BULKCURRENTED, 0);
@@ -1271,11 +1375,8 @@ pub fn poll_hotplug() {
     if ROOT_HUB_POLL_DIV.fetch_add(1, Ordering::Relaxed) % 10 != 0 {
         return;
     }
-    let controllers: Vec<Ohci> = {
-        let controllers = CONTROLLERS.lock();
-        controllers.iter().copied().collect()
-    };
-    for hc in controllers {
+    let controllers = CONTROLLERS.lock();
+    for hc in controllers.iter() {
         hc.poll_root_hub();
     }
 }

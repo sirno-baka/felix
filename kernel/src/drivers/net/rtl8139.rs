@@ -3,7 +3,7 @@
 
 use crate::drivers::net::{RX_BUF_SIZE, TX_BUF_SIZE};
 use crate::io::{inb, inl, inw, outb, outl, outw};
-use crate::memory::paging::{KERNEL_OFFSET, PAGE_SIZE, PAGING};
+use crate::memory::resources::{DmaBuffer as DmaAllocation, dma_alloc_for};
 use crate::pci;
 use crate::println;
 use crate::sync::mutex::Mutex;
@@ -67,6 +67,8 @@ pub struct Rtl8139 {
     rx_buf: *mut u8,
     tx_phys: [u32; TX_SLOTS],
     tx_buf: [*mut u8; TX_SLOTS],
+    _rx_dma: DmaAllocation,
+    _tx_dma: DmaAllocation,
     tx_cur: AtomicUsize,
     rx_off: AtomicUsize,
     initialized: AtomicBool,
@@ -82,21 +84,6 @@ fn dma_wbinvd() {
     unsafe {
         core::arch::asm!("wbinvd", options(nostack, preserves_flags));
     }
-}
-
-fn alloc_contig(bytes: usize) -> Result<(u32, *mut u8), &'static str> {
-    let pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-    let mut paging = unsafe { PAGING.lock() };
-    let frame = paging.alloc_frame();
-    for _ in 1..pages {
-        let _ = paging.alloc_frame();
-    }
-    let phys = frame << 12;
-    let virt = (phys + KERNEL_OFFSET) as *mut u8;
-    unsafe {
-        core::ptr::write_bytes(virt, 0, pages * PAGE_SIZE);
-    }
-    Ok((phys, virt))
 }
 
 impl Rtl8139 {
@@ -132,13 +119,18 @@ impl Rtl8139 {
 
         println!("rtl8139: I/O base {:#x}", io);
 
-        let (rx_phys, rx_buf) = alloc_contig(RX_ALLOC)?;
+        let rx_dma = dma_alloc_for("rtl8139 RX", RX_ALLOC, 4096, u32::MAX as u64)
+            .map_err(|_| "RTL8139 RX DMA allocation failed")?;
+        let tx_dma = dma_alloc_for("rtl8139 TX", TX_BUF_SIZE * TX_SLOTS, 4096, u32::MAX as u64)
+            .map_err(|_| "RTL8139 TX DMA allocation failed")?;
+        let rx_phys = rx_dma.phys.0;
+        let rx_buf = rx_dma.as_mut_ptr();
         let mut tx_phys = [0u32; TX_SLOTS];
         let mut tx_buf = [core::ptr::null_mut(); TX_SLOTS];
         for i in 0..TX_SLOTS {
-            let (p, v) = alloc_contig(TX_BUF_SIZE)?;
-            tx_phys[i] = p;
-            tx_buf[i] = v;
+            let off = i * TX_BUF_SIZE;
+            tx_phys[i] = tx_dma.phys.0 + off as u32;
+            tx_buf[i] = unsafe { tx_dma.as_mut_ptr().add(off) };
         }
 
         let mut nic = Rtl8139 {
@@ -149,6 +141,8 @@ impl Rtl8139 {
             rx_buf,
             tx_phys,
             tx_buf,
+            _rx_dma: rx_dma,
+            _tx_dma: tx_dma,
             tx_cur: AtomicUsize::new(0),
             rx_off: AtomicUsize::new(0),
             initialized: AtomicBool::new(false),

@@ -5,6 +5,6 @@
 /popui/.renderer.rs.disabled
 bx_enh_dbg.ini
 out.txt
-
+pxe
 .idea
 std-apps/.cargo/config.local.toml

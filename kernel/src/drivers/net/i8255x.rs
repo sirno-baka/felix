@@ -2,7 +2,7 @@
 //! Uses Felix PCI subsystem + PageManager for DMA buffers
 
 use crate::drivers::net::{map_mmio, RX_BUF_SIZE, RX_RING_SIZE, TX_BUF_SIZE, TX_RING_SIZE};
-use crate::memory::paging::{PhysAddr, KERNEL_OFFSET, PAGE_SIZE, PAGING};
+use crate::memory::resources::{DmaBuffer as DmaAllocation, dma_alloc_for};
 use crate::pci::{self, device::PciDevice};
 use crate::println;
 use crate::sync::mutex::Mutex;
@@ -94,6 +94,8 @@ pub struct I8255x {
     // Виртуальные указатели (identity map → можем использовать как phys)
     tx_ring: *mut TxDesc,
     rx_ring: *mut RxDesc,
+    _tx_dma: DmaAllocation,
+    _rx_dma: DmaAllocation,
 
     tx_head: AtomicUsize, // next free slot for TX
     tx_tail: AtomicUsize, // last completed
@@ -144,36 +146,24 @@ impl I8255x {
         let mmio = map_mmio(mmio_phys, bar_size)?;
         println!("i8255x: MMIO mapped at virt {:#x}", mmio);
 
-        // ---- Выделяем страницы под кольца ----
-        let tx_pages =
-            ((core::mem::size_of::<TxDesc>() * TX_RING_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
-        let rx_pages =
-            ((core::mem::size_of::<RxDesc>() * RX_RING_SIZE) + PAGE_SIZE - 1) / PAGE_SIZE;
-
-        let mut tx_phys = 0u32;
-        let mut rx_phys = 0u32;
-
-        unsafe {
-            let mut paging = PAGING.lock();
-
-            // TX ring — берём подряд идущие фреймы (bump-аллокатор даёт consecutive)
-            let tx_frame = paging.alloc_frame();
-            for _ in 1..tx_pages {
-                let _ = paging.alloc_frame();
-            }
-            tx_phys = tx_frame << 12; // ← важно!
-
-            // RX ring
-            let rx_frame = paging.alloc_frame();
-            for _ in 1..rx_pages {
-                let _ = paging.alloc_frame();
-            }
-            rx_phys = rx_frame << 12; // ← важно!
-        }
-        // Благодаря identity-mapping низкой памяти можем использовать phys как virt
-        use crate::memory::paging::KERNEL_OFFSET;
-        let tx_ring = (tx_phys + KERNEL_OFFSET) as *mut TxDesc;
-        let rx_ring = (rx_phys + KERNEL_OFFSET) as *mut RxDesc;
+        let tx_dma = dma_alloc_for(
+            "i8255x TX ring",
+            core::mem::size_of::<TxDesc>() * TX_RING_SIZE,
+            4096,
+            u32::MAX as u64,
+        )
+        .map_err(|_| "i8255x TX DMA allocation failed")?;
+        let rx_dma = dma_alloc_for(
+            "i8255x RX ring",
+            core::mem::size_of::<RxDesc>() * RX_RING_SIZE,
+            4096,
+            u32::MAX as u64,
+        )
+        .map_err(|_| "i8255x RX DMA allocation failed")?;
+        let tx_phys = tx_dma.phys.0;
+        let rx_phys = rx_dma.phys.0;
+        let tx_ring = tx_dma.as_mut_ptr() as *mut TxDesc;
+        let rx_ring = rx_dma.as_mut_ptr() as *mut RxDesc;
 
         let mut nic = I8255x {
             mmio,
@@ -183,6 +173,8 @@ impl I8255x {
             rx_ring_phys: rx_phys,
             tx_ring,
             rx_ring,
+            _tx_dma: tx_dma,
+            _rx_dma: rx_dma,
             tx_head: AtomicUsize::new(0),
             tx_tail: AtomicUsize::new(0),
             rx_idx: AtomicUsize::new(0),

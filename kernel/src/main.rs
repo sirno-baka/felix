@@ -188,8 +188,6 @@ pub extern "C" fn _start() -> ! {
         loop {}
     }
 }
-
-
 /// Continues kernel initialisation after we are running in higher-half.
 #[unsafe(no_mangle)]
 pub extern "C" fn higher_half_entry() -> ! {
@@ -223,6 +221,10 @@ pub extern "C" fn higher_half_entry() -> ! {
             crate::memory::paging::KERNEL_PD_PHYS = pm.dir_phys();
         }
 
+        if let Err(e) = crate::memory::resources::init() {
+            println!("[mem] resource manager init error: {}", e);
+        }
+
         // 3. IDT — загружаем ОЧЕНЬ РАНО
         IDT.init();
         IDT.add_exceptions();
@@ -250,9 +252,13 @@ pub extern "C" fn higher_half_entry() -> ! {
         // After graphics mode VGA text is gone — software console + mini-WM.
         crate::drivers::framebuffer::init();
 
-        match crate::drivers::ati_m6::init_native_lcd() {
-            Ok(()) => println!("[M6] native LCD mode enabled"),
-            Err(e) => println!("[M6] error: {}", e),
+        match crate::drivers::intel_snb::init_native_framebuffer() {
+            Ok(true) => println!("[SNB] native Intel framebuffer enabled"),
+            Ok(false) => match crate::drivers::ati_m6::init_native_lcd() {
+                Ok(()) => println!("[M6] native LCD mode enabled"),
+                Err(e) => println!("[M6] error: {}", e),
+            },
+            Err(e) => println!("[SNB] takeover skipped: {}", e),
         }
 
         crate::drivers::wm::init();

@@ -6,11 +6,10 @@
 //! safely join Felix's shared INTx dispatcher, hardware IRQ generation stays
 //! disabled and the same status registers are polled from PIT.
 
-use alloc::boxed::Box;
 use core::sync::atomic::{Ordering, compiler_fence};
 
-use crate::KERNEL_OFFSET;
 use crate::drivers::audio::Mixer;
+use crate::memory::resources::{DmaBuffer as DmaAllocation, dma_alloc_for, dma_free};
 use crate::io::{inb, inl, inw, io_wait, outb, outl, outw};
 use crate::pci::bar::Bar;
 use crate::pci::device::PciDevice;
@@ -86,8 +85,10 @@ pub struct IchAc97 {
     irq: u8,
     device_id: u16,
     revision: u8,
-    bdl: Box<Bdl>,
-    dma: Box<DmaBuffer>,
+    bdl: *mut Bdl,
+    dma: *mut DmaBuffer,
+    bdl_mem: DmaAllocation,
+    dma_mem: DmaAllocation,
     running: bool,
     irq_enabled: bool,
     last_civ: u8,
@@ -127,16 +128,6 @@ fn io_bar(dev: &PciDevice, index: usize) -> Result<u16, &'static str> {
         Some(Bar::Memory { .. }) => Err("ICH AC97 expected I/O BAR"),
         _ => Err("ICH AC97 missing BAR"),
     }
-}
-
-fn virt_to_phys<T>(p: *const T) -> Result<u32, &'static str> {
-    let v = p as usize;
-    let off = KERNEL_OFFSET as usize;
-    let phys = if v >= off { v - off } else { v };
-    if phys > u32::MAX as usize {
-        return Err("ICH AC97 DMA address above 4GiB");
-    }
-    Ok(phys as u32)
 }
 
 impl IchAc97 {
@@ -230,7 +221,10 @@ impl IchAc97 {
 
     fn fragment_mut(&mut self, index: usize) -> &mut [i16] {
         let start = (index & 31) * SAMPLES_PER_FRAG;
-        &mut self.dma.samples[start..start + SAMPLES_PER_FRAG]
+        unsafe {
+            let samples = &mut (*self.dma).samples;
+            &mut samples[start..start + SAMPLES_PER_FRAG]
+        }
     }
 
     fn fill_fragment(&mut self, index: usize, mixer: &mut Mixer) -> bool {
@@ -238,13 +232,13 @@ impl IchAc97 {
     }
 
     fn prepare_bdl(&mut self) -> Result<(), &'static str> {
-        let dma_phys = virt_to_phys(self.dma.samples.as_ptr())?;
+        let dma_phys = self.dma_mem.phys.0;
         for i in 0..BDL_COUNT {
             let byte_off = (i * SAMPLES_PER_FRAG * core::mem::size_of::<i16>()) as u32;
-            self.bdl.entries[i] = BdlEntry {
+            unsafe { (*self.bdl).entries[i] = BdlEntry {
                 addr: dma_phys.wrapping_add(byte_off),
                 control_len: (SAMPLES_PER_FRAG as u32) | BD_BUP | BD_IOC,
-            };
+            }; }
         }
         Ok(())
     }
@@ -256,12 +250,12 @@ impl IchAc97 {
 
         self.reset_pcm_out()?;
         self.prepare_bdl()?;
-        self.dma.samples.fill(0);
+        unsafe { (*self.dma).samples.fill(0); }
         for i in 0..ACTIVE_FRAGS {
             let _ = self.fill_fragment(i, mixer);
         }
 
-        let bdl_phys = virt_to_phys(self.bdl.entries.as_ptr())?;
+        let bdl_phys = self.bdl_mem.phys.0;
         compiler_fence(Ordering::SeqCst);
         outl(self.bport(PO_BDBAR), bdl_phys);
         self.last_civ = 0;
@@ -383,15 +377,17 @@ pub fn probe_first() -> Result<Option<IchAc97>, &'static str> {
     let nabm = io_bar(&dev, 1)?;
     dev.enable_bus_mastering();
 
-    let bdl = Box::new(Bdl {
-        entries: [BdlEntry {
-            addr: 0,
-            control_len: 0,
-        }; BDL_COUNT],
-    });
-    let dma = Box::new(DmaBuffer {
-        samples: [0; DMA_SAMPLES],
-    });
+    let bdl_mem = dma_alloc_for("ich-ac97 BDL", core::mem::size_of::<Bdl>(), core::mem::align_of::<Bdl>(), u32::MAX as u64)
+        .map_err(|_| "ICH AC97 BDL DMA allocation failed")?;
+    let dma_mem = match dma_alloc_for("ich-ac97 PCM", core::mem::size_of::<DmaBuffer>(), core::mem::align_of::<DmaBuffer>(), u32::MAX as u64) {
+        Ok(mem) => mem,
+        Err(_) => {
+            let _ = dma_free(bdl_mem);
+            return Err("ICH AC97 PCM DMA allocation failed");
+        }
+    };
+    let bdl = bdl_mem.as_mut_ptr() as *mut Bdl;
+    let dma = dma_mem.as_mut_ptr() as *mut DmaBuffer;
     let mut card = IchAc97 {
         nam,
         nabm,
@@ -400,6 +396,8 @@ pub fn probe_first() -> Result<Option<IchAc97>, &'static str> {
         revision: dev.revision_id,
         bdl,
         dma,
+        bdl_mem,
+        dma_mem,
         running: false,
         irq_enabled: false,
         last_civ: 0,

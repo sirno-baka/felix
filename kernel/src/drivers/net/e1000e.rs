@@ -10,7 +10,7 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering};
 
 use crate::drivers::net::{map_mmio, RX_RING_SIZE, TX_BUF_SIZE};
-use crate::memory::paging::{KERNEL_OFFSET, PAGE_SIZE, PAGING};
+use crate::memory::resources::{DmaBuffer as DmaAllocation, dma_alloc_for};
 use crate::pci;
 use crate::println;
 use crate::sync::mutex::Mutex;
@@ -203,6 +203,10 @@ pub struct E1000e {
     tx_buffers_phys: u32,
     rx_buffers: *mut u8,
     tx_buffers: *mut u8,
+    _rx_ring_dma: DmaAllocation,
+    _tx_ring_dma: DmaAllocation,
+    _rx_buffers_dma: DmaAllocation,
+    _tx_buffers_dma: DmaAllocation,
     rx_head: AtomicUsize,
     tx_head: AtomicUsize,
     tx_packets: AtomicUsize,
@@ -217,28 +221,9 @@ unsafe impl Sync for E1000e {}
 
 pub static NET: Mutex<Option<E1000e>> = Mutex::new(None);
 
-fn alloc_dma(bytes: usize) -> Result<(u32, *mut u8), &'static str> {
-    let pages = bytes.div_ceil(PAGE_SIZE);
-    if pages == 0 {
-        return Err("zero-sized DMA allocation");
-    }
-    let mut paging = unsafe { PAGING.lock() };
-    let first = paging.alloc_contiguous_frames(pages as u32);
-    let phys = first << 12;
-    let virt_addr = phys
-        .checked_add(KERNEL_OFFSET)
-        .ok_or("DMA virtual address overflow")?;
-
-    // DMA buffers rely on the permanent RAM direct map.  If some MMIO mapping
-    // has replaced this VA, touching the buffer would hit device registers (or
-    // another physical page) and turn a first TX into arbitrary corruption.
-    if paging.dir.translate(virt_addr) != Some(phys) {
-        return Err("DMA direct-map alias was overwritten");
-    }
-
-    let virt = virt_addr as *mut u8;
-    unsafe { core::ptr::write_bytes(virt, 0, pages * PAGE_SIZE) };
-    Ok((phys, virt))
+fn alloc_dma(owner: &'static str, bytes: usize) -> Result<DmaAllocation, &'static str> {
+    dma_alloc_for(owner, bytes, 4096, u32::MAX as u64)
+        .map_err(|_| "e1000e DMA allocation failed")
 }
 
 #[inline]
@@ -279,11 +264,18 @@ impl E1000e {
         }
         let mmio = map_mmio(bar_phys, bar_size)?;
 
-        let (rx_ring_phys, rx_ring) = alloc_dma(core::mem::size_of::<RxDesc>() * RX_RING_SIZE)?;
-        let (tx_ring_phys, tx_ring) =
-            alloc_dma(core::mem::size_of::<TxDesc>() * E1000E_TX_RING_SIZE)?;
-        let (rx_buffers_phys, rx_buffers) = alloc_dma(E1000E_RX_BUF_SIZE * RX_RING_SIZE)?;
-        let (tx_buffers_phys, tx_buffers) = alloc_dma(TX_BUF_SIZE * E1000E_TX_RING_SIZE)?;
+        let rx_ring_dma = alloc_dma("e1000e RX ring", core::mem::size_of::<RxDesc>() * RX_RING_SIZE)?;
+        let tx_ring_dma = alloc_dma("e1000e TX ring", core::mem::size_of::<TxDesc>() * E1000E_TX_RING_SIZE)?;
+        let rx_buffers_dma = alloc_dma("e1000e RX buffers", E1000E_RX_BUF_SIZE * RX_RING_SIZE)?;
+        let tx_buffers_dma = alloc_dma("e1000e TX buffers", TX_BUF_SIZE * E1000E_TX_RING_SIZE)?;
+        let rx_ring_phys = rx_ring_dma.phys.0;
+        let tx_ring_phys = tx_ring_dma.phys.0;
+        let rx_buffers_phys = rx_buffers_dma.phys.0;
+        let tx_buffers_phys = tx_buffers_dma.phys.0;
+        let rx_ring = rx_ring_dma.as_mut_ptr();
+        let tx_ring = tx_ring_dma.as_mut_ptr();
+        let rx_buffers = rx_buffers_dma.as_mut_ptr();
+        let tx_buffers = tx_buffers_dma.as_mut_ptr();
 
         let mut nic = Self {
             mmio,
@@ -296,6 +288,10 @@ impl E1000e {
             tx_buffers_phys,
             rx_buffers,
             tx_buffers,
+            _rx_ring_dma: rx_ring_dma,
+            _tx_ring_dma: tx_ring_dma,
+            _rx_buffers_dma: rx_buffers_dma,
+            _tx_buffers_dma: tx_buffers_dma,
             rx_head: AtomicUsize::new(0),
             tx_head: AtomicUsize::new(0),
             tx_packets: AtomicUsize::new(0),

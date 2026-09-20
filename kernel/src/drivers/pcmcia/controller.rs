@@ -2,7 +2,8 @@
 
 use core::ptr::{read_volatile, write_volatile};
 
-use crate::memory::paging::{PTEFlags, PAGING};
+use crate::memory::paging::detected_ram_bytes;
+use crate::memory::resources::{ResourceKind, is_free, reserve_and_ioremap, reserve_range};
 use crate::pci;
 
 use super::pc16::Pc16;
@@ -44,8 +45,8 @@ const PCI_COMMAND_IO: u16 = 1 << 0;
 const PCI_COMMAND_MEMORY: u16 = 1 << 1;
 
 pub const BAR0_SIZE: u32 = 0x1000;
+// Legacy Sony/firmware fallback until Felix has a full PCI BAR assignment pass.
 pub const BAR0_PHYS_FALLBACK: u32 = 0xF000_0000;
-pub const BAR0_VIRT: u32 = 0xE000_0000;
 
 const CB_SOCKET_EVENT: u32 = 0x00;
 const CB_SOCKET_MASK: u32 = 0x04;
@@ -244,12 +245,39 @@ fn probe_bar_size(dev: &pci::device::PciDevice, offset: u8, original: u32) -> u3
     }
 }
 
-fn map_bar0(phys: u32, size: u32) {
+fn map_bar0(phys: u32, size: u32) -> Option<u32> {
     let map_size = ((size as usize) + 0xFFF) & !0xFFF;
-    // crate::println!("[PCMCIA] mapping MMIO phys=0x{:08x} size=0x{:x} -> virt=0x{:08x}", phys, map_size, BAR0_VIRT);
-    let flags = PTEFlags::new().present().writable();
-    let mut paging = unsafe { PAGING.lock() };
-    let _ = paging.map_physical_range(phys, map_size as u32, BAR0_VIRT, flags);
+    reserve_and_ioremap(
+        phys as u64,
+        map_size,
+        ResourceKind::Mmio,
+        "pcmcia-ricoh-bar0",
+    )
+    .ok()
+    .map(|v| v.0)
+}
+
+fn reserve_cf_window(bar0_phys: u32, bar0_size: u32) -> Option<u32> {
+    let after_bar = bar0_phys.checked_add(bar0_size.max(BAR0_SIZE))?;
+    let mut candidate = after_bar.checked_add(0xFFF)? & !0xFFF;
+    for _ in 0..256 {
+        let above_ram = candidate as u64 >= detected_ram_bytes() as u64;
+        if above_ram && is_free(candidate as u64, super::CF_MEM_SIZE as u64) {
+            if reserve_range(
+                candidate as u64,
+                super::CF_MEM_SIZE as u64,
+                ResourceKind::Mmio,
+                "pcmcia-cf-window",
+            )
+            .is_ok()
+            {
+                super::set_cf_mem_phys(candidate);
+                return Some(candidate);
+            }
+        }
+        candidate = candidate.checked_add(0x1000)?;
+    }
+    None
 }
 
 pub fn setup(dev: pci::device::PciDevice) -> Option<RicohR5c475> {
@@ -285,8 +313,21 @@ pub fn setup(dev: pci::device::PciDevice) -> Option<RicohR5c475> {
     dev.write_u16(0x80, cfg80 | 0x0100);
     dev.write_u16(PCI_BRIDGE_CONTROL, 0x0780);
 
-    map_bar0(bar0_phys, size);
-    let controller = RicohR5c475::new(dev, bar0_phys, BAR0_VIRT, size);
+    let bar0_virt = match map_bar0(bar0_phys, size) {
+        Some(v) => v,
+        None => {
+            dev.write_u16(PCI_COMMAND, old_command);
+            return None;
+        }
+    };
+    let cf_mem_phys = match reserve_cf_window(bar0_phys, size) {
+        Some(v) => v,
+        None => {
+            crate::println!("[PCMCIA] no free CardBus attribute-memory window near BAR0");
+            return None;
+        }
+    };
+    let controller = RicohR5c475::new(dev, bar0_phys, bar0_virt, size);
 
     // unsafe {
     //     crate::println!(
@@ -299,10 +340,10 @@ pub fn setup(dev: pci::device::PciDevice) -> Option<RicohR5c475> {
     //     crate::println!("[PCMCIA] PC16 verify: IDREV={:02x} IFSTAT={:02x}", pc16.idrev(), pc16.ifstat());
     // }
 
-    dev.write_u32(PCI_CB_MEMORY_BASE_0, super::CF_MEM_PHYS & 0xfffffff0);
+    dev.write_u32(PCI_CB_MEMORY_BASE_0, cf_mem_phys & 0xfffffff0);
     dev.write_u32(
         PCI_CB_MEMORY_LIMIT_0,
-        (super::CF_MEM_PHYS + super::CF_MEM_SIZE - 1) | 0x0f,
+        (cf_mem_phys + super::CF_MEM_SIZE - 1) | 0x0f,
     );
     dev.write_u32(PCI_CB_IO_BASE_0, (super::CF_IO_BASE as u32) & 0xffff_fffc);
     dev.write_u32(PCI_CB_IO_LIMIT_0, (super::CF_IO_END as u32) | 0x3);

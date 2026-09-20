@@ -9,8 +9,8 @@ use crate::memory::paging::phys_to_virt;
 const FB_INFO_PHYS: u32 = 0x0000_5000;
 
 // Do not allocate a second framebuffer VA here. The normal framebuffer driver
-// installs the LFB at drivers::framebuffer::FB_VIRT_BASE before tasks are
-// created, and copy_kernel_mappings() carries that mapping into every task PD.
+// owns the mapping through the central kernel VA allocator; panic paths only
+// reuse that already-installed runtime mapping.
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -217,45 +217,17 @@ fn read_fb_info() -> FramebufferInfo {
     unsafe { ptr::read_volatile(ptr) }
 }
 
-/// Return the framebuffer driver's permanent LFB mapping without modifying the
-/// current address space. This function is reached from the F12 IRQ handler as
-/// well as panic/exception paths, so changing a PDE here corrupts live device
-/// mappings in whichever task happened to be running.
+/// Return the framebuffer driver's permanent runtime mapping without modifying
+/// page tables from panic/IRQ context. For an early panic before framebuffer
+/// init, return None and let the VGA/E9 fallback report the fault.
 unsafe fn map_lfb(phys: u32, size: u32) -> Option<*mut u8> {
-    const LARGE_SIZE: u32 = 0x0040_0000;
-    const LARGE_MASK: u32 = 0xFFC0_0000;
-    const PDE_PRESENT: u32 = 1 << 0;
-    const PDE_LARGE: u32 = 1 << 7;
-
-    let virt_base = crate::drivers::framebuffer::FB_VIRT_BASE;
-    let aligned_phys = phys & LARGE_MASK;
-    let offset = phys - aligned_phys;
-    let need = size.checked_add(offset)?;
-    let pages = ((need + LARGE_SIZE - 1) / LARGE_SIZE).max(1) as usize;
-    let start_pde = (virt_base >> 22) as usize;
-
-    let cr3: u32;
-    core::arch::asm!("mov {}, cr3", out(reg) cr3);
-    let pd = phys_to_virt(cr3 & 0xFFFF_F000) as *const u32;
-
-    if start_pde + pages >= 1023 {
+    let mapped_phys = crate::drivers::framebuffer::LFB_PHYS;
+    let mapped_size = crate::drivers::framebuffer::LFB_SIZE;
+    let mapped_virt = crate::drivers::framebuffer::LFB_VIRT;
+    if mapped_virt == 0 || mapped_phys != phys || size > mapped_size {
         return None;
     }
-
-    // framebuffer::init() already installed these large pages. Verify that the
-    // current task inherited the same mapping. For an early panic before FB init
-    // return None; the VGA/E9 fallback can still report the fault.
-    for i in 0..pages {
-        let pde = core::ptr::read_volatile(pd.add(start_pde + i));
-        let expected = aligned_phys + (i as u32) * LARGE_SIZE;
-        if pde & (PDE_PRESENT | PDE_LARGE) != (PDE_PRESENT | PDE_LARGE)
-            || (pde & LARGE_MASK) != expected
-        {
-            return None;
-        }
-    }
-
-    Some((virt_base + offset) as *mut u8)
+    Some(mapped_virt as *mut u8)
 }
 
 impl Fb {

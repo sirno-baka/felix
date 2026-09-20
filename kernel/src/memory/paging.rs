@@ -671,38 +671,86 @@ impl PageManager {
         frame
     }
 
+    /// Allocate a physically contiguous frame run with an explicit alignment and
+    /// upper physical-page limit. `max_page_exclusive` is expressed in 4 KiB
+    /// pages, so a value of 0x100000 means the allocation must end below 4 GiB.
+    pub(crate) fn alloc_contiguous_frames_aligned_below(
+        &mut self,
+        pages: u32,
+        align_pages: u32,
+        max_page_exclusive: u32,
+    ) -> Result<u32, &'static str> {
+        if pages == 0 {
+            return Err("zero-sized physical allocation");
+        }
+        if align_pages == 0 || !align_pages.is_power_of_two() {
+            return Err("physical allocation alignment is not a power of two");
+        }
+
+        let hard_limit = (detected_ram_bytes() >> 12).min(max_page_exclusive);
+        if hard_limit == 0 || pages > hard_limit {
+            return Err("physical allocation exceeds DMA/address limit");
+        }
+
+        // First try the reusable frame list.  Look for a contiguous run and
+        // choose an aligned sub-run inside it.
+        self.free_frames.sort_unstable();
+        let mut run_start = 0usize;
+        while run_start < self.free_frames.len() {
+            let mut run_end = run_start + 1;
+            while run_end < self.free_frames.len()
+                && self.free_frames[run_end] == self.free_frames[run_end - 1] + 1
+            {
+                run_end += 1;
+            }
+
+            let first = self.free_frames[run_start];
+            let last_exclusive = self.free_frames[run_end - 1].saturating_add(1);
+            let aligned = first
+                .checked_add(align_pages - 1)
+                .map(|v| v & !(align_pages - 1))
+                .ok_or("physical allocation alignment overflow")?;
+            let alloc_end = aligned
+                .checked_add(pages)
+                .ok_or("physical allocation range overflow")?;
+
+            if aligned >= first && alloc_end <= last_exclusive && alloc_end <= hard_limit {
+                let start_index = run_start + (aligned - first) as usize;
+                let end_index = start_index + pages as usize;
+                self.free_frames.drain(start_index..end_index);
+                return Ok(aligned);
+            }
+
+            run_start = run_end;
+        }
+
+        // Bump allocation.  Frames skipped solely for alignment remain reusable.
+        let aligned = self
+            .next_free_page
+            .checked_add(align_pages - 1)
+            .map(|v| v & !(align_pages - 1))
+            .ok_or("physical allocation alignment overflow")?;
+        let end = aligned
+            .checked_add(pages)
+            .ok_or("physical allocation range overflow")?;
+        if end > hard_limit {
+            return Err("out of contiguous physical frames below address limit");
+        }
+
+        for frame in self.next_free_page..aligned {
+            self.free_frames.push(frame);
+        }
+        self.next_free_page = end;
+        Ok(aligned)
+    }
+
     /// Reserve a physically contiguous range, reusing a verified free run first.
     ///
     /// Callers access this range through the contiguous higher-half mapping;
     /// arbitrary successive entries from the free list cannot be used.
     pub(crate) fn alloc_contiguous_frames(&mut self, pages: u32) -> u32 {
-        self.free_frames.sort_unstable();
-        if pages > 0 {
-            let mut run = 0usize;
-            for i in 0..self.free_frames.len() {
-                if i == 0 || self.free_frames[i] != self.free_frames[i - 1] + 1 {
-                    run = i;
-                }
-                if i - run + 1 == pages as usize {
-                    let first = self.free_frames[run];
-                    self.free_frames.drain(run..=i);
-                    return first;
-                }
-            }
-        }
-        let first = self.next_free_page;
-        let end = first
-            .checked_add(pages)
-            .expect("physical frame range overflow");
-        let max_page = detected_ram_bytes() >> 12;
-        if end > max_page {
-            panic!(
-                "[pg] out of contiguous physical frames (first={}, pages={}, max={})",
-                first, pages, max_page
-            );
-        }
-        self.next_free_page = end;
-        first
+        self.alloc_contiguous_frames_aligned_below(pages, 1, detected_ram_bytes() >> 12)
+            .unwrap_or_else(|e| panic!("[pg] contiguous allocation failed: {}", e))
     }
 
     /// Higher-half aware page-manager initialisation.
@@ -756,6 +804,46 @@ impl PageManager {
         // and turned phys pages 0..N (including FB_INFO @ 0x5000) into page tables.
         let _ = kernel_end_virt;
         self.next_free_page = FRAME_ALLOC_START >> 12;
+
+        // The PXE bootloader may place the root disk at RAMDISK_PHYS=0x02000000.
+        // That range can extend well beyond FRAME_ALLOC_START (0x02800000).
+        // Reserve it HERE, before any driver gets a chance to call alloc_frame().
+        //
+        // This is especially important for GPU/DMA drivers: the Intel Gen6
+        // framebuffer allocates backing RAM during early graphics init, which is
+        // earlier than filesystem::init_rootfs(). Reserving the ramdisk only in
+        // init_rootfs() is therefore too late and lets the framebuffer overwrite
+        // the ext2 image through GGTT mappings.
+        unsafe {
+            let bi = core::ptr::read_volatile(BOOTINFO_PHYS as *const BootInfo);
+            if bi.magic == BOOTINFO_MAGIC
+                && (bi.flags & 1) != 0
+                && bi.disk_phys != 0
+                && bi.disk_sectors != 0
+            {
+                let disk_end = bi.disk_phys as u64 + bi.disk_sectors as u64 * 512;
+                let end_page = ((disk_end + (PAGE_SIZE as u64 - 1)) / PAGE_SIZE as u64) as u32;
+                let max_page = detected_ram_bytes() >> 12;
+
+                if end_page > max_page {
+                    println!(
+                        "[pg] WARNING: boot ramdisk ends past detected RAM: end={:#x}, ram={:#x}",
+                        disk_end,
+                        detected_ram_bytes()
+                    );
+                } else if self.next_free_page < end_page {
+                    println!(
+                        "[pg] reserve boot ramdisk {:#x}..{:#x}: frames start {:#x} -> {:#x}",
+                        bi.disk_phys,
+                        disk_end,
+                        self.next_free_page << 12,
+                        end_page << 12
+                    );
+                    self.next_free_page = end_page;
+                }
+            }
+        }
+
         println!(
             "[pg] {}MiB RAM mapped ({} large pages), frames from phys {:#x} (page {})",
             detected_ram_bytes() / (1024 * 1024),

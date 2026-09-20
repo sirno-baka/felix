@@ -1118,14 +1118,6 @@ fn with_lfb<R>(f: impl FnOnce() -> R) -> R {
         let mut old: u32;
         core::arch::asm!("mov {}, cr3", out(reg) old);
         if kpd != 0 && old != kpd {
-            // ensure LFB large PDE exists on kernel PD
-            let kdir = crate::memory::paging::phys_to_virt(kpd)
-                as *mut crate::memory::paging::PageDirectory;
-            let idx = (crate::drivers::framebuffer::FB_VIRT_BASE >> 22) as usize;
-            let pde = (*kdir).entries[idx];
-            if pde & 1 == 0 || (pde & (1 << 7)) == 0 {
-                crate::drivers::framebuffer::map_lfb_large(&mut *kdir);
-            }
             core::arch::asm!("mov cr3, {}", in(reg) kpd);
         }
         let r = f();

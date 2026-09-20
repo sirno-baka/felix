@@ -16,9 +16,26 @@ pub use pc16::SocketStatus;
 
 pub const CF_IO_BASE: u16 = 0xC000;
 pub const CF_IO_END: u16 = 0xC00F;
-pub const CF_MEM_PHYS: u32 = 0xF000_1000;
-pub const CF_MEM_VIRT: u32 = 0xE000_1000;
 pub const CF_MEM_SIZE: u32 = 0x1000;
+
+static CF_MEM_PHYS: AtomicU32 = AtomicU32::new(0);
+static CF_MEM_VIRT: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn cf_mem_phys() -> u32 {
+    CF_MEM_PHYS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_cf_mem_phys(value: u32) {
+    CF_MEM_PHYS.store(value, Ordering::Relaxed);
+}
+
+pub(crate) fn cf_mem_virt() -> u32 {
+    CF_MEM_VIRT.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_cf_mem_virt(value: u32) {
+    CF_MEM_VIRT.store(value, Ordering::Relaxed);
+}
 
 static mut SOCKET: Option<alloc::boxed::Box<dyn controller::SocketController>> = None;
 static mut CARD_COR: Option<(u32, u8)> = None;
@@ -73,7 +90,7 @@ pub fn rearm_io() {
 use crate::drivers::pic::PICS;
 use crate::interrupts::idt::IDT;
 use crate::sync::mutex::Mutex;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 static IRQ_LINE: AtomicU8 = AtomicU8::new(0xFF);
 static PENDING: AtomicU8 = AtomicU8::new(0); // 1=insert 2=remove
