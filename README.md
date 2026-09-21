@@ -52,7 +52,7 @@ The project is developed against both **QEMU** and real legacy hardware, especia
 | Kernel virtual base | `0xC1000000` |
 | Paging | x86 paging with 4 MiB PSE kernel mappings + 4 KiB user/MMIO pages |
 | RAM detection | BootInfo / BIOS E801 / CMOS fallback, clamped to 64 MiB..1 GiB |
-| Scheduler | Preemptive round-robin across BSP and APs for process leaders |
+| Scheduler | Preemptive round-robin userspace on BSP; AP kernel work queue |
 | PIT frequency | Currently 200 Hz |
 | Task limit | 32 scheduler slots, slot 0 is idle; processes may contain native threads |
 | Userspace | Ring 3 native i386 ELF executables |
@@ -1587,8 +1587,8 @@ Felix is an actively developed hobby/research OS. The following are deliberate c
 - ACPI MADT / Intel MP discovery and INIT/SIPI startup bring up to 8 CPUs;
   each application processor has a private stack, GDT/TSS and periodic Local
   APIC timer, plus a shared queue for non-blocking kernel work
-- independent user processes can run on APs; shared-address-space threads stay
-  on the BSP until TLB shootdown is implemented, and device IRQs remain BSP-only
+- userspace, window management and device IRQ handling remain on the BSP;
+  APs run private timers and the shared non-blocking kernel work queue
 - maximum 32 scheduler slots shared by processes and threads
 - frame allocator does not recycle physical frames
 - userspace malloc is bump-style and `free()` is currently a no-op

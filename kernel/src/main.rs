@@ -329,7 +329,10 @@ pub extern "C" fn higher_half_entry() -> ! {
             }
         }
         println!("[!] init spawned as pid={}", init_pid);
-        crate::smp::enable_user_scheduling();
+        // Userspace stays on the BSP until the window manager, input path and
+        // remaining process-wide kernel state have SMP-safe synchronization.
+        // APs continue to run the kernel work queue and their local timers.
+        println!("[smp] userspace pinned to BSP; AP kernel workers remain active");
 
         // Enable only the IRQs with real handlers here:
         //   master IRQ0 = PIT, IRQ1 = keyboard, IRQ2 = slave cascade
