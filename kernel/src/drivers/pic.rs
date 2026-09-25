@@ -2,7 +2,48 @@
 //Used to initialize and configure pics
 //Remaps hardware interrupts starting from INT 32
 
-use core::arch::asm;
+use core::arch::{asm, naked_asm};
+
+// These entries use only port I/O and preserve EAX, their sole scratch register.
+// No Rust call or data-segment change is needed on the interrupted stack.
+// OCW3=0x0b selects the in-service register: bit 7 distinguishes a real
+// IRQ7/IRQ15 from the PIC's spurious vector.
+#[unsafe(naked)]
+pub extern "C" fn irq7() {
+    naked_asm!(
+        "push eax",
+        "mov al, 0x0b",
+        "out 0x20, al",
+        "in al, 0x20",
+        "test al, 0x80",
+        "jz 2f",
+        "mov al, 0x20",
+        "out 0x20, al",
+        "2:",
+        "pop eax",
+        "iretd",
+    );
+}
+
+#[unsafe(naked)]
+pub extern "C" fn irq15() {
+    naked_asm!(
+        "push eax",
+        "mov al, 0x0b",
+        "out 0xa0, al",
+        "in al, 0xa0",
+        "test al, 0x80",
+        "jz 2f",
+        "mov al, 0x20",
+        "out 0xa0, al",
+        "2:",
+        // Even a spurious slave IRQ has put the master's cascade in service.
+        "mov al, 0x20",
+        "out 0x20, al",
+        "pop eax",
+        "iretd",
+    );
+}
 
 //define a global PICS so it can be accessed from everywhere
 pub static PICS: Pics = Pics {

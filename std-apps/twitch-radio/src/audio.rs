@@ -1,10 +1,12 @@
 use std::error::Error;
 use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{self, ErrorKind, Write};
+#[cfg(target_os = "popugos")]
+use std::os::popugos::fs::{OpenOptionsExt, O_NONBLOCK};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+#[cfg(target_os = "popugos")]
+use tokio::io::{popugos::AsyncFd, Interest};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CodecParameters, Decoder, DecoderOptions, CODEC_TYPE_AAC};
 use symphonia::core::formats::Packet;
@@ -19,8 +21,14 @@ struct AdtsConfig {
     channels: u8,
 }
 
+enum AudioOutput {
+    File(File),
+    #[cfg(target_os = "popugos")]
+    Device(AsyncFd<File>),
+}
+
 pub struct AudioPlayer {
-    output: File,
+    output: AudioOutput,
     decoder: Option<Box<dyn Decoder>>,
     config: Option<AdtsConfig>,
     volume: Arc<AtomicU16>,
@@ -28,12 +36,33 @@ pub struct AudioPlayer {
 }
 
 impl AudioPlayer {
-    pub fn open(volume: Arc<AtomicU16>) -> Result<Self, Box<dyn Error>> {
-        let output = OpenOptions::new().write(true).open("/dev/audio")?;
+    pub fn open(volume: Arc<AtomicU16>, output_path: Option<&str>) -> Result<Self, Box<dyn Error>> {
+        let output = if let Some(path) = output_path {
+            AudioOutput::File(
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)?,
+            )
+        } else {
+            #[cfg(target_os = "popugos")]
+            {
+                let mut options = OpenOptions::new();
+                options.write(true);
+                options.custom_flags(O_NONBLOCK);
+                let file = options.open("/dev/audio")?;
+                AudioOutput::Device(AsyncFd::with_interest(file, Interest::WRITABLE)?)
+            }
+            #[cfg(not(target_os = "popugos"))]
+            {
+                AudioOutput::File(OpenOptions::new().write(true).open("/dev/audio")?)
+            }
+        };
         Ok(Self { output, decoder: None, config: None, volume, timestamp: 0 })
     }
 
-    pub fn decode_adts(&mut self, bytes: &[u8]) -> Result<usize, Box<dyn Error>> {
+    pub async fn decode_adts(&mut self, bytes: &[u8]) -> Result<usize, Box<dyn Error>> {
         let mut pos = 0usize;
         let mut decoded_frames = 0usize;
         while pos + 7 <= bytes.len() {
@@ -54,17 +83,47 @@ impl AudioPlayer {
             let payload = &bytes[pos + header_len..pos + frame_len];
             let packet = Packet::new_from_slice(0, self.timestamp, 1024, payload);
             self.timestamp = self.timestamp.saturating_add(1024);
-            let decoded = self.decoder.as_mut().unwrap().decode(&packet)?;
-            if decoded.spec().rate != OUTPUT_RATE {
-                return Err(format!("unsupported AAC sample rate {}; expected {OUTPUT_RATE}", decoded.spec().rate).into());
+
+            // Do not hold a borrow of the decoder across the async device
+            // write. Convert this AAC frame to an owned PCM buffer first.
+            let (decoded_rate, channels, sample_count, pcm) = {
+                let decoded = self.decoder.as_mut().unwrap().decode(&packet)?;
+                if decoded.spec().rate != OUTPUT_RATE {
+                    return Err(format!(
+                        "unsupported AAC sample rate {}; expected {OUTPUT_RATE}",
+                        decoded.spec().rate
+                    )
+                    .into());
+                }
+                let channels = decoded.spec().channels.count();
+                if channels == 0 || channels > 2 {
+                    return Err(format!("unsupported AAC channel count {channels}").into());
+                }
+                let decoded_rate = decoded.spec().rate;
+                let mut samples =
+                    SampleBuffer::<i16>::new(decoded.capacity() as u64, *decoded.spec());
+                samples.copy_interleaved_ref(decoded);
+                let sample_count = samples.samples().len();
+                let pcm = samples_to_pcm(
+                    samples.samples(),
+                    channels,
+                    self.volume.load(Ordering::Relaxed) as i32,
+                );
+                (decoded_rate, channels, sample_count, pcm)
+            };
+
+            if decoded_frames == 0 {
+                println!(
+                    "[audio] first AAC frame decoded rate={} channels={} samples={}; writing PCM",
+                    decoded_rate,
+                    channels,
+                    sample_count
+                );
             }
-            let channels = decoded.spec().channels.count();
-            if channels == 0 || channels > 2 {
-                return Err(format!("unsupported AAC channel count {channels}").into());
+            self.write_pcm(&pcm).await?;
+            if decoded_frames == 0 {
+                println!("[audio] first PCM frame write complete");
             }
-            let mut samples = SampleBuffer::<i16>::new(decoded.capacity() as u64, *decoded.spec());
-            samples.copy_interleaved_ref(decoded);
-            self.write_samples(samples.samples(), channels)?;
             decoded_frames += 1;
             pos += frame_len;
         }
@@ -92,18 +151,31 @@ impl AudioPlayer {
         Ok(())
     }
 
-    fn write_samples(&mut self, input: &[i16], channels: usize) -> Result<(), Box<dyn Error>> {
-        let volume = self.volume.load(Ordering::Relaxed) as i32;
-        let mut pcm = Vec::with_capacity(if channels == 1 { input.len() * 4 } else { input.len() * 2 });
-        for frame in input.chunks_exact(channels) {
-            let left = ((frame[0] as i32 * volume) / 100).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            let right_source = if channels == 1 { frame[0] } else { frame[1] };
-            let right = ((right_source as i32 * volume) / 100).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            pcm.extend_from_slice(&left.to_le_bytes());
-            pcm.extend_from_slice(&right.to_le_bytes());
+    async fn write_pcm(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match &mut self.output {
+            AudioOutput::File(output) => output.write_all(bytes),
+            #[cfg(target_os = "popugos")]
+            AudioOutput::Device(output) => {
+                let mut offset = 0usize;
+                while offset < bytes.len() {
+                    let mut ready = output.writable_mut().await?;
+                    match ready.try_io(|async_fd| {
+                        async_fd.get_mut().write(&bytes[offset..])
+                    }) {
+                        Ok(Ok(0)) => {
+                            return Err(io::Error::new(
+                                ErrorKind::WriteZero,
+                                "/dev/audio returned a zero-length write",
+                            ));
+                        }
+                        Ok(Ok(written)) => offset += written,
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => continue,
+                    }
+                }
+                Ok(())
+            }
         }
-        write_nonblocking(&mut self.output, &pcm)?;
-        Ok(())
     }
 }
 
@@ -123,16 +195,18 @@ fn parse_config(header: &[u8]) -> Result<AdtsConfig, Box<dyn Error>> {
     })
 }
 
-fn write_nonblocking(output: &mut File, mut bytes: &[u8]) -> std::io::Result<()> {
-    while !bytes.is_empty() {
-        match output.write(bytes) {
-            Ok(0) => thread::sleep(Duration::from_millis(5)),
-            Ok(written) => bytes = &bytes[written..],
-            Err(error) if error.kind() == ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(5)),
-            Err(error) => return Err(error),
-        }
+fn samples_to_pcm(input: &[i16], channels: usize, volume: i32) -> Vec<u8> {
+    let mut pcm = Vec::with_capacity(if channels == 1 { input.len() * 4 } else { input.len() * 2 });
+    for frame in input.chunks_exact(channels) {
+        let left = ((frame[0] as i32 * volume) / 100)
+            .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let right_source = if channels == 1 { frame[0] } else { frame[1] };
+        let right = ((right_source as i32 * volume) / 100)
+            .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        pcm.extend_from_slice(&left.to_le_bytes());
+        pcm.extend_from_slice(&right.to_le_bytes());
     }
-    Ok(())
+    pcm
 }
 
 #[cfg(test)]

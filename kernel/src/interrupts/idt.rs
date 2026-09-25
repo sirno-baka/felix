@@ -35,7 +35,10 @@ pub struct IdtDescriptor {
 
 impl InterruptDescriptorTable {
     pub fn init(&mut self) {
-        // ничего не делаем — будем добавлять вручную
+        // Spurious PIC interrupts can arrive even when IRQ7/IRQ15 are masked.
+        // Never leave these present gates pointing at address zero.
+        self.add(0x27, crate::drivers::pic::irq7 as u32);
+        self.add(0x2f, crate::drivers::pic::irq15 as u32);
     }
 
     pub fn add(&mut self, int: usize, handler: u32) {

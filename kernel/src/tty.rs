@@ -6,7 +6,6 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::arch::asm;
 
 use crate::filesystem::file::PtySide;
 use crate::multitasking::task::{MAX_TASKS, TASK_MANAGER};
@@ -17,6 +16,7 @@ pub const MAX_TTYS: usize = 4;
 pub const MAX_PTYS: usize = 8;
 const PTY_BUF: usize = 8192;
 const CANON_BUF: usize = 1024;
+pub const WOULD_BLOCK: usize = usize::MAX - 0x1001;
 
 pub const NCCS: usize = 19;
 pub const VINTR: usize = 0;
@@ -485,7 +485,7 @@ pub fn read(
         None
     };
     if side != PtySide::Slave || term.map_or(true, |t| t.canonical) {
-        loop {
+        {
             if check_background() {
                 return usize::MAX;
             }
@@ -493,11 +493,7 @@ pub fn read(
             if n > 0 || eof || nonblock {
                 return n;
             }
-            unsafe {
-                asm!("sti");
-                asm!("hlt");
-                asm!("cli");
-            }
+            return WOULD_BLOCK;
         }
     }
 
@@ -543,11 +539,7 @@ pub fn read(
                 return total;
             }
         }
-        unsafe {
-            asm!("sti");
-            asm!("hlt");
-            asm!("cli");
-        }
+        return if total == 0 { WOULD_BLOCK } else { total };
     }
 }
 
@@ -713,11 +705,7 @@ pub fn write(current_slot: usize, id: usize, side: PtySide, data: &[u8], nonbloc
         if nonblock {
             break;
         }
-        unsafe {
-            asm!("sti");
-            asm!("hlt");
-            asm!("cli");
-        }
+        return if written == 0 { WOULD_BLOCK } else { written };
     }
     written
 }

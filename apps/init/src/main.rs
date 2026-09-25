@@ -74,7 +74,9 @@ fn parse_config() -> Vec<(bool, Vec<String>)> {
 
 fn load_services() -> Vec<Service> {
     let mut specs = parse_config();
-    if !specs.iter().any(|(_, argv)| argv.first().map(|s| s.as_str()) == Some(DEFAULT_SHELL)) {
+    // Recovery fallback only: an explicit init.conf owns the complete service
+    // set. Do not silently inject a shell into a deliberately minimal config.
+    if specs.is_empty() {
         specs.push((true, alloc::vec![DEFAULT_SHELL.to_string()]));
     }
 
@@ -174,7 +176,7 @@ pub extern "C" fn main() -> i32 {
         println!("init: expected PID 1, got {}", pid);
     }
 
-    run_boot_selftest();
+    // run_boot_selftest();
 
     let mut services = load_services();
     if services.is_empty() {

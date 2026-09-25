@@ -1,8 +1,8 @@
 //! Minimal x86 SMP bootstrap.
 //!
 //! The bootstrap processor discovers CPUs through the legacy Intel MP tables,
-//! starts each application processor with INIT/SIPI, and leaves it in a private
-//! stack/idle loop. Scheduling and device interrupts remain on the BSP for now.
+//! starts each application processor with INIT/SIPI, and gives every online CPU
+//! a private stack, timer and scheduler entry point.
 
 use alloc::collections::VecDeque;
 use core::arch::{asm, global_asm, naked_asm};
@@ -29,12 +29,15 @@ const LAPIC_ESR: usize = 0x280;
 const LAPIC_ICR_LOW: usize = 0x300;
 const LAPIC_ICR_HIGH: usize = 0x310;
 const LAPIC_LVT_TIMER: usize = 0x320;
+const LAPIC_LVT_LINT0: usize = 0x350;
 const LAPIC_TIMER_INITIAL: usize = 0x380;
 const LAPIC_TIMER_DIVIDE: usize = 0x3e0;
 const ICR_DELIVERY_PENDING: u32 = 1 << 12;
 pub const AP_TIMER_VECTOR: u8 = 0xf0;
 pub const WORK_IPI_VECTOR: u8 = 0xf1;
+pub const TLB_IPI_VECTOR: u8 = 0xf2;
 const AP_TIMER_PERIODIC: u32 = 1 << 17;
+const LVT_DELIVERY_EXTINT: u32 = 0x7 << 8;
 
 #[repr(C, align(16))]
 struct ApStacks([[u8; AP_STACK_SIZE]; MAX_CPUS]);
@@ -43,10 +46,17 @@ static mut AP_STACKS: ApStacks = ApStacks([[0; AP_STACK_SIZE]; MAX_CPUS]);
 static mut AP_GDTS: [crate::gdt::PerCpuGdt; MAX_CPUS] =
     [const { crate::gdt::PerCpuGdt::new() }; MAX_CPUS];
 static AP_ONLINE: AtomicU32 = AtomicU32::new(1);
+static ONLINE_MASK: AtomicU32 = AtomicU32::new(1);
 static LAPIC_VIRT: AtomicU32 = AtomicU32::new(0);
 static CPU_APIC_IDS: [AtomicU32; MAX_CPUS] =
     [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
 static AP_TIMER_TICKS: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_CPUS];
+static CPU_USER_TICKS: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_CPUS];
+static CPU_SYSTEM_TICKS: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_CPUS];
+static CPU_IDLE_TICKS: [AtomicU32; MAX_CPUS] =
     [const { AtomicU32::new(0) }; MAX_CPUS];
 static WORK_QUEUE: interrupt_sync::SpinMutex<VecDeque<SmpJob>> =
     interrupt_sync::SpinMutex::new(VecDeque::new());
@@ -56,8 +66,13 @@ static WORK_CPU_MASK: AtomicU32 = AtomicU32::new(0);
 static USER_SCHEDULING: AtomicBool = AtomicBool::new(false);
 static CURRENT_TASK: [AtomicI8; MAX_CPUS] =
     [const { AtomicI8::new(-1) }; MAX_CPUS];
+static CURRENT_CR3: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 static IDLE_ESP: [AtomicU32; MAX_CPUS] =
     [const { AtomicU32::new(0) }; MAX_CPUS];
+static TLB_TARGET_CR3: AtomicU32 = AtomicU32::new(0);
+static TLB_TARGET_PAGE: AtomicU32 = AtomicU32::new(0);
+static TLB_ACKS: AtomicU32 = AtomicU32::new(0);
+static TLB_SHOOTDOWN_BROKEN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 struct SmpJob {
@@ -389,19 +404,143 @@ fn cpu_slot_for_lapic(base: *mut u8) -> Option<usize> {
 }
 
 pub fn current_cpu_index() -> usize {
-    let base = LAPIC_VIRT.load(Ordering::Acquire) as *mut u8;
-    if base.is_null() {
-        return 0;
+    // Do not read LAPIC_ID through MMIO here.  This function is used in every
+    // scheduler/lock transition, and the legacy LAPIC window on some real
+    // chipsets can occasionally stall an AP read indefinitely.  CPUID.1:EBX
+    // reports the same initial 8-bit APIC ID without touching the MMIO bus.
+    let apic_id = unsafe { core::arch::x86::__cpuid(1).ebx >> 24 };
+    CPU_APIC_IDS
+        .iter()
+        .position(|id| id.load(Ordering::Relaxed) == apic_id)
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct CpuTimes {
+    pub user: u32,
+    pub system: u32,
+    pub idle: u32,
+}
+
+pub fn online_cpu_count() -> usize {
+    (AP_ONLINE.load(Ordering::Acquire) as usize).clamp(1, MAX_CPUS)
+}
+
+pub fn cpu_slot_count() -> usize { MAX_CPUS }
+
+pub fn cpu_times(cpu: usize) -> Option<CpuTimes> {
+    if cpu >= MAX_CPUS || ONLINE_MASK.load(Ordering::Acquire) & (1 << cpu) == 0 {
+        return None;
     }
-    cpu_slot_for_lapic(base).unwrap_or(0)
+    Some(CpuTimes {
+        user: CPU_USER_TICKS[cpu].load(Ordering::Relaxed),
+        system: CPU_SYSTEM_TICKS[cpu].load(Ordering::Relaxed),
+        idle: CPU_IDLE_TICKS[cpu].load(Ordering::Relaxed),
+    })
+}
+
+/// Account the execution interrupted by this CPU's scheduler timer. Counters
+/// intentionally use local timer ticks: percentages are computed from deltas,
+/// so AP timer calibration is not required.
+static LAST_TIMER_EIP: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_CPUS];
+static LAST_TIMER_CS: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_CPUS];
+static LAST_TIMER_EFLAGS: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_CPUS];
+static SYSCALL_NUMBER: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
+static SYSCALL_PHASE: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_CPUS];
+
+static SCHEDULER_STAGE: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_CPUS];
+
+// Unlike LAST_TIMER_EIP, these markers advance with IF=0. F12 on another
+// CPU can therefore locate a stalled syscall without taking the kernel lock.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub enum KernelWork {
+    None, SpawnArgs, SpawnPath, SpawnRead, SpawnSlot, TaskPageDir, TaskStack,
+    TaskMetadata, SpawnMappings, SpawnUserStack, SpawnHeap, SpawnElf,
+    SpawnUserArgs, SpawnFds, SpawnPublish, SpawnFinish, ReapThreads,
+    ReapUserStack, ReapUserPages, ReapPageDir, ReapKernelStack,
+}
+
+static KERNEL_WORK: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_CPUS];
+
+pub fn trace_kernel_work(work: KernelWork, progress: u32) {
+    // One atomic snapshot keeps the stage and its progress consistent.
+    KERNEL_WORK[current_cpu_index()].store(
+        ((work as u32) << 24) | (progress & 0x00ff_ffff), Ordering::Relaxed);
+}
+
+fn kernel_work_name(work: u32) -> &'static str {
+    const NAMES: [&str; 21] = [
+        "none", "spawn/args", "spawn/path", "spawn/read", "spawn/slot",
+        "task/pd", "task/kstack", "task/metadata", "spawn/mappings",
+        "spawn/ustack", "spawn/heap", "spawn/elf", "spawn/argv",
+        "spawn/fds", "spawn/publish", "spawn/finish", "reap/threads",
+        "reap/ustack", "reap/pages", "reap/pd", "reap/kstack",
+    ];
+    NAMES.get(work as usize).copied().unwrap_or("unknown")
+}
+
+pub fn trace_scheduler(stage: u32) {
+    SCHEDULER_STAGE[current_cpu_index()].store(stage, Ordering::Relaxed);
+}
+
+pub fn trace_syscall(number: u32, phase: u32) {
+    let cpu = current_cpu_index();
+    if phase == 1 {
+        KERNEL_WORK[cpu].store(0, Ordering::Relaxed);
+    }
+    SYSCALL_NUMBER[cpu].store(number, Ordering::Relaxed);
+    SYSCALL_PHASE[cpu].store(phase, Ordering::Relaxed);
+}
+
+pub fn trace_kernel_return() {
+    trace_scheduler(0);
+    trace_kernel_work(KernelWork::None, 0);
+    SYSCALL_PHASE[current_cpu_index()].store(0, Ordering::Relaxed);
+}
+
+pub fn account_cpu_tick(state: *const crate::multitasking::task::CPUState) {
+    let cpu = current_cpu_index();
+    if cpu >= MAX_CPUS || state.is_null() {
+        return;
+    }
+    LAST_TIMER_EIP[cpu].store(unsafe { (*state).eip }, Ordering::Relaxed);
+    LAST_TIMER_CS[cpu].store(unsafe { (*state).cs }, Ordering::Relaxed);
+    LAST_TIMER_EFLAGS[cpu].store(unsafe { (*state).eflags }, Ordering::Relaxed);
+    let user = unsafe { (*state).cs & 3 == 3 };
+    let current = CURRENT_TASK[cpu].load(Ordering::Relaxed);
+    if current <= 0 {
+        CPU_IDLE_TICKS[cpu].fetch_add(1, Ordering::Relaxed);
+    } else if user {
+        CPU_USER_TICKS[cpu].fetch_add(1, Ordering::Relaxed);
+    } else {
+        CPU_SYSTEM_TICKS[cpu].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub fn current_task_slot() -> i8 {
     CURRENT_TASK[current_cpu_index()].load(Ordering::Acquire)
 }
 
+pub fn task_slot_on_cpu(cpu: usize) -> i8 {
+    CURRENT_TASK
+        .get(cpu)
+        .map_or(-1, |slot| slot.load(Ordering::Acquire))
+}
+
 pub fn set_current_task_slot(slot: i8) {
     CURRENT_TASK[current_cpu_index()].store(slot, Ordering::Release);
+}
+
+pub fn set_current_cr3(page_dir_phys: u32) {
+    CURRENT_CR3[current_cpu_index()].store(page_dir_phys, Ordering::Release);
 }
 
 pub fn set_idle_esp(cpu: usize, esp: u32) {
@@ -417,7 +556,6 @@ pub fn user_scheduling_enabled() -> bool {
 }
 
 pub fn enable_user_scheduling() {
-    CURRENT_TASK[0].store(0, Ordering::Release);
     USER_SCHEDULING.store(true, Ordering::Release);
     crate::println!("[smp] AP userspace scheduling enabled");
 }
@@ -444,6 +582,22 @@ unsafe fn configure_local_timer(base: *mut u8) {
     lapic_write(base, LAPIC_TIMER_INITIAL, 1_000_000);
 }
 
+/// Route the cascaded 8259 PIC through the BSP Local APIC. Some firmware
+/// leaves LINT0 masked while booting in legacy PIC mode; QEMU happens to leave
+/// a usable virtual-wire setup, but real machines are not required to do so.
+unsafe fn configure_bsp_virtual_wire(base: *mut u8) {
+    let previous = lapic_read(base, LAPIC_LVT_LINT0);
+    // Preserve firmware-selected polarity and trigger mode. The vector field
+    // is ignored for ExtINT delivery and the mask bit is deliberately clear.
+    let electrical = previous & ((1 << 13) | (1 << 15));
+    lapic_write(base, LAPIC_LVT_LINT0, LVT_DELIVERY_EXTINT | electrical);
+    crate::println!(
+        "[smp] BSP virtual wire LINT0={:#010x} (was {:#010x})",
+        lapic_read(base, LAPIC_LVT_LINT0),
+        previous
+    );
+}
+
 #[unsafe(naked)]
 pub extern "C" fn ap_timer_interrupt() {
     unsafe {
@@ -463,6 +617,10 @@ pub extern "C" fn ap_timer_interrupt() {
             "call ap_timer_handler",
             "add esp, 4",
             "mov esp, eax",
+            "test edx, edx",
+            "jz 3f",
+            "call finish_kernel_handoff",
+            "3:",
             "mov ax, [esp + 32]",
             "and ax, 3",
             "cmp ax, 3",
@@ -487,22 +645,35 @@ pub extern "C" fn ap_timer_interrupt() {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn ap_timer_handler(esp: u32) -> u32 {
+extern "C" fn ap_timer_handler(esp: u32) -> u64 {
     let base = LAPIC_VIRT.load(Ordering::Acquire) as *mut u8;
     if base.is_null() {
-        return esp;
+        return esp as u64;
     }
+    account_cpu_tick(esp as *const crate::multitasking::task::CPUState);
     if let Some(slot) = cpu_slot_for_lapic(base) {
         AP_TIMER_TICKS[slot].fetch_add(1, Ordering::Relaxed);
     }
-    let new_esp = if user_scheduling_enabled() {
-        let _kernel = crate::multitasking::task::SMP_KERNEL_LOCK.lock();
-        unsafe {
+    let new_esp = if user_scheduling_enabled()
+        && crate::multitasking::task::timer_may_schedule(esp as *const crate::multitasking::task::CPUState)
+    {
+        let Some(kernel) = crate::multitasking::task::try_lock_kernel() else {
+            unsafe { lapic_write(base, LAPIC_EOI, 0) };
+            return esp as u64;
+        };
+        crate::multitasking::task::set_kernel_lock_context(
+            crate::multitasking::task::KERNEL_LOCK_CTX_AP_TIMER,
+        );
+        trace_scheduler(1);
+        let next = unsafe {
             crate::multitasking::task::TASK_MANAGER
                 .schedule(esp as *mut crate::multitasking::task::CPUState) as u32
-        }
+        };
+        let next = crate::signal::deliver_pending(next);
+        trace_scheduler(9);
+        crate::multitasking::task::handoff_kernel_lock(kernel, next)
     } else {
-        esp
+        esp as u64
     };
     unsafe { lapic_write(base, LAPIC_EOI, 0) };
     new_esp
@@ -534,6 +705,78 @@ pub extern "C" fn work_ipi_interrupt() {
 
 #[unsafe(no_mangle)]
 extern "C" fn work_ipi_ack() {
+    let base = LAPIC_VIRT.load(Ordering::Acquire) as *mut u8;
+    if !base.is_null() {
+        unsafe { lapic_write(base, LAPIC_EOI, 0) };
+    }
+}
+
+pub fn shootdown_tlb(page_dir_phys: u32, page: u32) -> bool {
+    if TLB_SHOOTDOWN_BROKEN.load(Ordering::Acquire) {
+        return false;
+    }
+    let base = LAPIC_VIRT.load(Ordering::Acquire) as *mut u8;
+    if base.is_null() {
+        return true;
+    }
+    let sender = current_cpu_index();
+    let mut targets = [0u8; MAX_CPUS];
+    let mut count = 0usize;
+    for cpu in 0..MAX_CPUS {
+        if ONLINE_MASK.load(Ordering::Acquire) & (1 << cpu) != 0 && cpu != sender && CURRENT_CR3[cpu].load(Ordering::Acquire) == page_dir_phys {
+            targets[count] = CPU_APIC_IDS[cpu].load(Ordering::Acquire) as u8;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return true;
+    }
+    TLB_TARGET_CR3.store(page_dir_phys, Ordering::Relaxed);
+    TLB_TARGET_PAGE.store(page & !0xfff, Ordering::Relaxed);
+    TLB_ACKS.store(0, Ordering::Release);
+    for apic_id in targets[..count].iter().copied() {
+        if !unsafe { send_ipi(base, apic_id, TLB_IPI_VECTOR as u32) } {
+            TLB_SHOOTDOWN_BROKEN.store(true, Ordering::Release);
+            return false;
+        }
+    }
+    for _ in 0..10_000_000 {
+        if TLB_ACKS.load(Ordering::Acquire) >= count as u32 {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    // Never let one missing IPI acknowledgement freeze the giant kernel lock.
+    // The caller must retain the physical frame and virtual range, so a stale
+    // remote TLB entry cannot alias reused memory. Disable later transactions
+    // because a delayed acknowledgement must not satisfy a newer request.
+    TLB_SHOOTDOWN_BROKEN.store(true, Ordering::Release);
+    false
+}
+
+#[unsafe(naked)]
+pub extern "C" fn tlb_ipi_interrupt() {
+    unsafe {
+        naked_asm!(
+            "push ds", "push es",
+            "push eax", "push ecx", "push edx", "cld",
+            "mov ax, 0x10", "mov ds, ax", "mov es, ax",
+            "call tlb_ipi_ack",
+            "pop edx", "pop ecx", "pop eax",
+            "pop es", "pop ds",
+            "iretd",
+        );
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn tlb_ipi_ack() {
+    let current: u32;
+    unsafe { asm!("mov {}, cr3", out(reg) current, options(nomem, nostack)) };
+    if current == TLB_TARGET_CR3.load(Ordering::Acquire) {
+        crate::memory::paging::PageDirectory::flush_page(TLB_TARGET_PAGE.load(Ordering::Relaxed));
+    }
+    TLB_ACKS.fetch_add(1, Ordering::Release);
     let base = LAPIC_VIRT.load(Ordering::Acquire) as *mut u8;
     if !base.is_null() {
         unsafe { lapic_write(base, LAPIC_EOI, 0) };
@@ -608,9 +851,6 @@ pub fn init() {
         }
     };
     LAPIC_VIRT.store(lapic as u32, Ordering::Release);
-    for (slot, &apic_id) in info.apic_ids[..info.cpu_count].iter().enumerate() {
-        CPU_APIC_IDS[slot].store(apic_id as u32, Ordering::Release);
-    }
 
     unsafe {
         if install_trampoline().is_err() {
@@ -622,6 +862,18 @@ pub fn init() {
         lapic_write(lapic, LAPIC_ESR, 0);
 
         let bsp_id = (lapic_read(lapic, LAPIC_ID) >> 24) as u8;
+        // ACPI and MP tables do not promise that their first processor entry is
+        // the BSP. The scheduler reserves logical cpu0 for the BSP because it
+        // owns the PIT and all legacy device IRQs.
+        CPU_APIC_IDS[0].store(bsp_id as u32, Ordering::Release);
+        let mut logical = 1usize;
+        for &apic_id in &info.apic_ids[..info.cpu_count] {
+            if apic_id != bsp_id && logical < MAX_CPUS {
+                CPU_APIC_IDS[logical].store(apic_id as u32, Ordering::Release);
+                logical += 1;
+            }
+        }
+        configure_bsp_virtual_wire(lapic);
         crate::println!(
             "[smp] topology: {} CPU(s), BSP APIC {}, LAPIC={:#x}",
             info.cpu_count,
@@ -629,10 +881,8 @@ pub fn init() {
             info.lapic_phys
         );
 
-        for (slot, &apic_id) in info.apic_ids[..info.cpu_count].iter().enumerate() {
-            if apic_id == bsp_id {
-                continue;
-            }
+        for slot in 1..logical {
+            let apic_id = CPU_APIC_IDS[slot].load(Ordering::Acquire) as u8;
             let before = AP_ONLINE.load(Ordering::Acquire);
             let stack_top = AP_STACKS.0[slot].as_ptr().add(AP_STACK_SIZE) as u32;
             write_unaligned(phys_to_virt(PARAM_STACK) as *mut u32, stack_top);
@@ -643,7 +893,7 @@ pub fn init() {
             // universal startup algorithm for integrated Local APICs.
             if !send_ipi(lapic, apic_id, 0x0000_c500) {
                 crate::println!("[smp] APIC {} INIT timed out", apic_id);
-                continue;
+                break;
             }
             short_delay();
             crate::println!("[smp] APIC {} INIT asserted", apic_id);
@@ -670,6 +920,8 @@ pub fn init() {
                 crate::println!("[smp] APIC {} online", apic_id);
             } else {
                 crate::println!("[smp] APIC {} startup timed out", apic_id);
+                // Parameters are shared: a late AP must not take the next AP stack.
+                break;
             }
         }
     }
@@ -695,16 +947,75 @@ pub fn init() {
 #[unsafe(no_mangle)]
 extern "C" fn ap_entry() -> ! {
     let lapic = LAPIC_VIRT.load(Ordering::Acquire) as *mut u8;
-    let slot = cpu_slot_for_lapic(lapic).unwrap_or(0);
+    let Some(slot) = cpu_slot_for_lapic(lapic) else {
+        // Never alias an unrecognised AP onto CPU0's per-CPU state/stack.
+        // A duplicate CPU slot corrupts CURRENT_TASK, CR3 tracking and TSS state.
+        loop {
+            unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
+        }
+    };
     let stack_top = unsafe { AP_STACKS.0[slot].as_ptr().add(AP_STACK_SIZE) as u32 };
     unsafe {
         AP_GDTS[slot].init_and_load(stack_top);
         crate::interrupts::idt::IDT.load();
         configure_local_timer(lapic);
     }
+    set_current_cr3(unsafe { KERNEL_PD_PHYS });
+    ONLINE_MASK.fetch_or(1 << slot, Ordering::Release);
     AP_ONLINE.fetch_add(1, Ordering::Release);
     loop {
         let _ = run_pending_work(slot);
         unsafe { asm!("sti", "hlt", options(nomem, nostack)) };
+    }
+}
+
+/// Read only atomics: F12 must also work while another CPU holds the kernel lock.
+pub struct DebugSnapshot;
+
+impl core::fmt::Display for DebugSnapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let lock_ctx = crate::multitasking::task::KERNEL_LOCK_CONTEXT.load(Ordering::Relaxed);
+        let lock_ctx_name = match lock_ctx {
+            crate::multitasking::task::KERNEL_LOCK_CTX_SYSCALL => "syscall",
+            crate::multitasking::task::KERNEL_LOCK_CTX_BSP_TIMER => "bsp_timer",
+            crate::multitasking::task::KERNEL_LOCK_CTX_AP_TIMER => "ap_timer",
+            crate::multitasking::task::KERNEL_LOCK_CTX_EXCEPTION => "exception",
+            _ => "none",
+        };
+        writeln!(f, "PIT={} kernel_lock={} userspace={} owner={} lock_ctx={}",
+            crate::time::jiffies(),
+            crate::multitasking::task::SMP_KERNEL_LOCK.is_locked(),
+            user_scheduling_enabled(),
+            crate::multitasking::task::KERNEL_LOCK_OWNER.load(Ordering::Relaxed),
+            lock_ctx_name)?;
+        for cpu in 0..MAX_CPUS {
+            if ONLINE_MASK.load(Ordering::Acquire) & (1 << cpu) == 0 { continue; }
+            writeln!(f, "cpu{} apic={} slot={} ap_ticks={} u/s/i={}/{}/{} cr3={:#x}",
+                cpu, CPU_APIC_IDS[cpu].load(Ordering::Relaxed),
+                CURRENT_TASK[cpu].load(Ordering::Relaxed),
+                AP_TIMER_TICKS[cpu].load(Ordering::Relaxed),
+                CPU_USER_TICKS[cpu].load(Ordering::Relaxed),
+                CPU_SYSTEM_TICKS[cpu].load(Ordering::Relaxed),
+                CPU_IDLE_TICKS[cpu].load(Ordering::Relaxed),
+                CURRENT_CR3[cpu].load(Ordering::Relaxed))?;
+            let last_flags = LAST_TIMER_EFLAGS[cpu].load(Ordering::Relaxed);
+            writeln!(f, "  eip={:#010x} cs={:#x} eflags={:#010x} IF={} last_syscall={} phase={} sched={}",
+                LAST_TIMER_EIP[cpu].load(Ordering::Relaxed),
+                LAST_TIMER_CS[cpu].load(Ordering::Relaxed),
+                last_flags,
+                (last_flags >> 9) & 1,
+                SYSCALL_NUMBER[cpu].load(Ordering::Relaxed),
+                SYSCALL_PHASE[cpu].load(Ordering::Relaxed),
+                SCHEDULER_STAGE[cpu].load(Ordering::Relaxed))?;
+            let work = KERNEL_WORK[cpu].load(Ordering::Relaxed);
+            writeln!(f, "  work={} progress={:#x}",
+                kernel_work_name(work >> 24), work & 0x00ff_ffff)?;
+        }
+        if let Some(_guard) = crate::multitasking::task::SMP_KERNEL_LOCK.try_lock() {
+            unsafe { crate::multitasking::task::TASK_MANAGER.fmt_debug_tasks(f)?; }
+        } else {
+            writeln!(f, "tasks: unavailable (kernel lock held)")?;
+        }
+        Ok(())
     }
 }

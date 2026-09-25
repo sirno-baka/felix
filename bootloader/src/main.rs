@@ -24,10 +24,12 @@ const KERNEL_PATH: &str = "/kernel.bin";
 /// Kernel maps root from `disk_phys` when magic matches — no IDE needed (PXE).
 const BOOTINFO_PHYS: u32 = 0x0000_7000; // not 0x6000 — VESA uses 0x6000 as scratch
 const BOOTINFO_MAGIC: u32 = 0xFE11_B007;
-/// Whole-disk image in RAM (after kernel @ 0x01000000).
-const RAMDISK_PHYS: u32 = 0x0200_0000;
-/// Fallback size if INT 13h AH=48h fails (matches Makefile 32 MiB disk.img).
-const RAMDISK_FALLBACK_SECTORS: u32 = (32 * 1024 * 1024) / 512;
+/// Whole-disk image in RAM, immediately after the fixed kernel heap.
+/// The heap occupies phys 0x01800000..0x02800000, so placing the old ramdisk
+/// at 0x02000000 overwrote its final 8 MiB during network boot.
+const RAMDISK_PHYS: u32 = 0x0280_0000;
+/// Fallback size if INT 13h AH=48h fails (matches Makefile's 64 MiB disk.img).
+const RAMDISK_FALLBACK_SECTORS: u32 = (64 * 1024 * 1024) / 512;
 
 #[repr(C)]
 struct BootInfo {
@@ -85,6 +87,18 @@ pub extern "C" fn _start() -> ! {
     if is_network_boot() {
         use disk::DISK;
         let sectors = disk::Disk::drive_sector_count(RAMDISK_FALLBACK_SECTORS);
+        let ramdisk_end = sectors
+            .checked_mul(512)
+            .and_then(|bytes| RAMDISK_PHYS.checked_add(bytes));
+        if ramdisk_end.is_none_or(|end| end > mem_bytes) {
+            println!(
+                "[!] RAM disk does not fit: start=0x{:08x}, sectors={}, RAM={} MiB",
+                RAMDISK_PHYS,
+                sectors,
+                mem_bytes / (1024 * 1024)
+            );
+            loop {}
+        }
         println!(
             "[!] Network boot — hydrating disk → RAM @ 0x{:08x} ({} sectors)",
             RAMDISK_PHYS, sectors

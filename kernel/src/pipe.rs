@@ -1,10 +1,9 @@
 //! In-kernel anonymous pipes for shell pipelines.
 //!
-//! Each pipe has a fixed ring buffer, reader/writer refcounts, and blocking
-//! read/write via sti/hlt (same pattern as stdin).
+//! Each pipe has a fixed ring buffer and reader/writer refcounts. Blocking is
+//! implemented by the syscall layer with scheduler wait queues.
 
 use crate::println;
-use core::arch::asm;
 
 pub const PIPE_BUF_SIZE: usize = 4096;
 const MAX_PIPES: usize = 16;
@@ -77,6 +76,8 @@ pub fn pipe_close_reader(id: usize) {
         if PIPES[id].readers > 0 {
             PIPES[id].readers -= 1;
         }
+        crate::multitasking::task::TASK_MANAGER
+            .wake_waiters(crate::multitasking::task::WaitReason::Input);
         maybe_free(id);
     }
 }
@@ -89,6 +90,8 @@ pub fn pipe_close_writer(id: usize) {
         if PIPES[id].writers > 0 {
             PIPES[id].writers -= 1;
         }
+        crate::multitasking::task::TASK_MANAGER
+            .wake_waiters(crate::multitasking::task::WaitReason::Input);
         maybe_free(id);
     }
 }
@@ -148,6 +151,10 @@ pub fn pipe_try_read(id: usize, buf: *mut u8, count: usize) -> usize {
             *buf.add(read) = byte;
             read += 1;
         }
+        if read > 0 {
+            crate::multitasking::task::TASK_MANAGER
+                .wake_waiters(crate::multitasking::task::WaitReason::Input);
+        }
         read
     }
 }
@@ -178,66 +185,10 @@ pub fn pipe_try_write(id: usize, buf: *const u8, count: usize) -> usize {
             PIPES[id].len += 1;
             written += 1;
         }
+        if written > 0 {
+            crate::multitasking::task::TASK_MANAGER
+                .wake_waiters(crate::multitasking::task::WaitReason::Input);
+        }
         written
     }
-}
-
-/// Blocking read from pipe. Returns 0 on EOF (no writers left and empty).
-pub fn pipe_read(id: usize, buf: *mut u8, count: usize) -> usize {
-    if id >= MAX_PIPES || count == 0 {
-        return 0;
-    }
-    let mut read = 0usize;
-    unsafe {
-        if !PIPES[id].in_use {
-            return 0;
-        }
-        asm!("sti");
-        while read < count {
-            if PIPES[id].len == 0 {
-                if PIPES[id].writers == 0 {
-                    break; // EOF
-                }
-                asm!("hlt");
-                continue;
-            }
-            let byte = PIPES[id].buf[PIPES[id].tail];
-            PIPES[id].tail = (PIPES[id].tail + 1) % PIPE_BUF_SIZE;
-            PIPES[id].len -= 1;
-            *buf.add(read) = byte;
-            read += 1;
-        }
-        asm!("cli");
-    }
-    read
-}
-
-/// Blocking write to pipe. Returns bytes written (0 if no readers).
-pub fn pipe_write(id: usize, buf: *const u8, count: usize) -> usize {
-    if id >= MAX_PIPES || count == 0 {
-        return 0;
-    }
-    let mut written = 0usize;
-    unsafe {
-        if !PIPES[id].in_use {
-            return 0;
-        }
-        asm!("sti");
-        while written < count {
-            if PIPES[id].readers == 0 {
-                break; // SIGPIPE-ish: stop
-            }
-            if PIPES[id].len == PIPE_BUF_SIZE {
-                asm!("hlt");
-                continue;
-            }
-            let byte = *buf.add(written);
-            PIPES[id].buf[PIPES[id].head] = byte;
-            PIPES[id].head = (PIPES[id].head + 1) % PIPE_BUF_SIZE;
-            PIPES[id].len += 1;
-            written += 1;
-        }
-        asm!("cli");
-    }
-    written
 }

@@ -78,11 +78,17 @@ impl ATAPI {
         channel.polling(1)?;
         io::insw(bus as u16, buffer.as_mut_ptr() as *mut _, 4);
 
-        // (X) Waiting for BSY & DRQ to clear
+        // (X) Waiting for BSY & DRQ to clear. Never hang boot forever on
+        // legacy/quirky ATAPI hardware.
+        let mut completion_timeout = 2_000_000u32;
         loop {
             if (channel.read(ATAReg::STATUS) & (ATAStatus::BSY | ATAStatus::DRQ)) == 0 {
                 break;
             }
+            if completion_timeout == 0 {
+                return Err(0xFF);
+            }
+            completion_timeout -= 1;
         }
 
         // (((Last LBA + 1) * Block size) / (SECTOR_SIZE / 2)) * 2

@@ -35,7 +35,9 @@ impl TxToken for I8255xTxToken {
 
         unsafe {
             if !self.nic.is_null() {
-                let _ = (*self.nic).send(&buf[..len]);
+                if let Err(err) = (*self.nic).send(&buf[..len]) {
+                    println!("i8255x: TX token send failed len={} err={}", len, err);
+                }
             }
         }
         result
@@ -67,7 +69,8 @@ impl Device for I8255x {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1500;
+        // smoltcp's Ethernet MTU includes the 14-byte Ethernet header.
+        caps.max_transmission_unit = 1514;
         caps.max_burst_size = Some(512);
         caps.medium = Medium::Ethernet;
         caps
@@ -101,7 +104,9 @@ impl TxToken for AnyTxToken {
         let result = f(&mut buf[..len]);
         unsafe {
             if !self.nic.is_null() {
-                let _ = (*self.nic).send(&buf[..len]);
+                if let Err(err) = (*self.nic).send(&buf[..len]) {
+                    println!("net: TX token send failed len={} err={}", len, err);
+                }
             }
         }
         result
@@ -113,6 +118,9 @@ impl Device for AnyNic {
     type TxToken<'a> = AnyTxToken;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // RX must make progress independently of TX descriptor availability.
+        // The paired token may still fail if smoltcp uses it immediately; that
+        // failure is logged in AnyTxToken::consume instead of stalling RX.
         let mut buf = [0u8; RX_BUF_SIZE];
         if let Some(len) = self.recv(&mut buf) {
             Some((
@@ -127,14 +135,15 @@ impl Device for AnyNic {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(AnyTxToken {
+        self.can_transmit().then_some(AnyTxToken {
             nic: self as *mut _,
         })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1500;
+        // smoltcp's Ethernet MTU includes the 14-byte Ethernet header.
+        caps.max_transmission_unit = 1514;
         caps.max_burst_size = Some(16);
         caps.medium = Medium::Ethernet;
         caps

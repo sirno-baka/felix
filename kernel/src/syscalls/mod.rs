@@ -28,6 +28,8 @@ pub const SYS_NANOSLEEP: u32 = 162;
 /// Linux i386 scheduler/thread identity numbers.
 pub const SYS_SCHED_YIELD: u32 = 158;
 pub const SYS_GETTID: u32 = 224;
+/// futex(uaddr, op, val, timeout, uaddr2, val3) — Linux i386 #240.
+pub const SYS_FUTEX: u32 = 240;
 pub const SYS_GETCWD: u32 = 183;
 pub const SYS_CLOCK_GETTIME: u32 = 265;
 /// getrandom(buf, len, flags) — Linux i386 #355

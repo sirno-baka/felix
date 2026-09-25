@@ -443,8 +443,10 @@ fn close_group_io(group: &mut RunningGroup) {
     }
 }
 
-fn block_on_yield() {
-    libfelix::async_rt::block_on(async { yield_now().await; });
+fn wait_for_activity() {
+    // Waiting for child state and GUI input must actually block.  Yielding
+    // alone keeps the shell runnable and spins at 100% while the child runs.
+    unsafe { syscall::sys_sleep(10); }
 }
 
 fn supervise_group(
@@ -508,7 +510,7 @@ fn supervise_group(
             ui.redraw(out);
             return SuperviseResult::Stopped(group);
         }
-        block_on_yield();
+        wait_for_activity();
     }
 }
 
@@ -617,7 +619,7 @@ fn wait_job(job: BackgroundJob, out: &mut TermBuffer) -> (i32, Option<Background
             out.push(&format!("wait: job %{} stopped", id));
             return (1, Some(job_from_running(id, command, JobState::Stopped, group)));
         }
-        block_on_yield();
+        wait_for_activity();
     }
 }
 

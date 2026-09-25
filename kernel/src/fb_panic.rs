@@ -149,7 +149,7 @@ pub fn try_show(args: fmt::Arguments) -> bool {
 fn dump_recent_log(fb: &mut Fb) {
     // klog is independent of PRINTER's Mutex — always available on panic.
     let _ = write!(fb, "--- recent log ---\n");
-    crate::print::klog_for_each_line(|line| {
+    crate::print::klog_for_each_line_last(|line| {
         for &b in line {
             fb.putc(b as char);
         }

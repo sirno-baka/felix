@@ -10,10 +10,14 @@ use crate::{gdt, print, println};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::arch::asm;
-use core::sync::atomic::{AtomicI8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI8, AtomicU32, AtomicU8, Ordering};
 use core::u32::MAX;
 
-pub const STACK_SIZE: usize = 64 * 1024;
+// Rust networking, TLS and thread startup can nest several sizeable kernel
+// frames in one syscall. 64 KiB was demonstrably insufficient: the stack
+// reached stack_base+8 and the following push faulted at stack_base-4,
+// corrupting the page directory allocated immediately below it.
+pub const STACK_SIZE: usize = 256 * 1024;
 /// Space above the saved CPUState for the hardware interrupt frame (~few dozen bytes).
 pub const HEADROOM: usize = 256;
 /// Fixed scheduler slots. PID is deliberately independent from this index.
@@ -25,6 +29,29 @@ pub const USER_HEAP_BASE: u32 = 0x4000_0000;
 pub const USER_THREAD_STACK_BASE: u32 = 0xB000_0000;
 pub const USER_THREAD_STACK_STRIDE: u32 = 256 * 1024;
 pub const USER_THREAD_STACK_PAGES: u32 = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitReason {
+    Generic,
+    Input,
+    Timer,
+    Child,
+    Thread,
+    Poll,
+    Socket,
+    Audio,
+    Futex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskState {
+    New,
+    Runnable,
+    Running(u8),
+    Blocked(WaitReason),
+    Stopped,
+    Zombie,
+}
 
 /// Отслеживает сколько выделений памяти используют каждую страницу.
 /// Страница размапливается только когда счётчик достигает 0.
@@ -73,13 +100,13 @@ impl PageRefcounts {
 // Stack and PD live in allocated frames — NOT inline.
 // An inline 32KiB stack + 4KiB PD made Task ~37KiB; sys_execve from userspace
 // put that on the current task's 32KiB kernel stack and smashed WM BSS.
-#[derive(Clone)]
 pub struct Task {
     pub stack_base: u32,              // virt, STACK_SIZE bytes
     pub page_dir: *mut PageDirectory, // virt via phys_to_virt
     pub page_dir_phys: u32,           // goes into CR3
     pub cpu_state_ptr: u32,
     pub running: bool,
+    pub state: TaskState,
     pub kernel_stack: u32,
     pub fd_table: FileDescriptorTable,
     pub heap_next: u32,
@@ -136,9 +163,15 @@ pub struct Task {
     pub tls_ptr: u32,
     pub user_stack_bottom: u32,
     pub user_stack_top: u32,
+    pub wake_deadline_ms: u64,
+    pub connect_deadline_ms: u64,
+    /// Kernel wait key for FUTEX_WAIT. Shared futexes use the physical word
+    /// address; FUTEX_PRIVATE_FLAG uses a process-scoped virtual key.
+    pub futex_key: u64,
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct CPUState {
     pub eax: u32,
     pub ebx: u32,
@@ -158,23 +191,31 @@ impl Task {
     /// Called only after the task can no longer run, from another task's stack.
     fn release_memory(&mut self) {
         use crate::memory::paging::{phys_to_virt, PAGING};
+        use crate::smp::{trace_kernel_work, KernelWork};
         interrupt_sync::without_interrupts(|| unsafe {
-            let mut paging = PAGING.lock();
             if self.is_thread {
                 let mut addr = self.user_stack_bottom;
                 while addr < self.user_stack_top {
+                    trace_kernel_work(KernelWork::ReapUserStack, addr >> 12);
                     if let Some(phys) = (*self.page_dir).translate(addr) {
                         (*self.page_dir).unmap(addr);
-                        paging.free_phys_frame(phys >> 12);
+                        if crate::smp::shootdown_tlb(self.page_dir_phys, addr) {
+                            crate::memory::shared::release_user_frame(phys >> 12);
+                        }
                     }
                     addr += 4096;
                 }
                 for offset in (0..STACK_SIZE).step_by(4096) {
-                    paging.free_phys_frame((self.stack_base - KERNEL_OFFSET + offset as u32) >> 12);
+                    trace_kernel_work(KernelWork::ReapKernelStack, offset as u32 >> 12);
+                    PAGING
+                        .lock()
+                        .free_phys_frame((self.stack_base - KERNEL_OFFSET + offset as u32) >> 12);
                 }
                 return;
             }
+
             for index in 0..768 {
+                trace_kernel_work(KernelWork::ReapUserPages, index as u32);
                 let entry = (*self.page_dir).entries[index];
                 // Identity large pages are borrowed kernel mappings.
                 if entry & PDEFlags::PRESENT == 0 || entry & PDEFlags::DIR_PAGE_SIZE != 0 {
@@ -188,18 +229,23 @@ impl Task {
                 for slot in 0..1024 {
                     let page = *table.add(slot);
                     if page & 1 != 0 {
-                        paging.free_phys_frame((page & 0xffff_f000) >> 12);
+                        crate::memory::shared::release_user_frame((page & 0xffff_f000) >> 12);
                     }
                 }
-                paging.free_phys_frame(table_phys >> 12);
+                PAGING.lock().free_phys_frame(table_phys >> 12);
                 (*self.page_dir).entries[index] = 0;
             }
-            paging.free_phys_frame(self.page_dir_phys >> 12);
+            trace_kernel_work(KernelWork::ReapPageDir, self.page_dir_phys >> 12);
+            PAGING.lock().free_phys_frame(self.page_dir_phys >> 12);
             for offset in (0..STACK_SIZE).step_by(4096) {
-                paging.free_phys_frame((self.stack_base - KERNEL_OFFSET + offset as u32) >> 12);
+                trace_kernel_work(KernelWork::ReapKernelStack, offset as u32 >> 12);
+                PAGING
+                    .lock()
+                    .free_phys_frame((self.stack_base - KERNEL_OFFSET + offset as u32) >> 12);
             }
         });
     }
+
     pub fn pd(&self) -> &PageDirectory {
         unsafe { &*self.page_dir }
     }
@@ -213,13 +259,24 @@ impl Task {
     }
 
     pub fn new() -> Self {
+        use crate::smp::{trace_kernel_work, KernelWork};
+        trace_kernel_work(KernelWork::TaskPageDir, 0);
         let (page_dir, page_dir_phys) = alloc_task_page_dir();
+        trace_kernel_work(KernelWork::TaskStack, 0);
+        let stack_base = alloc_kernel_stack(STACK_SIZE);
+        let stack_phys = stack_base - KERNEL_OFFSET;
+        assert!(
+            page_dir_phys < stack_phys || page_dir_phys >= stack_phys + STACK_SIZE as u32,
+            "page directory overlaps kernel stack"
+        );
+        trace_kernel_work(KernelWork::TaskMetadata, 0);
         Task {
-            stack_base: alloc_kernel_stack(STACK_SIZE),
+            stack_base,
             page_dir,
             page_dir_phys,
             cpu_state_ptr: 0,
             running: false,
+            state: TaskState::New,
             fd_table: FileDescriptorTable::new(),
             kernel_stack: 0,
             heap_next: 0,
@@ -253,18 +310,28 @@ impl Task {
             tls_ptr: 0,
             user_stack_bottom: 0,
             user_stack_top: 0,
+            wake_deadline_ms: 0,
+            connect_deadline_ms: 0,
+            futex_key: 0,
         }
     }
 
     /// Construct a schedulable context borrowing an existing process address
     /// space.  It deliberately does not allocate a second page directory.
     pub fn new_thread(page_dir: *mut PageDirectory, page_dir_phys: u32) -> Self {
+        let stack_base = alloc_kernel_stack(STACK_SIZE);
+        let stack_phys = stack_base - KERNEL_OFFSET;
+        assert!(
+            page_dir_phys < stack_phys || page_dir_phys >= stack_phys + STACK_SIZE as u32,
+            "shared page directory overlaps thread kernel stack"
+        );
         Task {
-            stack_base: alloc_kernel_stack(STACK_SIZE),
+            stack_base,
             page_dir,
             page_dir_phys,
             cpu_state_ptr: 0,
             running: false,
+            state: TaskState::New,
             fd_table: FileDescriptorTable::new(),
             kernel_stack: 0,
             heap_next: 0,
@@ -298,6 +365,9 @@ impl Task {
             tls_ptr: 0,
             user_stack_bottom: 0,
             user_stack_top: 0,
+            wake_deadline_ms: 0,
+            connect_deadline_ms: 0,
+            futex_key: 0,
         }
     }
 
@@ -310,13 +380,28 @@ impl Task {
 
     pub fn sleep(&mut self) {
         self.running = false;
+        self.state = TaskState::Blocked(WaitReason::Generic);
     }
     pub fn wake(&mut self) {
         self.running = true;
+        self.state = TaskState::Runnable;
+    }
+    pub fn block(&mut self, reason: WaitReason) {
+        self.running = false;
+        self.state = TaskState::Blocked(reason);
+    }
+    pub fn stop(&mut self) {
+        self.running = false;
+        self.state = TaskState::Stopped;
+    }
+    pub fn mark_zombie(&mut self) {
+        self.running = false;
+        self.state = TaskState::Zombie;
     }
 
     pub fn init(&mut self, entry_point: u32, user_stack_top: u32, heap_start: u32) {
         self.running = true;
+        self.state = TaskState::Runnable;
 
         let kernel_stack_top = self.stack_base + STACK_SIZE as u32;
         self.kernel_stack = kernel_stack_top;
@@ -365,10 +450,98 @@ pub static mut TASK_MANAGER: TaskManager = TaskManager {
 
 pub static SMP_KERNEL_LOCK: interrupt_sync::SpinMutex<()> =
     interrupt_sync::SpinMutex::new(());
+
+pub static KERNEL_LOCK_OWNER: AtomicI8 = AtomicI8::new(-1);
+pub static KERNEL_LOCK_CONTEXT: AtomicU8 = AtomicU8::new(0);
+
+pub const KERNEL_LOCK_CTX_NONE: u8 = 0;
+pub const KERNEL_LOCK_CTX_SYSCALL: u8 = 1;
+pub const KERNEL_LOCK_CTX_BSP_TIMER: u8 = 2;
+pub const KERNEL_LOCK_CTX_AP_TIMER: u8 = 3;
+pub const KERNEL_LOCK_CTX_EXCEPTION: u8 = 4;
+
+/// Debug/allocator invariant: a physical frame handed out for a new mapping
+/// must never still belong to the kernel stack of a live task.
+pub fn live_kernel_stack_owner(frame: u32) -> Option<usize> {
+    unsafe {
+        for (slot, task) in TASK_MANAGER.tasks.iter().enumerate() {
+            let Some(task) = task.as_ref() else { continue };
+            if task.stack_base < KERNEL_OFFSET {
+                continue;
+            }
+            let first = (task.stack_base - KERNEL_OFFSET) >> 12;
+            let pages = (STACK_SIZE / 4096) as u32;
+            if frame >= first && frame < first.saturating_add(pages) {
+                return Some(slot);
+            }
+        }
+    }
+    None
+}
+
+pub fn try_lock_kernel() -> Option<interrupt_sync::SpinMutexGuard<'static, ()>> {
+    let guard = SMP_KERNEL_LOCK.try_lock()?;
+    KERNEL_LOCK_OWNER.store(crate::smp::current_cpu_index() as i8, Ordering::Relaxed);
+    Some(guard)
+}
+
+#[inline]
+pub fn set_kernel_lock_context(context: u8) {
+    KERNEL_LOCK_CONTEXT.store(context, Ordering::Relaxed);
+}
+
+pub fn lock_kernel() -> interrupt_sync::SpinMutexGuard<'static, ()> {
+    loop {
+        if let Some(guard) = try_lock_kernel() {
+            return guard;
+        }
+        // Lock release does not generate an interrupt. Sleeping with HLT here
+        // can strand a CPU forever when its Local APIC timer is slow or missed
+        // on real hardware. Keep IPIs serviceable and actively recheck.
+        unsafe { asm!("sti", "pause", "cli", options(nomem, nostack)) };
+    }
+}
+// The assembly epilogue owns this guard until it has left the outgoing stack.
+// Releasing it in Rust would let another CPU resume/reap that stack while the
+// old CPU is still returning through it. EDX:EAX carries (locked, next ESP).
+pub fn handoff_kernel_lock(
+    guard: interrupt_sync::SpinMutexGuard<'static, ()>,
+    next_esp: u32,
+) -> u64 {
+    // Ring 3 must always run with maskable interrupts enabled. A corrupted or
+    // accidentally reused CPUState with IF clear makes that CPU stop receiving
+    // its Local APIC timer forever, leaving TASK_OWNER pinned to a dead CPU.
+    // Enforce the architectural userspace invariant at the single handoff
+    // point shared by syscalls, timers, and user-fault recovery.
+    if next_esp != 0 {
+        unsafe {
+            let state = &mut *(next_esp as *mut CPUState);
+            if state.cs & 3 == 3 {
+                state.eflags |= 0x0000_0202;
+            }
+        }
+    }
+    core::mem::forget(guard);
+    (1u64 << 32) | next_esp as u64
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn finish_kernel_handoff() {
+    // Called only after MOV ESP from an epilogue whose EDX flag is nonzero.
+    crate::smp::trace_kernel_return();
+    KERNEL_LOCK_CONTEXT.store(KERNEL_LOCK_CTX_NONE, Ordering::Relaxed);
+    KERNEL_LOCK_OWNER.store(-1, Ordering::Relaxed);
+    SMP_KERNEL_LOCK.force_unlock();
+}
+
+/// Kernel continuations cannot migrate: they may hold CPU-local state or be
+/// waiting to acquire the giant lock. Only userspace and CPU idle may switch.
+pub fn timer_may_schedule(state: *const CPUState) -> bool {
+    unsafe { (*state).cs & 3 == 3 || crate::smp::current_task_slot() <= 0 }
+}
+
 static TASK_OWNER: [AtomicI8; MAX_TASKS as usize] =
     [const { AtomicI8::new(-1) }; MAX_TASKS as usize];
-static AP_USER_SEEN: AtomicU32 = AtomicU32::new(0);
-
 const fn init_tasks_array() -> [Option<Task>; MAX_TASKS as usize] {
     [const { None }; MAX_TASKS as usize]
 }
@@ -402,6 +575,7 @@ impl TaskManager {
             task.cpu_state_ptr = state_ptr as u32;
             task.kernel_stack = stack_top;
             task.running = true;
+            task.state = TaskState::Running(0);
             task.pid = 0;
             task.tid = 0;
             task.leader_slot = 0;
@@ -509,6 +683,9 @@ impl TaskManager {
 
     //CPU SCHEDULER LOGIC
     pub fn schedule(&mut self, cpu_state: *mut CPUState) -> *mut CPUState {
+        crate::smp::trace_scheduler(2);
+        self.wake_expired_timers(crate::time::uptime_ms());
+        crate::smp::trace_scheduler(3);
         let cpu = crate::smp::current_cpu_index();
         if cpu != 0 {
             return self.schedule_ap(cpu, cpu_state);
@@ -537,7 +714,11 @@ impl TaskManager {
 
             unsafe {
                 gdt::TSS.esp0 = task.kernel_stack;
+                crate::smp::set_current_cr3(task.page_dir_phys);
                 task.switch_address_space();
+            }
+            if let Some(task) = self.tasks[self.current_task as usize].as_mut() {
+                task.state = TaskState::Running(0);
             }
             return new_cpustate;
         }
@@ -546,9 +727,14 @@ impl TaskManager {
         if self.current_task >= 0 {
             if let Some(ref mut task) = self.tasks[self.current_task as usize] {
                 task.cpu_state_ptr = cpu_state as u32;
+                if task.running {
+                    task.state = TaskState::Runnable;
+                }
             }
             if self.current_task > 0 {
                 TASK_OWNER[self.current_task as usize].store(-1, Ordering::Release);
+                self.wake_waiters(WaitReason::Child);
+                self.wake_waiters(WaitReason::Thread);
             }
         }
 
@@ -565,6 +751,9 @@ impl TaskManager {
             self.current_task = 0;
         }
         crate::smp::set_current_task_slot(self.current_task);
+        if let Some(task) = self.tasks[self.current_task as usize].as_mut() {
+            task.state = TaskState::Running(0);
+        }
 
         let task = unsafe { self.tasks[self.current_task as usize].as_ref().unwrap() };
         // println!("[SCHEDULE] switching to task {} | pd_phys={:#x} | eip={:#x}",
@@ -574,6 +763,7 @@ impl TaskManager {
 
         unsafe {
             gdt::TSS.esp0 = task.kernel_stack;
+            crate::smp::set_current_cr3(task.page_dir_phys);
             // --- ELF @ 0x400000 ---
             // let virt = 0x0040_4000u32;
             // let page_num = virt >> 12;
@@ -604,34 +794,91 @@ impl TaskManager {
         new_cpustate
     }
 
+    fn wake_expired_timers(&mut self, now_ms: u64) {
+        for task in self.tasks.iter_mut().flatten() {
+            match task.state {
+                TaskState::Blocked(WaitReason::Timer) if now_ms >= task.wake_deadline_ms => {
+                    task.wake_deadline_ms = 0;
+                    task.wake();
+                }
+                TaskState::Blocked(WaitReason::Poll)
+                    if task.wake_deadline_ms != 0 && now_ms >= task.wake_deadline_ms =>
+                {
+                    task.wake()
+                }
+                TaskState::Blocked(WaitReason::Futex)
+                    if task.wake_deadline_ms != 0 && now_ms >= task.wake_deadline_ms =>
+                {
+                    // FUTEX_WAIT is not a restartable syscall. Its saved
+                    // userspace frame must carry -ETIMEDOUT when the timer
+                    // wakes it, while FUTEX_WAKE leaves the preloaded eax=0.
+                    if task.cpu_state_ptr != 0 {
+                        unsafe {
+                            (*(task.cpu_state_ptr as *mut CPUState)).eax = (-110i32) as u32;
+                        }
+                    }
+                    task.futex_key = 0;
+                    task.wake_deadline_ms = 0;
+                    task.wake();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn wake_waiters(&mut self, reason: WaitReason) {
+        for task in self.tasks.iter_mut().flatten() {
+            if task.state == TaskState::Blocked(reason) {
+                task.wake();
+            }
+        }
+    }
+
     fn schedule_ap(&mut self, cpu: usize, cpu_state: *mut CPUState) -> *mut CPUState {
+        crate::smp::trace_scheduler(4);
         let previous = crate::smp::current_task_slot();
         if previous < 0 {
             crate::smp::set_idle_esp(cpu, cpu_state as u32);
         } else if let Some(task) = self.tasks[previous as usize].as_mut() {
             task.cpu_state_ptr = cpu_state as u32;
+            if task.running {
+                task.state = TaskState::Runnable;
+            }
             TASK_OWNER[previous as usize].store(-1, Ordering::Release);
+            self.wake_waiters(WaitReason::Child);
+            self.wake_waiters(WaitReason::Thread);
         }
 
+        crate::smp::trace_scheduler(5);
         let next = self.claim_next_task(cpu as i8, previous);
+        crate::smp::trace_scheduler(6);
         if next <= 0 {
             crate::smp::set_current_task_slot(-1);
+            // Leave the outgoing address space before it can be reclaimed.
+            unsafe { asm!("mov cr3, {}", in(reg) crate::memory::paging::KERNEL_PD_PHYS); }
+            crate::smp::set_current_cr3(unsafe { crate::memory::paging::KERNEL_PD_PHYS });
             let idle = crate::smp::idle_esp(cpu);
+            crate::smp::trace_scheduler(7);
             return if idle != 0 { idle as *mut CPUState } else { cpu_state };
         }
 
+        crate::smp::trace_scheduler(8);
         crate::smp::set_current_task_slot(next);
-        let task = self.tasks[next as usize].as_ref().unwrap();
-        let cpu_bit = 1u32 << cpu;
-        if AP_USER_SEEN.fetch_or(cpu_bit, Ordering::Relaxed) & cpu_bit == 0 {
-            println!(
-                "[smp] CPU {} entered userspace: pid={} slot={}",
-                cpu, task.pid, next
-            );
+        if let Some(task) = self.tasks[next as usize].as_mut() {
+            task.state = TaskState::Running(cpu as u8);
         }
+        crate::smp::trace_scheduler(81);
+        let task = self.tasks[next as usize].as_ref().unwrap();
+        // Never print from the AP timer while it owns the giant kernel lock.
+        // Legacy VGA/port-I/O output from an AP can stall on real chipsets and
+        // would leave every other CPU waiting for this lock forever.
         unsafe {
             crate::smp::set_cpu_kernel_stack(cpu, task.kernel_stack);
+            crate::smp::trace_scheduler(82);
+            crate::smp::set_current_cr3(task.page_dir_phys);
+            crate::smp::trace_scheduler(83);
             task.switch_address_space();
+            crate::smp::trace_scheduler(84);
         }
         task.cpu_state_ptr as *mut CPUState
     }
@@ -642,13 +889,27 @@ impl TaskManager {
             if slot == 0 {
                 slot = 1;
             }
+            // A task owner is only valid while that CPU reports the same
+            // current slot.  Losing this invariant used to leave a woken task
+            // permanently unselectable: every CPU went idle although the task
+            // was Runnable.  Repair the stale reservation while the giant
+            // scheduler lock gives us exclusive access to task state.
+            let owner = TASK_OWNER[slot as usize].load(Ordering::Acquire);
+            if owner >= 0
+                && crate::smp::task_slot_on_cpu(owner as usize) != slot
+            {
+                let _ = TASK_OWNER[slot as usize].compare_exchange(
+                    owner,
+                    -1,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+            }
             if self.tasks[slot as usize].as_ref().is_some_and(|task| {
                 task.running
+                    && task.state == TaskState::Runnable
                     && !task.zombie
                     && !task.thread_exited
-                    // Shared address spaces still need TLB shootdown support.
-                    // Until then APs run process leaders; threads stay on BSP.
-                    && (cpu == 0 || !task.is_thread)
             })
                 && TASK_OWNER[slot as usize]
                     .compare_exchange(-1, cpu, Ordering::AcqRel, Ordering::Relaxed)
@@ -669,7 +930,10 @@ impl TaskManager {
         let mut i = (self.current_task + 1) % MAX_TASKS;
         for _ in 0..MAX_TASKS {
             if let Some(ref task) = self.tasks[i as usize] {
-                if task.running && TASK_OWNER[i as usize].load(Ordering::Acquire) < 0 {
+                if task.running
+                    && task.state == TaskState::Runnable
+                    && TASK_OWNER[i as usize].load(Ordering::Acquire) < 0
+                {
                     return i;
                 }
             }
@@ -842,9 +1106,20 @@ impl TaskManager {
         None
     }
 
+    /// Must hold the kernel lock; an exited sibling may still be entering the kernel.
+    pub fn siblings_quiescent(&self, leader: usize) -> bool {
+        self.thread_slots(leader).iter().all(|&slot| slot == leader || TASK_OWNER[slot].load(Ordering::Acquire) < 0)
+    }
+
+    pub fn process_quiescent(&self, leader: usize) -> bool {
+        self.thread_slots(leader).iter().all(|&slot| {
+            TASK_OWNER[slot].load(Ordering::Acquire) < 0
+        })
+    }
+
     /// Reap (free) a zombie task slot. Returns true on success.
     pub fn reap(&mut self, id: usize) -> bool {
-        if id == 0 || TASK_OWNER[id].load(Ordering::Acquire) >= 0 {
+        if id == 0 || id >= self.tasks.len() || !self.process_quiescent(id) {
             return false;
         }
         let dead_pid = if let Some(ref t) = self.tasks[id] {
@@ -860,6 +1135,7 @@ impl TaskManager {
         // their private stacks before releasing the shared address space.
         let members = self.thread_slots(id);
         for slot in members {
+            crate::smp::trace_kernel_work(crate::smp::KernelWork::ReapThreads, slot as u32);
             if slot == id {
                 continue;
             }
@@ -908,6 +1184,28 @@ impl TaskManager {
                 }
             }
         }
+    }
+
+    pub fn fmt_debug_tasks(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        writeln!(f, "tasks now_ms={}:", crate::time::uptime_ms())?;
+        for (slot, task) in self.tasks.iter().enumerate() {
+            let Some(task) = task.as_ref() else { continue };
+            let saved = task.cpu_state_ptr as *const CPUState;
+            let saved_eip = if saved.is_null() { 0 } else { unsafe { (*saved).eip } };
+            writeln!(
+                f,
+                "  s{} pid={} tid={} run={} state={:?} owner={} deadline={} eip={:#x}",
+                slot,
+                task.pid,
+                task.tid,
+                task.running,
+                task.state,
+                TASK_OWNER[slot].load(Ordering::Relaxed),
+                task.wake_deadline_ms,
+                saved_eip,
+            )?;
+        }
+        Ok(())
     }
 }
 

@@ -12,7 +12,7 @@ use crate::memory::paging::{
     PAGE_SIZE, PAGING,
 };
 use crate::multitasking::task::{
-    CPUState, Task, MAX_TASKS, TASK_MANAGER, USER_HEAP_BASE, USER_THREAD_STACK_BASE,
+    CPUState, Task, TaskState, MAX_TASKS, TASK_MANAGER, USER_HEAP_BASE, USER_THREAD_STACK_BASE,
     USER_THREAD_STACK_PAGES, USER_THREAD_STACK_STRIDE,
 };
 use crate::net::{SockAddrIn, SocketState, AF_INET, SOCKET_TABLE, SOCK_DGRAM, SOCK_STREAM};
@@ -29,6 +29,23 @@ use core::ops::Deref;
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 pub const SYSCALL_INT: u8 = 0x80;
+
+fn block_and_restart(
+    thread_slot: usize,
+    esp: u32,
+    reason: crate::multitasking::task::WaitReason,
+) -> u32 {
+    unsafe {
+        let state = &mut *(esp as *mut CPUState);
+        // `int 0x80` is two bytes. Resume at the instruction itself so the
+        // syscall rechecks its condition after the wait queue wakes the task.
+        state.eip = state.eip.wrapping_sub(2);
+        if let Some(task) = TASK_MANAGER.tasks[thread_slot].as_mut() {
+            task.block(reason);
+        }
+        TASK_MANAGER.schedule(esp as *mut CPUState) as u32
+    }
+}
 
 #[unsafe(naked)]
 pub extern "C" fn syscall() {
@@ -53,6 +70,10 @@ pub extern "C" fn syscall() {
             "add esp, 4",
             // Возвращаем новый esp (handler может вернуть тот же)
             "mov esp, eax",
+            "test edx, edx",
+            "jz 3f",
+            "call finish_kernel_handoff",
+            "3:",
             // A syscall may exit/sleep and return a different task's CPUState.
             // Select data segments from that task's saved CS before restoring
             // its GPRs, so no user register is clobbered on the way to iretd.
@@ -82,7 +103,20 @@ pub extern "C" fn syscall() {
     }
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn syscall_handler(esp: u32) -> u32 {
+pub extern "C" fn syscall_handler(esp: u32) -> u64 {
+    let number = unsafe { (*(esp as *const CPUState)).eax };
+    crate::smp::trace_syscall(number, 1);
+    let kernel = crate::multitasking::task::lock_kernel();
+    crate::multitasking::task::set_kernel_lock_context(
+        crate::multitasking::task::KERNEL_LOCK_CTX_SYSCALL,
+    );
+    crate::smp::trace_syscall(number, 2);
+    let next = syscall_handler_locked(esp);
+    let next = crate::signal::deliver_pending(next);
+    crate::multitasking::task::handoff_kernel_lock(kernel, next)
+}
+
+fn syscall_handler_locked(esp: u32) -> u32 {
     let state = unsafe { &mut *(esp as *mut CPUState) };
 
     let syscall_num = state.eax;
@@ -92,6 +126,27 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
     // Most syscalls operate on process-wide state.  Non-leader threads are
     // redirected to their group leader, while scheduling/exit use thread_slot.
     let current_slot = unsafe { TASK_MANAGER.process_slot(thread_slot) };
+    let trace_reqwest = unsafe {
+        TASK_MANAGER.tasks[current_slot]
+            .as_ref()
+            .map_or(false, |t| t.name.starts_with(b"123-smoke"))
+    };
+    if trace_reqwest {
+        crate::debugln!(
+            "[reqtrace] enter tslot={} pslot={} n={} frame={:#x} ueip={:#x} uesp={:#x}",
+            thread_slot,
+            current_slot,
+            syscall_num,
+            esp,
+            state.eip,
+            state.esp
+        );
+    }
+
+    // A sibling can terminate/stop us while we wait for the kernel lock.
+    if unsafe { TASK_MANAGER.tasks[thread_slot].as_ref().is_none_or(|t| !t.running || t.thread_exited || t.zombie) } {
+        return unsafe { TASK_MANAGER.schedule(esp as *mut CPUState) as u32 };
+    }
 
     // A detached thread cannot free the kernel stack it is currently using.
     // Reclaim it on the next syscall made from another task instead.
@@ -114,12 +169,57 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         state.eax = 0;
         return unsafe { TASK_MANAGER.schedule(esp as *mut CPUState) as u32 };
     }
+    if syscall_num == crate::syscalls::SYS_NANOSLEEP {
+        return sys_nanosleep_block(
+            thread_slot,
+            esp,
+            state.ebx as *const TimeSpec,
+            state.ecx as *mut TimeSpec,
+        );
+    }
+    if syscall_num == crate::syscalls::SYS_FUTEX {
+        return sys_futex(
+            thread_slot,
+            esp,
+            state.ebx as *mut u32,
+            state.ecx,
+            state.edx,
+            state.esi as *const TimeSpec,
+        );
+    }
+    if syscall_num == crate::syscalls::SYS_WAIT {
+        let result = sys_wait_status(
+            current_slot,
+            state.ebx as i32,
+            state.ecx as *mut i32,
+            state.edx,
+        );
+        if result == EAGAIN {
+            return block_and_restart(thread_slot, esp, crate::multitasking::task::WaitReason::Child);
+        }
+        state.eax = result as u32;
+        return esp;
+    }
+    if syscall_num == crate::syscalls::SYS_THREAD_JOIN {
+        let result = sys_thread_join(
+            current_slot,
+            thread_slot,
+            state.ebx as i32,
+            state.ecx as *mut u32,
+        );
+        if result == EAGAIN {
+            return block_and_restart(thread_slot, esp, crate::multitasking::task::WaitReason::Thread);
+        }
+        state.eax = result as u32;
+        return esp;
+    }
     if syscall_num == crate::syscalls::SYS_EXECVE {
         // Replacing an address space while sibling threads can still execute in
         // it is unsafe.  Match the useful Linux rule incrementally: only a
         // single-threaded leader may exec until sibling teardown is wired in.
         if thread_slot != current_slot
             || unsafe { TASK_MANAGER.live_thread_count(current_slot) } != 1
+            || !unsafe { TASK_MANAGER.siblings_quiescent(current_slot) }
         {
             state.eax = EBUSY as u32;
             return esp;
@@ -228,9 +328,7 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         crate::syscalls::SYS_GETRANDOM => {
             sys_getrandom(state.ebx as *mut u8, state.ecx as usize, state.edx as u32)
         }
-        crate::syscalls::SYS_NANOSLEEP => {
-            sys_nanosleep(state.ebx as *const TimeSpec, state.ecx as *mut TimeSpec)
-        }
+        crate::syscalls::SYS_NANOSLEEP => unreachable!(),
         crate::syscalls::SYS_TTY_SETFG => sys_tty_setfg(current_slot, state.ebx as i32),
         crate::syscalls::SYS_TTY_GETFG => sys_tty_getfg(current_slot),
         crate::syscalls::SYS_MOUNT => sys_mount(
@@ -261,6 +359,7 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
             )
         }
         crate::syscalls::SYS_SPAWN_PATH => {
+            crate::smp::trace_kernel_work(crate::smp::KernelWork::SpawnArgs, 0);
             let params = read_exec_params(state.edx as *const ExecParamsUser);
             sys_spawn_path(
                 current_slot,
@@ -275,22 +374,12 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
             )
         }
         // Linux i386 waitpid(pid, status, options).
-        crate::syscalls::SYS_WAIT => sys_wait_status(
-            current_slot,
-            state.ebx as i32,
-            state.ecx as *mut i32,
-            state.edx as u32,
-        ),
+        crate::syscalls::SYS_WAIT => unreachable!(),
         crate::syscalls::SYS_TASK_LIST => {
             sys_task_list(state.ebx as *mut TaskInfoUser, state.ecx as usize)
         }
         crate::syscalls::SYS_THREAD_CREATE => sys_thread_create(current_slot, state.ebx, state.ecx),
-        crate::syscalls::SYS_THREAD_JOIN => sys_thread_join(
-            current_slot,
-            thread_slot,
-            state.ebx as i32,
-            state.ecx as *mut u32,
-        ),
+        crate::syscalls::SYS_THREAD_JOIN => unreachable!(),
         crate::syscalls::SYS_THREAD_DETACH => {
             sys_thread_detach(current_slot, thread_slot, state.ebx as i32)
         }
@@ -400,6 +489,35 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
                                 task.pd_mut().alloc_and_map_user_page(addr);
                             }
                             addr += page_size;
+                        }
+
+                        // A large memset is a useful corruption tripwire: no
+                        // userspace PTE may ever alias this task's kernel stack
+                        // or page directory. Check before touching the payload.
+                        if size >= 256 * 1024 {
+                            let kstack_phys = task.stack_base - crate::memory::paging::KERNEL_OFFSET;
+                            let kstack_end = kstack_phys + crate::multitasking::task::STACK_SIZE as u32;
+                            let mut check = start_page;
+                            while check < end_page {
+                                if let Some(phys) = task.pd().translate(check) {
+                                    let page_phys = phys & !(page_size - 1);
+                                    if page_phys >= kstack_phys && page_phys < kstack_end {
+                                        println!(
+                                            "[malloc] FATAL alias slot={} va={:#x} phys={:#x} kstack={:#x}..{:#x}",
+                                            current_slot, check, page_phys, kstack_phys, kstack_end
+                                        );
+                                        panic!("userspace heap aliases kernel stack");
+                                    }
+                                    if page_phys == task.page_dir_phys {
+                                        println!(
+                                            "[malloc] FATAL alias slot={} va={:#x} phys={:#x} page_dir",
+                                            current_slot, check, page_phys
+                                        );
+                                        panic!("userspace heap aliases page directory");
+                                    }
+                                }
+                                check += page_size;
+                            }
                         }
                         core::ptr::write_bytes(start as *mut u8, 0, size);
                         task.heap_next = start + size as u32;
@@ -578,6 +696,48 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
         _ => 0,
     };
 
+    if ret == AUDIO_BLOCK_AND_RESTART {
+        return block_and_restart(
+            thread_slot,
+            esp,
+            crate::multitasking::task::WaitReason::Audio,
+        );
+    }
+
+    if ret == BLOCK_AND_RESTART {
+        let reason = match syscall_num {
+            crate::syscalls::SYS_READ | crate::syscalls::SYS_WRITE => {
+                // read(2)/write(2) are also the normal std::net socket I/O
+                // entry points. Keep socket waits on the socket queue rather
+                // than labelling them as terminal/pipe input waits.
+                let socket_io = unsafe {
+                    TASK_MANAGER
+                        .tasks
+                        .get(current_slot)
+                        .and_then(|task| task.as_ref())
+                        .and_then(|task| task.fd_table.get(state.ebx as usize))
+                        .map_or(false, |desc| matches!(desc, FileDescriptor::Socket { .. }))
+                };
+                if socket_io {
+                    crate::multitasking::task::WaitReason::Socket
+                } else {
+                    crate::multitasking::task::WaitReason::Input
+                }
+            }
+            crate::syscalls::SYS_POLL => crate::multitasking::task::WaitReason::Poll,
+            crate::syscalls::SYS_ACCEPT4
+            | crate::syscalls::SYS_CONNECT
+            | crate::syscalls::SYS_SENDTO
+            | crate::syscalls::SYS_RECVFROM => crate::multitasking::task::WaitReason::Socket,
+            _ => crate::multitasking::task::WaitReason::Generic,
+        };
+        return block_and_restart(thread_slot, esp, reason);
+    }
+
+    if syscall_num == crate::syscalls::SYS_CONNECT {
+        unsafe { if let Some(t) = TASK_MANAGER.tasks[thread_slot].as_mut() { t.connect_deadline_ms = 0; } }
+    }
+
     // println!("ret: 0x{:x}", ret);
     // КЛАДЁМ результат обратно в eax (чтобы пользовательская программа его получила)
     state.eax = ret as u32;
@@ -598,6 +758,18 @@ pub extern "C" fn syscall_handler(esp: u32) -> u32 {
     };
     if must_switch {
         return unsafe { TASK_MANAGER.schedule(esp as *mut CPUState) as u32 };
+    }
+
+    if trace_reqwest {
+        crate::debugln!(
+            "[reqtrace] leave tslot={} n={} ret={:#x} frame={:#x} ueip={:#x} uesp={:#x}",
+            thread_slot,
+            syscall_num,
+            ret,
+            esp,
+            state.eip,
+            state.esp
+        );
     }
 
     // Deliver any signals that arrived during the syscall (e.g. SIGINT while in read/wait).
@@ -636,9 +808,13 @@ const EXDEV: usize = (-18isize) as usize;
 const EINVAL: usize = (-22isize) as usize;
 const ENOTTY: usize = (-25isize) as usize;
 const EPIPE: usize = (-32isize) as usize;
+const ENOSYS: usize = (-38isize) as usize;
+const EOPNOTSUPP: usize = (-95isize) as usize;
 const ECONNREFUSED: usize = (-111isize) as usize;
 const ETIMEDOUT: usize = (-110isize) as usize;
 const EINPROGRESS: usize = (-115isize) as usize;
+const BLOCK_AND_RESTART: usize = usize::MAX - 0x1000;
+const AUDIO_BLOCK_AND_RESTART: usize = BLOCK_AND_RESTART - 1;
 
 static NEXT_EPHEMERAL_PORT: AtomicU32 = AtomicU32::new(0);
 
@@ -1114,6 +1290,17 @@ pub fn sys_mmap2(
     let len_u = ((len as u32) + page_size - 1) & !(page_size - 1);
 
     let anonymous = flags & MAP_ANONYMOUS != 0 || fd < 0;
+    let shared = flags & MAP_SHARED != 0;
+    let private = flags & MAP_PRIVATE != 0;
+    if shared == private {
+        return EINVAL;
+    }
+    if shared && anonymous {
+        // Felix has no fork()/named anonymous-shm object yet, so there is no
+        // second process that could attach to an anonymous mapping. Never
+        // pretend such a mapping is shared.
+        return EOPNOTSUPP;
+    }
 
     unsafe {
         if current_slot == 0 || current_slot >= MAX_TASKS as usize {
@@ -1173,26 +1360,91 @@ pub fn sys_mmap2(
             return EINVAL;
         }
 
-        // Map pages (zero-filled)
-        let mut p = va;
+        let inode = if !anonymous {
+            match task.fd_table.get(fd as usize) {
+                Some(FileDescriptor::File { inode, .. })
+                | Some(FileDescriptor::Device { inode, .. }) => *inode,
+                _ => return EBADF,
+            }
+        } else {
+            0
+        };
+
         let end = va + len_u;
+        if shared {
+            let file_off = (pgoff as u64) * (PAGE_SIZE as u64);
+            let Some(meta) = VFS.get().metadata_inode(inode) else {
+                return EBADF;
+            };
+            let last_page_off = file_off.saturating_add(len_u as u64 - PAGE_SIZE as u64);
+            if last_page_off >= meta.size {
+                // Felix cannot represent POSIX SIGBUS-on-access semantics yet.
+                // Reject pages wholly beyond EOF instead of mapping fake zeros.
+                return EINVAL;
+            }
+
+            // Shared mappings must never silently overlay an unrelated PTE.
+            let mut p = va;
+            while p < end {
+                if task.pd().translate(p).is_some() {
+                    return EBUSY;
+                }
+                p += page_size;
+            }
+
+            let mut p = va;
+            let mut off = file_off;
+            while p < end {
+                let frame = match crate::memory::shared::acquire_file_page(inode, off) {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        // Roll back pages already installed in this mapping.
+                        let mut q = va;
+                        while q < p {
+                            if let Some(phys) = task.pd().translate(q) {
+                                task.pd_mut().unmap(q);
+                                let frame = phys >> 12;
+                                use crate::memory::shared::SharedFrameRelease;
+                                match crate::memory::shared::release_shared_frame(frame) {
+                                    SharedFrameRelease::NotShared | SharedFrameRelease::Last => {
+                                        PAGING.lock().free_phys_frame(frame);
+                                    }
+                                    SharedFrameRelease::Retained => {}
+                                }
+                                let _ = task.page_refcounts.dec(q);
+                            }
+                            q += page_size;
+                        }
+                        return ENOMEM;
+                    }
+                };
+                let _ = task.page_refcounts.inc(p);
+                let mut alloc_pt = || PAGING.lock().alloc_frame();
+                task.pd_mut().map(
+                    p >> 12,
+                    frame,
+                    PTEFlags::new().present().writable().user().dirty(),
+                    &mut alloc_pt,
+                );
+                p += page_size;
+                off += PAGE_SIZE as u64;
+            }
+            return va as usize;
+        }
+
+        // MAP_PRIVATE / anonymous mappings get private zero-filled frames.
+        let mut p = va;
         while p < end {
             let need = task.page_refcounts.inc(p);
-            if need {
+            if need || task.pd().translate(p).is_none() {
                 task.pd_mut().alloc_and_map_user_page(p);
             }
-            // Clear page
             core::ptr::write_bytes(p as *mut u8, 0, PAGE_SIZE);
             p += page_size;
         }
 
-        // File-backed: copy file contents into mapping
+        // File-backed MAP_PRIVATE: copy file contents into the private pages.
         if !anonymous {
-            let inode = match task.fd_table.get(fd as usize) {
-                Some(FileDescriptor::File { inode, .. })
-                | Some(FileDescriptor::Device { inode, .. }) => *inode,
-                _ => return EBADF,
-            };
             let file_off = (pgoff as u64) * (PAGE_SIZE as u64);
             let mut remaining = len;
             let mut dst = va as *mut u8;
@@ -1228,6 +1480,7 @@ pub fn sys_munmap(current_slot: usize, addr: u32, len: usize) -> usize {
     unsafe {
         if let Some(ref mut task) = TASK_MANAGER.tasks[current_slot] {
             let mut p = start;
+            let mut remotely_flushed = true;
             while p < end && p < KERNEL_MMIO_BASE {
                 let should = task.page_refcounts.dec(p);
                 if should {
@@ -1237,8 +1490,10 @@ pub fn sys_munmap(current_slot: usize, addr: u32, len: usize) -> usize {
                     // Tokio exhaust all RAM after enough mmap/munmap churn.
                     let frame = task.pd().translate(p).map(|phys| phys >> 12);
                     task.pd_mut().unmap(p);
-                    if let Some(frame) = frame {
-                        PAGING.lock().free_phys_frame(frame);
+                    let flushed = crate::smp::shootdown_tlb(task.page_dir_phys, p);
+                    remotely_flushed &= flushed;
+                    if flushed && let Some(frame) = frame {
+                        crate::memory::shared::release_user_frame(frame);
                     }
                 }
                 p += page_size;
@@ -1248,7 +1503,11 @@ pub fn sys_munmap(current_slot: usize, addr: u32, len: usize) -> usize {
             // eligible; stack/ELF/fixed mappings must never become allocator
             // holes. If a page is still referenced, keep the whole range out of
             // the free list rather than risk overlapping a live mapping.
-            if start >= 0x6000_0000 && end <= 0xB000_0000 && end > start {
+            if remotely_flushed
+                && start >= 0x6000_0000
+                && end <= 0xB000_0000
+                && end > start
+            {
                 let mut q = start;
                 let mut fully_unmapped = true;
                 while q < end {
@@ -1573,14 +1832,29 @@ pub fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) 
                     if current.fd_table.is_nonblock(fd) {
                         return pipe::pipe_try_read(pipe_id, buf_ptr, count);
                     }
-                    return pipe::pipe_read(pipe_id, buf_ptr, count);
+                    let result = pipe::pipe_try_read(pipe_id, buf_ptr, count);
+                    return if result == usize::MAX {
+                        BLOCK_AND_RESTART
+                    } else {
+                        result
+                    };
                 }
                 Some(FileDescriptor::Pty { pty_id, side }) => {
                     let nonblock = current.fd_table.is_nonblock(fd);
                     let out = core::slice::from_raw_parts_mut(buf_ptr, count);
-                    return crate::tty::read(current_slot, pty_id, side, out, nonblock);
+                    let result = crate::tty::read(current_slot, pty_id, side, out, nonblock);
+                    return if result == crate::tty::WOULD_BLOCK {
+                        BLOCK_AND_RESTART
+                    } else {
+                        result
+                    };
                 }
-                Some(FileDescriptor::Socket { .. }) => return 0,
+                Some(FileDescriptor::Socket { .. }) => {
+                    // Rust std::net::TcpStream uses read(2), not recvfrom(2).
+                    // Returning 0 here reports EOF to userspace, which makes
+                    // TLS tear down a perfectly live TCP connection.
+                    return sys_recvfrom(current_slot, fd, buf_ptr, count);
+                }
                 Some(FileDescriptor::ConsoleOut) => return 0,
                 None => return 0,
                 Some(FileDescriptor::Device { inode, mode, .. }) => {
@@ -1605,21 +1879,14 @@ pub fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) 
 
 /// Блокирующее чтение из stdin (буфер клавиатуры).
 ///
-/// Сигналы `sti` чтобы прерывания клавиатуры (IRQ1) и таймера (IRQ0)
-/// могли срабатывать. Когда буфер пуст, `hlt` усыпляет CPU до следующего
-/// прерывания. KMutex буфера сам делает `cli`/`sti` при lock/unlock,
-/// поэтому гонки между чтением и обработчиком клавиатуры нет.
+/// Если буфер пуст, задача переходит в состояние ожидания, а планировщик
+/// запускает другую задачу. После пробуждения системный вызов повторяется.
 pub fn sys_read_stdin(buf_ptr: *mut u8, count: usize) -> usize {
     let mut read = 0;
 
-    // Включаем прерывания — обработчик клавиатуры сможет наполнять буфер
-    unsafe {
-        asm!("sti");
-    }
-
     while read < count {
         let byte = {
-            // KMutex: lock → cli, drop → sti
+            // KMutex сохраняет и восстанавливает состояние прерываний этого CPU.
             let mut guard = KEYBOARD_BUFFER.lock();
             match &mut *guard {
                 Some(b) if !b.is_empty() => Some(b.pop()),
@@ -1635,17 +1902,9 @@ pub fn sys_read_stdin(buf_ptr: *mut u8, count: usize) -> usize {
                 read += 1;
             }
             None => {
-                // Буфер пуст — спим до следующего прерывания
-                unsafe {
-                    asm!("hlt");
-                }
+                return if read == 0 { BLOCK_AND_RESTART } else { read };
             }
         }
-    }
-
-    // Восстанавливаем состояние (syscall entry сделал cli)
-    unsafe {
-        asm!("cli");
     }
     read
 }
@@ -1669,6 +1928,9 @@ pub fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usiz
 
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
+            if current.name.starts_with(b"thread-smoke") || current.name.starts_with(b"tokio-smoke") {
+                println!("[stdio-trace] task={} fd={} len={}", current_slot, fd, count);
+            }
             let desc = current.fd_table.get(fd).copied().or_else(|| {
                 if fd == 1 || fd == 2 {
                     Some(FileDescriptor::ConsoleOut)
@@ -1712,13 +1974,27 @@ pub fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usiz
                     if current.fd_table.is_nonblock(fd) {
                         return pipe::pipe_try_write(pipe_id, buf_ptr, count);
                     }
-                    return pipe::pipe_write(pipe_id, buf_ptr, count);
+                    let result = pipe::pipe_try_write(pipe_id, buf_ptr, count);
+                    return if result == usize::MAX {
+                        BLOCK_AND_RESTART
+                    } else {
+                        result
+                    };
                 }
                 Some(FileDescriptor::Pty { pty_id, side }) => {
                     let nonblock = current.fd_table.is_nonblock(fd);
-                    return crate::tty::write(current_slot, pty_id, side, buf, nonblock);
+                    let result = crate::tty::write(current_slot, pty_id, side, buf, nonblock);
+                    return if result == crate::tty::WOULD_BLOCK {
+                        BLOCK_AND_RESTART
+                    } else {
+                        result
+                    };
                 }
-                Some(FileDescriptor::Socket { .. }) => return 0,
+                Some(FileDescriptor::Socket { .. }) => {
+                    // Rust std::net::TcpStream uses write(2), not sendto(2).
+                    // Route it through the same smoltcp path as sendto.
+                    return sys_sendto(current_slot, fd, buf_ptr, count);
+                }
                 Some(FileDescriptor::Device { inode, mode, .. }) => {
                     if mode == FileMode::ReadOnly {
                         return 0;
@@ -1733,11 +2009,14 @@ pub fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usiz
                             0
                         };
 
-                        return crate::drivers::audio::write_stream_blocking(
-                            owner as i32,
-                            buf,
-                            nonblock,
-                        );
+                        return match crate::drivers::audio::try_write_stream(owner as i32, buf) {
+                            crate::drivers::audio::StreamWrite::Written(written) => written,
+                            crate::drivers::audio::StreamWrite::WouldBlock if nonblock => EAGAIN,
+                            crate::drivers::audio::StreamWrite::WouldBlock => {
+                                AUDIO_BLOCK_AND_RESTART
+                            }
+                            crate::drivers::audio::StreamWrite::Unavailable => 0,
+                        };
                     }
                     // O_APPEND is meaningful for seekable regular files, not raw
                     // character/block devices. Device writes use the shared OFD
@@ -2250,31 +2529,169 @@ pub fn sys_clock_gettime(clock_id: i32, tp: *mut TimeSpec) -> usize {
     0
 }
 
-pub fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> usize {
+const FUTEX_WAIT: u32 = 0;
+const FUTEX_WAKE: u32 = 1;
+const FUTEX_PRIVATE_FLAG: u32 = 128;
+const FUTEX_CLOCK_REALTIME: u32 = 256;
+const FUTEX_CMD_MASK: u32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+
+fn futex_key(thread_slot: usize, uaddr: *mut u32, op: u32) -> Result<u64, usize> {
+    let addr = uaddr as u32;
+    if addr == 0 || addr & 3 != 0 {
+        return Err(EINVAL);
+    }
+    if addr >= KERNEL_MMIO_BASE {
+        return Err(EFAULT);
+    }
+    let task = unsafe {
+        TASK_MANAGER
+            .tasks
+            .get(thread_slot)
+            .and_then(|task| task.as_ref())
+            .ok_or(EFAULT)?
+    };
+    let phys = task.pd().translate(addr).ok_or(EFAULT)?;
+    if op & FUTEX_PRIVATE_FLAG != 0 {
+        Ok((1u64 << 63) | ((task.pid as u32 as u64) << 32) | addr as u64)
+    } else {
+        Ok(phys as u64)
+    }
+}
+
+/// Linux-compatible i386 futex wait/wake subset.
+///
+/// The wait key is the physical address of the futex word, so aliases of a
+/// MAP_SHARED page across processes rendezvous on the same queue. Private
+/// futexes use a process-scoped virtual key. Wait/check and queue insertion are
+/// serialized by the SMP kernel lock, which closes the lost-wakeup window.
+fn sys_futex(
+    thread_slot: usize,
+    esp: u32,
+    uaddr: *mut u32,
+    op: u32,
+    val: u32,
+    timeout: *const TimeSpec,
+) -> u32 {
+    let state = unsafe { &mut *(esp as *mut CPUState) };
+    let cmd = op & FUTEX_CMD_MASK;
+    if op & FUTEX_CLOCK_REALTIME != 0 {
+        state.eax = ENOSYS as u32;
+        return esp;
+    }
+
+    // FUTEX_WAIT uses a relative timeout. Keep it in the task so a timer tick
+    // can complete the blocked syscall without polling/yielding in userspace.
+    let wait_deadline_ms = if cmd == FUTEX_WAIT && !timeout.is_null() {
+        let request = unsafe { *timeout };
+        if request.tv_sec < 0 || request.tv_nsec < 0 || request.tv_nsec >= 1_000_000_000 {
+            state.eax = EINVAL as u32;
+            return esp;
+        }
+        let wait_ms = (request.tv_sec as u64)
+            .saturating_mul(1000)
+            .saturating_add((request.tv_nsec as u64 + 999_999) / 1_000_000);
+        if wait_ms == 0 {
+            state.eax = ETIMEDOUT as u32;
+            return esp;
+        }
+        Some(monotonic_ms().saturating_add(wait_ms))
+    } else {
+        None
+    };
+
+    let key = match futex_key(thread_slot, uaddr, op) {
+        Ok(key) => key,
+        Err(err) => {
+            state.eax = err as u32;
+            return esp;
+        }
+    };
+
+    match cmd {
+        FUTEX_WAIT => {
+            let current = unsafe {
+                (&*(uaddr as *const AtomicU32)).load(Ordering::SeqCst)
+            };
+            if current != val {
+                state.eax = EAGAIN as u32;
+                return esp;
+            }
+            state.eax = 0;
+            unsafe {
+                let Some(task) = TASK_MANAGER.tasks[thread_slot].as_mut() else {
+                    state.eax = EFAULT as u32;
+                    return esp;
+                };
+                task.futex_key = key;
+                task.wake_deadline_ms = wait_deadline_ms.unwrap_or(0);
+                task.block(crate::multitasking::task::WaitReason::Futex);
+                TASK_MANAGER.schedule(esp as *mut CPUState) as u32
+            }
+        }
+        FUTEX_WAKE => {
+            let mut woken = 0u32;
+            unsafe {
+                for task in TASK_MANAGER.tasks.iter_mut().flatten() {
+                    if woken >= val {
+                        break;
+                    }
+                    if task.state == TaskState::Blocked(crate::multitasking::task::WaitReason::Futex)
+                        && task.futex_key == key
+                    {
+                        task.futex_key = 0;
+                        task.wake_deadline_ms = 0;
+                        task.wake();
+                        woken += 1;
+                    }
+                }
+            }
+            state.eax = woken;
+            esp
+        }
+        _ => {
+            state.eax = ENOSYS as u32;
+            esp
+        }
+    }
+}
+
+pub fn sys_nanosleep_block(
+    thread_slot: usize,
+    esp: u32,
+    req: *const TimeSpec,
+    rem: *mut TimeSpec,
+) -> u32 {
     if req.is_null() {
-        return EFAULT;
+        unsafe { (*(esp as *mut CPUState)).eax = EFAULT as u32 };
+        return esp;
     }
     let request = unsafe { *req };
     if request.tv_sec < 0 || request.tv_nsec < 0 || request.tv_nsec >= 1_000_000_000 {
-        return EINVAL;
+        unsafe { (*(esp as *mut CPUState)).eax = EINVAL as u32 };
+        return esp;
     }
     let wait_ms = (request.tv_sec as u64)
         .saturating_mul(1000)
         .saturating_add((request.tv_nsec as u64 + 999_999) / 1_000_000);
-    let start = monotonic_ms();
-    while monotonic_ms().wrapping_sub(start) < wait_ms {
-        unsafe {
-            asm!("sti");
-            asm!("hlt");
-            asm!("cli");
-        }
-    }
     if !rem.is_null() {
         unsafe {
             *rem = TimeSpec::default();
         }
     }
-    0
+    unsafe {
+        let state = &mut *(esp as *mut CPUState);
+        state.eax = 0;
+        if wait_ms == 0 {
+            return esp;
+        }
+        let Some(task) = TASK_MANAGER.tasks[thread_slot].as_mut() else {
+            state.eax = EINVAL as u32;
+            return esp;
+        };
+        task.wake_deadline_ms = monotonic_ms().saturating_add(wait_ms);
+        task.block(crate::multitasking::task::WaitReason::Timer);
+        TASK_MANAGER.schedule(esp as *mut CPUState) as u32
+    }
 }
 
 pub fn sys_tty_setfg(current_slot: usize, pgid: i32) -> usize {
@@ -2393,6 +2810,7 @@ fn finish_process(leader_slot: usize, status: i32, term_signal: u32) {
                 close_descriptor(desc);
             }
             leader.running = false;
+            leader.state = TaskState::Zombie;
             leader.stopped = false;
             leader.thread_exited = true;
             leader.zombie = true;
@@ -2401,6 +2819,8 @@ fn finish_process(leader_slot: usize, status: i32, term_signal: u32) {
         }
         crate::syscalls::wasm::clear_task_state(leader_slot);
         TASK_MANAGER.reparent_children_of(dead_pid);
+        TASK_MANAGER.wake_waiters(crate::multitasking::task::WaitReason::Child);
+        TASK_MANAGER.wake_waiters(crate::multitasking::task::WaitReason::Thread);
     }
 }
 
@@ -2414,6 +2834,7 @@ pub fn sys_exit(current_slot: usize, esp: u32, status: i32) -> u32 {
             for slot in members {
                 if let Some(ref mut thread) = TASK_MANAGER.tasks[slot] {
                     thread.running = false;
+                    thread.state = TaskState::Zombie;
                     thread.stopped = false;
                     thread.thread_exited = true;
                     thread.thread_exit_value = status as u32;
@@ -2441,10 +2862,12 @@ pub fn sys_thread_exit(thread_slot: usize, esp: u32, value: u32) -> u32 {
         let leader_slot = TASK_MANAGER.process_slot(thread_slot);
         if let Some(ref mut thread) = TASK_MANAGER.tasks[thread_slot] {
             thread.running = false;
+            thread.state = TaskState::Zombie;
             thread.stopped = false;
             thread.thread_exited = true;
             thread.thread_exit_value = value;
         }
+        TASK_MANAGER.wake_waiters(crate::multitasking::task::WaitReason::Thread);
         if TASK_MANAGER.live_thread_count(leader_slot) == 0 {
             finish_process(leader_slot, value as i32, 0);
         }
@@ -2496,6 +2919,14 @@ pub fn sys_thread_create(leader_slot: usize, entry: u32, arg: u32) -> usize {
         }
 
         let mut thread = Task::new_thread(page_dir, page_dir_phys);
+        crate::debugln!(
+            "[thread] create-args leader={} slot={} entry={:#x} arg={:#x} kstack_base={:#x}",
+            leader_slot,
+            slot,
+            entry,
+            arg,
+            thread.stack_base
+        );
         let kernel_stack_top = thread.stack_base + crate::multitasking::task::STACK_SIZE as u32;
         thread.kernel_stack = kernel_stack_top;
         let state_ptr = (kernel_stack_top as usize
@@ -2525,6 +2956,7 @@ pub fn sys_thread_create(leader_slot: usize, entry: u32, arg: u32) -> usize {
 
         thread.cpu_state_ptr = state_ptr as u32;
         thread.running = true;
+        thread.state = TaskState::Runnable;
         thread.pid = pid;
         thread.tid = tid;
         thread.leader_slot = leader_slot as i8;
@@ -2578,21 +3010,17 @@ pub fn sys_thread_join(
             return EINVAL;
         }
         if exited {
+            if !unsafe { TASK_MANAGER.reap_thread(slot) } {
+                return EAGAIN;
+            }
             if !value_out.is_null() {
                 unsafe {
                     *value_out = value;
                 }
             }
-            unsafe {
-                TASK_MANAGER.reap_thread(slot);
-            }
             return tid as usize;
         }
-        unsafe {
-            asm!("sti");
-            asm!("hlt");
-            asm!("cli");
-        }
+        return EAGAIN;
     }
 }
 
@@ -2839,6 +3267,9 @@ pub fn sys_wait_status(current_slot: usize, pid: i32, status_ptr: *mut i32, opti
         if let Some(event) = event {
             match event {
                 ChildEvent::Exited(slot, child_pid, exit_code, term_signal) => {
+                    if !unsafe { TASK_MANAGER.reap(slot) } {
+                        return if options & WNOHANG != 0 { 0 } else { EAGAIN };
+                    }
                     if !status_ptr.is_null() {
                         // Unix wait status: normal exit code in bits 8..15;
                         // signal termination in low 7 bits.
@@ -2850,9 +3281,6 @@ pub fn sys_wait_status(current_slot: usize, pid: i32, status_ptr: *mut i32, opti
                         unsafe {
                             *status_ptr = status;
                         }
-                    }
-                    unsafe {
-                        TASK_MANAGER.reap(slot);
                     }
                     return child_pid as usize;
                 }
@@ -2899,11 +3327,7 @@ pub fn sys_wait_status(current_slot: usize, pid: i32, status_ptr: *mut i32, opti
             return usize::MAX;
         }
 
-        unsafe {
-            asm!("sti");
-            asm!("hlt");
-            asm!("cli");
-        }
+        return EAGAIN;
     }
 }
 
@@ -3045,6 +3469,44 @@ pub const POLLOUT: i16 = 0x0004;
 pub const POLLERR: i16 = 0x0008;
 pub const POLLHUP: i16 = 0x0010;
 
+static POLL_DEBUG_CALLS: AtomicU32 = AtomicU32::new(0);
+static POLL_DEBUG_BLOCKS: AtomicU32 = AtomicU32::new(0);
+static POLL_DEBUG_NFDS: AtomicU32 = AtomicU32::new(0);
+static POLL_DEBUG_REQUESTED: AtomicU32 = AtomicU32::new(0);
+static POLL_DEBUG_RETURNED: AtomicU32 = AtomicU32::new(0);
+static POLL_DEBUG_READY: AtomicU32 = AtomicU32::new(0);
+static POLL_DEBUG_SLOT: AtomicU32 = AtomicU32::new(u32::MAX);
+static POLL_DEBUG_FDS: [AtomicU32; 8] = [const { AtomicU32::new(0xffff_ffff) }; 8];
+
+pub struct PollDebugSnapshot;
+
+impl core::fmt::Display for PollDebugSnapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "poll: calls={} blocks={} slot={} nfds={} requested={:#06x} returned={:#06x} ready={}",
+            POLL_DEBUG_CALLS.load(Ordering::Relaxed),
+            POLL_DEBUG_BLOCKS.load(Ordering::Relaxed),
+            POLL_DEBUG_SLOT.load(Ordering::Relaxed),
+            POLL_DEBUG_NFDS.load(Ordering::Relaxed),
+            POLL_DEBUG_REQUESTED.load(Ordering::Relaxed),
+            POLL_DEBUG_RETURNED.load(Ordering::Relaxed),
+            POLL_DEBUG_READY.load(Ordering::Relaxed),
+        )?;
+        for packed in &POLL_DEBUG_FDS {
+            let packed = packed.load(Ordering::Relaxed);
+            if packed == 0xffff_ffff {
+                continue;
+            }
+            let fd = (packed & 0xffff) as u16;
+            let events = ((packed >> 16) & 0xff) as u8;
+            let revents = ((packed >> 24) & 0xff) as u8;
+            write!(f, " fd{}:{:#04x}->{:#04x}", fd, events, revents)?;
+        }
+        Ok(())
+    }
+}
+
 fn fd_poll_revents(current_slot: usize, fd: i32, events: i16) -> i16 {
     if fd < 0 {
         return 0;
@@ -3088,6 +3550,15 @@ fn fd_poll_revents(current_slot: usize, fd: i32, events: i16) -> i16 {
                 } else {
                     0
                 }
+            }
+            Some(FileDescriptor::Device { inode, .. }) if crate::drivers::audio::is_audio_inode(inode) => {
+                let mut rev = 0i16;
+                if events & POLLOUT != 0
+                    && crate::drivers::audio::stream_writable(current.pid)
+                {
+                    rev |= POLLOUT;
+                }
+                rev
             }
             Some(FileDescriptor::ConsoleOut)
             | Some(FileDescriptor::File { .. })
@@ -3173,32 +3644,87 @@ fn fd_poll_revents(current_slot: usize, fd: i32, events: i16) -> i16 {
 }
 
 pub fn sys_poll(current_slot: usize, fds: *mut PollFd, nfds: usize, timeout_ms: i32) -> usize {
-    if fds.is_null() || nfds == 0 {
-        return 0;
+    let thread_slot = unsafe { TASK_MANAGER.get_current_slot() as usize };
+    POLL_DEBUG_CALLS.fetch_add(1, Ordering::Relaxed);
+    POLL_DEBUG_SLOT.store(current_slot as u32, Ordering::Relaxed);
+    for packed in &POLL_DEBUG_FDS {
+        packed.store(0xffff_ffff, Ordering::Relaxed);
     }
+    let trace_reqwest = unsafe {
+        TASK_MANAGER.tasks[current_slot]
+            .as_ref()
+            .map_or(false, |t| t.name.starts_with(b"reqwest-smoke"))
+    };
+    if fds.is_null() && nfds != 0 { return EFAULT; }
     let nfds = nfds.min(64);
-    let start_ms = crate::time::uptime_ms();
+    if timeout_ms > 0 {
+        unsafe {
+            if let Some(task) = TASK_MANAGER.tasks[thread_slot].as_mut() {
+                if task.wake_deadline_ms == 0 {
+                    task.wake_deadline_ms = crate::time::uptime_ms()
+                        .saturating_add(timeout_ms as u64);
+                }
+            }
+        }
+    }
 
     loop {
+        if trace_reqwest {
+            crate::debugln!("[reqpoll] before stack.poll nfds={} fds={:#x}", nfds, fds as u32);
+        }
         if let Some(mut g) = crate::net::stack::NET_STACK.try_lock() {
             if let Some(ref mut stack) = *g {
                 stack.poll(crate::time::uptime_ms() as i64);
             }
         }
+        if trace_reqwest {
+            crate::debugln!("[reqpoll] after stack.poll");
+        }
         let mut ready = 0usize;
+        let mut requested_mask = 0u32;
+        let mut returned_mask = 0u32;
         for i in 0..nfds {
             unsafe {
                 let p = fds.add(i);
                 let fd = (*p).fd;
                 let events = (*p).events;
+                requested_mask |= events as u16 as u32;
+                if trace_reqwest {
+                    crate::debugln!(
+                        "[reqpoll] before fd_poll i={} fd={} events={:#x} p={:#x}",
+                        i,
+                        fd,
+                        events,
+                        p as u32
+                    );
+                }
                 let rev = fd_poll_revents(current_slot, fd, events);
+                if trace_reqwest {
+                    crate::debugln!("[reqpoll] after fd_poll i={} fd={} rev={:#x}", i, fd, rev);
+                }
                 (*p).revents = rev;
+                if i < POLL_DEBUG_FDS.len() {
+                    let packed = (fd as u32 & 0xffff)
+                        | (((events as u16 as u32) & 0xff) << 16)
+                        | (((rev as u16 as u32) & 0xff) << 24);
+                    POLL_DEBUG_FDS[i].store(packed, Ordering::Relaxed);
+                }
+                returned_mask |= rev as u16 as u32;
                 if rev != 0 {
                     ready += 1;
                 }
             }
         }
+        POLL_DEBUG_NFDS.store(nfds as u32, Ordering::Relaxed);
+        POLL_DEBUG_REQUESTED.store(requested_mask, Ordering::Relaxed);
+        POLL_DEBUG_RETURNED.store(returned_mask, Ordering::Relaxed);
+        POLL_DEBUG_READY.store(ready as u32, Ordering::Relaxed);
         if ready > 0 {
+            unsafe {
+                if let Some(task) = TASK_MANAGER.tasks[thread_slot].as_mut() {
+                    task.wake_deadline_ms = 0;
+                }
+            }
             return ready;
         }
         // timeout_ms: -1 = block forever, 0 = return immediately, >0 = ms
@@ -3206,17 +3732,23 @@ pub fn sys_poll(current_slot: usize, fds: *mut PollFd, nfds: usize, timeout_ms: 
             return 0;
         }
         if timeout_ms > 0 {
-            let elapsed = crate::time::uptime_ms().saturating_sub(start_ms);
-            if elapsed >= timeout_ms as u64 {
+            let deadline = unsafe {
+                TASK_MANAGER.tasks[thread_slot]
+                    .as_ref()
+                    .map_or(0, |task| task.wake_deadline_ms)
+            };
+            if crate::time::uptime_ms() >= deadline {
+                unsafe {
+                    if let Some(task) = TASK_MANAGER.tasks[thread_slot].as_mut() {
+                        task.wake_deadline_ms = 0;
+                    }
+                }
                 return 0;
             }
         }
         // Sleep until next timer/keyboard interrupt so other tasks can run.
-        unsafe {
-            asm!("sti");
-            asm!("hlt");
-            asm!("cli");
-        }
+        POLL_DEBUG_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        return BLOCK_AND_RESTART;
     }
 }
 
@@ -3570,6 +4102,8 @@ pub fn sys_spawn_path(
     requested_pgid: i32,
     foreground: bool,
 ) -> usize {
+    use crate::smp::{trace_kernel_work, KernelWork};
+    trace_kernel_work(KernelWork::SpawnPath, 0);
     if path_ptr.is_null() {
         return usize::MAX;
     }
@@ -3578,6 +4112,7 @@ pub fn sys_spawn_path(
         return usize::MAX;
     }
     let path = resolve_task_path(parent_slot, &raw_path);
+    trace_kernel_work(KernelWork::SpawnRead, 0);
     let image = match VFS.get().read_file(&path) {
         Some(image) => image,
         None => return usize::MAX,
@@ -3609,6 +4144,8 @@ fn sys_spawn_image(
     requested_pgid: i32,
     foreground: bool,
 ) -> usize {
+    use crate::smp::{trace_kernel_work, KernelWork};
+    trace_kernel_work(KernelWork::SpawnSlot, 0);
     let slot_i8 = unsafe { TASK_MANAGER.get_free_slot() };
     if slot_i8 < 0 {
         println!("[spawn] No free task slot!");
@@ -3672,10 +4209,12 @@ fn sys_spawn_image(
         let pd_phys = task.page_dir_phys;
 
         // Kernel mappings в PD задачи
+        trace_kernel_work(KernelWork::SpawnMappings, 0);
         copy_kernel_mappings(task.pd_mut(), pd_phys);
 
         // User stack
         for i in 0..USER_STACK_PAGES {
+            trace_kernel_work(KernelWork::SpawnUserStack, i);
             let page = USER_STACK_TOP - (i + 1) * PAGE_SIZE as u32;
             task.pd_mut().alloc_and_map_user_page(page);
         }
@@ -3684,6 +4223,7 @@ fn sys_spawn_image(
         // Also seed page_refcounts so a stray FREE cannot unmap these pages.
         const USER_HEAP_PAGES: u32 = 512; // 2 MiB
         for i in 0..USER_HEAP_PAGES {
+            if i % 32 == 0 { trace_kernel_work(KernelWork::SpawnHeap, i); }
             let va = heap_start + i * PAGE_SIZE as u32;
             task.pd_mut().alloc_and_map_user_page(va);
             let _ = task.page_refcounts.inc(va);
@@ -3692,6 +4232,7 @@ fn sys_spawn_image(
         // Переключаемся на PD задачи и грузим ELF по его p_vaddr
         // task.page_dir.switch();
 
+        trace_kernel_work(KernelWork::SpawnElf, 0);
         let entry_point = match crate::elf::load_elf(buf, task.pd_mut()) {
             Ok(e) => e,
             Err(e) => {
@@ -3721,6 +4262,7 @@ fn sys_spawn_image(
         task.cpu_state_ptr = state_ptr as u32;
 
         // argc/argv/envp on the initial user stack.
+        trace_kernel_work(KernelWork::SpawnUserArgs, 0);
         let user_esp = setup_user_stack(task.pd(), USER_STACK_TOP, argv, envp);
 
         *state_ptr = CPUState {
@@ -3744,6 +4286,7 @@ fn sys_spawn_image(
             | crate::memory::paging::PDEFlags::WRITABLE;
 
         task.running = true;
+        task.state = TaskState::Runnable;
         task.heap_next = heap_start;
         task.mmap_next = 0x6000_0000;
         task.pid = pid;
@@ -3769,6 +4312,7 @@ fn sys_spawn_image(
         task.pending_signals = 0;
         task.signal_handlers = [0; 32];
 
+        trace_kernel_work(KernelWork::SpawnFds, 0);
         let mut fd_table = FileDescriptorTable::with_stdio();
         install_child_fd(
             parent_slot,
@@ -3806,6 +4350,7 @@ fn sys_spawn_image(
         task.fd_table = fd_table;
 
         // Publish only a fully initialized runnable task.
+        trace_kernel_work(KernelWork::SpawnPublish, slot as u32);
         TASK_MANAGER.tasks[slot] = Some(task);
         TASK_MANAGER.task_count += 1;
 
@@ -3823,6 +4368,7 @@ fn sys_spawn_image(
             }
         }
 
+        trace_kernel_work(KernelWork::SpawnFinish, pid as u32);
         pid as usize
     }
 }
@@ -4130,15 +4676,12 @@ pub fn sys_accept4(
 
         // Blocking accept: release all networking locks and sleep until the next
         // IRQ. The next iteration polls smoltcp again and re-checks the listener.
-        unsafe {
-            asm!("sti");
-            asm!("hlt");
-            asm!("cli");
-        }
+        return BLOCK_AND_RESTART;
     }
 }
 
 pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: usize) -> usize {
+    let thread_slot = unsafe { TASK_MANAGER.get_current_slot() as usize };
     if addr_ptr.is_null() {
         return EFAULT;
     }
@@ -4165,7 +4708,6 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
         addr: IpAddress::Ipv4(Ipv4Addr::from_bits(addr.sin_addr.s_addr)),
         port: u16::from_be(addr.sin_port),
     };
-    let local_port = alloc_ephemeral_port();
 
     // UDP connect only records the peer and binds an ephemeral local port.
     {
@@ -4182,7 +4724,7 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
             let socket = stack.sockets.get_mut::<udp::Socket>(handle);
             let listen = IpListenEndpoint {
                 addr: None,
-                port: local_port,
+                port: alloc_ephemeral_port(),
             };
             if socket.bind(listen).is_err() {
                 return EINVAL;
@@ -4195,11 +4737,6 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
             return 0;
         }
     }
-
-    let local = IpListenEndpoint {
-        addr: None,
-        port: local_port,
-    };
 
     // Start the TCP handshake exactly once. Mio/Tokio sockets are non-blocking,
     // so connect(2) must return -EINPROGRESS after SYN is queued and let poll()
@@ -4235,9 +4772,24 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
             return 0;
         }
         if !matches!(state, tcp::State::Closed) {
-            return if nonblock { EINPROGRESS } else { EINVAL };
+            return if nonblock { EINPROGRESS } else {
+                let deadline = unsafe { TASK_MANAGER.tasks[thread_slot].as_ref().map_or(0, |t| t.connect_deadline_ms) };
+                if deadline != 0 && crate::time::uptime_ms() >= deadline { ETIMEDOUT } else { BLOCK_AND_RESTART }
+            };
+        }
+        // A restarted failed handshake must not start a new SYN transaction.
+        if unsafe { TASK_MANAGER.tasks[thread_slot].as_ref().is_some_and(|t| t.connect_deadline_ms != 0) } {
+            return ECONNREFUSED;
         }
 
+        // Allocate a source port only when a brand-new TCP handshake is
+        // actually started. Restarted blocking connect(2) calls and repeated
+        // EINPROGRESS probes must not consume ports and perturb the next flow's
+        // 4-tuple/RSS hash.
+        let local = IpListenEndpoint {
+            addr: None,
+            port: alloc_ephemeral_port(),
+        };
         let connect_result = {
             let socket = stack.sockets.get_mut::<tcp::Socket>(handle);
             socket.connect(stack.iface.context(), endpoint, local)
@@ -4268,6 +4820,7 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
 
     // Blocking std::net::TcpStream::connect keeps the old synchronous behaviour.
     let start = crate::time::uptime_ms();
+    unsafe { if let Some(t) = TASK_MANAGER.tasks[thread_slot].as_mut() { t.connect_deadline_ms = start.saturating_add(10_000); } }
     loop {
         {
             let mut guard = NET_STACK.lock();
@@ -4299,11 +4852,7 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
         if crate::time::uptime_ms().saturating_sub(start) >= 10_000 {
             return ETIMEDOUT;
         }
-        unsafe {
-            asm!("sti");
-            asm!("hlt");
-            asm!("cli");
-        }
+        return BLOCK_AND_RESTART;
     }
 }
 
@@ -4457,11 +5006,7 @@ pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) ->
         if nonblock {
             return EAGAIN;
         }
-        unsafe {
-            asm!("sti");
-            asm!("hlt");
-            asm!("cli");
-        }
+        return BLOCK_AND_RESTART;
     }
 }
 
@@ -4553,11 +5098,7 @@ pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) ->
         if nonblock {
             return EAGAIN;
         }
-        unsafe {
-            asm!("sti");
-            asm!("hlt");
-            asm!("cli");
-        }
+        return BLOCK_AND_RESTART;
     }
 }
 

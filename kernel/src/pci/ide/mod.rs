@@ -108,6 +108,10 @@ impl IDEController {
                 }
                 sleep(5);
 
+                // Never let a broken/legacy channel stall the whole boot.
+                // Some real controllers can leave IDENTIFY in BSY forever for
+                // an absent or unsupported device.
+                let mut identify_timeout = 2_000_000u32;
                 loop {
                     let status: u8 = channels[i].lock().read(ATAReg::STATUS);
                     if (status & ATAStatus::ERR) != 0 {
@@ -117,6 +121,20 @@ impl IDEController {
                     if ((status & ATAStatus::BSY) == 0) && ((status & ATAStatus::DRQ) != 0) {
                         break;
                     }
+                    if status == 0x00 || status == 0xFF || identify_timeout == 0 {
+                        err = 2;
+                        break;
+                    }
+                    identify_timeout -= 1;
+                }
+
+                if err == 2 {
+                    println!(
+                        "[IDE] IDENTIFY timeout/no device on {} {}",
+                        if i == 0 { "primary" } else { "secondary" },
+                        if j == 0 { "master" } else { "slave" }
+                    );
+                    continue;
                 }
 
                 // (IV) Probe for ATAPI Devices

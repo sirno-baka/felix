@@ -2,12 +2,12 @@
 //! Uses Felix PCI subsystem + PageManager for DMA buffers
 
 use crate::drivers::net::{map_mmio, RX_BUF_SIZE, RX_RING_SIZE, TX_BUF_SIZE, TX_RING_SIZE};
-use crate::memory::resources::{DmaBuffer as DmaAllocation, dma_alloc_for};
+use crate::memory::resources::{DmaBuffer as DmaAllocation, MmioMapping, dma_alloc_for, dma_wmb, dma_rmb};
 use crate::pci::{self, device::PciDevice};
 use crate::println;
 use crate::sync::mutex::Mutex;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 // ===================== Константы =====================
 const EE_SHIFT_CLK: u16 = 0x01;
@@ -84,6 +84,7 @@ struct RxDesc {
 
 pub struct I8255x {
     pub(crate) mmio: usize,
+    _mmio_mapping: MmioMapping,
     irq: u8,
     pub(crate) mac: [u8; 6],
 
@@ -107,7 +108,24 @@ pub struct I8255x {
 unsafe impl Send for I8255x {}
 unsafe impl Sync for I8255x {}
 
+impl Drop for I8255x {
+    fn drop(&mut self) {
+        self.initialized.store(false, Ordering::Release);
+        unsafe {
+            // SCB command high byte bit 0 masks all device interrupts.
+            write_volatile((self.mmio + SCB_CMD + 1) as *mut u8, 0x01);
+        }
+        let _ = self.reset();
+        unsafe {
+            write_volatile((self.mmio + SCB_CMD + 1) as *mut u8, 0x01);
+        }
+        crate::memory::resources::dma_mb();
+    }
+}
+
 pub static NET: Mutex<Option<I8255x>> = Mutex::new(None);
+static IRQ_MMIO: AtomicUsize = AtomicUsize::new(0);
+static IRQ_LINE: AtomicU8 = AtomicU8::new(u8::MAX);
 /// Проверенный Configure-блок для 82557/82558/82559
 /// (на основе Linux eepro100 + Intel рекомендаций)
 const CONFIG_DATA: [u8; 22] = [
@@ -143,7 +161,8 @@ impl I8255x {
 
         println!("i8255x: BAR0 phys={:#x} size={:#x}", mmio_phys, bar_size);
 
-        let mmio = map_mmio(mmio_phys, bar_size)?;
+        let mmio_mapping = map_mmio(mmio_phys, bar_size)?;
+        let mmio = mmio_mapping.as_usize();
         println!("i8255x: MMIO mapped at virt {:#x}", mmio);
 
         let tx_dma = dma_alloc_for(
@@ -167,6 +186,7 @@ impl I8255x {
 
         let mut nic = I8255x {
             mmio,
+            _mmio_mapping: mmio_mapping,
             irq: dev.interrupt_line,
             mac: [0; 6],
             tx_ring_phys: tx_phys,
@@ -201,6 +221,20 @@ impl I8255x {
         );
 
         *NET.lock() = Some(nic);
+        IRQ_MMIO.store(mmio, Ordering::Release);
+        IRQ_LINE.store(dev.interrupt_line, Ordering::Release);
+        if crate::drivers::shared_irq::register_named(dev.interrupt_line, irq_entry, "i8255x").is_ok() {
+            dev.write_u16(0x04, dev.read_u16(0x04) & !0x0400);
+            if let Some(nic) = NET.lock().as_ref() {
+                unsafe {
+                    // SCB interrupt-control byte: zero clears the global and
+                    // per-cause masks after all stale causes were acknowledged.
+                    write_volatile((nic.mmio + SCB_CMD + 1) as *mut u8, 0);
+                }
+            }
+        } else {
+            println!("i8255x: IRQ{} unavailable, polling fallback", dev.interrupt_line);
+        }
         Ok(())
     }
 
@@ -368,6 +402,7 @@ impl I8255x {
         self.wait_scb();
 
         // 2. Указать на первый RFD и запустить
+        dma_wmb();
         self.write_pointer(self.tx_ring_phys);
         self.scb_cmd(CU_START);
         self.wait_scb();
@@ -395,6 +430,7 @@ impl I8255x {
             }
         }
 
+        dma_wmb();
         self.write_pointer(self.tx_ring_phys);
         self.scb_cmd(CU_START);
         self.wait_scb();
@@ -419,6 +455,7 @@ impl I8255x {
         // Restart from the RFD we will read next, not always slot 0.
         let idx = self.rx_idx.load(Ordering::Relaxed);
         let ptr = self.rx_ring_phys + (idx * core::mem::size_of::<RxDesc>()) as u32;
+        dma_wmb();
         self.write_pointer(ptr);
         self.scb_cmd(RU_START);
         self.wait_scb();
@@ -471,6 +508,10 @@ impl I8255x {
             return Err("frame too large");
         }
 
+        // CU_START must never replace a command while the CU still owns it.
+        if unsafe { (read_volatile((self.mmio + SCB_STATUS) as *const u16) >> 6) & 3 } == 2 {
+            return Err("TX busy");
+        }
         let head = self.tx_head.load(Ordering::Relaxed);
         let next = (head + 1) % TX_RING_SIZE;
 
@@ -486,7 +527,7 @@ impl I8255x {
             write_volatile(&mut desc.status, 0);
             write_volatile(&mut desc.command, CMD_TX | CMD_EL | CMD_I);
             write_volatile(&mut desc.tbd_addr, 0xFFFFFFFF); // immediate
-            write_volatile(&mut desc.tcb_byte_count, data.len() as u16);
+            write_volatile(&mut desc.tcb_byte_count, 0x8000 | data.len() as u16);
             write_volatile(&mut desc.tx_threshold, 0xE0);
             write_volatile(&mut desc.tbd_number, 0);
 
@@ -494,6 +535,7 @@ impl I8255x {
             core::ptr::copy_nonoverlapping(data.as_ptr(), desc.data.as_mut_ptr(), data.len());
         }
 
+        dma_wmb();
         self.wait_scb();
         self.write_pointer(self.tx_ring_phys + (head * core::mem::size_of::<TxDesc>()) as u32);
         self.scb_cmd(CU_START);
@@ -518,13 +560,14 @@ impl I8255x {
             // Scanning ahead orphaned the in-order segment (pcap hole at seq 17486).
             if status & CMD_C == 0 {
                 let scb = read_volatile((self.mmio + SCB_STATUS) as *const u16);
-                if (scb & STAT_RNR) != 0 {
+                if matches!((scb >> 2) & 0xf, 0 | 1 | 2) {
                     write_volatile((self.mmio + SCB_STATUS) as *mut u16, STAT_RNR);
                     let _ = self.start_ru();
                 }
                 return None;
             }
 
+            dma_rmb();
             let count = (read_volatile(&desc.count) & 0x3FFF) as usize;
             let valid =
                 count >= 14 && count <= buf.len() && count <= RX_BUF_SIZE && (status & CMD_OK) != 0;
@@ -533,15 +576,16 @@ impl I8255x {
                 core::ptr::copy_nonoverlapping(desc.data.as_ptr(), buf.as_mut_ptr(), count);
             }
 
-            write_volatile(&mut desc.status, 0);
             write_volatile(&mut desc.count, 0);
             write_volatile(&mut desc.size, RX_BUF_SIZE as u16);
             write_volatile(&mut desc.command, 0);
+            dma_wmb();
+            write_volatile(&mut desc.status, 0);
 
             self.rx_idx.store((i + 1) % RX_RING_SIZE, Ordering::Release);
 
             let scb = read_volatile((self.mmio + SCB_STATUS) as *const u16);
-            if (scb & STAT_RNR) != 0 {
+            if matches!((scb >> 2) & 0xf, 0 | 1 | 2) {
                 write_volatile((self.mmio + SCB_STATUS) as *mut u16, STAT_RNR);
                 let _ = self.start_ru();
             }
@@ -560,25 +604,36 @@ impl I8255x {
 
     // -------------------- Interrupt handler --------------------
 
-    pub fn handle_interrupt(&self) {
+    pub fn handle_interrupt(&self) -> bool {
         unsafe {
             let status = read_volatile((self.mmio + SCB_STATUS) as *const u16);
-
-            // Acknowledge
-            write_volatile((self.mmio + SCB_STATUS) as *mut u16, status & 0xFF00);
-
-            if status & STAT_FR != 0 {
-                // Frame received — можно уведомить сетевой стек / задачу
+            let causes = status & (STAT_CX | STAT_FR | STAT_CNA | STAT_RNR);
+            if causes == 0 {
+                return false;
             }
 
-            if status & STAT_CX != 0 {
-                // Command completed
-            }
-
-            if status & STAT_RNR != 0 {
-                // Receiver Not Ready — перезапускаем
-                let _ = self.start_ru();
-            }
+            // W1C only. RU restart and descriptor processing belong to the
+            // network bottom half, never to the shared hard IRQ.
+            write_volatile((self.mmio + SCB_STATUS) as *mut u16, causes);
+            true
         }
     }
+}
+
+fn irq_entry(irq: u8) -> bool {
+    if IRQ_LINE.load(Ordering::Acquire) != irq {
+        return false;
+    }
+    let mmio = IRQ_MMIO.load(Ordering::Acquire);
+    if mmio == 0 {
+        return false;
+    }
+    let status = unsafe { read_volatile((mmio + SCB_STATUS) as *const u16) };
+    let causes = status & (STAT_CX | STAT_FR | STAT_CNA | STAT_RNR);
+    if causes == 0 {
+        return false;
+    }
+    unsafe { write_volatile((mmio + SCB_STATUS) as *mut u16, causes) };
+    crate::drivers::net::mark_irq_pending();
+    true
 }

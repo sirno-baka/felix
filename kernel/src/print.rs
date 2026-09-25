@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::fmt;
 use core::fmt::Write;
+use interrupt_sync::InterruptSpinMutex;
 
 // Keep the whole pre-STI boot log in memory. 4096 * 150 bytes is ~600 KiB,
 // large enough for verbose PCI/USB/network probing while still remaining a
@@ -43,12 +44,11 @@ const fn klog_new() -> Klog {
     }
 }
 
-/// Global ring; access only under `without_interrupts` / cli.
-static mut KLOG: Klog = klog_new();
+/// Independent SMP-safe ring. The lock also keeps local IRQs disabled for
+/// the whole critical section, so IRQ logging cannot re-enter on the same CPU.
+static KLOG: InterruptSpinMutex<Klog> = InterruptSpinMutex::new(klog_new());
 
-fn klog_feed_char(c: char) {
-    // SAFETY: caller must hold exclusive access (cli / without_interrupts).
-    let k = unsafe { &mut *core::ptr::addr_of_mut!(KLOG) };
+fn klog_feed_char(k: &mut Klog, c: char) {
     if c == '\n' {
         klog_commit_line(k);
         return;
@@ -89,38 +89,67 @@ fn klog_commit_line(k: &mut Klog) {
     k.cur_len = 0;
 }
 
-/// Append string to klog under cli. Safe to call from any context.
+/// Append string to klog. Never wait here: panic/exception logging may
+/// re-enter after a fault in a context that was already writing the log.
 pub fn klog_write_str(s: &str) {
-    interrupt_sync::without_interrupts(|| {
-        for c in s.chars() {
-            klog_feed_char(c);
-        }
-    });
+    let Some(mut k) = KLOG.try_lock() else {
+        return;
+    };
+    for c in s.chars() {
+        klog_feed_char(&mut k, c);
+    }
 }
 
 /// Oldest → newest completed lines, then incomplete current line.
 /// Does not take PRINTER lock.
 pub fn klog_for_each_line(mut f: impl FnMut(&[u8])) {
-    interrupt_sync::without_interrupts(|| {
-        let k = unsafe { &*core::ptr::addr_of!(KLOG) };
-        let count = k.count;
-        if count == 0 && k.cur_len == 0 {
-            return;
-        }
-        let start = if count < LOG_LINES {
-            0
-        } else {
-            k.head % LOG_LINES
-        };
-        for idx in 0..count {
-            let i = (start + idx) % LOG_LINES;
-            let len = k.lens[i] as usize;
-            f(&k.lines[i][..len]);
-        }
-        if k.cur_len > 0 {
-            f(&k.cur[..k.cur_len as usize]);
-        }
-    });
+    let Some(k) = KLOG.try_lock() else {
+        return;
+    };
+    let count = k.count;
+    if count == 0 && k.cur_len == 0 {
+        return;
+    }
+    let start = if count < LOG_LINES {
+        0
+    } else {
+        k.head % LOG_LINES
+    };
+    for idx in 0..count {
+        let i = (start + idx) % LOG_LINES;
+        let len = k.lens[i] as usize;
+        f(&k.lines[i][..len]);
+    }
+    if k.cur_len > 0 {
+        f(&k.cur[..k.cur_len as usize]);
+    }
+}
+
+/// Up to the newest 80 completed lines, then the incomplete current line.
+/// Does not take PRINTER lock.
+pub fn klog_for_each_line_last(mut f: impl FnMut(&[u8])) {
+    let Some(k) = KLOG.try_lock() else {
+        return;
+    };
+    let count = k.count;
+    if count == 0 && k.cur_len == 0 {
+        return;
+    }
+    let shown = count.min(50);
+    let oldest = if count < LOG_LINES {
+        0
+    } else {
+        k.head % LOG_LINES
+    };
+    let start = (oldest + count - shown) % LOG_LINES;
+    for idx in 0..shown {
+        let i = (start + idx) % LOG_LINES;
+        let len = k.lens[i] as usize;
+        f(&k.lines[i][..len]);
+    }
+    if k.cur_len > 0 {
+        f(&k.cur[..k.cur_len as usize]);
+    }
 }
 
 /// Copy the current kernel log oldest -> newest, adding a newline after every

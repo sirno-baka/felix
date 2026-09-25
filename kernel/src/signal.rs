@@ -8,7 +8,7 @@
 //! Signal numbers intentionally mirror Linux where practical.
 
 use crate::filesystem::file::{FileDescriptor, PipeEnd};
-use crate::multitasking::task::{CPUState, MAX_TASKS, TASK_MANAGER};
+use crate::multitasking::task::{CPUState, MAX_TASKS, TASK_MANAGER, TaskState};
 use crate::net::SocketState;
 use crate::println;
 
@@ -58,6 +58,7 @@ pub fn send_signal(slot: i8, sig: u32) -> bool {
                 return false;
             }
             t.pending_signals |= sigbit(sig);
+            if matches!(t.state, TaskState::Blocked(_)) { t.wake(); }
             true
         } else {
             false
@@ -92,6 +93,7 @@ pub fn stop_task_with_signal(slot: i8, sig: u32) -> bool {
                     continue;
                 }
                 t.running = false;
+                t.state = TaskState::Stopped;
                 t.stopped = true;
             }
         }
@@ -103,6 +105,7 @@ pub fn stop_task_with_signal(slot: i8, sig: u32) -> bool {
             t.wait_stopped_pending = true;
             // POSIX: generating a stop signal discards a pending SIGCONT.
             t.pending_signals &= !(sigbit(sig) | sigbit(SIGCONT));
+            TASK_MANAGER.wake_waiters(crate::multitasking::task::WaitReason::Child);
             println!("[signal] task {} stopped by {}", slot, sig);
             true
         } else {
@@ -129,6 +132,7 @@ pub fn continue_task(slot: i8) -> bool {
                 }
                 thread.stopped = false;
                 thread.running = true;
+                thread.state = TaskState::Runnable;
             }
         }
         if let Some(ref mut t) = TASK_MANAGER.tasks[leader] {
@@ -145,6 +149,7 @@ pub fn continue_task(slot: i8) -> bool {
                 | sigbit(SIGTSTP)
                 | sigbit(SIGTTIN)
                 | sigbit(SIGTTOU));
+            TASK_MANAGER.wake_waiters(crate::multitasking::task::WaitReason::Child);
             println!("[signal] task {} continued", slot);
             true
         } else {
@@ -173,6 +178,7 @@ pub fn force_kill(slot: i8, sig: u32) -> bool {
             if let Some(ref mut t) = TASK_MANAGER.tasks[member] {
                 t.pending_signals = 0;
                 t.running = false;
+                t.state = TaskState::Zombie;
                 t.stopped = false;
                 t.thread_exited = true;
                 t.term_signal = if sig == 0 { SIGKILL } else { sig };
@@ -186,6 +192,8 @@ pub fn force_kill(slot: i8, sig: u32) -> bool {
     };
     unsafe {
         TASK_MANAGER.reparent_children_of(dead_pid);
+        TASK_MANAGER.wake_waiters(crate::multitasking::task::WaitReason::Child);
+        TASK_MANAGER.wake_waiters(crate::multitasking::task::WaitReason::Thread);
     }
     close_task_fds(leader as i8);
     crate::syscalls::wasm::clear_task_state(leader);
@@ -240,6 +248,7 @@ fn close_task_fds(slot: i8) {
 /// from a normal syscall path.
 pub fn deliver_pending(esp: u32) -> u32 {
     unsafe {
+        if (*(esp as *const CPUState)).cs & 3 != 3 { return esp; }
         // Loop in case the newly scheduled task also has fatal signals.
         for _ in 0..MAX_TASKS_GUARD {
             let thread_slot = TASK_MANAGER.get_current_slot();

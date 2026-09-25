@@ -32,6 +32,7 @@ pub const SYS_GETSID: u32 = 147;
 pub const SYS_NANOSLEEP: u32 = 162;
 pub const SYS_SCHED_YIELD: u32 = 158;
 pub const SYS_GETTID: u32 = 224;
+pub const SYS_FUTEX: u32 = 240;
 pub const SYS_GETCWD: u32 = 183;
 pub const SYS_CLOCK_GETTIME: u32 = 265;
 pub const SYS_GETRANDOM: u32 = 355;
@@ -390,6 +391,39 @@ pub unsafe fn open(path: *const u8, flags: u32) -> usize {
     ret
 }
 
+#[repr(C)]
+pub struct MmapArgStruct {
+    pub addr: u32,
+    pub len: u32,
+    pub prot: u32,
+    pub flags: u32,
+    pub fd: i32,
+    pub offset: u32,
+}
+
+pub unsafe fn mmap_old(args: &MmapArgStruct) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_MMAP => ret,
+        in("ebx") args as *const MmapArgStruct,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn munmap(addr: *mut u8, len: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_MUNMAP => ret,
+        in("ebx") addr,
+        in("ecx") len,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
 pub unsafe fn close(fd: u32) -> usize {
     let ret: usize;
     asm!(
@@ -593,6 +627,41 @@ pub unsafe fn getrandom(buf: *mut u8, len: usize, flags: u32) -> isize {
         in("ecx") len,
         in("edx") flags,
         options(nostack, preserves_flags)
+    );
+    ret
+}
+
+pub const FUTEX_WAIT: u32 = 0;
+pub const FUTEX_WAKE: u32 = 1;
+
+pub unsafe fn futex_wait(uaddr: *mut u32, expected: u32) -> isize {
+    let ret: isize;
+    asm!(
+        "push esi",
+        "mov esi, 0",
+        "int 0x80",
+        "pop esi",
+        inlateout("eax") SYS_FUTEX => ret,
+        in("ebx") uaddr,
+        in("ecx") FUTEX_WAIT,
+        in("edx") expected,
+        options(preserves_flags)
+    );
+    ret
+}
+
+pub unsafe fn futex_wake(uaddr: *mut u32, count: u32) -> isize {
+    let ret: isize;
+    asm!(
+        "push esi",
+        "mov esi, 0",
+        "int 0x80",
+        "pop esi",
+        inlateout("eax") SYS_FUTEX => ret,
+        in("ebx") uaddr,
+        in("ecx") FUTEX_WAKE,
+        in("edx") count,
+        options(preserves_flags)
     );
     ret
 }

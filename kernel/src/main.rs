@@ -114,12 +114,6 @@ macro_rules! run {
     };
 }
 
-pub extern "C" fn irq6() {
-    unsafe {
-        outb(0x20, 0x20);
-    }
-}
-
 /// Early higher-half transition.
 /// This runs while we are still executing from the physical address
 /// (bootloader jumped to 0x01000000). We set up a temporary page directory
@@ -241,6 +235,7 @@ pub extern "C" fn higher_half_entry() -> ! {
             smp::WORK_IPI_VECTOR as usize,
             smp::work_ipi_interrupt as u32,
         );
+        IDT.add(smp::TLB_IPI_VECTOR as usize, smp::tlb_ipi_interrupt as u32);
         IDT.add_user_interrupt(
             syscalls::handler::SYSCALL_INT as usize,
             syscalls::handler::syscall as u32,
@@ -253,7 +248,6 @@ pub extern "C" fn higher_half_entry() -> ! {
             drivers::mouse::MOUSE_INT as usize,
             drivers::mouse::mouse_irq as u32,
         );
-        IDT.add(6, irq6 as u32);
         IDT.load(); // ← ПЕРЕМЕСТИТЬ СЮДА
                     // После полной инициализации paging
 
@@ -329,10 +323,6 @@ pub extern "C" fn higher_half_entry() -> ! {
             }
         }
         println!("[!] init spawned as pid={}", init_pid);
-        // Userspace stays on the BSP until the window manager, input path and
-        // remaining process-wide kernel state have SMP-safe synchronization.
-        // APs continue to run the kernel work queue and their local timers.
-        println!("[smp] userspace pinned to BSP; AP kernel workers remain active");
 
         // Enable only the IRQs with real handlers here:
         //   master IRQ0 = PIT, IRQ1 = keyboard, IRQ2 = slave cascade

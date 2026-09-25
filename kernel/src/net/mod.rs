@@ -38,5 +38,5 @@ static NET_LOGGER: NetLogger = NetLogger;
 
 pub fn init_logger() {
     let _ = log::set_logger(&NET_LOGGER);
-    log::set_max_level(log::LevelFilter::Debug);
+    log::set_max_level(log::LevelFilter::Error);
 }

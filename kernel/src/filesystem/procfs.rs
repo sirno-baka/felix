@@ -2,6 +2,8 @@
 //!
 //! Layout:
 //!   /proc/uptime
+//!   /proc/stat
+//!   /proc/interrupts
 //!   /proc/mounts
 //!   /proc/<pid>/status
 //!   /proc/<pid>/stat
@@ -17,6 +19,8 @@ use crate::multitasking::task::{Task, TASK_MANAGER};
 const INO_ROOT: u32 = 1;
 const INO_UPTIME: u32 = 2;
 const INO_MOUNTS: u32 = 3;
+const INO_STAT: u32 = 4;
+const INO_INTERRUPTS: u32 = 5;
 const PID_BASE: u32 = 0x0001_0000;
 const PID_STRIDE: u32 = 8;
 
@@ -117,6 +121,58 @@ impl ProcFs {
         out.into_bytes()
     }
 
+    fn interrupts() -> Vec<u8> {
+        let mut out = String::from("irq handled unhandled owners devices\n");
+        for irq in [5u8, 9, 10, 11] {
+            if let Some(stats) = crate::drivers::shared_irq::stats(irq) {
+                let owners = crate::drivers::shared_irq::owner_names(irq);
+                let mut names = String::new();
+                for (index, owner) in owners.iter().enumerate() {
+                    if index != 0 {
+                        names.push(',');
+                    }
+                    names.push_str(owner);
+                }
+                if names.is_empty() {
+                    names.push('-');
+                }
+                out.push_str(&format!(
+                    "{} {} {} {} {}\n",
+                    irq, stats.handled, stats.unhandled, stats.owners, names
+                ));
+            }
+        }
+        out.into_bytes()
+    }
+
+    fn cpu_stat() -> Vec<u8> {
+        let count = crate::smp::online_cpu_count();
+        let mut rows = Vec::with_capacity(count);
+        let mut total = crate::smp::CpuTimes::default();
+        for cpu in 0..crate::smp::cpu_slot_count() {
+            if let Some(times) = crate::smp::cpu_times(cpu) {
+                total.user = total.user.wrapping_add(times.user);
+                total.system = total.system.wrapping_add(times.system);
+                total.idle = total.idle.wrapping_add(times.idle);
+                rows.push((cpu, times));
+            }
+        }
+
+        // Linux-compatible field order: user nice system idle iowait irq
+        // softirq steal guest guest_nice. Unsupported classes are zero.
+        let mut out = format!(
+            "cpu {} 0 {} {} 0 0 0 0 0 0\n",
+            total.user, total.system, total.idle
+        );
+        for (cpu, times) in &rows {
+            out.push_str(&format!(
+                "cpu{} {} 0 {} {} 0 0 0 0 0 0\n",
+                cpu, times.user, times.system, times.idle
+            ));
+        }
+        out.into_bytes()
+    }
+
     fn data_for_inode(inode: u32) -> Option<Vec<u8>> {
         match inode {
             INO_UPTIME => {
@@ -133,6 +189,8 @@ impl ProcFs {
                 )
             }
             INO_MOUNTS => Some(Self::mounts()),
+            INO_STAT => Some(Self::cpu_stat()),
+            INO_INTERRUPTS => Some(Self::interrupts()),
             _ => {
                 let (pid, kind) = Self::decode_pid_inode(inode)?;
                 let task = Self::task_by_pid(pid)?;
@@ -156,6 +214,12 @@ impl ProcFs {
         }
         if clean == "mounts" {
             return Some(INO_MOUNTS);
+        }
+        if clean == "stat" {
+            return Some(INO_STAT);
+        }
+        if clean == "interrupts" {
+            return Some(INO_INTERRUPTS);
         }
 
         let mut parts = clean.split('/');
@@ -207,6 +271,18 @@ impl Filesystem for ProcFs {
             out.push(DirEntry {
                 inode: INO_MOUNTS,
                 name: "mounts".to_string(),
+                file_type: 1,
+                size: 0,
+            });
+            out.push(DirEntry {
+                inode: INO_STAT,
+                name: "stat".to_string(),
+                file_type: 1,
+                size: 0,
+            });
+            out.push(DirEntry {
+                inode: INO_INTERRUPTS,
+                name: "interrupts".to_string(),
                 file_type: 1,
                 size: 0,
             });

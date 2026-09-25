@@ -52,7 +52,7 @@ The project is developed against both **QEMU** and real legacy hardware, especia
 | Kernel virtual base | `0xC1000000` |
 | Paging | x86 paging with 4 MiB PSE kernel mappings + 4 KiB user/MMIO pages |
 | RAM detection | BootInfo / BIOS E801 / CMOS fallback, clamped to 64 MiB..1 GiB |
-| Scheduler | Preemptive round-robin userspace on BSP; AP kernel work queue |
+| Scheduler | Preemptive round-robin across BSP and APs for processes and threads |
 | PIT frequency | Currently 200 Hz |
 | Task limit | 32 scheduler slots, slot 0 is idle; processes may contain native threads |
 | Userspace | Ring 3 native i386 ELF executables |
@@ -550,7 +550,7 @@ Current limits:
 - maximum 16 pipes
 - 4096-byte ring buffer per pipe
 - reader/writer reference counts
-- blocking read/write using `sti` + `hlt`
+- blocking read/write through scheduler task states and syscall restart
 - non-blocking mode through `fcntl(O_NONBLOCK)`
 - EOF when the final writer disappears
 
@@ -1252,6 +1252,17 @@ dd if=<src> of=<dst> [bs=N] [count=N] [skip=N]
 
 It can copy between regular files and block devices exposed through DevFS.
 
+## `cpustat`
+
+A live console CPU monitor backed by Linux-style counters in `/proc/stat`:
+
+```text
+cpustat [sample_interval_ms]
+```
+
+The default interval is 1000 ms. It reports user, kernel, idle and total busy
+percentages with a load bar for every online processor. Press Ctrl+C to exit.
+
 ## `http-client`
 
 Experimental HTTP client using the Felix networking library.
@@ -1587,8 +1598,10 @@ Felix is an actively developed hobby/research OS. The following are deliberate c
 - ACPI MADT / Intel MP discovery and INIT/SIPI startup bring up to 8 CPUs;
   each application processor has a private stack, GDT/TSS and periodic Local
   APIC timer, plus a shared queue for non-blocking kernel work
-- userspace, window management and device IRQ handling remain on the BSP;
-  APs run private timers and the shared non-blocking kernel work queue
+- user processes and shared-address-space threads run on APs; page-table changes
+  use targeted Local APIC TLB shootdown, while device IRQs remain BSP-only
+- blocking input, pipe, PTY, timer, child, thread, poll and socket calls sleep
+  in scheduler wait classes and restart after a matching wakeup
 - maximum 32 scheduler slots shared by processes and threads
 - frame allocator does not recycle physical frames
 - userspace malloc is bump-style and `free()` is currently a no-op

@@ -2,7 +2,7 @@ pub const SYS_EXECVE_WASM: u32 = crate::syscalls::SYS_EXECVE_WASM;
 
 use crate::filesystem::file::{FileDescriptor, FileDescriptorTable};
 use crate::memory::paging::{copy_kernel_mappings, PDEFlags};
-use crate::multitasking::task::{CPUState, Task, MAX_TASKS, TASK_MANAGER};
+use crate::multitasking::task::{CPUState, Task, TaskState, MAX_TASKS, TASK_MANAGER};
 use crate::print::klog_write_str;
 use crate::syscalls::handler::*;
 use crate::wrappers::{cli, hlt, sti};
@@ -873,6 +873,7 @@ pub(crate) fn sys_execve_wasm(
         };
 
         task.running = true;
+        task.state = TaskState::Runnable;
         task.pid = pid;
         task.tid = pid;
         task.leader_slot = slot as i8;

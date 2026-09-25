@@ -343,6 +343,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dlmalloc"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad5208a115eaba24916f7456929832e310a81518c641f93fee4f89aa93aa3675"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "ecdsa"
 version = "0.16.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -931,7 +942,8 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.2.3"
+version = "1.2.4"
+source = "git+https://github.com/sirno-baka/mio?branch=master#e43b844f6dedc70d11cf81bff6488c956bbb309a"
 dependencies = [
  "libc",
  "wasi",
@@ -1648,6 +1660,7 @@ dependencies = [
 [[package]]
 name = "socket2"
 version = "0.6.5"
+source = "git+https://github.com/sirno-baka/socket2?branch=master#87153e4d2346314a6027f9fa856d1ff6364fe490"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -1820,6 +1833,7 @@ dependencies = [
 [[package]]
 name = "tokio"
 version = "1.53.1"
+source = "git+https://github.com/sirno-baka/tokio?branch=popugos#db0e3f6d9465e269984fdbf42d0aa4ac39f7c15c"
 dependencies = [
  "bytes",
  "libc",
@@ -1932,6 +1946,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 name = "twitch-radio"
 version = "0.1.0"
 dependencies = [
+ "dlmalloc",
  "getrandom",
  "libm",
  "reqwest",

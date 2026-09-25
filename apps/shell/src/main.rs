@@ -9,7 +9,6 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::min;
 
-use libfelix::async_rt::yield_now;
 use libfelix::embedded_graphics;
 use libfelix::prelude::*;
 mod executor;
@@ -1942,8 +1941,12 @@ fn redraw_editor(term: &mut TermBuffer, shell: &Shell, editor: &LineEditor) {
     }
 }
 
-fn block_on_yield() {
-    libfelix::async_rt::block_on(async { yield_now().await; });
+fn wait_for_activity() {
+    // WM polling is non-blocking.  A plain sched_yield leaves the shell
+    // runnable, so an otherwise idle shell is immediately selected again and
+    // consumes an entire CPU.  Sleep briefly to let the scheduler run its idle
+    // task while keeping keyboard and mouse latency low.
+    unsafe { syscall::sys_sleep(10); }
 }
 
 const BUILTINS: &[&str] = &[
@@ -2184,7 +2187,7 @@ pub extern "C" fn main() -> i32 {
             refresh_terminal(&mut win, &term);
             let _ = win.flip();
         } else {
-            block_on_yield();
+            wait_for_activity();
         }
     }
 

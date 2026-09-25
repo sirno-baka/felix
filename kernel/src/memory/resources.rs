@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering, compiler_fence, fence};
 
 use interrupt_sync::{SpinMutex, without_interrupts};
 
@@ -347,13 +347,57 @@ struct IoMapRecord {
 }
 
 #[derive(Debug)]
+pub struct MmioMapping {
+    pub virt: VirtAddr,
+    phys: u64,
+    size: usize,
+    mapped: bool,
+    reserved: bool,
+}
+
+impl MmioMapping {
+    pub const fn as_usize(&self) -> usize {
+        self.virt.0 as usize
+    }
+
+    fn release_owned(&mut self) -> Result<(), ResourceError> {
+        if self.mapped {
+            iounmap(self.virt)?;
+            self.mapped = false;
+        }
+        if self.reserved {
+            let _ = release_range(self.phys, self.size as u64)?;
+            self.reserved = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MmioMapping {
+    fn drop(&mut self) {
+        let _ = self.release_owned();
+    }
+}
+
+#[derive(Debug)]
 pub struct DmaBuffer {
     pub phys: PhysAddr,
     pub virt: VirtAddr,
     pub len: usize,
     alloc_len: usize,
     owner: &'static str,
+    released: bool,
 }
+
+/// PCI DMA uses the cache-coherent write-back direct mapping on x86.
+/// Order descriptor/payload accesses explicitly; WBINVD is neither necessary
+/// nor an ownership protocol, and SSE2 fences are unavailable on older CPUs.
+#[inline]
+pub fn dma_wmb() { compiler_fence(Ordering::Release); }
+#[inline]
+pub fn dma_rmb() { compiler_fence(Ordering::Acquire); }
+#[inline]
+pub fn dma_mb() { fence(Ordering::SeqCst); }
 
 impl DmaBuffer {
     /// Translate an address inside this owned DMA allocation to its bus-visible
@@ -364,7 +408,7 @@ impl DmaBuffer {
         let addr = ptr as usize;
         let offset = addr.checked_sub(base).ok_or(ResourceError::NotFound)?;
         let end = offset.checked_add(len).ok_or(ResourceError::Overflow)?;
-        if end > self.alloc_len {
+        if end > self.len {
             return Err(ResourceError::NotFound);
         }
         let phys = (self.phys.0 as u64)
@@ -382,6 +426,42 @@ impl DmaBuffer {
 
     pub const fn allocated_len(&self) -> usize {
         self.alloc_len
+    }
+
+    fn release_owned(&mut self) -> Result<(), ResourceError> {
+        if self.released {
+            return Ok(());
+        }
+
+        let pages = self.alloc_len / PAGE_SIZE;
+        let first = self.phys.0 >> 12;
+        let released = release_range(self.phys.0 as u64, self.alloc_len as u64)?;
+        self.released = true;
+
+        without_interrupts(|| unsafe {
+            let mut paging = PAGING.lock();
+            for frame in first..first + pages as u32 {
+                paging.free_phys_frame(frame);
+            }
+        });
+        crate::println!(
+            "[dma] free {:<16} phys={:08x} size={}",
+            self.owner,
+            self.phys.0,
+            self.alloc_len
+        );
+
+        if released.kind != ResourceKind::Dma {
+            Err(ResourceError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for DmaBuffer {
+    fn drop(&mut self) {
+        let _ = self.release_owned();
     }
 }
 
@@ -616,6 +696,24 @@ pub fn reserve_and_ioremap(
     }
 }
 
+/// Owning variant of reserve_and_ioremap(). The mapping and physical resource
+/// reservation are released automatically if probe/initialization unwinds.
+pub fn map_resource(
+    phys: u64,
+    size: usize,
+    kind: ResourceKind,
+    owner: &'static str,
+) -> Result<MmioMapping, ResourceError> {
+    let virt = reserve_and_ioremap(phys, size, kind, owner)?;
+    Ok(MmioMapping {
+        virt,
+        phys,
+        size,
+        mapped: true,
+        reserved: true,
+    })
+}
+
 pub fn dma_alloc_for(
     owner: &'static str,
     size: usize,
@@ -623,6 +721,8 @@ pub fn dma_alloc_for(
     max_phys: u64,
 ) -> Result<DmaBuffer, ResourceError> {
     let alloc_len = align_up_u64(size as u64, PAGE_SIZE as u64)? as usize;
+    if size == 0 { return Err(ResourceError::ZeroSize); }
+    let max_phys = max_phys.min(detected_ram_bytes() as u64 - 1);
     let phys = alloc_phys_below(max_phys, size, align, ResourceKind::Dma, owner)?;
     let virt = VirtAddr(phys_to_virt(phys.0));
     unsafe {
@@ -643,6 +743,7 @@ pub fn dma_alloc_for(
         len: size,
         alloc_len,
         owner,
+        released: false,
     })
 }
 
@@ -650,26 +751,8 @@ pub fn dma_alloc(size: usize, align: usize, max_phys: u64) -> Result<DmaBuffer, 
     dma_alloc_for("dma", size, align, max_phys)
 }
 
-pub fn dma_free(buffer: DmaBuffer) -> Result<(), ResourceError> {
-    let pages = buffer.alloc_len / PAGE_SIZE;
-    let first = buffer.phys.0 >> 12;
-    let released = release_range(buffer.phys.0 as u64, buffer.alloc_len as u64)?;
-    if released.kind != ResourceKind::Dma {
-        return Err(ResourceError::NotFound);
-    }
-    without_interrupts(|| unsafe {
-        let mut paging = PAGING.lock();
-        for frame in first..first + pages as u32 {
-            paging.free_phys_frame(frame);
-        }
-    });
-    crate::println!(
-        "[dma] free {:<16} phys={:08x} size={}",
-        buffer.owner,
-        buffer.phys.0,
-        buffer.alloc_len
-    );
-    Ok(())
+pub fn dma_free(mut buffer: DmaBuffer) -> Result<(), ResourceError> {
+    buffer.release_owned()
 }
 
 pub fn dump_ranges() {

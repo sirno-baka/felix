@@ -1,14 +1,11 @@
-use alloc::collections::VecDeque;
 use core::arch::asm;
 use core::ops::{Deref, DerefMut};
 
-use crate::multitasking::task::TASK_MANAGER;
 use crate::print::{printer_new, PRINTER};
 use crate::println;
 use interrupt_sync::{without_interrupts, SpinMutex};
 
 pub struct Mutex<T: ?Sized> {
-    waiters: SpinMutex<VecDeque<i8>>,
     inner: SpinMutex<T>,
 }
 
@@ -19,16 +16,12 @@ impl<T: ?Sized> Mutex<T> {
     {
         Self {
             inner: SpinMutex::new(data),
-            waiters: SpinMutex::new(VecDeque::new()),
         }
     }
 
     /// Non-blocking lock for panic/exception paths (must not sleep).
     pub fn try_lock_nb(&self) -> Option<MutexGuard<'_, T>> {
-        self.inner.try_lock().map(|guard| MutexGuard {
-            guard,
-            parent: self,
-        })
+        self.inner.try_lock().map(|guard| MutexGuard { guard })
     }
 
     pub fn lock(&self) -> MutexGuard<'_, T> {
@@ -47,49 +40,22 @@ impl<T: ?Sized> Mutex<T> {
                 if was_enabled {
                     unsafe { asm!("sti") };
                 }
-                return MutexGuard {
-                    guard,
-                    parent: self,
-                };
+                return MutexGuard { guard };
             }
 
-            // === contended path ===
-            unsafe {
-                let current = TASK_MANAGER.get_current_slot();
-                if current >= 0 {
-                    let current_esp: u32;
-                    core::arch::asm!("mov {}, esp", out(reg) current_esp);
-
-                    if let Some(ref mut task) = TASK_MANAGER.tasks[current as usize] {
-                        task.cpu_state_ptr = current_esp;
-                        task.running = false;
-                    }
-
-                    self.waiters.lock().push_back(current);
-                }
-            }
-
-            // Важно: sti + hlt только если прерывания должны быть включены
+            // A mutex wait is not a scheduler context switch. Marking this task
+            // runnable from another CPU while it still executes on its kernel
+            // stack would let two CPUs run the same task and corrupt its saved
+            // CPUState. Keep interrupts serviceable, but retain ownership of
+            // the current execution context until the lock becomes available.
             if was_enabled {
                 unsafe {
                     asm!("sti");
-                    asm!("hlt");
+                    asm!("pause");
+                    asm!("cli");
                 }
             } else {
-                // Во время boot (прерывания выключены) — просто спин
                 core::hint::spin_loop();
-            }
-        }
-    }
-
-    fn wake_one(&self) {
-        if let Some(id) = self.waiters.lock().pop_front() {
-            unsafe {
-                if id >= 0 && (id as usize) < TASK_MANAGER.tasks.len() {
-                    if let Some(ref mut task) = TASK_MANAGER.tasks[id as usize] {
-                        task.running = true;
-                    }
-                }
             }
         }
     }
@@ -114,10 +80,7 @@ impl<T: ?Sized> Mutex<T> {
             if was_enabled {
                 unsafe { asm!("sti") };
             }
-            Some(MutexGuard {
-                guard,
-                parent: self,
-            })
+            Some(MutexGuard { guard })
         } else {
             // не получилось — восстанавливаем IF и уходим
             if was_enabled {
@@ -130,7 +93,6 @@ impl<T: ?Sized> Mutex<T> {
 
 pub struct MutexGuard<'a, T: ?Sized> {
     guard: interrupt_sync::SpinMutexGuard<'a, T>,
-    parent: &'a Mutex<T>,
 }
 
 impl<T: ?Sized> Deref for MutexGuard<'_, T> {
@@ -143,11 +105,5 @@ impl<T: ?Sized> Deref for MutexGuard<'_, T> {
 impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.guard
-    }
-}
-
-impl<T: ?Sized> Drop for MutexGuard<'_, T> {
-    fn drop(&mut self) {
-        self.parent.wake_one();
     }
 }

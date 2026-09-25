@@ -40,6 +40,7 @@ endif
 # migrated to the std userspace.
 NATIVE_APPS := $(sort $(filter-out wasm-% filemanager,$(patsubst apps/%/Cargo.toml,%,$(wildcard apps/*/Cargo.toml))))
 WASM_APPS   := $(sort $(patsubst apps/%/Cargo.toml,%,$(wildcard apps/wasm-*/Cargo.toml)))
+STD_RUNTIME_APPS := reqwest-smoke tokio-smoke twitch-radio ui-smoke
 ROOTFS_FILES := $(shell find rootfs -type f ! -name README ! -name '.gitkeep' 2>/dev/null)
 
 .PHONY: all
@@ -157,16 +158,26 @@ floppy-image:
 	@echo "=== Floppy image ready ==="
 	@ls -lh build/floppy.img
 
+.PHONY: std-runtime-apps
+std-runtime-apps:
+	@echo "Building std runtime apps: $(STD_RUNTIME_APPS)"
+	@cargo +popugos $(STD_APPS_CONFIG_ARG) build --manifest-path std-apps/Cargo.toml --target i686-unknown-popugos --release $(addprefix -p ,$(STD_RUNTIME_APPS))
+	@mkdir -p rootfs/bin
+	@for p in $(STD_RUNTIME_APPS); do \
+		cp -f std-apps/target/i686-unknown-popugos/release/$$p rootfs/bin/$$p; \
+		echo "  → rootfs/bin/$$p"; \
+	done
+
 .PHONY: image
-image:
-	@echo "=== Creating 32 MiB bootable disk (MBR | bootloader | ext2) ==="
+image: std-runtime-apps
+	@echo "=== Creating 64 MiB bootable disk (MBR | bootloader | ext2) ==="
 	@rm -f build/disk.img build/rootfs.img
 	@dd if=/dev/zero of=build/disk.img bs=1M count=64 status=none
 	@$(SFDISK) build/disk.img < disk.layout
 	@$(SFDISK) --list build/disk.img
 	@dd if=build/boot.bin of=build/disk.img bs=512 conv=notrunc status=none
 	@dd if=build/bootloader.bin of=build/disk.img bs=512 seek=1 conv=notrunc status=none
-	@dd if=/dev/zero of=build/rootfs.img bs=512 count=128488 status=none
+	@dd if=/dev/zero of=build/rootfs.img bs=512 count=64488 status=none
 	@$(E2MKFS) -I 128 -O ^64bit,^metadata_csum,^dir_index,^ext_attr,^resize_inode build/rootfs.img
 	$(call populate_ext2,build/rootfs.img)
 	@dd if=build/rootfs.img of=build/disk.img bs=512 seek=2048 conv=notrunc status=none
@@ -222,13 +233,11 @@ run: all usb-image
 		-drive file=build/disk.img,index=0,media=disk,format=raw,if=ide \
 		-boot order=c \
 		-netdev user,id=net0 \
-		-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
+		-device rtl8139,netdev=net0,mac=52:54:00:12:34:56 \
 		-device pci-ohci,id=ohci \
 		-device AC97 \
-		-smp 2 \
-		-drive if=none,id=usbstick,format=raw,file=build/usb.img \
-		-device usb-storage,bus=ohci.0,drive=usbstick \
-		-no-reboot -no-shutdown -vga std -m 128M \
+		-smp 3 \
+		-no-reboot -no-shutdown -vga std -m 1280M \
 		-debugcon file:debug.log -serial stdio
 
 .PHONY: std-thread-smoke
@@ -245,15 +254,28 @@ std-tokio-smoke:
 
 .PHONY: smoke
 smoke: std-thread-smoke std-tokio-smoke all usb-image
+	@echo "Preparing smoke-only disk image..."
+	@cp -f build/disk.img build/smoke-disk.img
+	@dd if=build/smoke-disk.img of=build/smoke-rootfs.img bs=512 skip=2048 count=128488 status=none
+	@{ \
+		echo '# smoke-only services'; \
+		echo 'once       /bin/thread-smoke'; \
+		echo 'once       /bin/tokio-smoke'; \
+		cat rootfs/etc/init.conf; \
+	} > build/smoke-init.conf
+	@$(E2CP) -p build/smoke-init.conf build/smoke-rootfs.img:/etc/init.conf
+	@dd if=build/smoke-rootfs.img of=build/smoke-disk.img bs=512 seek=2048 conv=notrunc status=none
 	@echo "Running Felix smoke test..."
 	@rm -f build/smoke.log
 	@set +e; \
-		timeout 15s qemu-system-i386 \
-			-drive file=build/disk.img,index=0,media=disk,format=raw,if=ide \
+		timeout 45s qemu-system-i386 \
+			-drive file=build/smoke-disk.img,index=0,media=disk,format=raw,if=ide \
 			-boot order=c \
 			-netdev user,id=net0 \
 			-device rtl8139,netdev=net0,mac=52:54:00:12:34:56 \
 			-device pci-ohci,id=ohci \
+			-device AC97 \
+			-smp 3 \
 			-drive if=none,id=usbstick,format=raw,file=build/usb.img \
 			-device usb-storage,bus=ohci.0,drive=usbstick \
 			-no-reboot -no-shutdown -vga std -m 128M \
@@ -273,6 +295,14 @@ smoke: std-thread-smoke std-tokio-smoke all usb-image
 	fi
 	@grep -q '\[!\] init spawned as pid=1' build/smoke.log || { echo "smoke: PID 1 was not spawned"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'Felix init: service manager pid=1' build/smoke.log || { echo "smoke: userspace init did not run as PID 1"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q '\[smp\] 3 processor(s) online' build/smoke.log || { echo "smoke: SMP did not bring 3 CPUs online"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'selftest: OK device-irqs' build/smoke.log || { echo "smoke: DMA/IRQ selftest failed"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'selftest: NIC shared IRQ observed' build/smoke.log || { echo "smoke: NIC IRQ was not observed"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'selftest: audio IRQ[0-9][0-9]* handled [0-9][0-9]* -> [1-9][0-9]*' build/smoke.log || { echo "smoke: audio DMA IRQ did not advance"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'selftest: OK threads' build/smoke.log || { echo "smoke: kernel thread test failed"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'selftest: OK parallel-timeouts' build/smoke.log || { echo "smoke: parallel thread timeout test failed"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'selftest: OK process-shared-mutex' build/smoke.log || { echo "smoke: process-shared mutex/futex test failed"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'selftest: OK process-reclaim' build/smoke.log || { echo "smoke: SMP process/thread reclaim test failed"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'selftest: PASS' build/smoke.log || { echo "smoke: userspace selftest failed"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'init: boot selftest pid=.* status=0' build/smoke.log || { echo "smoke: PID 1 did not reap selftest cleanly"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'std::thread smoke: PASS' build/smoke.log || { echo "smoke: std::thread test failed"; tail -n 160 build/smoke.log; exit 1; }
@@ -297,4 +327,4 @@ debug: all usb-image
                  -device AC97 \
                  -drive if=none,id=usbstick,format=raw,file=/media/sirno/b68c5baf-cda7-4901-a031-5acf01621548/Torrent/win98drvXP.img \
                  -device usb-storage,bus=ohci.0,drive=usbstick \
-		-m 128M -s -S &
+		-m 512M -s -S &

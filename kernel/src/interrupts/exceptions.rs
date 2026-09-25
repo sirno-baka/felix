@@ -22,6 +22,14 @@ fn is_user_cs(cs: u32) -> bool {
     (cs & 3) == 3
 }
 
+#[inline]
+fn read_cpu_state(esp: u32) -> CPUState {
+    // x86 exception frames are byte-addressable and the CPU itself does not
+    // require a 4-byte aligned ESP. Never create an aligned Rust reference to
+    // an arbitrary hardware frame; copy it out with unaligned loads instead.
+    unsafe { core::ptr::read_unaligned(esp as *const CPUState) }
+}
+
 fn close_descriptor(closed: ClosedFileDescriptor) {
     if !closed.last_open_ref {
         return;
@@ -64,11 +72,28 @@ fn kill_current_task(esp: u32, reason: &str, exit_code: i32) -> u32 {
     }
 }
 
-fn kernel_halt(name: &str, eip: u32, cs: u32, eflags: u32) -> ! {
+fn kernel_halt(name: &str, exception_esp: u32, eip: u32, cs: u32, eflags: u32) -> ! {
     let used_fb = crate::fb_panic::try_exception_fb(name, eip, cs, eflags);
 
     println!("\n=== KERNEL EXCEPTION: {} ===", name);
     println!("  EIP={:#x} CS={:#x} EFLAGS={:#b}", eip, cs, eflags);
+    let slot = unsafe { TASK_MANAGER.get_current_slot() };
+    let cpu = crate::smp::current_cpu_index();
+    println!("  cpu={} task={} exception_esp={:#x}", cpu, slot, exception_esp);
+    if slot >= 0 {
+        if let Some(task) = unsafe { TASK_MANAGER.tasks[slot as usize].as_ref() } {
+            let top = task.stack_base.saturating_add(crate::multitasking::task::STACK_SIZE as u32);
+            println!(
+                "  pid={} tid={} kstack={:#x}..{:#x} saved={:#x}",
+                task.pid, task.tid, task.stack_base, top, task.cpu_state_ptr
+            );
+        }
+    }
+    let s = read_cpu_state(exception_esp);
+    println!(
+        "  EAX={:#x} EBX={:#x} ECX={:#x} EDX={:#x} ESI={:#x} EDI={:#x} EBP={:#x}",
+        s.eax, s.ebx, s.ecx, s.edx, s.esi, s.edi, s.ebp
+    );
     println!("System halted");
 
     loop {
@@ -78,11 +103,32 @@ fn kernel_halt(name: &str, eip: u32, cs: u32, eflags: u32) -> ! {
     }
 }
 
-fn kernel_halt_page_fault(eip: u32, cs: u32, eflags: u32, cr2: u32) -> ! {
+fn kernel_halt_page_fault(
+    eip: u32,
+    cs: u32,
+    eflags: u32,
+    cr2: u32,
+    exception_esp: u32,
+) -> ! {
     let used_fb = crate::fb_panic::try_page_fault_fb(eip, cs, eflags, cr2);
     println!("\n=== KERNEL EXCEPTION: page_fault ===");
     println!("  CR2={:#x}", cr2);
     println!("  EIP={:#x} CS={:#x} EFLAGS={:#b}", eip, cs, eflags);
+    let slot = unsafe { TASK_MANAGER.get_current_slot() };
+    if slot >= 0 {
+        if let Some(task) = unsafe { TASK_MANAGER.tasks[slot as usize].as_ref() } {
+            let stack_end = task
+                .stack_base
+                .saturating_add(crate::multitasking::task::STACK_SIZE as u32);
+            println!(
+                "  task={} exception_esp={:#x} kernel_stack={:#x}..{:#x}",
+                slot, exception_esp, task.stack_base, stack_end
+            );
+            if exception_esp < task.stack_base && exception_esp >= task.stack_base.saturating_sub(4096) {
+                println!("  KERNEL STACK OVERFLOW");
+            }
+        }
+    }
     println!("System halted");
 
     loop {
@@ -97,7 +143,7 @@ fn handle_fault(name: &str, sig_exit: i32, esp: u32, eip: u32, cs: u32, eflags: 
     if is_user_cs(cs) {
         kill_current_task(esp, name, sig_exit)
     } else {
-        kernel_halt(name, eip, cs, eflags)
+        kernel_halt(name, esp, eip, cs, eflags)
     }
 }
 
@@ -128,6 +174,10 @@ macro_rules! exception_stub {
                     "call {handler}",
                     "add esp, 4",
                     "mov esp, eax",
+                    "test edx, edx",
+                    "jz 3f",
+                    "call finish_kernel_handoff",
+                    "3:",
                     // Restore DS/ES while the selected task's GPRs are still
                     // saved. Using CX after the pops corrupts userspace state.
                     "mov ax, [esp + 32]",
@@ -183,6 +233,10 @@ macro_rules! exception_stub_with_error_code {
                     "call {handler}",
                     "add esp, 4",
                     "mov esp, eax",
+                    "test edx, edx",
+                    "jz 3f",
+                    "call finish_kernel_handoff",
+                    "3:",
                     "mov ax, [esp + 32]",
                     "and ax, 3",
                     "cmp ax, 3",
@@ -213,8 +267,21 @@ macro_rules! exception_stub_with_error_code {
 exception_stub!(div_error, div_error_handler);
 
 #[unsafe(no_mangle)]
-pub extern "C" fn div_error_handler(esp: u32) -> u32 {
-    let state = unsafe { &*(esp as *const CPUState) };
+pub extern "C" fn div_error_handler(esp: u32) -> u64 {
+    if is_user_cs(read_cpu_state(esp).cs) {
+        let kernel = crate::multitasking::task::lock_kernel();
+        crate::multitasking::task::set_kernel_lock_context(
+            crate::multitasking::task::KERNEL_LOCK_CTX_EXCEPTION,
+        );
+        let next = div_error_handler_locked(esp);
+        crate::multitasking::task::handoff_kernel_lock(kernel, next)
+    } else {
+        div_error_handler_locked(esp) as u64
+    }
+}
+
+fn div_error_handler_locked(esp: u32) -> u32 {
+    let state = read_cpu_state(esp);
     // Unix: SIGFPE → 128+8 = 136
     handle_fault("div_error", 136, esp, state.eip, state.cs, state.eflags)
 }
@@ -223,8 +290,21 @@ pub extern "C" fn div_error_handler(esp: u32) -> u32 {
 exception_stub!(invalid_opcode, invalid_opcode_handler);
 
 #[unsafe(no_mangle)]
-pub extern "C" fn invalid_opcode_handler(esp: u32) -> u32 {
-    let state = unsafe { &*(esp as *const CPUState) };
+pub extern "C" fn invalid_opcode_handler(esp: u32) -> u64 {
+    if is_user_cs(read_cpu_state(esp).cs) {
+        let kernel = crate::multitasking::task::lock_kernel();
+        crate::multitasking::task::set_kernel_lock_context(
+            crate::multitasking::task::KERNEL_LOCK_CTX_EXCEPTION,
+        );
+        let next = invalid_opcode_handler_locked(esp);
+        crate::multitasking::task::handoff_kernel_lock(kernel, next)
+    } else {
+        invalid_opcode_handler_locked(esp) as u64
+    }
+}
+
+fn invalid_opcode_handler_locked(esp: u32) -> u32 {
+    let state = read_cpu_state(esp);
     // SIGILL → 128+4 = 132
     handle_fault(
         "invalid_opcode",
@@ -240,8 +320,21 @@ pub extern "C" fn invalid_opcode_handler(esp: u32) -> u32 {
 exception_stub_with_error_code!(general_protection_fault, general_protection_fault_handler);
 
 #[unsafe(no_mangle)]
-pub extern "C" fn general_protection_fault_handler(esp: u32) -> u32 {
-    let state = unsafe { &*(esp as *const CPUState) };
+pub extern "C" fn general_protection_fault_handler(esp: u32) -> u64 {
+    if is_user_cs(read_cpu_state(esp).cs) {
+        let kernel = crate::multitasking::task::lock_kernel();
+        crate::multitasking::task::set_kernel_lock_context(
+            crate::multitasking::task::KERNEL_LOCK_CTX_EXCEPTION,
+        );
+        let next = general_protection_fault_handler_locked(esp);
+        crate::multitasking::task::handoff_kernel_lock(kernel, next)
+    } else {
+        general_protection_fault_handler_locked(esp) as u64
+    }
+}
+
+fn general_protection_fault_handler_locked(esp: u32) -> u32 {
+    let state = read_cpu_state(esp);
     // SIGSEGV → 128+11 = 139
     handle_fault(
         "general_protection_fault",
@@ -257,13 +350,26 @@ pub extern "C" fn general_protection_fault_handler(esp: u32) -> u32 {
 exception_stub_with_error_code!(double_fault, double_fault_handler);
 
 #[unsafe(no_mangle)]
-pub extern "C" fn double_fault_handler(esp: u32) -> u32 {
+pub extern "C" fn double_fault_handler(esp: u32) -> u64 {
+    if is_user_cs(read_cpu_state(esp).cs) {
+        let kernel = crate::multitasking::task::lock_kernel();
+        crate::multitasking::task::set_kernel_lock_context(
+            crate::multitasking::task::KERNEL_LOCK_CTX_EXCEPTION,
+        );
+        let next = double_fault_handler_locked(esp);
+        crate::multitasking::task::handoff_kernel_lock(kernel, next)
+    } else {
+        double_fault_handler_locked(esp) as u64
+    }
+}
+
+fn double_fault_handler_locked(esp: u32) -> u32 {
     // Double fault is almost always fatal even from user context
-    let state = unsafe { &*(esp as *const CPUState) };
+    let state = read_cpu_state(esp);
     if is_user_cs(state.cs) {
         kill_current_task(esp, "double_fault", 139)
     } else {
-        kernel_halt("double_fault", state.eip, state.cs, state.eflags)
+        kernel_halt("double_fault", esp, state.eip, state.cs, state.eflags)
     }
 }
 
@@ -271,8 +377,21 @@ pub extern "C" fn double_fault_handler(esp: u32) -> u32 {
 exception_stub!(generic_handler, generic_handler_handler);
 
 #[unsafe(no_mangle)]
-pub extern "C" fn generic_handler_handler(esp: u32) -> u32 {
-    let state = unsafe { &*(esp as *const CPUState) };
+pub extern "C" fn generic_handler_handler(esp: u32) -> u64 {
+    if is_user_cs(read_cpu_state(esp).cs) {
+        let kernel = crate::multitasking::task::lock_kernel();
+        crate::multitasking::task::set_kernel_lock_context(
+            crate::multitasking::task::KERNEL_LOCK_CTX_EXCEPTION,
+        );
+        let next = generic_handler_handler_locked(esp);
+        crate::multitasking::task::handoff_kernel_lock(kernel, next)
+    } else {
+        generic_handler_handler_locked(esp) as u64
+    }
+}
+
+fn generic_handler_handler_locked(esp: u32) -> u32 {
+    let state = read_cpu_state(esp);
     handle_fault("generic", 139, esp, state.eip, state.cs, state.eflags)
 }
 
@@ -280,9 +399,22 @@ pub extern "C" fn generic_handler_handler(esp: u32) -> u32 {
 exception_stub_with_error_code!(page_fault, page_fault_handler);
 
 #[unsafe(no_mangle)]
-pub extern "C" fn page_fault_handler(esp: u32) -> u32 {
+pub extern "C" fn page_fault_handler(esp: u32) -> u64 {
+    if is_user_cs(read_cpu_state(esp).cs) {
+        let kernel = crate::multitasking::task::lock_kernel();
+        crate::multitasking::task::set_kernel_lock_context(
+            crate::multitasking::task::KERNEL_LOCK_CTX_EXCEPTION,
+        );
+        let next = page_fault_handler_locked(esp);
+        crate::multitasking::task::handoff_kernel_lock(kernel, next)
+    } else {
+        page_fault_handler_locked(esp) as u64
+    }
+}
+
+fn page_fault_handler_locked(esp: u32) -> u32 {
     // After dropping error code + pushing regs, `esp` points at a CPUState-shaped frame.
-    let state = unsafe { &*(esp as *const CPUState) };
+    let state = read_cpu_state(esp);
 
     let cr2: u32;
     unsafe {
@@ -323,6 +455,6 @@ pub extern "C" fn page_fault_handler(esp: u32) -> u32 {
         // SIGSEGV → 128+11 = 139
         kill_current_task(esp, "page_fault", 139)
     } else {
-        kernel_halt_page_fault(state.eip, state.cs, state.eflags, cr2)
+        kernel_halt_page_fault(state.eip, state.cs, state.eflags, cr2, esp)
     }
 }

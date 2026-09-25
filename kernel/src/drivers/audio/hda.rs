@@ -3,17 +3,17 @@
 //! First target: Intel 6 Series/C200 (8086:1c20) + Conexant CX20590
 //! (14f1:506e), as found in ThinkPad X220/T420 generation machines.
 //!
-//! Deliberately polling-only:
+//! Codec verbs remain polling-based, while stream completion uses INTx:
 //! - codec verbs use the Immediate Command interface (ICOI/ICII/ICIS)
-//! - stream progress is observed through LPIB from the PIT audio poll
-//! - INTCTL and stream interrupt-enable bits stay disabled
+//! - the hard IRQ acknowledges stream status only
+//! - stream progress/refill is handled by the PIT bottom half via LPIB
 //! - one cyclic output stream, PCM S16LE / stereo / 48 kHz
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use crate::drivers::audio::Mixer;
-use crate::memory::resources::{DmaBuffer as DmaAllocation, ResourceKind, dma_alloc_for, dma_free, reserve_and_ioremap};
+use crate::memory::resources::{DmaBuffer as DmaAllocation, MmioMapping, ResourceKind, dma_alloc_for, dma_free, map_resource};
 use crate::pci::bar::Bar;
 use crate::pci::device::PciDevice;
 
@@ -50,6 +50,9 @@ const SD_BDLPU: usize = 0x1c;
 
 const SD_CTL_SRST: u8 = 1 << 0;
 const SD_CTL_RUN: u8 = 1 << 1;
+const SD_CTL_IOCE: u8 = 1 << 2;
+const SD_CTL_FEIE: u8 = 1 << 3;
+const SD_CTL_DEIE: u8 = 1 << 4;
 const SD_STS_W1C: u8 = (1 << 2) | (1 << 3) | (1 << 4);
 
 // 48 kHz base, x1 /1, 16-bit, 2 channels.
@@ -114,6 +117,7 @@ struct DmaBuffer {
 
 pub struct Hda {
     mmio: usize,
+    _mmio_mapping: MmioMapping,
     irq: u8,
     codec: u8,
     codec_vendor: u32,
@@ -123,6 +127,7 @@ pub struct Hda {
     bdl_mem: DmaAllocation,
     dma_mem: DmaAllocation,
     running: bool,
+    irq_enabled: bool,
     last_frag: usize,
     idle_refills: usize,
     debug_polls: u8,
@@ -130,6 +135,22 @@ pub struct Hda {
 }
 
 unsafe impl Send for Hda {}
+
+impl Drop for Hda {
+    fn drop(&mut self) {
+        self.w32(INTCTL, 0);
+        let _ = self.r32(INTCTL);
+        if self.stream >= SD_BASE {
+            let enables = SD_CTL_IOCE | SD_CTL_FEIE | SD_CTL_DEIE;
+            let ctl = self.r8(self.sr(SD_CTL0));
+            self.w8(self.sr(SD_CTL0), ctl & !(SD_CTL_RUN | enables));
+            self.w8(self.sr(SD_STS), SD_STS_W1C);
+        }
+        self.running = false;
+        self.irq_enabled = false;
+        crate::memory::resources::dma_mb();
+    }
+}
 
 impl Hda {
     pub fn name(&self) -> &'static str {
@@ -143,10 +164,33 @@ impl Hda {
         self.irq
     }
 
-    // Audio core keeps the same backend API as legacy cards. HDA intentionally
-    // ignores this and remains polling-only for now.
-    pub fn set_irq_enabled(&mut self, _enabled: bool) {
-        self.w32(INTCTL, 0);
+    pub fn irq_ack_cookie(&self) -> (usize, usize) {
+        (self.mmio, self.stream)
+    }
+
+    /// Lock-free hard-IRQ acknowledge path. `mmio` and `stream` are immutable
+    /// after probe and are published by audio::init before interrupts are enabled.
+    pub fn ack_irq_raw(mmio: usize, stream: usize) -> u32 {
+        let reg = mmio + stream + SD_STS;
+        let status = unsafe { read_volatile(reg as *const u8) } & SD_STS_W1C;
+        if status != 0 {
+            unsafe { write_volatile(reg as *mut u8, status) };
+        }
+        status as u32
+    }
+
+    pub fn set_irq_enabled(&mut self, enabled: bool) {
+        self.irq_enabled = enabled;
+        self.w8(self.sr(SD_STS), SD_STS_W1C);
+        let enables = SD_CTL_IOCE | SD_CTL_FEIE | SD_CTL_DEIE;
+        let ctl = self.r8(self.sr(SD_CTL0));
+        self.w8(
+            self.sr(SD_CTL0),
+            if enabled { ctl | enables } else { ctl & !enables },
+        );
+        let stream_index = ((self.stream - SD_BASE) / SD_STRIDE) as u32;
+        self.w32(INTCTL, if enabled { (1 << 31) | (1 << stream_index) } else { 0 });
+        let _ = self.r32(INTCTL);
     }
 
     #[inline]
@@ -179,7 +223,7 @@ impl Hda {
         self.stream + off
     }
 
-    fn map_bar(dev: &PciDevice) -> Result<(usize, u32, u32), &'static str> {
+    fn map_bar(dev: &PciDevice) -> Result<(MmioMapping, u32, u32), &'static str> {
         let (phys, size) = match dev.get_bar(0) {
             Some(Bar::Memory { address, size, .. }) if *address != 0 => {
                 (*address, (*size).max(0x1000))
@@ -189,9 +233,9 @@ impl Hda {
             _ => return Err("HDA missing BAR0"),
         };
 
-        let virt = reserve_and_ioremap(phys as u64, size as usize, ResourceKind::Mmio, "hda-mmio")
+        let mapping = map_resource(phys as u64, size as usize, ResourceKind::Mmio, "hda-mmio")
             .map_err(|_| "HDA MMIO mapping failed")?;
-        Ok((virt.0 as usize, phys, size))
+        Ok((mapping, phys, size))
     }
 
     fn controller_reset(&self) -> Result<u16, &'static str> {
@@ -420,7 +464,7 @@ impl Hda {
                 addr_lo: dma_phys.wrapping_add((i * BYTES_PER_FRAG) as u32),
                 addr_hi: 0,
                 length: BYTES_PER_FRAG as u32,
-                flags: 0, // polling only: no IOC
+                flags: 1, // IOC: one completion interrupt per fragment
             }; }
         }
         Ok(())
@@ -450,9 +494,15 @@ impl Hda {
         self.w16(self.sr(SD_FMT), HDA_FMT_48K_S16_STEREO);
         self.w8(self.sr(SD_STS), SD_STS_W1C);
 
-        // Stream tag is bits 7:4 of CTL byte 2. No interrupt-enable bits.
+        // Stream tag is bits 7:4 of CTL byte 2.
         let ctl2 = self.r8(self.sr(SD_CTL2));
         self.w8(self.sr(SD_CTL2), (ctl2 & 0x0f) | (STREAM_TAG << 4));
+        let enables = SD_CTL_IOCE | SD_CTL_FEIE | SD_CTL_DEIE;
+        let ctl0 = self.r8(self.sr(SD_CTL0));
+        self.w8(
+            self.sr(SD_CTL0),
+            if self.irq_enabled { ctl0 | enables } else { ctl0 & !enables },
+        );
         Ok(())
     }
 
@@ -475,7 +525,7 @@ impl Hda {
         self.program_stream()?;
         self.setup_cx20590()?;
 
-        compiler_fence(Ordering::SeqCst);
+        crate::memory::resources::dma_wmb();
         self.last_frag = 0;
         self.debug_polls = 0;
         self.debug_last_lpib = 0;
@@ -508,16 +558,20 @@ impl Hda {
         self.idle_refills = 0;
     }
 
-    // Not used in polling mode; retained so audio::Backend has one shape.
     pub fn ack_irq(&mut self) -> bool {
-        false
+        let status = self.r8(self.sr(SD_STS)) & SD_STS_W1C;
+        if status == 0 {
+            return false;
+        }
+        self.w8(self.sr(SD_STS), status);
+        true
     }
 
     /// PIT bottom half: use LPIB to see which BDL fragment hardware has left,
     /// refill those fragments, and never depend on HDA interrupts.
-    pub fn poll(&mut self, mixer: &mut Mixer) {
+    pub fn poll(&mut self, mixer: &mut Mixer) -> bool {
         if !self.running {
-            return;
+            return false;
         }
 
         let lpib_raw = self.r32(self.sr(SD_LPIB));
@@ -525,16 +579,6 @@ impl Hda {
         let current = (lpib / BYTES_PER_FRAG).min(BDL_COUNT - 1);
 
         if self.debug_polls < 8 || lpib_raw != self.debug_last_lpib {
-            if self.debug_polls < 8 {
-                crate::println!(
-                    "[audio/hda] poll#{} LPIB={} frag={} CTL={:#04x} STS={:#04x}",
-                    self.debug_polls,
-                    lpib_raw,
-                    current,
-                    self.r8(self.sr(SD_CTL0)),
-                    self.r8(self.sr(SD_STS)),
-                );
-            }
             self.debug_last_lpib = lpib_raw;
             self.debug_polls = self.debug_polls.saturating_add(1);
         }
@@ -548,7 +592,7 @@ impl Hda {
             } else {
                 self.idle_refills = self.idle_refills.saturating_add(1);
             }
-            compiler_fence(Ordering::SeqCst);
+            crate::memory::resources::dma_wmb();
             self.last_frag = (self.last_frag + 1) % BDL_COUNT;
             progressed += 1;
         }
@@ -557,6 +601,7 @@ impl Hda {
         if self.idle_refills >= BDL_COUNT + 2 && !mixer.has_data() {
             self.stop();
         }
+        progressed != 0
     }
 }
 
@@ -595,9 +640,10 @@ pub fn probe_first() -> Result<Option<Hda>, &'static str> {
 
     // HDA uses MMIO + bus-master DMA. Preserve unrelated PCI command bits.
     let cmd = dev.read_u16(0x04);
-    dev.write_u16(0x04, cmd | 0x0006);
+    dev.write_u16(0x04, (cmd | 0x0006) & !0x0400);
 
-    let (mmio, phys, size) = Hda::map_bar(&dev)?;
+    let (mmio_mapping, phys, size) = Hda::map_bar(&dev)?;
+    let mmio = mmio_mapping.as_usize();
     let bdl_mem = dma_alloc_for("hda BDL", core::mem::size_of::<Bdl>(), core::mem::align_of::<Bdl>(), u32::MAX as u64)
         .map_err(|_| "HDA BDL DMA allocation failed")?;
     let dma_mem = match dma_alloc_for("hda PCM", core::mem::size_of::<DmaBuffer>(), core::mem::align_of::<DmaBuffer>(), u32::MAX as u64) {
@@ -612,6 +658,7 @@ pub fn probe_first() -> Result<Option<Hda>, &'static str> {
 
     let mut card = Hda {
         mmio,
+        _mmio_mapping: mmio_mapping,
         irq: dev.interrupt_line,
         codec: 0,
         codec_vendor: 0,
@@ -621,6 +668,7 @@ pub fn probe_first() -> Result<Option<Hda>, &'static str> {
         bdl_mem,
         dma_mem,
         running: false,
+        irq_enabled: false,
         last_frag: 0,
         idle_refills: 0,
         debug_polls: 0,
@@ -655,7 +703,7 @@ pub fn probe_first() -> Result<Option<Hda>, &'static str> {
     card.program_stream()?;
 
     crate::println!(
-        "[audio/hda] CX20590 ready: DAC=0x10 speaker=0x1f hp=0x19, polling LPIB, no IRQ"
+        "[audio/hda] CX20590 ready: DAC=0x10 speaker=0x1f hp=0x19"
     );
     Ok(Some(card))
 }

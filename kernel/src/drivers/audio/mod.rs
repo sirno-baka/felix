@@ -10,8 +10,7 @@ pub mod ich_ac97;
 pub mod trident;
 
 use alloc::boxed::Box;
-use core::arch::asm;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use crate::device::char::CharDevice;
 use crate::filesystem::devfs::DevFS;
@@ -55,6 +54,10 @@ impl Stream {
 
     fn free_samples(&self) -> usize {
         STREAM_SAMPLES - self.len
+    }
+
+    fn can_write_stereo_frame(&self) -> bool {
+        self.free_samples() >= 2
     }
 
     fn push(&mut self, s: i16) -> bool {
@@ -110,6 +113,14 @@ impl Mixer {
             .or_else(|| self.streams.iter().position(|s| s.len == 0))?;
         self.streams[idx].clear_for(owner_pid);
         Some(&mut self.streams[idx])
+    }
+
+    fn can_write(&self, owner_pid: i32) -> bool {
+        let owner_pid = owner_pid.max(0);
+        if let Some(stream) = self.streams.iter().find(|s| s.owner_pid == owner_pid) {
+            return stream.can_write_stereo_frame();
+        }
+        self.streams.iter().any(|s| s.owner_pid < 0 || s.len == 0)
     }
 
     fn write_pcm16le(&mut self, owner_pid: i32, bytes: &[u8]) -> usize {
@@ -213,7 +224,7 @@ impl Backend {
             Self::Trident(v) => v.ack_irq(),
         }
     }
-    fn poll(&mut self, mixer: &mut Mixer) {
+    fn poll(&mut self, mixer: &mut Mixer) -> bool {
         match self {
             Self::Hda(v) => v.poll(mixer),
             Self::Ich(v) => v.poll(mixer),
@@ -238,6 +249,62 @@ impl AudioManager {
 
 static AUDIO: KMutex<AudioManager> = KMutex::new(AudioManager::new());
 static AUDIO_INODE: AtomicU32 = AtomicU32::new(0);
+static AUDIO_IRQ: AtomicU8 = AtomicU8::new(u8::MAX);
+static AUDIO_IRQ_PENDING: AtomicBool = AtomicBool::new(false);
+static AUDIO_IRQ_STATUS: AtomicU32 = AtomicU32::new(0);
+static AUDIO_FALLBACK_TICK: AtomicU8 = AtomicU8::new(0);
+
+const IRQ_ROUTE_NONE: u8 = 0;
+const IRQ_ROUTE_HDA: u8 = 1;
+const IRQ_ROUTE_ICH: u8 = 2;
+const IRQ_ROUTE_TRIDENT: u8 = 3;
+static AUDIO_IRQ_ROUTE: AtomicU8 = AtomicU8::new(IRQ_ROUTE_NONE);
+static AUDIO_IRQ_ARG0: AtomicUsize = AtomicUsize::new(0);
+static AUDIO_IRQ_ARG1: AtomicU32 = AtomicU32::new(0);
+static AUDIO_IRQ_ARG2: AtomicU32 = AtomicU32::new(0);
+
+fn publish_irq_route(backend: &Backend) {
+    match backend {
+        Backend::Hda(v) => {
+            let (mmio, stream) = v.irq_ack_cookie();
+            AUDIO_IRQ_ARG0.store(mmio, Ordering::Relaxed);
+            AUDIO_IRQ_ARG1.store(stream as u32, Ordering::Relaxed);
+            AUDIO_IRQ_ARG2.store(0, Ordering::Relaxed);
+            AUDIO_IRQ_ROUTE.store(IRQ_ROUTE_HDA, Ordering::Release);
+        }
+        Backend::Ich(v) => {
+            AUDIO_IRQ_ARG0.store(v.irq_ack_port() as usize, Ordering::Relaxed);
+            AUDIO_IRQ_ARG1.store(0, Ordering::Relaxed);
+            AUDIO_IRQ_ARG2.store(0, Ordering::Relaxed);
+            AUDIO_IRQ_ROUTE.store(IRQ_ROUTE_ICH, Ordering::Release);
+        }
+        Backend::Trident(v) => {
+            let (iobase, aint, voice_mask) = v.irq_ack_cookie();
+            AUDIO_IRQ_ARG0.store(iobase as usize, Ordering::Relaxed);
+            AUDIO_IRQ_ARG1.store(aint as u32, Ordering::Relaxed);
+            AUDIO_IRQ_ARG2.store(voice_mask, Ordering::Relaxed);
+            AUDIO_IRQ_ROUTE.store(IRQ_ROUTE_TRIDENT, Ordering::Release);
+        }
+    }
+}
+
+fn ack_irq_without_audio_lock() -> u32 {
+    match AUDIO_IRQ_ROUTE.load(Ordering::Acquire) {
+        IRQ_ROUTE_HDA => hda::Hda::ack_irq_raw(
+            AUDIO_IRQ_ARG0.load(Ordering::Relaxed),
+            AUDIO_IRQ_ARG1.load(Ordering::Relaxed) as usize,
+        ),
+        IRQ_ROUTE_ICH => ich_ac97::IchAc97::ack_irq_raw(
+            AUDIO_IRQ_ARG0.load(Ordering::Relaxed) as u16,
+        ),
+        IRQ_ROUTE_TRIDENT => trident::Trident::ack_irq_raw(
+            AUDIO_IRQ_ARG0.load(Ordering::Relaxed) as u16,
+            AUDIO_IRQ_ARG1.load(Ordering::Relaxed) as u16,
+            AUDIO_IRQ_ARG2.load(Ordering::Relaxed),
+        ),
+        _ => 0,
+    }
+}
 
 pub struct AudioCharDevice;
 
@@ -306,24 +373,31 @@ pub fn init() {
     };
 
     let irq = backend.irq();
+    AUDIO_IRQ.store(irq, Ordering::Release);
     let name = backend.name();
-    // let irq_result = crate::drivers::shared_irq::register(irq, irq_entry);
-    backend.set_irq_enabled(false); //irq_result.is_ok());
+    backend.set_irq_enabled(false);
+    // Publish only immutable hardware coordinates to the hard-IRQ path. The
+    // mutable mixer/backend remains exclusively protected by AUDIO.
+    publish_irq_route(&backend);
     AUDIO.lock().backend = Some(backend);
+    let irq_result = crate::drivers::shared_irq::register_named(irq, irq_entry, "audio");
+    if let Some(backend) = AUDIO.lock().backend.as_mut() {
+        backend.set_irq_enabled(irq_result.is_ok());
+    }
 
     let inode = DevFS::register_char_global("audio", Box::new(AudioCharDevice));
     AUDIO_INODE.store(inode, Ordering::Release);
 
-    // match irq_result {
-    //     Ok(()) => crate::println!(
-    //         "[audio] {} ready: /dev/audio S16LE 48000 stereo; IRQ{} shared, PIT refill",
-    //         name, irq
-    //     ),
-    //     Err(e) => crate::println!(
-    //         "[audio] {} ready: /dev/audio S16LE 48000 stereo; pure polling ({})",
-    //         name, e
-    //     ),
-    // }
+    match irq_result {
+        Ok(()) => crate::println!(
+            "[audio] {} ready: /dev/audio S16LE 48000 stereo; shared IRQ{}, deferred refill",
+            name, irq
+        ),
+        Err(e) => crate::println!(
+            "[audio] {} ready: /dev/audio S16LE 48000 stereo; polling fallback ({})",
+            name, e
+        ),
+    }
 }
 
 pub fn is_available() -> bool {
@@ -345,9 +419,41 @@ pub fn is_audio_inode(global_inode: u32) -> bool {
 }
 
 pub fn write_stream(owner_pid: i32, bytes: &[u8]) -> usize {
+    match try_write_stream(owner_pid, bytes) {
+        StreamWrite::Written(written) => written,
+        StreamWrite::WouldBlock | StreamWrite::Unavailable => 0,
+    }
+}
+
+/// Result of one attempt to append PCM data to the software mixer.
+///
+/// Waiting is deliberately left to the syscall layer. Sleeping here would
+/// keep the process-wide SMP kernel lock held and stall every CPU until the
+/// PIT bottom half made room in the ring.
+pub enum StreamWrite {
+    Written(usize),
+    WouldBlock,
+    Unavailable,
+}
+
+pub fn stream_writable(owner_pid: i32) -> bool {
+    let Some(audio) = AUDIO.try_lock() else {
+        return false;
+    };
+    audio.backend.is_some() && audio.mixer.can_write(owner_pid)
+}
+
+pub fn try_write_stream(owner_pid: i32, bytes: &[u8]) -> StreamWrite {
+    if bytes.is_empty() {
+        return StreamWrite::Written(0);
+    }
+    if bytes.len() < 4 {
+        return StreamWrite::Written(0);
+    }
+
     let mut audio = AUDIO.lock();
     if audio.backend.is_none() {
-        return 0;
+        return StreamWrite::Unavailable;
     }
     let written = audio.mixer.write_pcm16le(owner_pid, bytes);
     if written != 0 {
@@ -358,72 +464,57 @@ pub fn write_stream(owner_pid: i32, bytes: &[u8]) -> usize {
             }
         }
     }
-    written
-}
-
-pub fn write_stream_blocking(owner: i32, buf: &[u8], nonblock: bool) -> usize {
-    if buf.is_empty() {
-        return 0;
-    }
-
-    let mut written = 0usize;
-
-    loop {
-        let n = write_stream(owner, &buf[written..]);
-
-        if n > 0 {
-            written += n;
-
-            if written >= buf.len() {
-                return written;
-            }
-
-            continue;
-        }
-
-        // Ring заполнен.
-        if nonblock {
-            // Felix сейчас использует usize::MAX как would-block
-            // в pipe_try_write().
-            return if written == 0 { usize::MAX } else { written };
-        }
-
-        /*
-         * Очень важно:
-         *
-         * IRQ audio у тебя выключен, а ring освобождается из audio::poll()
-         * в PIT. Поэтому здесь НЕЛЬЗЯ просто spin_loop().
-         *
-         * Разрешаем IRQ0, засыпаем до следующего PIT tick.
-         * PIT вызовет audio::poll(), DMA/ring продвинется,
-         * после возврата опять отключаем interrupts и пробуем запись.
-         */
-        unsafe {
-            asm!("sti", "hlt", "cli", options(nomem, nostack));
-        }
+    if written == 0 {
+        StreamWrite::WouldBlock
+    } else {
+        StreamWrite::Written(written)
     }
 }
 
 fn irq_entry(irq: u8) -> bool {
-    let Some(mut audio) = AUDIO.try_lock() else {
-        return false;
-    };
-    let Some(backend) = audio.backend.as_mut() else {
-        return false;
-    };
-    if backend.irq() != irq {
+    if AUDIO_IRQ.load(Ordering::Acquire) != irq {
         return false;
     }
-    backend.ack_irq()
+    // Never take AUDIO from hard IRQ context: another CPU may hold it while
+    // programming/refilling the same backend. Acknowledge only through the
+    // immutable route published before device interrupts were enabled.
+    let status = ack_irq_without_audio_lock();
+    if status != 0 {
+        AUDIO_IRQ_STATUS.fetch_or(status, Ordering::AcqRel);
+        AUDIO_IRQ_PENDING.store(true, Ordering::Release);
+        true
+    } else {
+        false
+    }
 }
 
-pub fn poll() {
+/// Interrupt-driven refill with a low-rate polling safety net for hardware
+/// that loses an edge or is temporarily inaccessible from another CPU.
+pub fn poll_due() -> bool {
+    if AUDIO_IRQ_PENDING.swap(false, Ordering::AcqRel) {
+        return true;
+    }
+    AUDIO_FALLBACK_TICK.fetch_add(1, Ordering::Relaxed) & 3 == 0
+}
+
+pub fn poll() -> bool {
     let Some(mut audio) = AUDIO.try_lock() else {
-        return;
+        return false;
     };
     let AudioManager { mixer, backend } = &mut *audio;
     if let Some(backend) = backend.as_mut() {
-        backend.poll(mixer);
+        let irq_status = AUDIO_IRQ_STATUS.swap(0, Ordering::AcqRel);
+        if irq_status != 0 {
+            match backend {
+                Backend::Ich(v) => v.note_irq_status(irq_status as u16),
+                Backend::Trident(v) => v.note_irq(),
+                Backend::Hda(_) => {}
+            }
+        }
+        let _ = backend.ack_irq();
+        backend.poll(mixer)
+    } else {
+        false
     }
 }
 

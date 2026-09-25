@@ -105,7 +105,7 @@ pub const KERNEL_VIRT: u32 = KERNEL_PHYS + KERNEL_OFFSET; // 0xC100_0000
 ///   0x0100_0000..0x0180_0000  kernel image
 ///   0x0180_0000..0x0280_0000  kernel heap (virt 0xC1800000..0xC2800000)
 ///   0x0280_0000..ram_end      free frames (user PTs, stacks, surfaces)
-///   0x0200_0000..             PXE ramdisk may sit here; reserve_frames_past()
+///   0x0280_0000..             PXE ramdisk may sit here; reserve_frames_past()
 ///
 /// Large-page window and frame limit are set by `configure_from_ram()` from
 /// CMOS / BootInfo — no hardcoded `-m N` match required.
@@ -631,10 +631,20 @@ impl PageManager {
 
     pub fn alloc_phys_frame(&mut self) -> u32 {
         if let Some(frame) = self.free_frames.pop() {
+            // Old teardown paths could insert the same frame more than once.
+            // Remove every duplicate before publishing the frame again.
+            self.free_frames.retain(|&candidate| candidate != frame);
+            if let Some(slot) = crate::multitasking::task::live_kernel_stack_owner(frame) {
+                panic!("[pg] free-list frame {} still belongs to live kernel stack slot {}", frame, slot);
+            }
             return frame;
         }
+        assert!(self.next_free_page < detected_ram_bytes() >> 12, "physical frame allocator exhausted");
         let frame = self.next_free_page;
         self.next_free_page += 1;
+        if let Some(slot) = crate::multitasking::task::live_kernel_stack_owner(frame) {
+            panic!("[pg] bump frame {} overlaps live kernel stack slot {}", frame, slot);
+        }
         frame
     }
 
@@ -653,6 +663,10 @@ impl PageManager {
 
     pub(crate) fn alloc_frame(&mut self) -> u32 {
         if let Some(frame) = self.free_frames.pop() {
+            self.free_frames.retain(|&candidate| candidate != frame);
+            if let Some(slot) = crate::multitasking::task::live_kernel_stack_owner(frame) {
+                panic!("[pg] reusable frame {} still belongs to live kernel stack slot {}", frame, slot);
+            }
             return frame;
         }
 
@@ -668,6 +682,9 @@ impl PageManager {
             );
         }
         self.next_free_page += 1;
+        if let Some(slot) = crate::multitasking::task::live_kernel_stack_owner(frame) {
+            panic!("[pg] allocated frame {} overlaps live kernel stack slot {}", frame, slot);
+        }
         frame
     }
 
@@ -695,6 +712,7 @@ impl PageManager {
         // First try the reusable frame list.  Look for a contiguous run and
         // choose an aligned sub-run inside it.
         self.free_frames.sort_unstable();
+        self.free_frames.dedup();
         let mut run_start = 0usize;
         while run_start < self.free_frames.len() {
             let mut run_end = run_start + 1;
@@ -717,6 +735,11 @@ impl PageManager {
             if aligned >= first && alloc_end <= last_exclusive && alloc_end <= hard_limit {
                 let start_index = run_start + (aligned - first) as usize;
                 let end_index = start_index + pages as usize;
+                for frame in aligned..alloc_end {
+                    if let Some(slot) = crate::multitasking::task::live_kernel_stack_owner(frame) {
+                        panic!("[pg] contiguous reusable frame {} overlaps live kernel stack slot {}", frame, slot);
+                    }
+                }
                 self.free_frames.drain(start_index..end_index);
                 return Ok(aligned);
             }
@@ -739,6 +762,11 @@ impl PageManager {
 
         for frame in self.next_free_page..aligned {
             self.free_frames.push(frame);
+        }
+        for frame in aligned..end {
+            if let Some(slot) = crate::multitasking::task::live_kernel_stack_owner(frame) {
+                panic!("[pg] contiguous bump frame {} overlaps live kernel stack slot {}", frame, slot);
+            }
         }
         self.next_free_page = end;
         Ok(aligned)
@@ -805,7 +833,8 @@ impl PageManager {
         let _ = kernel_end_virt;
         self.next_free_page = FRAME_ALLOC_START >> 12;
 
-        // The PXE bootloader may place the root disk at RAMDISK_PHYS=0x02000000.
+        // The PXE bootloader places the root disk after the fixed kernel heap,
+        // at RAMDISK_PHYS=0x02800000.
         // That range can extend well beyond FRAME_ALLOC_START (0x02800000).
         // Reserve it HERE, before any driver gets a chance to call alloc_frame().
         //
@@ -1071,6 +1100,9 @@ pub fn alloc_kernel_stack(size: usize) -> u32 {
     let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     let first = interrupt_sync::without_interrupts(|| unsafe {
         let mut pm = PAGING.lock();
+        // Reuse a verified contiguous run when possible. Kernel stacks are
+        // large enough that monotonically leaking every exited task's stack
+        // would exhaust a 128 MiB machine after modest process churn.
         pm.alloc_contiguous_frames(pages as u32)
     });
     let base = phys_to_virt(first << 12);

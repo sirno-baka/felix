@@ -34,6 +34,7 @@ const PO_BDBAR: u16 = 0x10;
 const PO_CIV: u16 = 0x14;
 const PO_LVI: u16 = 0x15;
 const PO_SR: u16 = 0x16;
+const PO_PICB: u16 = 0x18;
 const PO_CR: u16 = 0x1b;
 const GLOB_CNT: u16 = 0x2c;
 const GLOB_STA: u16 = 0x30;
@@ -100,6 +101,22 @@ pub struct IchAc97 {
 
 unsafe impl Send for IchAc97 {}
 
+impl Drop for IchAc97 {
+    fn drop(&mut self) {
+        self.irq_enabled = false;
+        self.stop();
+        let gc = inl(self.bport(GLOB_CNT));
+        outl(self.bport(GLOB_CNT), gc & !GLOB_CNT_GIE);
+        for _ in 0..10_000 {
+            if inw(self.bport(PO_SR)) & SR_DCH != 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        crate::memory::resources::dma_mb();
+    }
+}
+
 fn supported(id: u16) -> bool {
     IDS.iter().any(|&x| x == id)
 }
@@ -137,6 +154,29 @@ impl IchAc97 {
     pub fn irq(&self) -> u8 {
         self.irq
     }
+    pub fn irq_ack_port(&self) -> u16 {
+        self.bport(PO_SR)
+    }
+
+    /// Lock-free hard-IRQ acknowledge path. The bus-master status port is
+    /// immutable after probe, so this never aliases mutable backend state.
+    pub fn ack_irq_raw(status_port: u16) -> u32 {
+        let pending = inw(status_port) & (SR_BCIS | SR_LVBCI | SR_FIFOE);
+        if pending != 0 {
+            outw(status_port, pending);
+        }
+        pending as u32
+    }
+
+    pub fn note_irq_status(&mut self, pending: u16) {
+        if pending & (SR_BCIS | SR_LVBCI) != 0 {
+            self.pending_completion = true;
+        }
+        if pending & SR_FIFOE != 0 {
+            self.pending_fifo_error = true;
+        }
+    }
+
     pub fn set_irq_enabled(&mut self, enabled: bool) {
         self.irq_enabled = enabled;
     }
@@ -256,7 +296,7 @@ impl IchAc97 {
         }
 
         let bdl_phys = self.bdl_mem.phys.0;
-        compiler_fence(Ordering::SeqCst);
+        crate::memory::resources::dma_wmb();
         outl(self.bport(PO_BDBAR), bdl_phys);
         self.last_civ = 0;
         self.lvi = (ACTIVE_FRAGS - 1) as u8;
@@ -298,70 +338,50 @@ impl IchAc97 {
             return false;
         }
         outw(self.bport(PO_SR), pending);
-        if pending & (SR_BCIS | SR_LVBCI) != 0 {
-            self.pending_completion = true;
-        }
-        if pending & SR_FIFOE != 0 {
-            self.pending_fifo_error = true;
-        }
+        self.note_irq_status(pending);
         true
     }
 
     /// Bottom half, called by PIT. It polls status too, so pure-polling mode and
     /// storm-masked legacy IRQs use the same refill path.
-    pub fn poll(&mut self, mixer: &mut Mixer) {
+    pub fn poll(&mut self, mixer: &mut Mixer) -> bool {
         if !self.running {
-            return;
+            return false;
         }
         let _ = self.ack_irq();
-        if !self.pending_completion && !self.pending_fifo_error {
-            return;
-        }
-
-        let had_completion = self.pending_completion;
         let fifo_error = self.pending_fifo_error;
         self.pending_completion = false;
         self.pending_fifo_error = false;
-
         if fifo_error {
-            crate::println!("[audio/ich] PCM FIFO error");
+            // Reset before rewriting descriptors still owned by a stalled DMA engine.
+            self.stop();
+            let _ = self.kick(mixer);
+            return true;
         }
 
         let civ = inb(self.bport(PO_CIV)) & 31;
-        let mut completed = 0usize;
-        while self.last_civ != civ && completed < BDL_COUNT {
-            self.last_civ = (self.last_civ + 1) & 31;
-            let append = ((self.lvi as usize + 1) & 31) as u8;
+        let halted_at_end = inw(self.bport(PO_SR)) & SR_DCH != 0
+            && civ == self.lvi && inw(self.bport(PO_PICB)) == 0;
+        let mut completed = civ.wrapping_sub(self.last_civ) as usize & 31;
+        if halted_at_end { completed += 1; }
+        // Never infer a completed fragment solely from a stale BCIS bit.
+        if completed == 0 { return false; }
+        for _ in 0..completed {
+            let append = (self.lvi + 1) & 31;
             let data = self.fill_fragment(append as usize, mixer);
-            if data {
-                self.idle_appends = 0;
-            } else {
-                self.idle_appends = self.idle_appends.saturating_add(1);
-            }
-            compiler_fence(Ordering::SeqCst);
-            self.lvi = append;
-            outb(self.bport(PO_LVI), self.lvi);
-            completed += 1;
-        }
-
-        if completed == 0 && had_completion {
-            let append = ((self.lvi as usize + 1) & 31) as u8;
-            let data = self.fill_fragment(append as usize, mixer);
-            if data {
-                self.idle_appends = 0;
-            } else {
-                self.idle_appends = self.idle_appends.saturating_add(1);
-            }
-            compiler_fence(Ordering::SeqCst);
+            if data { self.idle_appends = 0; }
+            else { self.idle_appends = self.idle_appends.saturating_add(1); }
+            crate::memory::resources::dma_wmb();
             self.lvi = append;
             outb(self.bport(PO_LVI), self.lvi);
         }
-
+        self.last_civ = if halted_at_end { (civ + 1) & 31 } else { civ };
         if self.idle_appends >= ACTIVE_FRAGS + 2 && !mixer.has_data() {
             self.stop();
-        } else if inw(self.bport(PO_SR)) & SR_DCH != 0 && mixer.has_data() {
+        } else if inw(self.bport(PO_SR)) & SR_DCH != 0 {
             outb(self.bport(PO_CR), self.run_control());
         }
+        true
     }
 }
 
@@ -376,6 +396,7 @@ pub fn probe_first() -> Result<Option<IchAc97>, &'static str> {
     let nam = io_bar(&dev, 0)?;
     let nabm = io_bar(&dev, 1)?;
     dev.enable_bus_mastering();
+    dev.write_u16(0x04, dev.read_u16(0x04) & !0x0400);
 
     let bdl_mem = dma_alloc_for("ich-ac97 BDL", core::mem::size_of::<Bdl>(), core::mem::align_of::<Bdl>(), u32::MAX as u64)
         .map_err(|_| "ICH AC97 BDL DMA allocation failed")?;

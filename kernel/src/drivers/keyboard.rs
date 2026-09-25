@@ -142,7 +142,10 @@ pub extern "C" fn keyboard_handler() {
     // Does NOT halt — useful when the shell appears hung on real HW.
     if code == 0x58 && !released {
         let _ = crate::fb_panic::try_show(format_args!(
-            "=== F12 DEBUG DUMP ===\n(system still running; recent log above)\n"
+            "=== F12 DEBUG DUMP ===\n{}\n{}\n{}",
+            crate::smp::DebugSnapshot,
+            crate::drivers::net::e1000e::DebugSnapshot,
+            crate::syscalls::handler::PollDebugSnapshot,
         ));
         PICS.end_interrupt(KEYBOARD_INT);
         return;

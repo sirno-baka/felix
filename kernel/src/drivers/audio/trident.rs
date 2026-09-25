@@ -129,6 +129,14 @@ pub struct Trident {
 
 unsafe impl Send for Trident {}
 
+impl Drop for Trident {
+    fn drop(&mut self) {
+        self.irq_enabled = false;
+        self.stop();
+        crate::memory::resources::dma_mb();
+    }
+}
+
 fn identify(d: &PciDevice) -> Option<Chip> {
     match (d.vendor_id, d.device_id) {
         (VENDOR_TRIDENT, DEV_DX) => Some(Chip::Dx),
@@ -160,6 +168,36 @@ impl Trident {
     pub fn irq(&self) -> u8 {
         self.irq
     }
+    pub fn irq_ack_cookie(&self) -> (u16, u16, u32) {
+        let (_, _, aint, _) = self.bank_regs();
+        (self.iobase, aint, self.voice_mask())
+    }
+
+    /// Lock-free hard-IRQ acknowledge path. Only this playback voice is
+    /// acknowledged; unrelated voices on the same controller are left alone.
+    pub fn ack_irq_raw(iobase: u16, aint: u16, voice_mask: u32) -> u32 {
+        if inl(iobase.wrapping_add(T4D_MISCINT)) & ADDRESS_IRQ == 0 {
+            return 0;
+        }
+        let active = inl(iobase.wrapping_add(aint));
+        let ours = active & voice_mask;
+        if ours == 0 {
+            return 0;
+        }
+        outl(iobase.wrapping_add(aint), ours);
+        outl(iobase.wrapping_add(T4D_MISCINT), MISC_ACK);
+        ours
+    }
+
+    pub fn note_irq(&mut self) {
+        if !self.running {
+            return;
+        }
+        let cso = self.current_frame() as usize % RING_FRAMES;
+        let safe_half = if cso >= HALF_FRAMES { 0 } else { 1 };
+        self.pending_halves |= 1u8 << safe_half;
+    }
+
     pub fn set_irq_enabled(&mut self, enabled: bool) {
         self.irq_enabled = enabled;
     }
@@ -405,7 +443,7 @@ impl Trident {
         unsafe { (*self.dma).samples.fill(0); }
         let _ = self.fill_half(0, mixer);
         let _ = self.fill_half(1, mixer);
-        compiler_fence(Ordering::SeqCst);
+        crate::memory::resources::dma_wmb();
 
         self.program_voice()?;
         if self.irq_enabled {
@@ -460,9 +498,9 @@ impl Trident {
 
     /// PIT bottom half. With a registered IRQ it consumes pending address
     /// interrupts. In pure-polling mode it watches CSO cross the half boundary.
-    pub fn poll(&mut self, mixer: &mut Mixer) {
+    pub fn poll(&mut self, mixer: &mut Mixer) -> bool {
         if !self.running {
-            return;
+            return false;
         }
 
         if self.irq_enabled {
@@ -472,20 +510,23 @@ impl Trident {
             if event & ADDRESS_IRQ != 0 {
                 let _ = self.ack_irq();
             }
-        } else {
-            let cso = self.current_frame() as usize % RING_FRAMES;
-            let current_half = if cso >= HALF_FRAMES { 1u8 } else { 0u8 };
-            if current_half != self.last_poll_half {
-                // The half just left by hardware is now safe to refill.
-                self.pending_halves |= 1u8 << self.last_poll_half;
-                self.last_poll_half = current_half;
-            }
         }
 
-        let pending = self.pending_halves;
+        // CSO is authoritative for DMA ownership. Track half crossings even
+        // when IRQs are enabled so a lock-free hard-IRQ ACK cannot erase the
+        // only evidence that a half became safe to refill.
+        let cso = self.current_frame() as usize % RING_FRAMES;
+        let current_half = if cso >= HALF_FRAMES { 1u8 } else { 0u8 };
+        if current_half != self.last_poll_half {
+            self.pending_halves |= 1u8 << self.last_poll_half;
+            self.last_poll_half = current_half;
+        }
+
+        let active_half = usize::from(self.current_frame() as usize % RING_FRAMES >= HALF_FRAMES);
+        let pending = self.pending_halves & !(1 << active_half);
         self.pending_halves = 0;
         if pending == 0 {
-            return;
+            return false;
         }
 
         for half in 0..2usize {
@@ -493,7 +534,7 @@ impl Trident {
                 continue;
             }
             let data = self.fill_half(half, mixer);
-            compiler_fence(Ordering::SeqCst);
+            crate::memory::resources::dma_wmb();
             if data {
                 self.idle_halves = 0;
             } else {
@@ -504,6 +545,7 @@ impl Trident {
         if self.idle_halves >= 3 && !mixer.has_data() {
             self.stop();
         }
+        true
     }
 }
 
@@ -517,7 +559,7 @@ pub fn probe_first() -> Result<Option<Trident>, &'static str> {
 
     let iobase = io_bar0(&dev)?;
     let command = dev.read_u16(0x04);
-    dev.write_u16(0x04, command | 0x0005); // I/O + bus master
+    dev.write_u16(0x04, (command | 0x0005) & !0x0400); // I/O + bus master + INTx
 
     let channel = if chip == Chip::Ali5451 { 0 } else { 63 };
     let dma_mem = dma_alloc_for("trident PCM", core::mem::size_of::<DmaBuffer>(), core::mem::align_of::<DmaBuffer>(), DMA_MASK_30BIT as u64)

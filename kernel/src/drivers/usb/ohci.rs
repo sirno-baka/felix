@@ -341,14 +341,38 @@ impl Ohci {
         self.frame_number().wrapping_sub(start)
     }
 
-    fn wait_frames(&self, frames: u16) {
+    /// Guard frame-clock based waits against a wedged host controller. A
+    /// healthy OHCI advances HcFmNumber every 1 ms; if the value remains
+    /// unchanged for a very large number of MMIO polls, no frame-based timeout
+    /// can ever expire on its own.
+    #[inline]
+    fn frame_clock_alive(&self, last: &mut u16, stagnant_polls: &mut u32) -> bool {
+        const MAX_STAGNANT_POLLS: u32 = 1_000_000;
+        let now = self.frame_number();
+        if now != *last {
+            *last = now;
+            *stagnant_polls = 0;
+            true
+        } else {
+            *stagnant_polls = (*stagnant_polls).saturating_add(1);
+            *stagnant_polls < MAX_STAGNANT_POLLS
+        }
+    }
+
+    fn wait_frames(&self, frames: u16) -> Result<(), &'static str> {
         if frames == 0 {
-            return;
+            return Ok(());
         }
         let start = self.frame_number();
+        let mut last = start;
+        let mut stagnant_polls = 0u32;
         while self.frames_since(start) < frames {
+            if !self.frame_clock_alive(&mut last, &mut stagnant_polls) {
+                return Err("OHCI: frame counter stalled");
+            }
             core::hint::spin_loop();
         }
+        Ok(())
     }
 
     fn port_status(&self, port: u8) -> u32 {
@@ -567,6 +591,11 @@ impl Ohci {
             spin_ms(10);
         }
 
+        // A controller that entered OPERATIONAL must advance HcFmNumber. If
+        // the clock never starts, every later frame-based USB timeout would
+        // otherwise become an infinite loop on old hardware.
+        self.wait_frames(2)?;
+
         // Global power on root-hub ports. HcRhDescriptorA.POTPGT tells the
         // HCD how long a newly powered port needs before it may be accessed;
         // the field is in 2 ms units. Real southbridges can need much longer
@@ -609,10 +638,15 @@ impl Ohci {
 
         self.write_port(port, PS_PRS);
         let reset_start = self.frame_number();
+        let mut reset_last_frame = reset_start;
+        let mut reset_stagnant_polls = 0u32;
         let mut reset_done = false;
         while self.frames_since(reset_start) < 100 {
             if self.port_status(port) & PS_PRSC != 0 {
                 reset_done = true;
+                break;
+            }
+            if !self.frame_clock_alive(&mut reset_last_frame, &mut reset_stagnant_polls) {
                 break;
             }
             core::hint::spin_loop();
@@ -624,7 +658,7 @@ impl Ohci {
         self.write_port(port, PS_PRSC | PS_CSC | PS_PESC);
         self.write_port(port, PS_PES);
         // USB requires recovery time after reset before address-0 traffic.
-        self.wait_frames(10);
+        self.wait_frames(10)?;
 
         let s = self.port_status(port);
         Ok(s & PS_PES != 0 && s & PS_CCS != 0)
@@ -767,11 +801,16 @@ impl Ohci {
 
         let mut ok = false;
         let wait_start = self.frame_number();
+        let mut wait_last_frame = wait_start;
+        let mut wait_stagnant_polls = 0u32;
         while self.frames_since(wait_start) < 500 {
             let setup_cc = dma.setup_td.cc();
             let status_cc = dma.status_td.cc();
             if setup_cc != TD_CC_NOT_ACCESSED && status_cc != TD_CC_NOT_ACCESSED {
                 ok = true;
+                break;
+            }
+            if !self.frame_clock_alive(&mut wait_last_frame, &mut wait_stagnant_polls) {
                 break;
             }
             core::hint::spin_loop();
@@ -970,9 +1009,14 @@ impl Ohci {
 
         let mut ok = false;
         let wait_start = self.frame_number();
+        let mut wait_last_frame = wait_start;
+        let mut wait_stagnant_polls = 0u32;
         while self.frames_since(wait_start) < 2000 {
             if unsafe { read_volatile(&(*td).flags) } >> TD_CC_SHIFT != TD_CC_NOT_ACCESSED {
                 ok = true;
+                break;
+            }
+            if !self.frame_clock_alive(&mut wait_last_frame, &mut wait_stagnant_polls) {
                 break;
             }
             core::hint::spin_loop();
@@ -1099,9 +1143,14 @@ impl Ohci {
 
         let mut ok = false;
         let wait_start = self.frame_number();
+        let mut wait_last_frame = wait_start;
+        let mut wait_stagnant_polls = 0u32;
         while self.frames_since(wait_start) < 200 {
             if unsafe { (*td).cc() } != TD_CC_NOT_ACCESSED {
                 ok = true;
+                break;
+            }
+            if !self.frame_clock_alive(&mut wait_last_frame, &mut wait_stagnant_polls) {
                 break;
             }
             core::hint::spin_loop();
@@ -1279,8 +1328,16 @@ impl Ohci {
                 // connector settles; only reset/enumeration is atomic against
                 // the PIT scheduler on this old M5237.
                 let debounce_start = self.frame_number();
+                let mut debounce_last_frame = debounce_start;
+                let mut debounce_stagnant_polls = 0u32;
                 while self.frames_since(debounce_start) < 100 {
                     if self.port_status(p) & PS_CCS == 0 {
+                        break;
+                    }
+                    if !self.frame_clock_alive(
+                        &mut debounce_last_frame,
+                        &mut debounce_stagnant_polls,
+                    ) {
                         break;
                     }
                     core::hint::spin_loop();
@@ -1362,7 +1419,7 @@ impl Ohci {
             mps,
             ls,
         )?;
-        self.wait_frames(2);
+        self.wait_frames(2)?;
         crate::drivers::usb::device::bind_with_port(self, port, addr, &desc);
         Ok(addr)
     }
@@ -1382,11 +1439,6 @@ pub fn poll_hotplug() {
 }
 
 pub fn init_all() {
-    // Do NOT install a USB-specific IRQ9 gate here.  On the target Sony C1M
-    // generation PCI INTx/IRQ9 is shared with CardBus and several other devices,
-    // and PCMCIA may already own vector 41 by the time USB is initialized.
-    // This HCD uses polling for transfer completion anyway, so root-hub hotplug
-    // is polled from idle until the kernel gains a shared IRQ dispatcher.
     let devices = pci::enumerate();
     let mut n = 0u32;
     for dev in devices.iter() {
@@ -1420,10 +1472,6 @@ pub fn init_all() {
                 if let Some(hc) = controller {
                     hc.enumerate_ports();
                     hc.ack_root_hub_changes();
-
-                    // Never assert PCI INTx from OHCI in polling mode.  In
-                    // particular, do not overwrite/unmask shared IRQ9 after the
-                    // ToPIC/CardBus driver has already installed its handler.
                     hc.w32(HC_INTDIS, 0xFFFF_FFFF);
                     hc.w32(HC_INTSTATUS, 0xFFFF_FFFF);
                 }

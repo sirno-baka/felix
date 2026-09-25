@@ -7,7 +7,7 @@ use crate::memory::resources::{DmaBuffer as DmaAllocation, dma_alloc_for};
 use crate::pci;
 use crate::println;
 use crate::sync::mutex::Mutex;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 const VENDOR: u16 = 0x10EC;
 const DEVICE: u16 = 0x8139;
@@ -38,6 +38,12 @@ const ISR_ROK: u16 = 1 << 0;
 const ISR_RER: u16 = 1 << 1;
 const ISR_TOK: u16 = 1 << 2;
 const ISR_TER: u16 = 1 << 3;
+const ISR_RXOVW: u16 = 1 << 4;
+const ISR_PUN_LINKCHG: u16 = 1 << 5;
+const ISR_FOVW: u16 = 1 << 6;
+const ISR_SERR: u16 = 1 << 15;
+const IRQ_MASK: u16 = ISR_ROK | ISR_RER | ISR_TOK | ISR_TER | ISR_RXOVW
+    | ISR_PUN_LINKCHG | ISR_FOVW | ISR_SERR;
 
 const TSD_OWN: u32 = 1 << 13;
 const TSD_TOK: u32 = 1 << 15;
@@ -77,14 +83,24 @@ pub struct Rtl8139 {
 unsafe impl Send for Rtl8139 {}
 unsafe impl Sync for Rtl8139 {}
 
-pub static NET: Mutex<Option<Rtl8139>> = Mutex::new(None);
-static RX_LOGS: AtomicUsize = AtomicUsize::new(12);
-
-fn dma_wbinvd() {
-    unsafe {
-        core::arch::asm!("wbinvd", options(nostack, preserves_flags));
+impl Drop for Rtl8139 {
+    fn drop(&mut self) {
+        self.initialized.store(false, Ordering::Release);
+        outw(self.io + REG_IMR, 0);
+        outw(self.io + REG_ISR, 0xffff);
+        outb(self.io + REG_CMD, 0);
+        // A chip reset guarantees that no RX/TX bus-master transaction can
+        // outlive the DMA buffers that are dropped immediately afterwards.
+        let _ = self.reset();
+        crate::memory::resources::dma_mb();
     }
 }
+
+pub static NET: Mutex<Option<Rtl8139>> = Mutex::new(None);
+static RX_LOGS: AtomicUsize = AtomicUsize::new(12);
+static IRQ_IO: AtomicUsize = AtomicUsize::new(0);
+static IRQ_LINE: AtomicU8 = AtomicU8::new(u8::MAX);
+
 
 impl Rtl8139 {
     pub fn init() -> Result<(), &'static str> {
@@ -163,6 +179,17 @@ impl Rtl8139 {
         );
 
         *NET.lock() = Some(nic);
+        IRQ_IO.store(io as usize, Ordering::Release);
+        IRQ_LINE.store(dev.interrupt_line, Ordering::Release);
+        if crate::drivers::shared_irq::register_named(dev.interrupt_line, irq_entry, "rtl8139").is_ok() {
+            dev.write_u16(0x04, dev.read_u16(0x04) & !0x0400);
+            if let Some(nic) = NET.lock().as_ref() {
+                outw(nic.io + REG_ISR, 0xffff);
+                outw(nic.io + REG_IMR, IRQ_MASK);
+            }
+        } else {
+            println!("rtl8139: IRQ{} unavailable, polling fallback", dev.interrupt_line);
+        }
         Ok(())
     }
 
@@ -206,7 +233,7 @@ impl Rtl8139 {
         outb(self.io + REG_CMD, CMD_TE | CMD_RE);
         outl(self.io + REG_RCR, rcr);
         outw(self.io + REG_CAPR, 0xFFF0);
-        dma_wbinvd();
+        crate::memory::resources::dma_mb();
         Ok(())
     }
 
@@ -249,7 +276,7 @@ impl Rtl8139 {
             }
         }
 
-        dma_wbinvd();
+        crate::memory::resources::dma_mb();
         outl(self.io + REG_TSAD0 + (slot as u16) * 4, self.tx_phys[slot]);
         outl(tsd, len as u32);
 
@@ -274,7 +301,7 @@ impl Rtl8139 {
             return None;
         }
 
-        dma_wbinvd();
+        crate::memory::resources::dma_mb();
 
         let off = self.rx_off.load(Ordering::Relaxed);
         unsafe {
@@ -307,10 +334,12 @@ impl Rtl8139 {
                 let next = (off + 4 + 3) & !3;
                 let next = next % RX_RING;
                 self.rx_off.store(next, Ordering::Release);
-                outw(self.io + REG_CAPR, next.wrapping_sub(16) as u16);
+                crate::memory::resources::dma_mb();
+            outw(self.io + REG_CAPR, next.wrapping_sub(16) as u16);
                 return None;
             }
 
+            crate::memory::resources::dma_rmb();
             let payload = size - 4;
             let copy = core::cmp::min(payload, buf.len());
             core::ptr::copy_nonoverlapping(hdr.add(4), buf.as_mut_ptr(), copy);
@@ -318,15 +347,36 @@ impl Rtl8139 {
             let next = (off + size + 4 + 3) & !3;
             let next = next % RX_RING;
             self.rx_off.store(next, Ordering::Release);
+            crate::memory::resources::dma_mb();
             outw(self.io + REG_CAPR, next.wrapping_sub(16) as u16);
 
             Some(copy)
         }
     }
 
-    pub fn handle_interrupt(&self) {
-        let isr = inw(self.io + REG_ISR);
+    pub fn handle_interrupt(&self) -> bool {
+        let isr = inw(self.io + REG_ISR) & IRQ_MASK;
+        if isr == 0 {
+            return false;
+        }
         outw(self.io + REG_ISR, isr);
-        let _ = isr & (ISR_ROK | ISR_TOK | ISR_RER | ISR_TER);
+        true
     }
+}
+
+fn irq_entry(irq: u8) -> bool {
+    if IRQ_LINE.load(Ordering::Acquire) != irq {
+        return false;
+    }
+    let io = IRQ_IO.load(Ordering::Acquire) as u16;
+    if io == 0 {
+        return false;
+    }
+    let isr = inw(io + REG_ISR) & IRQ_MASK;
+    if isr == 0 {
+        return false;
+    }
+    outw(io + REG_ISR, isr);
+    crate::drivers::net::mark_irq_pending();
+    true
 }

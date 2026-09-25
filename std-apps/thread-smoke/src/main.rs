@@ -8,6 +8,7 @@ thread_local! {
 }
 
 fn main() {
+    println!("thread-smoke: stage start");
     let sum = Arc::new(Mutex::new(0usize));
     let barrier = Arc::new(Barrier::new(4));
     let mut threads = Vec::new();
@@ -29,6 +30,7 @@ fn main() {
     assert_eq!(*sum.lock().unwrap(), 6);
     assert_eq!(results.iter().map(|(_, value)| *value).collect::<Vec<_>>(), [1, 2, 3]);
     assert!(results.windows(2).all(|pair| pair[0].0 != pair[1].0));
+    println!("thread-smoke: stage joined");
 
     // Dropping JoinHandle must detach instead of leaking a scheduler slot.
     // Exceed MAX_TASKS over time to prove exited detached tasks are reclaimed.
@@ -40,5 +42,6 @@ fn main() {
             thread::yield_now();
         }
     }
+    println!("thread-smoke: stage detached");
     println!("std::thread smoke: PASS ({results:?})");
 }

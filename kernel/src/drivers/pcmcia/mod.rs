@@ -87,8 +87,6 @@ pub fn rearm_io() {
     }
 }
 
-use crate::drivers::pic::PICS;
-use crate::interrupts::idt::IDT;
 use crate::sync::mutex::Mutex;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
@@ -109,63 +107,42 @@ pub fn set_card_live(v: bool) {
     CARD_LIVE.store(v, Ordering::Relaxed);
 }
 
-#[unsafe(naked)]
-pub extern "C" fn pcmcia_irq_stub() {
-    unsafe {
-        core::arch::naked_asm!(
-            "cli",
-            "pusha",
-            "call {handler}",
-            "popa",
-            "iretd",
-            handler = sym pcmcia_irq_handler,
-        );
+fn pcmcia_irq_handler(irq: u8) -> bool {
+    if IRQ_LINE.load(Ordering::Acquire) != irq {
+        return false;
     }
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn pcmcia_irq_handler() {
     unsafe {
         if let Some(c) = SOCKET.as_ref() {
             let (cschg, ev, present) = c.ack_csc();
+            if cschg == 0 && ev == 0 {
+                return false;
+            }
             let evt = if present { EVT_INSERT } else { EVT_REMOVE };
-            PENDING.store(evt, Ordering::Relaxed);
-            DEBOUNCE.store(20, Ordering::Relaxed); // ~20 timer ticks
-            crate::println!(
-                "[PCMCIA] CSC irq cschg={:02x} ev={:08x} present={}",
-                cschg,
-                ev,
-                present
-            );
-        }
-        let irq = IRQ_LINE.load(Ordering::Relaxed);
-        if irq < 16 {
-            PICS.end_interrupt(32 + irq);
+            PENDING.store(evt, Ordering::Release);
+            DEBOUNCE.store(20, Ordering::Release); // ~20 timer ticks
+            return true;
         }
     }
+    false
 }
 
 /// Enable Card Detect monitoring.
 ///
-/// Felix currently has one IDT handler per legacy PIC vector and no shared-INTx
-/// dispatcher.  On the Sony C1M platform ToPIC100 and both ALi M5237 OHCI
-/// controllers share IRQ9.  Driving CardBus CSC through IRQ9 therefore lets a
-/// level/shared PCI interrupt starve IRQ0 immediately after STI.  The timer
-/// already calls poll_hotplug() every tick, so use socket-status polling until a
-/// real shared-IRQ dispatcher exists.
+/// Register CardBus card-detect as one owner of its shared PCI INTx line.
 pub fn enable_hotplug() {
     unsafe {
         let Some(c) = SOCKET.as_ref() else { return };
         let irq = c.irq_line();
-        IRQ_LINE.store(irq, Ordering::Relaxed);
+        IRQ_LINE.store(irq, Ordering::Release);
         c.restore_host_decode();
-
-        // Do not enable CSC interrupt routing, do not install an IDT gate and do
-        // not unmask the shared PCI line. Presence changes are detected below by
-        // comparing the live socket status on each timer tick.
-        PICS.mask_irq(irq);
         CARD_LIVE.store(c.pc16().status().card_present(), Ordering::Relaxed);
-        crate::println!("[PCMCIA] hotplug polling IRQ{} masked", irq);
+        match crate::drivers::shared_irq::register(irq, pcmcia_irq_handler) {
+            Ok(()) => {
+                c.enable_csc(irq);
+                crate::println!("[PCMCIA] hotplug shared IRQ{} + polling fallback", irq);
+            }
+            Err(e) => crate::println!("[PCMCIA] hotplug polling fallback: {}", e),
+        }
     }
 }
 

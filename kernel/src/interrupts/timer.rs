@@ -2,7 +2,7 @@
 // Triggers the scheduler and performs context switching
 
 use crate::drivers::pic::PICS;
-use crate::multitasking::task::{CPUState, TASK_MANAGER};
+use crate::multitasking::task::{CPUState, WaitReason, TASK_MANAGER};
 use crate::println;
 use crate::time::uptime_ms;
 use core::arch::asm;
@@ -41,6 +41,10 @@ pub extern "C" fn timer() {
             "call timer_handler",
             "add esp, 4",
             "mov esp, eax",
+            "test edx, edx",
+            "jz 3f",
+            "call finish_kernel_handoff",
+            "3:",
             // CPUState layout at the selected task's ESP:
             // eax,ebx,ecx,edx,esi,edi,ebp,eip,cs,eflags,esp,ss.
             // Pick DS/ES BEFORE restoring EAX/ECX; the previous code changed
@@ -69,8 +73,9 @@ pub extern "C" fn timer() {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn timer_handler(esp: u32) -> u32 {
+pub extern "C" fn timer_handler(esp: u32) -> u64 {
     unsafe {
+        crate::smp::account_cpu_tick(esp as *const CPUState);
         // main.rs writes complete legacy PIC masks shortly before STI. Restore
         // registered PCI INTx lines once, after the system has actually entered
         // normal interrupt-driven operation.
@@ -80,23 +85,52 @@ pub extern "C" fn timer_handler(esp: u32) -> u32 {
         // the hard IRQ only reads/acks status and records completion. Mixing and
         // DMA refill happen here. poll() uses try_lock, so it never blocks the
         // timer when a syscall currently owns the audio core.
-        crate::drivers::audio::poll();
+        static AUDIO_WAKE_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        let audio_progressed = crate::drivers::audio::poll_due()
+            && crate::drivers::audio::poll();
+        if audio_progressed {
+            AUDIO_WAKE_PENDING.store(true, core::sync::atomic::Ordering::Release);
+        }
 
         // === 1. Сетевой полл (неблокирующий) ===
         let now_ms = uptime_ms();
-        if now_ms.saturating_sub(LAST_NET_POLL_MS) >= NET_POLL_EVERY_MS {
+        let net_irq = crate::drivers::net::take_irq_pending();
+        if net_irq || now_ms.saturating_sub(LAST_NET_POLL_MS) >= NET_POLL_EVERY_MS {
             LAST_NET_POLL_MS = now_ms;
-            poll_network(now_ms as i64);
+            if !poll_network(now_ms as i64) && net_irq {
+                crate::drivers::net::restore_irq_pending();
+            }
         }
+        crate::drivers::shared_irq::maintenance_tick();
 
         // TaskManager and the process-wide kernel structures are shared by all
         // processors. Keep this first SMP version simple: only one CPU may be
         // inside the scheduler/syscall core at a time.
-        let new_esp = {
-            let _kernel = crate::multitasking::task::SMP_KERNEL_LOCK.lock();
+        let new_esp = if !crate::multitasking::task::timer_may_schedule(esp as *const CPUState) {
+            esp as u64
+        } else if let Some(kernel) = crate::multitasking::task::try_lock_kernel() {
+            crate::multitasking::task::set_kernel_lock_context(
+                crate::multitasking::task::KERNEL_LOCK_CTX_BSP_TIMER,
+            );
+            // These sources are polled by the timer/device bottom halves. Wake
+            // only their queues so restartable syscalls can recheck readiness.
+            TASK_MANAGER.wake_waiters(WaitReason::Poll);
+            TASK_MANAGER.wake_waiters(WaitReason::Socket);
+            TASK_MANAGER.wake_waiters(WaitReason::Input);
+            if AUDIO_WAKE_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
+                TASK_MANAGER.wake_waiters(WaitReason::Audio);
+            }
             let mut selected = TASK_MANAGER.schedule(esp as *mut CPUState) as u32;
+            // AP timers are already live during late boot. Do not let them run
+            // init against half-initialized PIC/PIT/VFS state. The first BSP
+            // PIT context switch is the boot-complete barrier for SMP userspace.
+            if !crate::smp::user_scheduling_enabled() {
+                crate::smp::enable_user_scheduling();
+            }
             selected = crate::signal::deliver_pending(selected);
-            selected
+            crate::multitasking::task::handoff_kernel_lock(kernel, selected)
+        } else {
+            esp as u64
         };
 
         // === 4. EOI ===
@@ -106,12 +140,15 @@ pub extern "C" fn timer_handler(esp: u32) -> u32 {
 }
 
 /// Безопасный полл из IRQ-контекста
-unsafe fn poll_network(timestamp_ms: i64) {
+unsafe fn poll_network(timestamp_ms: i64) -> bool {
     // Пытаемся взять стек без блокировки
     if let Some(mut guard) = crate::net::stack::NET_STACK.try_lock() {
         if let Some(ref mut stack) = *guard {
             stack.poll(timestamp_ms);
         }
+        true
+    } else {
+        false
     }
     // Если лок занят (syscall как раз работает с сетью) — просто пропускаем этот тик.
     // Это нормально и безопасно.
