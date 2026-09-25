@@ -8,3 +8,4 @@ out.txt
 pxe
 .idea
 std-apps/.cargo/config.local.toml
+std-apps/target
