@@ -1,0 +1,8 @@
+[package]
+name = "telnetd"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "telnetd"
+path = "src/main.rs"
