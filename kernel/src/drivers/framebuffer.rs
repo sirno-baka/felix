@@ -58,9 +58,8 @@ pub fn map_framebuffer_resource(
         return Err("invalid framebuffer range");
     }
 
-    let (old_phys, old_size, old_virt, old_owner) = unsafe {
-        (LFB_PHYS, LFB_SIZE, LFB_VIRT, LFB_OWNER)
-    };
+    let (old_phys, old_size, old_virt, old_owner) =
+        unsafe { (LFB_PHYS, LFB_SIZE, LFB_VIRT, LFB_OWNER) };
     if old_phys == phys && old_size >= size && old_virt != 0 {
         return Ok(old_virt);
     }
@@ -174,8 +173,12 @@ impl Framebuffer {
         let height_u = info.height as u32;
         let size = bytes_per_line * height_u;
         let total_size = size.checked_add(0x10000)?;
-        println!("[FB] mapping LFB through resource manager (≈ {} KB)", total_size / 1024);
-        let virt_base = match map_framebuffer_resource(info.address, total_size, "vesa-framebuffer") {
+        println!(
+            "[FB] mapping LFB through resource manager (≈ {} KB)",
+            total_size / 1024
+        );
+        let virt_base = match map_framebuffer_resource(info.address, total_size, "vesa-framebuffer")
+        {
             Ok(v) => v,
             Err(e) => {
                 println!("[FB] mapping failed: {}", e);
@@ -347,7 +350,7 @@ pub fn init() {
     }
 }
 
-use embedded_graphics::{pixelcolor::Rgb888, prelude::*, Pixel};
+use embedded_graphics::{Pixel, pixelcolor::Rgb888, prelude::*};
 
 impl OriginDimensions for Framebuffer {
     fn size(&self) -> Size {

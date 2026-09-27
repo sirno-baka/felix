@@ -1,7 +1,7 @@
 // kernel/src/filesystem/vfs.rs
 use crate::println;
-use crate::sync::mutex::Mutex;
 use crate::sync::MutexLazy;
+use crate::sync::mutex::Mutex;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;

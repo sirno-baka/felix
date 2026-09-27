@@ -9,8 +9,8 @@
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use crate::drivers::audio::Mixer;
-use crate::memory::resources::{DmaBuffer as DmaAllocation, dma_alloc_for};
 use crate::io::{inl, inw, io_wait, outb, outl, outw};
+use crate::memory::resources::{DmaBuffer as DmaAllocation, dma_alloc_for};
 use crate::pci::bar::Bar;
 use crate::pci::device::PciDevice;
 
@@ -440,7 +440,9 @@ impl Trident {
             return Ok(());
         }
 
-        unsafe { (*self.dma).samples.fill(0); }
+        unsafe {
+            (*self.dma).samples.fill(0);
+        }
         let _ = self.fill_half(0, mixer);
         let _ = self.fill_half(1, mixer);
         crate::memory::resources::dma_wmb();
@@ -562,8 +564,13 @@ pub fn probe_first() -> Result<Option<Trident>, &'static str> {
     dev.write_u16(0x04, (command | 0x0005) & !0x0400); // I/O + bus master + INTx
 
     let channel = if chip == Chip::Ali5451 { 0 } else { 63 };
-    let dma_mem = dma_alloc_for("trident PCM", core::mem::size_of::<DmaBuffer>(), core::mem::align_of::<DmaBuffer>(), DMA_MASK_30BIT as u64)
-        .map_err(|_| "Trident DMA allocation below 30-bit limit failed")?;
+    let dma_mem = dma_alloc_for(
+        "trident PCM",
+        core::mem::size_of::<DmaBuffer>(),
+        core::mem::align_of::<DmaBuffer>(),
+        DMA_MASK_30BIT as u64,
+    )
+    .map_err(|_| "Trident DMA allocation below 30-bit limit failed")?;
     let dma = dma_mem.as_mut_ptr() as *mut DmaBuffer;
 
     let card = Trident {

@@ -11,6 +11,7 @@ use crate::filesystem::file::{FileDescriptor, PipeEnd};
 use crate::multitasking::task::{CPUState, MAX_TASKS, TASK_MANAGER, TaskState};
 use crate::net::SocketState;
 use crate::println;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 // ====================== Signal numbers ======================
 
@@ -27,6 +28,10 @@ pub const SIGTTOU: u32 = 22;
 
 pub const SIG_DFL: u32 = 0;
 pub const SIG_IGN: u32 = 1;
+
+// Heavy process teardown must never run from an AP timer interrupt while the
+// giant kernel lock is held. One bit per leader slot is enough (MAX_TASKS=32).
+static DEFERRED_KILL_CLEANUP: AtomicU32 = AtomicU32::new(0);
 
 /// Bit for signal number `sig` (1..=31).
 #[inline]
@@ -58,7 +63,9 @@ pub fn send_signal(slot: i8, sig: u32) -> bool {
                 return false;
             }
             t.pending_signals |= sigbit(sig);
-            if matches!(t.state, TaskState::Blocked(_)) { t.wake(); }
+            if matches!(t.state, TaskState::Blocked(_)) {
+                t.wake();
+            }
             true
         } else {
             false
@@ -195,14 +202,39 @@ pub fn force_kill(slot: i8, sig: u32) -> bool {
         TASK_MANAGER.wake_waiters(crate::multitasking::task::WaitReason::Child);
         TASK_MANAGER.wake_waiters(crate::multitasking::task::WaitReason::Thread);
     }
-    close_task_fds(leader as i8);
-    crate::syscalls::wasm::clear_task_state(leader);
-    crate::drivers::wm::destroy_windows_of(leader as i8);
-    unsafe {
-        TASK_MANAGER.reap_orphans();
-    }
-    println!("[signal] process {} force-killed ({})", dead_pid, sig);
+
+    // `deliver_pending()` is also called from the AP timer. At that point the
+    // giant kernel lock is held and interrupts are masked. Closing fds, taking
+    // WM/device locks, reaping memory or printing from there can stall the AP
+    // forever. Publish the cleanup and let the next normal syscall perform it.
+    DEFERRED_KILL_CLEANUP.fetch_or(1u32 << leader, Ordering::Release);
     true
+}
+
+/// Finish resource teardown for processes killed from signal delivery.
+/// Call only from normal syscall context, never from a timer interrupt.
+pub fn drain_deferred_cleanup() {
+    let mut pending = DEFERRED_KILL_CLEANUP.swap(0, Ordering::AcqRel);
+    while pending != 0 {
+        let leader = pending.trailing_zeros() as usize;
+        pending &= !(1u32 << leader);
+        if leader == 0 || leader >= MAX_TASKS as usize {
+            continue;
+        }
+
+        let zombie = unsafe {
+            TASK_MANAGER.tasks[leader]
+                .as_ref()
+                .is_some_and(|task| task.zombie)
+        };
+        if !zombie {
+            continue;
+        }
+
+        close_task_fds(leader as i8);
+        crate::syscalls::wasm::clear_task_state(leader);
+        crate::drivers::wm::destroy_windows_of(leader as i8);
+    }
 }
 
 /// Drop every fd of `slot` so pipes/sockets get EOF immediately.
@@ -227,6 +259,7 @@ fn close_task_fds(slot: i8) {
                 PipeEnd::Write => crate::pipe::pipe_close_writer(pipe_id),
             },
             FileDescriptor::Socket { socket_id } => {
+                crate::net::stack::defer_remove_handle(socket_id);
                 crate::net::SOCKET_TABLE.lock().free(socket_id);
             }
             FileDescriptor::Pty { pty_id, side } => {
@@ -248,7 +281,9 @@ fn close_task_fds(slot: i8) {
 /// from a normal syscall path.
 pub fn deliver_pending(esp: u32) -> u32 {
     unsafe {
-        if (*(esp as *const CPUState)).cs & 3 != 3 { return esp; }
+        if (*(esp as *const CPUState)).cs & 3 != 3 {
+            return esp;
+        }
         // Loop in case the newly scheduled task also has fatal signals.
         for _ in 0..MAX_TASKS_GUARD {
             let thread_slot = TASK_MANAGER.get_current_slot();

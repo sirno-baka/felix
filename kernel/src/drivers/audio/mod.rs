@@ -294,9 +294,9 @@ fn ack_irq_without_audio_lock() -> u32 {
             AUDIO_IRQ_ARG0.load(Ordering::Relaxed),
             AUDIO_IRQ_ARG1.load(Ordering::Relaxed) as usize,
         ),
-        IRQ_ROUTE_ICH => ich_ac97::IchAc97::ack_irq_raw(
-            AUDIO_IRQ_ARG0.load(Ordering::Relaxed) as u16,
-        ),
+        IRQ_ROUTE_ICH => {
+            ich_ac97::IchAc97::ack_irq_raw(AUDIO_IRQ_ARG0.load(Ordering::Relaxed) as u16)
+        }
         IRQ_ROUTE_TRIDENT => trident::Trident::ack_irq_raw(
             AUDIO_IRQ_ARG0.load(Ordering::Relaxed) as u16,
             AUDIO_IRQ_ARG1.load(Ordering::Relaxed) as u16,
@@ -391,11 +391,13 @@ pub fn init() {
     match irq_result {
         Ok(()) => crate::println!(
             "[audio] {} ready: /dev/audio S16LE 48000 stereo; shared IRQ{}, deferred refill",
-            name, irq
+            name,
+            irq
         ),
         Err(e) => crate::println!(
             "[audio] {} ready: /dev/audio S16LE 48000 stereo; polling fallback ({})",
-            name, e
+            name,
+            e
         ),
     }
 }

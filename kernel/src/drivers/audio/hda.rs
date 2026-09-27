@@ -13,7 +13,9 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use crate::drivers::audio::Mixer;
-use crate::memory::resources::{DmaBuffer as DmaAllocation, MmioMapping, ResourceKind, dma_alloc_for, dma_free, map_resource};
+use crate::memory::resources::{
+    DmaBuffer as DmaAllocation, MmioMapping, ResourceKind, dma_alloc_for, dma_free, map_resource,
+};
 use crate::pci::bar::Bar;
 use crate::pci::device::PciDevice;
 
@@ -186,10 +188,21 @@ impl Hda {
         let ctl = self.r8(self.sr(SD_CTL0));
         self.w8(
             self.sr(SD_CTL0),
-            if enabled { ctl | enables } else { ctl & !enables },
+            if enabled {
+                ctl | enables
+            } else {
+                ctl & !enables
+            },
         );
         let stream_index = ((self.stream - SD_BASE) / SD_STRIDE) as u32;
-        self.w32(INTCTL, if enabled { (1 << 31) | (1 << stream_index) } else { 0 });
+        self.w32(
+            INTCTL,
+            if enabled {
+                (1 << 31) | (1 << stream_index)
+            } else {
+                0
+            },
+        );
         let _ = self.r32(INTCTL);
     }
 
@@ -460,12 +473,14 @@ impl Hda {
     fn prepare_bdl(&mut self) -> Result<(), &'static str> {
         let dma_phys = self.dma_mem.phys.0;
         for i in 0..BDL_COUNT {
-            unsafe { (*self.bdl).entries[i] = BdlEntry {
-                addr_lo: dma_phys.wrapping_add((i * BYTES_PER_FRAG) as u32),
-                addr_hi: 0,
-                length: BYTES_PER_FRAG as u32,
-                flags: 1, // IOC: one completion interrupt per fragment
-            }; }
+            unsafe {
+                (*self.bdl).entries[i] = BdlEntry {
+                    addr_lo: dma_phys.wrapping_add((i * BYTES_PER_FRAG) as u32),
+                    addr_hi: 0,
+                    length: BYTES_PER_FRAG as u32,
+                    flags: 1, // IOC: one completion interrupt per fragment
+                };
+            }
         }
         Ok(())
     }
@@ -501,7 +516,11 @@ impl Hda {
         let ctl0 = self.r8(self.sr(SD_CTL0));
         self.w8(
             self.sr(SD_CTL0),
-            if self.irq_enabled { ctl0 | enables } else { ctl0 & !enables },
+            if self.irq_enabled {
+                ctl0 | enables
+            } else {
+                ctl0 & !enables
+            },
         );
         Ok(())
     }
@@ -512,7 +531,9 @@ impl Hda {
         }
 
         self.reset_stream()?;
-        unsafe { (*self.dma).samples.fill(0); }
+        unsafe {
+            (*self.dma).samples.fill(0);
+        }
         self.idle_refills = 0;
         for i in 0..BDL_COUNT {
             if self.fill_fragment(i, mixer) {
@@ -644,9 +665,19 @@ pub fn probe_first() -> Result<Option<Hda>, &'static str> {
 
     let (mmio_mapping, phys, size) = Hda::map_bar(&dev)?;
     let mmio = mmio_mapping.as_usize();
-    let bdl_mem = dma_alloc_for("hda BDL", core::mem::size_of::<Bdl>(), core::mem::align_of::<Bdl>(), u32::MAX as u64)
-        .map_err(|_| "HDA BDL DMA allocation failed")?;
-    let dma_mem = match dma_alloc_for("hda PCM", core::mem::size_of::<DmaBuffer>(), core::mem::align_of::<DmaBuffer>(), u32::MAX as u64) {
+    let bdl_mem = dma_alloc_for(
+        "hda BDL",
+        core::mem::size_of::<Bdl>(),
+        core::mem::align_of::<Bdl>(),
+        u32::MAX as u64,
+    )
+    .map_err(|_| "HDA BDL DMA allocation failed")?;
+    let dma_mem = match dma_alloc_for(
+        "hda PCM",
+        core::mem::size_of::<DmaBuffer>(),
+        core::mem::align_of::<DmaBuffer>(),
+        u32::MAX as u64,
+    ) {
         Ok(mem) => mem,
         Err(_) => {
             let _ = dma_free(bdl_mem);
@@ -702,8 +733,6 @@ pub fn probe_first() -> Result<Option<Hda>, &'static str> {
     card.setup_cx20590()?;
     card.program_stream()?;
 
-    crate::println!(
-        "[audio/hda] CX20590 ready: DAC=0x10 speaker=0x1f hp=0x19"
-    );
+    crate::println!("[audio/hda] CX20590 ready: DAC=0x10 speaker=0x1f hp=0x19");
     Ok(Some(card))
 }

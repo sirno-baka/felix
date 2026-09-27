@@ -1,9 +1,9 @@
 use core::arch::asm;
 use core::ops::{Deref, DerefMut};
 
-use crate::print::{printer_new, PRINTER};
+use crate::print::{PRINTER, printer_new};
 use crate::println;
-use interrupt_sync::{without_interrupts, SpinMutex};
+use interrupt_sync::{SpinMutex, without_interrupts};
 
 pub struct Mutex<T: ?Sized> {
     inner: SpinMutex<T>,

@@ -13,7 +13,7 @@ pub mod channel;
 pub mod device;
 
 use crate::io::{inb, outb};
-use ata::{ATAChannel, ATACommand, ATADirection, ATAIdentify, ATAReg, ATAStatus, ATA};
+use ata::{ATA, ATAChannel, ATACommand, ATADirection, ATAIdentify, ATAReg, ATAStatus};
 use atapi::ATAPI;
 use channel::IDEChannelRegisters;
 pub use device::IDEDevice;

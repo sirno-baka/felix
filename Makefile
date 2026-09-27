@@ -40,7 +40,7 @@ endif
 # migrated to the std userspace.
 NATIVE_APPS := $(sort $(filter-out wasm-% filemanager,$(patsubst apps/%/Cargo.toml,%,$(wildcard apps/*/Cargo.toml))))
 WASM_APPS   := $(sort $(patsubst apps/%/Cargo.toml,%,$(wildcard apps/wasm-*/Cargo.toml)))
-STD_RUNTIME_APPS := reqwest-smoke tokio-smoke twitch-radio ui-smoke
+STD_RUNTIME_APPS := reqwest-smoke tokio-smoke netbench telnetd twitch-radio ui-smoke
 ROOTFS_FILES := $(shell find rootfs -type f ! -name README ! -name '.gitkeep' 2>/dev/null)
 
 .PHONY: all
@@ -177,7 +177,7 @@ image: std-runtime-apps
 	@$(SFDISK) --list build/disk.img
 	@dd if=build/boot.bin of=build/disk.img bs=512 conv=notrunc status=none
 	@dd if=build/bootloader.bin of=build/disk.img bs=512 seek=1 conv=notrunc status=none
-	@dd if=/dev/zero of=build/rootfs.img bs=512 count=64488 status=none
+	@dd if=/dev/zero of=build/rootfs.img bs=512 count=129024 status=none
 	@$(E2MKFS) -I 128 -O ^64bit,^metadata_csum,^dir_index,^ext_attr,^resize_inode build/rootfs.img
 	$(call populate_ext2,build/rootfs.img)
 	@dd if=build/rootfs.img of=build/disk.img bs=512 seek=2048 conv=notrunc status=none
@@ -233,10 +233,10 @@ run: all usb-image
 		-drive file=build/disk.img,index=0,media=disk,format=raw,if=ide \
 		-boot order=c \
 		-netdev user,id=net0 \
-		-device rtl8139,netdev=net0,mac=52:54:00:12:34:56 \
+		-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
 		-device pci-ohci,id=ohci \
 		-device AC97 \
-		-smp 3 \
+		-smp 4 \
 		-no-reboot -no-shutdown -vga std -m 1280M \
 		-debugcon file:debug.log -serial stdio
 

@@ -1,4 +1,4 @@
-pub mod e1000e;
+pub mod e1000e_min;
 pub mod i8255x;
 pub mod rtl8139;
 pub mod tcp;
@@ -14,7 +14,7 @@ use crate::memory::resources::{MmioMapping, ResourceKind, map_resource};
 use crate::net::ifconfig_dhcp;
 use crate::println;
 
-use self::e1000e::E1000e;
+use self::e1000e_min::E1000e;
 use self::i8255x::I8255x;
 use self::rtl8139::Rtl8139;
 
@@ -84,10 +84,10 @@ fn map_mmio(phys: u32, size: u32) -> Result<MmioMapping, &'static str> {
 
 /// Optional network bring-up (does not fail boot).
 pub fn init_net() {
-    let ok = match crate::drivers::net::e1000e::E1000e::init() {
+    let ok = match crate::drivers::net::e1000e_min::E1000e::init() {
         Ok(_) => {
             crate::net::stack::init_e1000e();
-            println!("[init] network ready (e1000e/82579LM)");
+            println!("[init] network ready (e1000e-min)");
             true
         }
         Err(err) => {

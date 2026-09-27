@@ -102,11 +102,7 @@ fn ed_flags(addr: u8, ep: u8, mps: u16, ls: bool) -> u32 {
 }
 
 fn td_toggle(data1: bool) -> u32 {
-    if data1 {
-        TD_T_DATA1
-    } else {
-        TD_T_DATA0
-    }
+    if data1 { TD_T_DATA1 } else { TD_T_DATA0 }
 }
 
 /// DATA0/1 per (addr, ep). Bulk/interrupt only — control toggle is fixed by spec.
@@ -1334,10 +1330,9 @@ impl Ohci {
                     if self.port_status(p) & PS_CCS == 0 {
                         break;
                     }
-                    if !self.frame_clock_alive(
-                        &mut debounce_last_frame,
-                        &mut debounce_stagnant_polls,
-                    ) {
+                    if !self
+                        .frame_clock_alive(&mut debounce_last_frame, &mut debounce_stagnant_polls)
+                    {
                         break;
                     }
                     core::hint::spin_loop();

@@ -4,7 +4,7 @@
 //! `wm_flip` copies pixels into the window surface and composes to the LFB.
 //! Title bars are drawn only by the WM. No resize in v1. Max 8 windows.
 
-use crate::drivers::framebuffer::{Framebuffer, FRAMEBUFFER};
+use crate::drivers::framebuffer::{FRAMEBUFFER, Framebuffer};
 use crate::drivers::wm_flags::WindowFlags;
 use crate::sync::mutex::Mutex;
 use crate::utils::flags::{FlagOp, Flags};
@@ -13,7 +13,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, MonoTextStyle},
+    mono_font::{MonoTextStyle, ascii::FONT_6X10},
     pixelcolor::Rgb888,
     prelude::*,
     text::{Baseline, Text},
@@ -305,11 +305,7 @@ impl Window {
     }
 
     fn title_height(&self) -> u32 {
-        if self.has_title_bar() {
-            TITLE_H
-        } else {
-            0
-        }
+        if self.has_title_bar() { TITLE_H } else { 0 }
     }
 
     fn client_rect(&self) -> (i32, i32, u32, u32) {

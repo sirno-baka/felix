@@ -144,7 +144,7 @@ pub extern "C" fn keyboard_handler() {
         let _ = crate::fb_panic::try_show(format_args!(
             "=== F12 DEBUG DUMP ===\n{}\n{}\n{}",
             crate::smp::DebugSnapshot,
-            crate::drivers::net::e1000e::DebugSnapshot,
+            crate::drivers::net::e1000e_min::DebugSnapshot,
             crate::syscalls::handler::PollDebugSnapshot,
         ));
         PICS.end_interrupt(KEYBOARD_INT);

@@ -542,6 +542,7 @@ impl PageDirectory {
 
         let frame = self.alloc_frame();
         unsafe {
+            write_bytes(phys_to_virt(frame << 12) as *mut u8, 0, PAGE_SIZE);
             (*pt)[pt_idx] = (frame << 12)
                 | PTEFlags::PRESENT
                 | PTEFlags::WRITABLE
@@ -635,15 +636,24 @@ impl PageManager {
             // Remove every duplicate before publishing the frame again.
             self.free_frames.retain(|&candidate| candidate != frame);
             if let Some(slot) = crate::multitasking::task::live_kernel_stack_owner(frame) {
-                panic!("[pg] free-list frame {} still belongs to live kernel stack slot {}", frame, slot);
+                panic!(
+                    "[pg] free-list frame {} still belongs to live kernel stack slot {}",
+                    frame, slot
+                );
             }
             return frame;
         }
-        assert!(self.next_free_page < detected_ram_bytes() >> 12, "physical frame allocator exhausted");
+        assert!(
+            self.next_free_page < detected_ram_bytes() >> 12,
+            "physical frame allocator exhausted"
+        );
         let frame = self.next_free_page;
         self.next_free_page += 1;
         if let Some(slot) = crate::multitasking::task::live_kernel_stack_owner(frame) {
-            panic!("[pg] bump frame {} overlaps live kernel stack slot {}", frame, slot);
+            panic!(
+                "[pg] bump frame {} overlaps live kernel stack slot {}",
+                frame, slot
+            );
         }
         frame
     }
@@ -665,7 +675,10 @@ impl PageManager {
         if let Some(frame) = self.free_frames.pop() {
             self.free_frames.retain(|&candidate| candidate != frame);
             if let Some(slot) = crate::multitasking::task::live_kernel_stack_owner(frame) {
-                panic!("[pg] reusable frame {} still belongs to live kernel stack slot {}", frame, slot);
+                panic!(
+                    "[pg] reusable frame {} still belongs to live kernel stack slot {}",
+                    frame, slot
+                );
             }
             return frame;
         }
@@ -683,7 +696,10 @@ impl PageManager {
         }
         self.next_free_page += 1;
         if let Some(slot) = crate::multitasking::task::live_kernel_stack_owner(frame) {
-            panic!("[pg] allocated frame {} overlaps live kernel stack slot {}", frame, slot);
+            panic!(
+                "[pg] allocated frame {} overlaps live kernel stack slot {}",
+                frame, slot
+            );
         }
         frame
     }
@@ -737,7 +753,10 @@ impl PageManager {
                 let end_index = start_index + pages as usize;
                 for frame in aligned..alloc_end {
                     if let Some(slot) = crate::multitasking::task::live_kernel_stack_owner(frame) {
-                        panic!("[pg] contiguous reusable frame {} overlaps live kernel stack slot {}", frame, slot);
+                        panic!(
+                            "[pg] contiguous reusable frame {} overlaps live kernel stack slot {}",
+                            frame, slot
+                        );
                     }
                 }
                 self.free_frames.drain(start_index..end_index);
@@ -765,7 +784,10 @@ impl PageManager {
         }
         for frame in aligned..end {
             if let Some(slot) = crate::multitasking::task::live_kernel_stack_owner(frame) {
-                panic!("[pg] contiguous bump frame {} overlaps live kernel stack slot {}", frame, slot);
+                panic!(
+                    "[pg] contiguous bump frame {} overlaps live kernel stack slot {}",
+                    frame, slot
+                );
             }
         }
         self.next_free_page = end;

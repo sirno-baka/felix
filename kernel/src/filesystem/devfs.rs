@@ -10,8 +10,8 @@ use crate::disk::interface::BlockDevice;
 use crate::filesystem::file::DeviceKind;
 use crate::filesystem::vfs::{DirEntry, Filesystem, Metadata};
 use crate::spin;
-use crate::sync::mutex::Mutex;
 use crate::sync::MutexLazy;
+use crate::sync::mutex::Mutex;
 
 pub type SharedBlockDevice = Arc<spin::Mutex<dyn BlockDevice>>;
 

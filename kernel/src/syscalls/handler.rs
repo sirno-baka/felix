@@ -1,21 +1,21 @@
 use crate::drivers::keyboard_buffer::KEYBOARD_BUFFER;
 use crate::drivers::pic::PICS;
+use crate::filesystem::VFS;
 use crate::filesystem::file::{
     ClosedFileDescriptor, DeviceKind, FileDescriptor, FileDescriptorTable, FileMode, PipeEnd,
     PtySide,
 };
 use crate::filesystem::vfs::{Metadata, RenameError};
-use crate::filesystem::VFS;
 use crate::memory::allocator::ALLOCATOR;
 use crate::memory::paging::{
-    copy_kernel_mappings, PDEFlags, PTEFlags, PageDirectory, PhysAddr, VirtAddr, KERNEL_MMIO_BASE,
-    PAGE_SIZE, PAGING,
+    KERNEL_MMIO_BASE, PAGE_SIZE, PAGING, PDEFlags, PTEFlags, PageDirectory, PhysAddr, VirtAddr,
+    copy_kernel_mappings,
 };
 use crate::multitasking::task::{
-    CPUState, Task, TaskState, MAX_TASKS, TASK_MANAGER, USER_HEAP_BASE, USER_THREAD_STACK_BASE,
+    CPUState, MAX_TASKS, TASK_MANAGER, Task, TaskState, USER_HEAP_BASE, USER_THREAD_STACK_BASE,
     USER_THREAD_STACK_PAGES, USER_THREAD_STACK_STRIDE,
 };
-use crate::net::{SockAddrIn, SocketState, AF_INET, SOCKET_TABLE, SOCK_DGRAM, SOCK_STREAM};
+use crate::net::{AF_INET, SOCK_DGRAM, SOCK_STREAM, SOCKET_TABLE, SockAddrIn, SocketState};
 use crate::{pipe, utils};
 use crate::{print, println};
 use alloc::string::{String, ToString};
@@ -26,7 +26,7 @@ use core::arch::naked_asm;
 use core::ffi::CStr;
 use core::net::Ipv4Addr;
 use core::ops::Deref;
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 pub const SYSCALL_INT: u8 = 0x80;
 
@@ -106,10 +106,15 @@ pub extern "C" fn syscall() {
 pub extern "C" fn syscall_handler(esp: u32) -> u64 {
     let number = unsafe { (*(esp as *const CPUState)).eax };
     crate::smp::trace_syscall(number, 1);
+
     let kernel = crate::multitasking::task::lock_kernel();
     crate::multitasking::task::set_kernel_lock_context(
         crate::multitasking::task::KERNEL_LOCK_CTX_SYSCALL,
     );
+    // Signal delivery from an AP timer only marks a process dead and queues
+    // resource teardown. Finish that work here, in normal syscall context,
+    // rather than while an interrupt handler owns the giant kernel lock.
+    crate::signal::drain_deferred_cleanup();
     crate::smp::trace_syscall(number, 2);
     let next = syscall_handler_locked(esp);
     let next = crate::signal::deliver_pending(next);
@@ -144,7 +149,11 @@ fn syscall_handler_locked(esp: u32) -> u32 {
     }
 
     // A sibling can terminate/stop us while we wait for the kernel lock.
-    if unsafe { TASK_MANAGER.tasks[thread_slot].as_ref().is_none_or(|t| !t.running || t.thread_exited || t.zombie) } {
+    if unsafe {
+        TASK_MANAGER.tasks[thread_slot]
+            .as_ref()
+            .is_none_or(|t| !t.running || t.thread_exited || t.zombie)
+    } {
         return unsafe { TASK_MANAGER.schedule(esp as *mut CPUState) as u32 };
     }
 
@@ -195,7 +204,11 @@ fn syscall_handler_locked(esp: u32) -> u32 {
             state.edx,
         );
         if result == EAGAIN {
-            return block_and_restart(thread_slot, esp, crate::multitasking::task::WaitReason::Child);
+            return block_and_restart(
+                thread_slot,
+                esp,
+                crate::multitasking::task::WaitReason::Child,
+            );
         }
         state.eax = result as u32;
         return esp;
@@ -208,7 +221,11 @@ fn syscall_handler_locked(esp: u32) -> u32 {
             state.ecx as *mut u32,
         );
         if result == EAGAIN {
-            return block_and_restart(thread_slot, esp, crate::multitasking::task::WaitReason::Thread);
+            return block_and_restart(
+                thread_slot,
+                esp,
+                crate::multitasking::task::WaitReason::Thread,
+            );
         }
         state.eax = result as u32;
         return esp;
@@ -495,8 +512,10 @@ fn syscall_handler_locked(esp: u32) -> u32 {
                         // userspace PTE may ever alias this task's kernel stack
                         // or page directory. Check before touching the payload.
                         if size >= 256 * 1024 {
-                            let kstack_phys = task.stack_base - crate::memory::paging::KERNEL_OFFSET;
-                            let kstack_end = kstack_phys + crate::multitasking::task::STACK_SIZE as u32;
+                            let kstack_phys =
+                                task.stack_base - crate::memory::paging::KERNEL_OFFSET;
+                            let kstack_end =
+                                kstack_phys + crate::multitasking::task::STACK_SIZE as u32;
                             let mut check = start_page;
                             while check < end_page {
                                 if let Some(phys) = task.pd().translate(check) {
@@ -519,7 +538,9 @@ fn syscall_handler_locked(esp: u32) -> u32 {
                                 check += page_size;
                             }
                         }
-                        core::ptr::write_bytes(start as *mut u8, 0, size);
+                        // New frames are zeroed in alloc_and_map_user_page.
+                        // A bulk write_bytes over an 18 MiB reqwest body holds
+                        // KERNEL_LOCK with IF=0 and starves connect/poll/Ctrl+C.
                         task.heap_next = start + size as u32;
                         start as usize
                     } else {
@@ -735,7 +756,11 @@ fn syscall_handler_locked(esp: u32) -> u32 {
     }
 
     if syscall_num == crate::syscalls::SYS_CONNECT {
-        unsafe { if let Some(t) = TASK_MANAGER.tasks[thread_slot].as_mut() { t.connect_deadline_ms = 0; } }
+        unsafe {
+            if let Some(t) = TASK_MANAGER.tasks[thread_slot].as_mut() {
+                t.connect_deadline_ms = 0;
+            }
+        }
     }
 
     // println!("ret: 0x{:x}", ret);
@@ -1503,11 +1528,7 @@ pub fn sys_munmap(current_slot: usize, addr: u32, len: usize) -> usize {
             // eligible; stack/ELF/fixed mappings must never become allocator
             // holes. If a page is still referenced, keep the whole range out of
             // the free list rather than risk overlapping a live mapping.
-            if remotely_flushed
-                && start >= 0x6000_0000
-                && end <= 0xB000_0000
-                && end > start
-            {
+            if remotely_flushed && start >= 0x6000_0000 && end <= 0xB000_0000 && end > start {
                 let mut q = start;
                 let mut fully_unmapped = true;
                 while q < end {
@@ -1928,8 +1949,12 @@ pub fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usiz
 
     unsafe {
         if let Some(ref mut current) = TASK_MANAGER.tasks[current_slot] {
-            if current.name.starts_with(b"thread-smoke") || current.name.starts_with(b"tokio-smoke") {
-                println!("[stdio-trace] task={} fd={} len={}", current_slot, fd, count);
+            if current.name.starts_with(b"thread-smoke") || current.name.starts_with(b"tokio-smoke")
+            {
+                println!(
+                    "[stdio-trace] task={} fd={} len={}",
+                    current_slot, fd, count
+                );
             }
             let desc = current.fd_table.get(fd).copied().or_else(|| {
                 if fd == 1 || fd == 2 {
@@ -2052,12 +2077,11 @@ fn close_descriptor(closed: ClosedFileDescriptor) {
     }
     match closed.desc {
         FileDescriptor::Socket { socket_id } => {
-            // Keep NET_STACK and SOCKET_TABLE lifetime in sync. Previously only
-            // the metadata entry was freed, leaking the smoltcp socket/handle on
-            // every close and preventing public socket ids from being reused.
-            if let Some(ref mut stack) = *NET_STACK.lock() {
-                stack.remove_handle(socket_id);
-            }
+            // Do not block the calling userspace thread on the global network
+            // stack spinlock. In particular, a current-thread Tokio runtime
+            // would stop polling every other socket while close() spins here.
+            // The smoltcp handle is removed by the next NetStack::poll().
+            crate::net::stack::defer_remove_handle(socket_id);
             SOCKET_TABLE.lock().free(socket_id);
         }
         FileDescriptor::Pipe { pipe_id, end } => match end {
@@ -2188,11 +2212,7 @@ pub fn sys_mkdir(current_slot: usize, path_ptr: *const u8) -> usize {
     }
     let path = resolve_task_path(current_slot, &raw);
     let success = VFS.get().mkdir(&path);
-    if success {
-        0
-    } else {
-        usize::MAX
-    }
+    if success { 0 } else { usize::MAX }
 }
 
 pub fn sys_rmdir(current_slot: usize, path_ptr: *const u8) -> usize {
@@ -2202,11 +2222,7 @@ pub fn sys_rmdir(current_slot: usize, path_ptr: *const u8) -> usize {
     }
     let path = resolve_task_path(current_slot, &raw);
     let success = VFS.get().rmdir(&path);
-    if success {
-        0
-    } else {
-        usize::MAX
-    }
+    if success { 0 } else { usize::MAX }
 }
 
 pub fn sys_unlink(current_slot: usize, path_ptr: *const u8) -> usize {
@@ -2216,11 +2232,7 @@ pub fn sys_unlink(current_slot: usize, path_ptr: *const u8) -> usize {
     }
     let path = resolve_task_path(current_slot, &raw);
     let success = VFS.get().remove_file(&path);
-    if success {
-        0
-    } else {
-        usize::MAX
-    }
+    if success { 0 } else { usize::MAX }
 }
 
 pub fn sys_rename(current_slot: usize, old_ptr: *const u8, new_ptr: *const u8) -> usize {
@@ -3153,11 +3165,7 @@ pub fn sys_kill(current_slot: usize, pid: i32, sig: u32) -> usize {
     for slot in slots {
         any |= signal_slot(slot, sig);
     }
-    if any {
-        0
-    } else {
-        usize::MAX
-    }
+    if any { 0 } else { usize::MAX }
 }
 
 #[repr(C)]
@@ -3545,17 +3553,13 @@ fn fd_poll_revents(current_slot: usize, fd: i32, events: i16) -> i16 {
             }
             Some(FileDescriptor::ConsoleIn) => {
                 // Always report readable for simplicity (stdin may still block on read).
-                if events & POLLIN != 0 {
-                    POLLIN
-                } else {
-                    0
-                }
+                if events & POLLIN != 0 { POLLIN } else { 0 }
             }
-            Some(FileDescriptor::Device { inode, .. }) if crate::drivers::audio::is_audio_inode(inode) => {
+            Some(FileDescriptor::Device { inode, .. })
+                if crate::drivers::audio::is_audio_inode(inode) =>
+            {
                 let mut rev = 0i16;
-                if events & POLLOUT != 0
-                    && crate::drivers::audio::stream_writable(current.pid)
-                {
+                if events & POLLOUT != 0 && crate::drivers::audio::stream_writable(current.pid) {
                     rev |= POLLOUT;
                 }
                 rev
@@ -3655,14 +3659,16 @@ pub fn sys_poll(current_slot: usize, fds: *mut PollFd, nfds: usize, timeout_ms: 
             .as_ref()
             .map_or(false, |t| t.name.starts_with(b"reqwest-smoke"))
     };
-    if fds.is_null() && nfds != 0 { return EFAULT; }
+    if fds.is_null() && nfds != 0 {
+        return EFAULT;
+    }
     let nfds = nfds.min(64);
     if timeout_ms > 0 {
         unsafe {
             if let Some(task) = TASK_MANAGER.tasks[thread_slot].as_mut() {
                 if task.wake_deadline_ms == 0 {
-                    task.wake_deadline_ms = crate::time::uptime_ms()
-                        .saturating_add(timeout_ms as u64);
+                    task.wake_deadline_ms =
+                        crate::time::uptime_ms().saturating_add(timeout_ms as u64);
                 }
             }
         }
@@ -3670,7 +3676,11 @@ pub fn sys_poll(current_slot: usize, fds: *mut PollFd, nfds: usize, timeout_ms: 
 
     loop {
         if trace_reqwest {
-            crate::debugln!("[reqpoll] before stack.poll nfds={} fds={:#x}", nfds, fds as u32);
+            crate::debugln!(
+                "[reqpoll] before stack.poll nfds={} fds={:#x}",
+                nfds,
+                fds as u32
+            );
         }
         if let Some(mut g) = crate::net::stack::NET_STACK.try_lock() {
             if let Some(ref mut stack) = *g {
@@ -4102,7 +4112,7 @@ pub fn sys_spawn_path(
     requested_pgid: i32,
     foreground: bool,
 ) -> usize {
-    use crate::smp::{trace_kernel_work, KernelWork};
+    use crate::smp::{KernelWork, trace_kernel_work};
     trace_kernel_work(KernelWork::SpawnPath, 0);
     if path_ptr.is_null() {
         return usize::MAX;
@@ -4144,7 +4154,7 @@ fn sys_spawn_image(
     requested_pgid: i32,
     foreground: bool,
 ) -> usize {
-    use crate::smp::{trace_kernel_work, KernelWork};
+    use crate::smp::{KernelWork, trace_kernel_work};
     trace_kernel_work(KernelWork::SpawnSlot, 0);
     let slot_i8 = unsafe { TASK_MANAGER.get_free_slot() };
     if slot_i8 < 0 {
@@ -4198,7 +4208,7 @@ fn sys_spawn_image(
     // Не зависит от base ELF
     const USER_STACK_TOP: u32 = 0xBFFF_F000;
     const USER_STACK_PAGES: u32 = 32; // 128 KiB
-                                      // Heap — отдельный регион
+    // Heap — отдельный регион
     let heap_start = USER_HEAP_BASE;
 
     unsafe {
@@ -4223,7 +4233,9 @@ fn sys_spawn_image(
         // Also seed page_refcounts so a stray FREE cannot unmap these pages.
         const USER_HEAP_PAGES: u32 = 512; // 2 MiB
         for i in 0..USER_HEAP_PAGES {
-            if i % 32 == 0 { trace_kernel_work(KernelWork::SpawnHeap, i); }
+            if i % 32 == 0 {
+                trace_kernel_work(KernelWork::SpawnHeap, i);
+            }
             let va = heap_start + i * PAGE_SIZE as u32;
             task.pd_mut().alloc_and_map_user_page(va);
             let _ = task.page_refcounts.inc(va);
@@ -4375,7 +4387,7 @@ fn sys_spawn_image(
 
 use crate::drivers::wm::WindowListItem;
 use crate::drivers::wm_flags::WindowFlags;
-use crate::net::stack::{poll_stack, NET_STACK};
+use crate::net::stack::{NET_STACK, poll_stack};
 use crate::print::klog_write_str;
 use crate::time::sleep;
 use crate::utils::flags::{FlagOp, Flags};
@@ -4448,7 +4460,9 @@ pub fn sys_bind(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: us
         }
     };
 
-    let mut stack_guard = NET_STACK.lock();
+    let Some(mut stack_guard) = NET_STACK.try_lock() else {
+        return BLOCK_AND_RESTART;
+    };
     let stack = match stack_guard.as_mut() {
         Some(s) => s,
         None => return usize::MAX,
@@ -4500,11 +4514,7 @@ pub fn sys_bind(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen: us
         }
     }
 
-    if result.is_ok() {
-        0
-    } else {
-        usize::MAX
-    }
+    if result.is_ok() { 0 } else { usize::MAX }
 }
 
 pub fn sys_listen(current_slot: usize, fd: usize, backlog: usize) -> usize {
@@ -4590,7 +4600,9 @@ pub fn sys_accept4(
 
     loop {
         let accepted = {
-            let mut guard = NET_STACK.lock();
+            let Some(mut guard) = NET_STACK.try_lock() else {
+                return BLOCK_AND_RESTART;
+            };
             let Some(ref mut stack) = *guard else {
                 return ENXIO;
             };
@@ -4600,15 +4612,11 @@ pub fn sys_accept4(
 
         if let Some((accepted_id, local_endpoint, remote_endpoint)) = accepted {
             let Some(local_addr) = endpoint_to_sockaddr(local_endpoint) else {
-                if let Some(ref mut stack) = *NET_STACK.lock() {
-                    stack.remove_handle(accepted_id);
-                }
+                crate::net::stack::defer_remove_handle(accepted_id);
                 return EINVAL;
             };
             let Some(peer_addr) = endpoint_to_sockaddr(remote_endpoint) else {
-                if let Some(ref mut stack) = *NET_STACK.lock() {
-                    stack.remove_handle(accepted_id);
-                }
+                crate::net::stack::defer_remove_handle(accepted_id);
                 return EINVAL;
             };
 
@@ -4616,9 +4624,7 @@ pub fn sys_accept4(
                 let mut table = SOCKET_TABLE.lock();
                 if !table.insert_with_id(accepted_id, domain, ty, protocol, current_slot) {
                     drop(table);
-                    if let Some(ref mut stack) = *NET_STACK.lock() {
-                        stack.remove_handle(accepted_id);
-                    }
+                    crate::net::stack::defer_remove_handle(accepted_id);
                     return ENOMEM;
                 }
                 let socket = table.get_mut(accepted_id).unwrap();
@@ -4646,9 +4652,7 @@ pub fn sys_accept4(
             };
 
             if !installed {
-                if let Some(ref mut stack) = *NET_STACK.lock() {
-                    stack.remove_handle(accepted_id);
-                }
+                crate::net::stack::defer_remove_handle(accepted_id);
                 SOCKET_TABLE.lock().free(accepted_id);
                 return ENOMEM;
             }
@@ -4711,7 +4715,9 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
 
     // UDP connect only records the peer and binds an ephemeral local port.
     {
-        let mut guard = NET_STACK.lock();
+        let Some(mut guard) = NET_STACK.try_lock() else {
+            return BLOCK_AND_RESTART;
+        };
         let Some(ref mut stack) = *guard else {
             return ENXIO;
         };
@@ -4742,7 +4748,9 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
     // so connect(2) must return -EINPROGRESS after SYN is queued and let poll()
     // report writability when smoltcp reaches ESTABLISHED.
     {
-        let mut guard = NET_STACK.lock();
+        let Some(mut guard) = NET_STACK.try_lock() else {
+            return BLOCK_AND_RESTART;
+        };
         let Some(ref mut stack) = *guard else {
             return ENXIO;
         };
@@ -4772,13 +4780,27 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
             return 0;
         }
         if !matches!(state, tcp::State::Closed) {
-            return if nonblock { EINPROGRESS } else {
-                let deadline = unsafe { TASK_MANAGER.tasks[thread_slot].as_ref().map_or(0, |t| t.connect_deadline_ms) };
-                if deadline != 0 && crate::time::uptime_ms() >= deadline { ETIMEDOUT } else { BLOCK_AND_RESTART }
+            return if nonblock {
+                EINPROGRESS
+            } else {
+                let deadline = unsafe {
+                    TASK_MANAGER.tasks[thread_slot]
+                        .as_ref()
+                        .map_or(0, |t| t.connect_deadline_ms)
+                };
+                if deadline != 0 && crate::time::uptime_ms() >= deadline {
+                    ETIMEDOUT
+                } else {
+                    BLOCK_AND_RESTART
+                }
             };
         }
         // A restarted failed handshake must not start a new SYN transaction.
-        if unsafe { TASK_MANAGER.tasks[thread_slot].as_ref().is_some_and(|t| t.connect_deadline_ms != 0) } {
+        if unsafe {
+            TASK_MANAGER.tasks[thread_slot]
+                .as_ref()
+                .is_some_and(|t| t.connect_deadline_ms != 0)
+        } {
             return ECONNREFUSED;
         }
 
@@ -4820,10 +4842,16 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
 
     // Blocking std::net::TcpStream::connect keeps the old synchronous behaviour.
     let start = crate::time::uptime_ms();
-    unsafe { if let Some(t) = TASK_MANAGER.tasks[thread_slot].as_mut() { t.connect_deadline_ms = start.saturating_add(10_000); } }
+    unsafe {
+        if let Some(t) = TASK_MANAGER.tasks[thread_slot].as_mut() {
+            t.connect_deadline_ms = start.saturating_add(10_000);
+        }
+    }
     loop {
         {
-            let mut guard = NET_STACK.lock();
+            let Some(mut guard) = NET_STACK.try_lock() else {
+                return BLOCK_AND_RESTART;
+            };
             let Some(ref mut stack) = *guard else {
                 return ENXIO;
             };
@@ -4947,7 +4975,13 @@ pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) ->
     let data = unsafe { core::slice::from_raw_parts(buf, len) };
 
     loop {
-        let mut stack_guard = NET_STACK.lock();
+        // Syscalls enter through an interrupt gate with IF=0. Never spin on
+        // NET_STACK here: a contended blocking lock would freeze IRQ delivery
+        // on this CPU (keyboard/mouse included). Nonblocking Tokio sockets must
+        // report WouldBlock; blocking sockets sleep and restart instead.
+        let Some(mut stack_guard) = NET_STACK.try_lock() else {
+            return if nonblock { EAGAIN } else { BLOCK_AND_RESTART };
+        };
         let Some(ref mut stack) = *stack_guard else {
             return ENXIO;
         };
@@ -5031,7 +5065,11 @@ pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) ->
     let user_buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
 
     loop {
-        let mut stack_guard = NET_STACK.lock();
+        // See sys_sendto(): network I/O from an int 0x80 syscall must never
+        // spin on the global stack lock while IF is cleared.
+        let Some(mut stack_guard) = NET_STACK.try_lock() else {
+            return if nonblock { EAGAIN } else { BLOCK_AND_RESTART };
+        };
         let Some(ref mut stack) = *stack_guard else {
             return ENXIO;
         };

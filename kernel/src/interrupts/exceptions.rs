@@ -79,10 +79,15 @@ fn kernel_halt(name: &str, exception_esp: u32, eip: u32, cs: u32, eflags: u32) -
     println!("  EIP={:#x} CS={:#x} EFLAGS={:#b}", eip, cs, eflags);
     let slot = unsafe { TASK_MANAGER.get_current_slot() };
     let cpu = crate::smp::current_cpu_index();
-    println!("  cpu={} task={} exception_esp={:#x}", cpu, slot, exception_esp);
+    println!(
+        "  cpu={} task={} exception_esp={:#x}",
+        cpu, slot, exception_esp
+    );
     if slot >= 0 {
         if let Some(task) = unsafe { TASK_MANAGER.tasks[slot as usize].as_ref() } {
-            let top = task.stack_base.saturating_add(crate::multitasking::task::STACK_SIZE as u32);
+            let top = task
+                .stack_base
+                .saturating_add(crate::multitasking::task::STACK_SIZE as u32);
             println!(
                 "  pid={} tid={} kstack={:#x}..{:#x} saved={:#x}",
                 task.pid, task.tid, task.stack_base, top, task.cpu_state_ptr
@@ -103,13 +108,7 @@ fn kernel_halt(name: &str, exception_esp: u32, eip: u32, cs: u32, eflags: u32) -
     }
 }
 
-fn kernel_halt_page_fault(
-    eip: u32,
-    cs: u32,
-    eflags: u32,
-    cr2: u32,
-    exception_esp: u32,
-) -> ! {
+fn kernel_halt_page_fault(eip: u32, cs: u32, eflags: u32, cr2: u32, exception_esp: u32) -> ! {
     let used_fb = crate::fb_panic::try_page_fault_fb(eip, cs, eflags, cr2);
     println!("\n=== KERNEL EXCEPTION: page_fault ===");
     println!("  CR2={:#x}", cr2);
@@ -124,7 +123,9 @@ fn kernel_halt_page_fault(
                 "  task={} exception_esp={:#x} kernel_stack={:#x}..{:#x}",
                 slot, exception_esp, task.stack_base, stack_end
             );
-            if exception_esp < task.stack_base && exception_esp >= task.stack_base.saturating_sub(4096) {
+            if exception_esp < task.stack_base
+                && exception_esp >= task.stack_base.saturating_sub(4096)
+            {
                 println!("  KERNEL STACK OVERFLOW");
             }
         }

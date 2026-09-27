@@ -6,11 +6,13 @@
 
 use alloc::collections::VecDeque;
 use core::arch::{asm, global_asm, naked_asm};
-use core::ptr::{copy_nonoverlapping, read_unaligned, read_volatile, write_unaligned, write_volatile};
+use core::ptr::{
+    copy_nonoverlapping, read_unaligned, read_volatile, write_unaligned, write_volatile,
+};
 use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, Ordering};
 
-use crate::memory::paging::{phys_to_virt, KERNEL_PD_PHYS};
-use crate::memory::resources::{ioremap, iounmap, reserve_and_ioremap, ResourceKind};
+use crate::memory::paging::{KERNEL_PD_PHYS, phys_to_virt};
+use crate::memory::resources::{ResourceKind, ioremap, iounmap, reserve_and_ioremap};
 
 const MAX_CPUS: usize = 8;
 const AP_STACK_SIZE: usize = 16 * 1024;
@@ -48,27 +50,20 @@ static mut AP_GDTS: [crate::gdt::PerCpuGdt; MAX_CPUS] =
 static AP_ONLINE: AtomicU32 = AtomicU32::new(1);
 static ONLINE_MASK: AtomicU32 = AtomicU32::new(1);
 static LAPIC_VIRT: AtomicU32 = AtomicU32::new(0);
-static CPU_APIC_IDS: [AtomicU32; MAX_CPUS] =
-    [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
-static AP_TIMER_TICKS: [AtomicU32; MAX_CPUS] =
-    [const { AtomicU32::new(0) }; MAX_CPUS];
-static CPU_USER_TICKS: [AtomicU32; MAX_CPUS] =
-    [const { AtomicU32::new(0) }; MAX_CPUS];
-static CPU_SYSTEM_TICKS: [AtomicU32; MAX_CPUS] =
-    [const { AtomicU32::new(0) }; MAX_CPUS];
-static CPU_IDLE_TICKS: [AtomicU32; MAX_CPUS] =
-    [const { AtomicU32::new(0) }; MAX_CPUS];
+static CPU_APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
+static AP_TIMER_TICKS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+static CPU_USER_TICKS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+static CPU_SYSTEM_TICKS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+static CPU_IDLE_TICKS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 static WORK_QUEUE: interrupt_sync::SpinMutex<VecDeque<SmpJob>> =
     interrupt_sync::SpinMutex::new(VecDeque::new());
 static WORK_SUBMITTED: AtomicU32 = AtomicU32::new(0);
 static WORK_COMPLETED: AtomicU32 = AtomicU32::new(0);
 static WORK_CPU_MASK: AtomicU32 = AtomicU32::new(0);
 static USER_SCHEDULING: AtomicBool = AtomicBool::new(false);
-static CURRENT_TASK: [AtomicI8; MAX_CPUS] =
-    [const { AtomicI8::new(-1) }; MAX_CPUS];
+static CURRENT_TASK: [AtomicI8; MAX_CPUS] = [const { AtomicI8::new(-1) }; MAX_CPUS];
 static CURRENT_CR3: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
-static IDLE_ESP: [AtomicU32; MAX_CPUS] =
-    [const { AtomicU32::new(0) }; MAX_CPUS];
+static IDLE_ESP: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 static TLB_TARGET_CR3: AtomicU32 = AtomicU32::new(0);
 static TLB_TARGET_PAGE: AtomicU32 = AtomicU32::new(0);
 static TLB_ACKS: AtomicU32 = AtomicU32::new(0);
@@ -243,7 +238,9 @@ unsafe fn find_mp_floating_pointer() -> Option<u32> {
 unsafe fn discover_mp() -> Option<MpInfo> {
     let mp = find_mp_floating_pointer()?;
     let config_phys = read_unaligned(phys_ptr::<u32>(mp + 4));
-    if config_phys == 0 || read_unaligned(phys_ptr::<u32>(config_phys)) != u32::from_le_bytes(*b"PCMP") {
+    if config_phys == 0
+        || read_unaligned(phys_ptr::<u32>(config_phys)) != u32::from_le_bytes(*b"PCMP")
+    {
         return None;
     }
     let table_len = read_unaligned(phys_ptr::<u16>(config_phys + 4)) as usize;
@@ -426,7 +423,9 @@ pub fn online_cpu_count() -> usize {
     (AP_ONLINE.load(Ordering::Acquire) as usize).clamp(1, MAX_CPUS)
 }
 
-pub fn cpu_slot_count() -> usize { MAX_CPUS }
+pub fn cpu_slot_count() -> usize {
+    MAX_CPUS
+}
 
 pub fn cpu_times(cpu: usize) -> Option<CpuTimes> {
     if cpu >= MAX_CPUS || ONLINE_MASK.load(Ordering::Acquire) & (1 << cpu) == 0 {
@@ -442,47 +441,75 @@ pub fn cpu_times(cpu: usize) -> Option<CpuTimes> {
 /// Account the execution interrupted by this CPU's scheduler timer. Counters
 /// intentionally use local timer ticks: percentages are computed from deltas,
 /// so AP timer calibration is not required.
-static LAST_TIMER_EIP: [AtomicU32; MAX_CPUS] =
-    [const { AtomicU32::new(0) }; MAX_CPUS];
-static LAST_TIMER_CS: [AtomicU32; MAX_CPUS] =
-    [const { AtomicU32::new(0) }; MAX_CPUS];
-static LAST_TIMER_EFLAGS: [AtomicU32; MAX_CPUS] =
-    [const { AtomicU32::new(0) }; MAX_CPUS];
-static SYSCALL_NUMBER: [AtomicU32; MAX_CPUS] =
-    [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
-static SYSCALL_PHASE: [AtomicU32; MAX_CPUS] =
-    [const { AtomicU32::new(0) }; MAX_CPUS];
+static LAST_TIMER_EIP: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+static LAST_TIMER_CS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+static LAST_TIMER_EFLAGS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+static SYSCALL_NUMBER: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
+static SYSCALL_PHASE: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 
-static SCHEDULER_STAGE: [AtomicU32; MAX_CPUS] =
-    [const { AtomicU32::new(0) }; MAX_CPUS];
+static SCHEDULER_STAGE: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 
 // Unlike LAST_TIMER_EIP, these markers advance with IF=0. F12 on another
 // CPU can therefore locate a stalled syscall without taking the kernel lock.
 #[derive(Clone, Copy)]
 #[repr(u32)]
 pub enum KernelWork {
-    None, SpawnArgs, SpawnPath, SpawnRead, SpawnSlot, TaskPageDir, TaskStack,
-    TaskMetadata, SpawnMappings, SpawnUserStack, SpawnHeap, SpawnElf,
-    SpawnUserArgs, SpawnFds, SpawnPublish, SpawnFinish, ReapThreads,
-    ReapUserStack, ReapUserPages, ReapPageDir, ReapKernelStack,
+    None,
+    SpawnArgs,
+    SpawnPath,
+    SpawnRead,
+    SpawnSlot,
+    TaskPageDir,
+    TaskStack,
+    TaskMetadata,
+    SpawnMappings,
+    SpawnUserStack,
+    SpawnHeap,
+    SpawnElf,
+    SpawnUserArgs,
+    SpawnFds,
+    SpawnPublish,
+    SpawnFinish,
+    ReapThreads,
+    ReapUserStack,
+    ReapUserPages,
+    ReapPageDir,
+    ReapKernelStack,
 }
 
-static KERNEL_WORK: [AtomicU32; MAX_CPUS] =
-    [const { AtomicU32::new(0) }; MAX_CPUS];
+static KERNEL_WORK: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 
 pub fn trace_kernel_work(work: KernelWork, progress: u32) {
     // One atomic snapshot keeps the stage and its progress consistent.
     KERNEL_WORK[current_cpu_index()].store(
-        ((work as u32) << 24) | (progress & 0x00ff_ffff), Ordering::Relaxed);
+        ((work as u32) << 24) | (progress & 0x00ff_ffff),
+        Ordering::Relaxed,
+    );
 }
 
 fn kernel_work_name(work: u32) -> &'static str {
     const NAMES: [&str; 21] = [
-        "none", "spawn/args", "spawn/path", "spawn/read", "spawn/slot",
-        "task/pd", "task/kstack", "task/metadata", "spawn/mappings",
-        "spawn/ustack", "spawn/heap", "spawn/elf", "spawn/argv",
-        "spawn/fds", "spawn/publish", "spawn/finish", "reap/threads",
-        "reap/ustack", "reap/pages", "reap/pd", "reap/kstack",
+        "none",
+        "spawn/args",
+        "spawn/path",
+        "spawn/read",
+        "spawn/slot",
+        "task/pd",
+        "task/kstack",
+        "task/metadata",
+        "spawn/mappings",
+        "spawn/ustack",
+        "spawn/heap",
+        "spawn/elf",
+        "spawn/argv",
+        "spawn/fds",
+        "spawn/publish",
+        "spawn/finish",
+        "reap/threads",
+        "reap/ustack",
+        "reap/pages",
+        "reap/pd",
+        "reap/kstack",
     ];
     NAMES.get(work as usize).copied().unwrap_or("unknown")
 }
@@ -655,8 +682,9 @@ extern "C" fn ap_timer_handler(esp: u32) -> u64 {
         AP_TIMER_TICKS[slot].fetch_add(1, Ordering::Relaxed);
     }
     let new_esp = if user_scheduling_enabled()
-        && crate::multitasking::task::timer_may_schedule(esp as *const crate::multitasking::task::CPUState)
-    {
+        && crate::multitasking::task::timer_may_schedule(
+            esp as *const crate::multitasking::task::CPUState,
+        ) {
         let Some(kernel) = crate::multitasking::task::try_lock_kernel() else {
             unsafe { lapic_write(base, LAPIC_EOI, 0) };
             return esp as u64;
@@ -723,7 +751,10 @@ pub fn shootdown_tlb(page_dir_phys: u32, page: u32) -> bool {
     let mut targets = [0u8; MAX_CPUS];
     let mut count = 0usize;
     for cpu in 0..MAX_CPUS {
-        if ONLINE_MASK.load(Ordering::Acquire) & (1 << cpu) != 0 && cpu != sender && CURRENT_CR3[cpu].load(Ordering::Acquire) == page_dir_phys {
+        if ONLINE_MASK.load(Ordering::Acquire) & (1 << cpu) != 0
+            && cpu != sender
+            && CURRENT_CR3[cpu].load(Ordering::Acquire) == page_dir_phys
+        {
             targets[count] = CPU_APIC_IDS[cpu].load(Ordering::Acquire) as u8;
             count += 1;
         }
@@ -758,12 +789,21 @@ pub fn shootdown_tlb(page_dir_phys: u32, page: u32) -> bool {
 pub extern "C" fn tlb_ipi_interrupt() {
     unsafe {
         naked_asm!(
-            "push ds", "push es",
-            "push eax", "push ecx", "push edx", "cld",
-            "mov ax, 0x10", "mov ds, ax", "mov es, ax",
+            "push ds",
+            "push es",
+            "push eax",
+            "push ecx",
+            "push edx",
+            "cld",
+            "mov ax, 0x10",
+            "mov ds, ax",
+            "mov es, ax",
             "call tlb_ipi_ack",
-            "pop edx", "pop ecx", "pop eax",
-            "pop es", "pop ds",
+            "pop edx",
+            "pop ecx",
+            "pop eax",
+            "pop es",
+            "pop ds",
             "iretd",
         );
     }
@@ -818,12 +858,21 @@ unsafe fn install_trampoline() -> Result<(), &'static str> {
     copy_nonoverlapping(start, phys_to_virt(TRAMPOLINE_PHYS) as *mut u8, len);
 
     write_unaligned(phys_to_virt(PARAM_CR3) as *mut u32, KERNEL_PD_PHYS);
-    write_unaligned(phys_to_virt(PARAM_ENTRY) as *mut u32, ap_entry as usize as u32);
+    write_unaligned(
+        phys_to_virt(PARAM_ENTRY) as *mut u32,
+        ap_entry as usize as u32,
+    );
     write_unaligned(phys_to_virt(PARAM_GDTR) as *mut u16, 24 - 1);
     write_unaligned(phys_to_virt(PARAM_GDTR + 2) as *mut u32, PARAM_GDT);
     write_unaligned(phys_to_virt(PARAM_GDT) as *mut u64, 0);
-    write_unaligned(phys_to_virt(PARAM_GDT + 8) as *mut u64, 0x00cf_9a00_0000_ffff);
-    write_unaligned(phys_to_virt(PARAM_GDT + 16) as *mut u64, 0x00cf_9200_0000_ffff);
+    write_unaligned(
+        phys_to_virt(PARAM_GDT + 8) as *mut u64,
+        0x00cf_9a00_0000_ffff,
+    );
+    write_unaligned(
+        phys_to_virt(PARAM_GDT + 16) as *mut u64,
+        0x00cf_9200_0000_ffff,
+    );
     Ok(())
 }
 
@@ -857,7 +906,11 @@ pub fn init() {
             crate::println!("[smp] AP trampoline setup failed");
             return;
         }
-        lapic_write(lapic, LAPIC_SVR, lapic_read(lapic, LAPIC_SVR) | 0x100 | 0xff);
+        lapic_write(
+            lapic,
+            LAPIC_SVR,
+            lapic_read(lapic, LAPIC_SVR) | 0x100 | 0xff,
+        );
         lapic_write(lapic, LAPIC_EOI, 0);
         lapic_write(lapic, LAPIC_ESR, 0);
 
@@ -925,7 +978,10 @@ pub fn init() {
             }
         }
     }
-    crate::println!("[smp] {} processor(s) online", AP_ONLINE.load(Ordering::Acquire));
+    crate::println!(
+        "[smp] {} processor(s) online",
+        AP_ONLINE.load(Ordering::Acquire)
+    );
 
     // Give each AP timer enough time to fire at least once, then report the
     // per-CPU counters. This catches an AP that reached Rust but cannot receive
@@ -946,6 +1002,8 @@ pub fn init() {
 
 #[unsafe(no_mangle)]
 extern "C" fn ap_entry() -> ! {
+    // Each logical CPU owns a distinct hardware x87 register file.
+    crate::multitasking::task::init_cpu_x87();
     let lapic = LAPIC_VIRT.load(Ordering::Acquire) as *mut u8;
     let Some(slot) = cpu_slot_for_lapic(lapic) else {
         // Never alias an unrecognised AP onto CPU0's per-CPU state/stack.
@@ -982,37 +1040,55 @@ impl core::fmt::Display for DebugSnapshot {
             crate::multitasking::task::KERNEL_LOCK_CTX_EXCEPTION => "exception",
             _ => "none",
         };
-        writeln!(f, "PIT={} kernel_lock={} userspace={} owner={} lock_ctx={}",
+        writeln!(
+            f,
+            "PIT={} kernel_lock={} userspace={} owner={} lock_ctx={}",
             crate::time::jiffies(),
             crate::multitasking::task::SMP_KERNEL_LOCK.is_locked(),
             user_scheduling_enabled(),
             crate::multitasking::task::KERNEL_LOCK_OWNER.load(Ordering::Relaxed),
-            lock_ctx_name)?;
+            lock_ctx_name
+        )?;
         for cpu in 0..MAX_CPUS {
-            if ONLINE_MASK.load(Ordering::Acquire) & (1 << cpu) == 0 { continue; }
-            writeln!(f, "cpu{} apic={} slot={} ap_ticks={} u/s/i={}/{}/{} cr3={:#x}",
-                cpu, CPU_APIC_IDS[cpu].load(Ordering::Relaxed),
+            if ONLINE_MASK.load(Ordering::Acquire) & (1 << cpu) == 0 {
+                continue;
+            }
+            writeln!(
+                f,
+                "cpu{} apic={} slot={} ap_ticks={} u/s/i={}/{}/{} cr3={:#x}",
+                cpu,
+                CPU_APIC_IDS[cpu].load(Ordering::Relaxed),
                 CURRENT_TASK[cpu].load(Ordering::Relaxed),
                 AP_TIMER_TICKS[cpu].load(Ordering::Relaxed),
                 CPU_USER_TICKS[cpu].load(Ordering::Relaxed),
                 CPU_SYSTEM_TICKS[cpu].load(Ordering::Relaxed),
                 CPU_IDLE_TICKS[cpu].load(Ordering::Relaxed),
-                CURRENT_CR3[cpu].load(Ordering::Relaxed))?;
+                CURRENT_CR3[cpu].load(Ordering::Relaxed)
+            )?;
             let last_flags = LAST_TIMER_EFLAGS[cpu].load(Ordering::Relaxed);
-            writeln!(f, "  eip={:#010x} cs={:#x} eflags={:#010x} IF={} last_syscall={} phase={} sched={}",
+            writeln!(
+                f,
+                "  eip={:#010x} cs={:#x} eflags={:#010x} IF={} last_syscall={} phase={} sched={}",
                 LAST_TIMER_EIP[cpu].load(Ordering::Relaxed),
                 LAST_TIMER_CS[cpu].load(Ordering::Relaxed),
                 last_flags,
                 (last_flags >> 9) & 1,
                 SYSCALL_NUMBER[cpu].load(Ordering::Relaxed),
                 SYSCALL_PHASE[cpu].load(Ordering::Relaxed),
-                SCHEDULER_STAGE[cpu].load(Ordering::Relaxed))?;
+                SCHEDULER_STAGE[cpu].load(Ordering::Relaxed)
+            )?;
             let work = KERNEL_WORK[cpu].load(Ordering::Relaxed);
-            writeln!(f, "  work={} progress={:#x}",
-                kernel_work_name(work >> 24), work & 0x00ff_ffff)?;
+            writeln!(
+                f,
+                "  work={} progress={:#x}",
+                kernel_work_name(work >> 24),
+                work & 0x00ff_ffff
+            )?;
         }
         if let Some(_guard) = crate::multitasking::task::SMP_KERNEL_LOCK.try_lock() {
-            unsafe { crate::multitasking::task::TASK_MANAGER.fmt_debug_tasks(f)?; }
+            unsafe {
+                crate::multitasking::task::TASK_MANAGER.fmt_debug_tasks(f)?;
+            }
         } else {
             writeln!(f, "tasks: unavailable (kernel lock held)")?;
         }

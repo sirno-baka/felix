@@ -2,7 +2,7 @@
 // Triggers the scheduler and performs context switching
 
 use crate::drivers::pic::PICS;
-use crate::multitasking::task::{CPUState, WaitReason, TASK_MANAGER};
+use crate::multitasking::task::{CPUState, TASK_MANAGER, WaitReason};
 use crate::println;
 use crate::time::uptime_ms;
 use core::arch::asm;
@@ -85,9 +85,9 @@ pub extern "C" fn timer_handler(esp: u32) -> u64 {
         // the hard IRQ only reads/acks status and records completion. Mixing and
         // DMA refill happen here. poll() uses try_lock, so it never blocks the
         // timer when a syscall currently owns the audio core.
-        static AUDIO_WAKE_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-        let audio_progressed = crate::drivers::audio::poll_due()
-            && crate::drivers::audio::poll();
+        static AUDIO_WAKE_PENDING: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        let audio_progressed = crate::drivers::audio::poll_due() && crate::drivers::audio::poll();
         if audio_progressed {
             AUDIO_WAKE_PENDING.store(true, core::sync::atomic::Ordering::Release);
         }

@@ -191,11 +191,7 @@ impl SocketController for RicohR5c475 {
 
     fn irq_line(&self) -> u8 {
         let irq = self.pci.read_u8(PCI_INTERRUPT_LINE);
-        if irq == 0 || irq == 0xFF {
-            11
-        } else {
-            irq
-        }
+        if irq == 0 || irq == 0xFF { 11 } else { irq }
     }
 
     fn restore_host_decode(&self) {

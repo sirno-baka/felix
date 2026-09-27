@@ -3,8 +3,8 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 // fs/ext2.rs
-use crate::disk::interface::BlockDevice;
 use crate::disk::PartitionConfig;
+use crate::disk::interface::BlockDevice;
 use crate::filesystem::vfs::{DirEntry, Metadata};
 use crate::spin::Mutex;
 use crate::{print, println};
@@ -1751,7 +1751,7 @@ impl crate::filesystem::Filesystem for Ext2 {
     }
 
     fn write_file(&mut self, path: &str, data: &[u8]) -> bool {
-        self.create_file_path(path, data)
+        self.write_file_path(path, data)
     }
     fn create_file(&mut self, path: &str, data: &[u8]) -> bool {
         self.create_file_path(path, data)

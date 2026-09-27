@@ -352,11 +352,18 @@ macro_rules! print {
 
 #[macro_export]
 macro_rules! println {
-    () => {
-        $crate::print::print!("{} | \n", $crate::time::get_timestamp().as_f64());
-    };
+    () => {{
+        let timestamp = $crate::time::get_timestamp();
+        $crate::print!("{}.{:03} | \n", timestamp.second, timestamp.millisecond);
+    }};
     ($($arg:tt)*) => {{
-        $crate::print!("{} | {}\n", $crate::time::get_timestamp().as_f64(), format_args!($($arg)*));
+        let timestamp = $crate::time::get_timestamp();
+        $crate::print!(
+            "{}.{:03} | {}\n",
+            timestamp.second,
+            timestamp.millisecond,
+            format_args!($($arg)*)
+        );
     }};
 }
 

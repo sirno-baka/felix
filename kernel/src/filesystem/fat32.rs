@@ -12,8 +12,8 @@ use core::cmp;
 
 use fatfs::{FileSystem, FsOptions, Read, Seek, SeekFrom, Write};
 
-use crate::disk::interface::BlockDevice;
 use crate::disk::PartitionConfig;
+use crate::disk::interface::BlockDevice;
 use crate::filesystem::vfs::{DirEntry, Filesystem, Metadata};
 use crate::println;
 use crate::spin::Mutex;

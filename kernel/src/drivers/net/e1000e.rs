@@ -311,26 +311,37 @@ impl fmt::Display for DebugSnapshot {
             let Some((handle, is_tcp)) = mapping else {
                 continue;
             };
-            if !*is_tcp {
-                continue;
+            if *is_tcp {
+                let socket = stack.sockets.get::<smoltcp::socket::tcp::Socket>(*handle);
+                writeln!(
+                    f,
+                    "tcp[{}]: state={:?} local={:?} remote={:?} can_recv={} may_recv={} rxq={}/{} can_send={} may_send={} txq={}/{}",
+                    index + 1,
+                    socket.state(),
+                    socket.local_endpoint(),
+                    socket.remote_endpoint(),
+                    socket.can_recv(),
+                    socket.may_recv(),
+                    socket.recv_queue(),
+                    socket.recv_capacity(),
+                    socket.can_send(),
+                    socket.may_send(),
+                    socket.send_queue(),
+                    socket.send_capacity(),
+                )?;
+            } else {
+                let socket = stack.sockets.get::<smoltcp::socket::udp::Socket>(*handle);
+                writeln!(
+                    f,
+                    "udp[{}]: local={:?} can_recv={} rxq={} can_send={} txq={}",
+                    index + 1,
+                    socket.endpoint(),
+                    socket.can_recv(),
+                    socket.recv_queue(),
+                    socket.can_send(),
+                    socket.send_queue(),
+                )?;
             }
-            let socket = stack.sockets.get::<smoltcp::socket::tcp::Socket>(*handle);
-            writeln!(
-                f,
-                "tcp[{}]: state={:?} local={:?} remote={:?} can_recv={} may_recv={} rxq={}/{} can_send={} may_send={} txq={}/{}",
-                index + 1,
-                socket.state(),
-                socket.local_endpoint(),
-                socket.remote_endpoint(),
-                socket.can_recv(),
-                socket.may_recv(),
-                socket.recv_queue(),
-                socket.recv_capacity(),
-                socket.can_send(),
-                socket.may_send(),
-                socket.send_queue(),
-                socket.send_capacity(),
-            )?;
         }
         Ok(())
     }
@@ -1243,13 +1254,13 @@ impl E1000e {
         let slot = self.tx_head.load(Ordering::Relaxed);
         let next = (slot + 1) % E1000E_TX_RING_SIZE;
         dma_sync();
-        unsafe {
-            // Keep one descriptor unused. TDT is the first descriptor not
-            // owned by hardware, so publishing a completely full circular
-            // ring would make TDT catch TDH and look empty to the device.
-            read_volatile(&(*self.tx_ring.add(slot)).status) & TXD_STAT_DD != 0
-                && read_volatile(&(*self.tx_ring.add(next)).status) & TXD_STAT_DD != 0
+        // Keep one descriptor unused: after this send TDT becomes `next`.
+        // If that equals TDH the device treats the ring as empty.
+        let tdh = self.read(REG_TDH) as usize % E1000E_TX_RING_SIZE;
+        if next == tdh {
+            return false;
         }
+        unsafe { read_volatile(&(*self.tx_ring.add(slot)).status) & TXD_STAT_DD != 0 }
     }
 
     pub fn send(&self, data: &[u8]) -> Result<(), &'static str> {
@@ -1267,9 +1278,9 @@ impl E1000e {
             // Check capacity before touching the current descriptor. If this
             // returned after clearing current.status but before advancing TDT,
             // the unpublished slot would remain permanently busy in software.
-            if read_volatile(&desc.status) & TXD_STAT_DD == 0
-                || read_volatile(&(*self.tx_ring.add(next)).status) & TXD_STAT_DD == 0
-            {
+            let tdh = self.read(REG_TDH) as usize % E1000E_TX_RING_SIZE;
+            if read_volatile(&desc.status) & TXD_STAT_DD == 0 || next == tdh {
+
                 let packet = self.tx_packets.load(Ordering::Relaxed);
                 if !self.tx_stall_reported.swap(true, Ordering::AcqRel) {
                     println!(
@@ -1517,29 +1528,33 @@ impl E1000e {
             let next = (slot + 1) % RX_RING_SIZE;
             self.rx_head.store(next, Ordering::Release);
 
-            // Return RX descriptors to hardware in batches. Linux e1000e does
-            // the same (E1000_RX_BUFFER_WRITE == 16), and on 82579/PCH2 it
-            // verifies RDT writes because ME/PCIm2PCI arbitration can corrupt
-            // tail updates. Do not wrap RDT 127 -> 0 after every single packet.
-            if next % 16 == 0 {
-                let wanted_rdt = slot as u32;
+            // Give the just-recycled descriptor back immediately. Batching 16
+            // under 4 concurrent bulk TCP flows lets the 82579 run out of RX
+            // buffers, collapse the window and stall while concurrency=1 still
+            // works. Retry the tail write: PCH2 ME can drop a single store.
+            let wanted_rdt = slot as u32;
+            let mut actual_rdt = u32::MAX;
+            for _ in 0..3 {
                 self.write(REG_RDT, wanted_rdt);
-                let actual_rdt = self.read(REG_RDT);
-                if actual_rdt != wanted_rdt {
-                    println!(
-                        "e1000e: RDT WRITE LOST wanted={} actual={} RDH={} FWSM={:#010x}",
-                        wanted_rdt,
-                        actual_rdt,
-                        self.read(REG_RDH),
-                        self.read(REG_FWSM)
-                    );
-                } else if packet < 32 {
-                    // println!(
-                    //     "e1000e: RX returned batch tail={} RDH={}",
-                    //     actual_rdt,
-                    //     self.read(REG_RDH)
-                    // );
+                actual_rdt = self.read(REG_RDT);
+                if actual_rdt == wanted_rdt {
+                    break;
                 }
+            }
+            if actual_rdt != wanted_rdt {
+                println!(
+                    "e1000e: RDT WRITE LOST wanted={} actual={} RDH={} FWSM={:#010x}",
+                    wanted_rdt,
+                    actual_rdt,
+                    self.read(REG_RDH),
+                    self.read(REG_FWSM)
+                );
+            } else if packet < 32 {
+                // println!(
+                //     "e1000e: RX returned tail={} RDH={}",
+                //     actual_rdt,
+                //     self.read(REG_RDH)
+                // );
             }
             valid.then_some(length)
         }

@@ -6,10 +6,10 @@ use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr};
 
-use crate::drivers::net::e1000e::NET as E1000E_NET;
+use crate::drivers::net::AnyNic;
+use crate::drivers::net::e1000e_min::NET as E1000E_NET;
 use crate::drivers::net::i8255x::NET as I8255X_NET;
 use crate::drivers::net::rtl8139::NET as RTL_NET;
-use crate::drivers::net::AnyNic;
 use crate::net::socket::{Socket, SocketState, SocketTable};
 use crate::net::types::*;
 use crate::sync::mutex::Mutex;
@@ -252,9 +252,27 @@ impl NetStack {
 
     /// Поллим стек (вызывать из таймера / из syscalls)
     pub fn poll(&mut self, timestamp_ms: i64) {
-        // print!(".");
+        // Socket close must not block a userspace runtime thread on NET_STACK.
+        // Drain handles queued by close_descriptor() while we already own the
+        // stack and before smoltcp polls the socket set.
+        if let Some(mut pending) = PENDING_SOCKET_REMOVALS.try_lock() {
+            while let Some(id) = pending.pop() {
+                self.remove_handle(id);
+            }
+        }
+
         let ts = Instant::from_millis(timestamp_ms);
-        self.iface.poll(ts, &mut self.device, &mut self.sockets);
+        // Two passes: ingress + the ACKs that pass queued after TX slots freed.
+        // Four full bursts held NET_STACK (and often KERNEL_LOCK) long enough
+        // that a concurrent connect() spinning on the stack looked like a hang.
+        for _ in 0..2 {
+            if matches!(
+                self.iface.poll(ts, &mut self.device, &mut self.sockets),
+                smoltcp::iface::PollResult::None
+            ) {
+                break;
+            }
+        }
         self.process_dhcp();
     }
 
@@ -365,6 +383,22 @@ impl NetStack {
 }
 
 pub static NET_STACK: Mutex<Option<NetStack>> = Mutex::new(None);
+static PENDING_SOCKET_REMOVALS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Queue smoltcp handle removal for the next NetStack::poll().
+///
+/// close(2) can run on a Tokio worker. Waiting on the global NET_STACK spinlock
+/// there stalls the whole current-thread runtime, so close only publishes the
+/// id here and returns. The network poller performs the actual SocketSet remove.
+pub fn defer_remove_handle(id: usize) {
+    if id == 0 {
+        return;
+    }
+    let mut pending = PENDING_SOCKET_REMOVALS.lock();
+    if !pending.iter().any(|queued| *queued == id) {
+        pending.push(id);
+    }
+}
 
 /// Инициализация (вызывать один раз из main после I8255x::init)
 pub fn init() {
@@ -426,7 +460,11 @@ pub fn ifconfig_dhcp() -> Result<(), &'static str> {
 
 /// Удобный хелпер для поллинга
 pub fn poll_stack(timestamp_ms: i64) {
-    if let Some(ref mut stack) = *NET_STACK.lock() {
-        stack.poll(timestamp_ms);
+    // Syscalls and the timer already hold or cannot take KERNEL_LOCK. Never
+    // spin here: IF is often 0 and a blocking wait freezes this CPU's IRQs.
+    if let Some(mut guard) = NET_STACK.try_lock() {
+        if let Some(ref mut stack) = *guard {
+            stack.poll(timestamp_ms);
+        }
     }
 }

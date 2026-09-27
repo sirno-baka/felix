@@ -3,14 +3,14 @@
 use crate::drivers::pic::wait;
 use crate::filesystem::file::FileDescriptorTable;
 use crate::memory::paging::{
-    alloc_kernel_stack, alloc_task_page_dir, copy_kernel_mappings, PDEFlags, PageDirectory,
-    PhysAddr, VirtAddr, KERNEL_OFFSET,
+    KERNEL_OFFSET, PDEFlags, PageDirectory, PhysAddr, VirtAddr, alloc_kernel_stack,
+    alloc_task_page_dir, copy_kernel_mappings,
 };
 use crate::{gdt, print, println};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::arch::asm;
-use core::sync::atomic::{AtomicI8, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicI8, AtomicU8, AtomicU32, Ordering};
 use core::u32::MAX;
 
 // Rust networking, TLS and thread startup can nest several sizeable kernel
@@ -168,6 +168,58 @@ pub struct Task {
     /// Kernel wait key for FUTEX_WAIT. Shared futexes use the physical word
     /// address; FUTEX_PRIVATE_FLAG uses a process-scoped virtual key.
     pub futex_key: u64,
+    /// Per-thread x87 state. The i386 userspace target has SSE disabled, so
+    /// LLVM uses the x87 stack for ordinary floating-point conversions too.
+    x87_state: X87State,
+    x87_initialized: bool,
+}
+
+#[repr(C, align(16))]
+pub struct X87State {
+    bytes: [u8; 108],
+}
+
+impl X87State {
+    const fn new() -> Self {
+        Self { bytes: [0; 108] }
+    }
+}
+
+/// Enable the legacy x87 unit on the current CPU and reset it to the standard
+/// masked-exception state. Must be called independently by the BSP and every AP.
+pub fn init_cpu_x87() {
+    unsafe {
+        let mut cr0: u32;
+        asm!("mov {0:e}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+        // MP=1, NE=1; EM=0 and TS=0. We use eager context switching, not #NM.
+        cr0 |= (1 << 1) | (1 << 5);
+        cr0 &= !((1 << 2) | (1 << 3));
+        asm!("mov cr0, {0:e}", in(reg) cr0, options(nostack, preserves_flags));
+        asm!("fninit", options(nomem, nostack));
+    }
+}
+
+#[inline]
+fn save_task_x87(task: &mut Task) {
+    unsafe {
+        // FNSAVE stores the complete 32-bit x87 environment/register stack and
+        // then resets the hardware x87 unit. It does not require SSE/FXSR.
+        asm!("fnsave [{}]", in(reg) task.x87_state.bytes.as_mut_ptr(), options(nostack));
+    }
+    task.x87_initialized = true;
+}
+
+#[inline]
+fn restore_task_x87(task: &mut Task) {
+    unsafe {
+        if task.x87_initialized {
+            asm!("frstor [{}]", in(reg) task.x87_state.bytes.as_ptr(), options(nostack));
+        } else {
+            // A brand-new thread gets the architectural default control word
+            // (all exceptions masked, round-to-nearest) and an empty x87 stack.
+            asm!("fninit", options(nomem, nostack));
+        }
+    }
 }
 
 #[repr(C)]
@@ -190,8 +242,8 @@ pub struct CPUState {
 impl Task {
     /// Called only after the task can no longer run, from another task's stack.
     fn release_memory(&mut self) {
-        use crate::memory::paging::{phys_to_virt, PAGING};
-        use crate::smp::{trace_kernel_work, KernelWork};
+        use crate::memory::paging::{PAGING, phys_to_virt};
+        use crate::smp::{KernelWork, trace_kernel_work};
         interrupt_sync::without_interrupts(|| unsafe {
             if self.is_thread {
                 let mut addr = self.user_stack_bottom;
@@ -259,7 +311,7 @@ impl Task {
     }
 
     pub fn new() -> Self {
-        use crate::smp::{trace_kernel_work, KernelWork};
+        use crate::smp::{KernelWork, trace_kernel_work};
         trace_kernel_work(KernelWork::TaskPageDir, 0);
         let (page_dir, page_dir_phys) = alloc_task_page_dir();
         trace_kernel_work(KernelWork::TaskStack, 0);
@@ -313,6 +365,8 @@ impl Task {
             wake_deadline_ms: 0,
             connect_deadline_ms: 0,
             futex_key: 0,
+            x87_state: X87State::new(),
+            x87_initialized: false,
         }
     }
 
@@ -368,6 +422,8 @@ impl Task {
             wake_deadline_ms: 0,
             connect_deadline_ms: 0,
             futex_key: 0,
+            x87_state: X87State::new(),
+            x87_initialized: false,
         }
     }
 
@@ -448,8 +504,7 @@ pub static mut TASK_MANAGER: TaskManager = TaskManager {
     next_pid: 1,
 };
 
-pub static SMP_KERNEL_LOCK: interrupt_sync::SpinMutex<()> =
-    interrupt_sync::SpinMutex::new(());
+pub static SMP_KERNEL_LOCK: interrupt_sync::SpinMutex<()> = interrupt_sync::SpinMutex::new(());
 
 pub static KERNEL_LOCK_OWNER: AtomicI8 = AtomicI8::new(-1);
 pub static KERNEL_LOCK_CONTEXT: AtomicU8 = AtomicU8::new(0);
@@ -662,10 +717,7 @@ impl TaskManager {
 
     //remove task
     pub fn remove_task(&mut self, id: usize) {
-        if id != 0
-            && id < self.tasks.len()
-            && TASK_OWNER[id].load(Ordering::Acquire) < 0
-        {
+        if id != 0 && id < self.tasks.len() && TASK_OWNER[id].load(Ordering::Acquire) < 0 {
             if let Some(pid) = self.tasks[id].as_ref().map(|t| t.pid) {
                 self.reparent_children_of(pid);
                 self.tasks[id] = None;
@@ -719,6 +771,9 @@ impl TaskManager {
             }
             if let Some(task) = self.tasks[self.current_task as usize].as_mut() {
                 task.state = TaskState::Running(0);
+                if self.current_task > 0 {
+                    restore_task_x87(task);
+                }
             }
             return new_cpustate;
         }
@@ -726,6 +781,9 @@ impl TaskManager {
         // Сохраняем состояние текущей задачи
         if self.current_task >= 0 {
             if let Some(ref mut task) = self.tasks[self.current_task as usize] {
+                if self.current_task > 0 {
+                    save_task_x87(task);
+                }
                 task.cpu_state_ptr = cpu_state as u32;
                 if task.running {
                     task.state = TaskState::Runnable;
@@ -753,6 +811,9 @@ impl TaskManager {
         crate::smp::set_current_task_slot(self.current_task);
         if let Some(task) = self.tasks[self.current_task as usize].as_mut() {
             task.state = TaskState::Running(0);
+            if self.current_task > 0 {
+                restore_task_x87(task);
+            }
         }
 
         let task = unsafe { self.tasks[self.current_task as usize].as_ref().unwrap() };
@@ -840,6 +901,9 @@ impl TaskManager {
         if previous < 0 {
             crate::smp::set_idle_esp(cpu, cpu_state as u32);
         } else if let Some(task) = self.tasks[previous as usize].as_mut() {
+            if previous > 0 {
+                save_task_x87(task);
+            }
             task.cpu_state_ptr = cpu_state as u32;
             if task.running {
                 task.state = TaskState::Runnable;
@@ -855,17 +919,24 @@ impl TaskManager {
         if next <= 0 {
             crate::smp::set_current_task_slot(-1);
             // Leave the outgoing address space before it can be reclaimed.
-            unsafe { asm!("mov cr3, {}", in(reg) crate::memory::paging::KERNEL_PD_PHYS); }
+            unsafe {
+                asm!("mov cr3, {}", in(reg) crate::memory::paging::KERNEL_PD_PHYS);
+            }
             crate::smp::set_current_cr3(unsafe { crate::memory::paging::KERNEL_PD_PHYS });
             let idle = crate::smp::idle_esp(cpu);
             crate::smp::trace_scheduler(7);
-            return if idle != 0 { idle as *mut CPUState } else { cpu_state };
+            return if idle != 0 {
+                idle as *mut CPUState
+            } else {
+                cpu_state
+            };
         }
 
         crate::smp::trace_scheduler(8);
         crate::smp::set_current_task_slot(next);
         if let Some(task) = self.tasks[next as usize].as_mut() {
             task.state = TaskState::Running(cpu as u8);
+            restore_task_x87(task);
         }
         crate::smp::trace_scheduler(81);
         let task = self.tasks[next as usize].as_ref().unwrap();
@@ -884,7 +955,11 @@ impl TaskManager {
     }
 
     fn claim_next_task(&self, cpu: i8, after: i8) -> i8 {
-        let mut slot = if after < 1 { 1 } else { (after + 1) % MAX_TASKS };
+        let mut slot = if after < 1 {
+            1
+        } else {
+            (after + 1) % MAX_TASKS
+        };
         for _ in 1..MAX_TASKS {
             if slot == 0 {
                 slot = 1;
@@ -895,9 +970,7 @@ impl TaskManager {
             // was Runnable.  Repair the stale reservation while the giant
             // scheduler lock gives us exclusive access to task state.
             let owner = TASK_OWNER[slot as usize].load(Ordering::Acquire);
-            if owner >= 0
-                && crate::smp::task_slot_on_cpu(owner as usize) != slot
-            {
+            if owner >= 0 && crate::smp::task_slot_on_cpu(owner as usize) != slot {
                 let _ = TASK_OWNER[slot as usize].compare_exchange(
                     owner,
                     -1,
@@ -910,10 +983,9 @@ impl TaskManager {
                     && task.state == TaskState::Runnable
                     && !task.zombie
                     && !task.thread_exited
-            })
-                && TASK_OWNER[slot as usize]
-                    .compare_exchange(-1, cpu, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
+            }) && TASK_OWNER[slot as usize]
+                .compare_exchange(-1, cpu, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
             {
                 return slot;
             }
@@ -1108,13 +1180,15 @@ impl TaskManager {
 
     /// Must hold the kernel lock; an exited sibling may still be entering the kernel.
     pub fn siblings_quiescent(&self, leader: usize) -> bool {
-        self.thread_slots(leader).iter().all(|&slot| slot == leader || TASK_OWNER[slot].load(Ordering::Acquire) < 0)
+        self.thread_slots(leader)
+            .iter()
+            .all(|&slot| slot == leader || TASK_OWNER[slot].load(Ordering::Acquire) < 0)
     }
 
     pub fn process_quiescent(&self, leader: usize) -> bool {
-        self.thread_slots(leader).iter().all(|&slot| {
-            TASK_OWNER[slot].load(Ordering::Acquire) < 0
-        })
+        self.thread_slots(leader)
+            .iter()
+            .all(|&slot| TASK_OWNER[slot].load(Ordering::Acquire) < 0)
     }
 
     /// Reap (free) a zombie task slot. Returns true on success.

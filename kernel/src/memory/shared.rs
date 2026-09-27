@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use core::{ptr::write_bytes, slice};
 
 use crate::filesystem::VFS;
-use crate::memory::paging::{phys_to_virt, PAGE_SIZE, PAGING};
+use crate::memory::paging::{PAGE_SIZE, PAGING, phys_to_virt};
 use crate::spin::KMutex;
 
 #[derive(Clone, Copy)]

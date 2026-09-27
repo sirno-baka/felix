@@ -9,8 +9,8 @@
 use core::sync::atomic::{Ordering, compiler_fence};
 
 use crate::drivers::audio::Mixer;
-use crate::memory::resources::{DmaBuffer as DmaAllocation, dma_alloc_for, dma_free};
 use crate::io::{inb, inl, inw, io_wait, outb, outl, outw};
+use crate::memory::resources::{DmaBuffer as DmaAllocation, dma_alloc_for, dma_free};
 use crate::pci::bar::Bar;
 use crate::pci::device::PciDevice;
 
@@ -275,10 +275,12 @@ impl IchAc97 {
         let dma_phys = self.dma_mem.phys.0;
         for i in 0..BDL_COUNT {
             let byte_off = (i * SAMPLES_PER_FRAG * core::mem::size_of::<i16>()) as u32;
-            unsafe { (*self.bdl).entries[i] = BdlEntry {
-                addr: dma_phys.wrapping_add(byte_off),
-                control_len: (SAMPLES_PER_FRAG as u32) | BD_BUP | BD_IOC,
-            }; }
+            unsafe {
+                (*self.bdl).entries[i] = BdlEntry {
+                    addr: dma_phys.wrapping_add(byte_off),
+                    control_len: (SAMPLES_PER_FRAG as u32) | BD_BUP | BD_IOC,
+                };
+            }
         }
         Ok(())
     }
@@ -290,7 +292,9 @@ impl IchAc97 {
 
         self.reset_pcm_out()?;
         self.prepare_bdl()?;
-        unsafe { (*self.dma).samples.fill(0); }
+        unsafe {
+            (*self.dma).samples.fill(0);
+        }
         for i in 0..ACTIVE_FRAGS {
             let _ = self.fill_fragment(i, mixer);
         }
@@ -361,16 +365,24 @@ impl IchAc97 {
 
         let civ = inb(self.bport(PO_CIV)) & 31;
         let halted_at_end = inw(self.bport(PO_SR)) & SR_DCH != 0
-            && civ == self.lvi && inw(self.bport(PO_PICB)) == 0;
+            && civ == self.lvi
+            && inw(self.bport(PO_PICB)) == 0;
         let mut completed = civ.wrapping_sub(self.last_civ) as usize & 31;
-        if halted_at_end { completed += 1; }
+        if halted_at_end {
+            completed += 1;
+        }
         // Never infer a completed fragment solely from a stale BCIS bit.
-        if completed == 0 { return false; }
+        if completed == 0 {
+            return false;
+        }
         for _ in 0..completed {
             let append = (self.lvi + 1) & 31;
             let data = self.fill_fragment(append as usize, mixer);
-            if data { self.idle_appends = 0; }
-            else { self.idle_appends = self.idle_appends.saturating_add(1); }
+            if data {
+                self.idle_appends = 0;
+            } else {
+                self.idle_appends = self.idle_appends.saturating_add(1);
+            }
             crate::memory::resources::dma_wmb();
             self.lvi = append;
             outb(self.bport(PO_LVI), self.lvi);
@@ -398,9 +410,19 @@ pub fn probe_first() -> Result<Option<IchAc97>, &'static str> {
     dev.enable_bus_mastering();
     dev.write_u16(0x04, dev.read_u16(0x04) & !0x0400);
 
-    let bdl_mem = dma_alloc_for("ich-ac97 BDL", core::mem::size_of::<Bdl>(), core::mem::align_of::<Bdl>(), u32::MAX as u64)
-        .map_err(|_| "ICH AC97 BDL DMA allocation failed")?;
-    let dma_mem = match dma_alloc_for("ich-ac97 PCM", core::mem::size_of::<DmaBuffer>(), core::mem::align_of::<DmaBuffer>(), u32::MAX as u64) {
+    let bdl_mem = dma_alloc_for(
+        "ich-ac97 BDL",
+        core::mem::size_of::<Bdl>(),
+        core::mem::align_of::<Bdl>(),
+        u32::MAX as u64,
+    )
+    .map_err(|_| "ICH AC97 BDL DMA allocation failed")?;
+    let dma_mem = match dma_alloc_for(
+        "ich-ac97 PCM",
+        core::mem::size_of::<DmaBuffer>(),
+        core::mem::align_of::<DmaBuffer>(),
+        u32::MAX as u64,
+    ) {
         Ok(mem) => mem,
         Err(_) => {
             let _ = dma_free(bdl_mem);

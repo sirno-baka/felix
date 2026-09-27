@@ -40,10 +40,8 @@ impl Line {
 }
 
 static LINES: KMutex<[Line; IRQ_LINES]> = KMutex::new([Line::new(); IRQ_LINES]);
-static HANDLED_COUNT: [AtomicU32; IRQ_LINES] =
-    [const { AtomicU32::new(0) }; IRQ_LINES];
-static UNHANDLED_COUNT: [AtomicU32; IRQ_LINES] =
-    [const { AtomicU32::new(0) }; IRQ_LINES];
+static HANDLED_COUNT: [AtomicU32; IRQ_LINES] = [const { AtomicU32::new(0) }; IRQ_LINES];
+static UNHANDLED_COUNT: [AtomicU32; IRQ_LINES] = [const { AtomicU32::new(0) }; IRQ_LINES];
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IrqStats {
@@ -158,9 +156,7 @@ pub fn late_restore_once() {
     }
     let lines = LINES.lock();
     for irq in 0..IRQ_LINES {
-        if lines[irq].handlers.iter().any(|h| h.is_some())
-            && lines[irq].storm_cooldown == 0
-        {
+        if lines[irq].handlers.iter().any(|h| h.is_some()) && lines[irq].storm_cooldown == 0 {
             PICS.unmask_irq(irq as u8);
         }
     }

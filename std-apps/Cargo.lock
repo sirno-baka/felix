@@ -943,7 +943,6 @@ dependencies = [
 [[package]]
 name = "mio"
 version = "1.2.4"
-source = "git+https://github.com/sirno-baka/mio?branch=master#e43b844f6dedc70d11cf81bff6488c956bbb309a"
 dependencies = [
  "libc",
  "wasi",
@@ -976,6 +975,18 @@ name = "multiversion_no_op"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
+
+[[package]]
+name = "netbench"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "reqwest",
+ "rustls",
+ "rustls-rustcrypto",
+ "tokio",
+ "webpki-roots",
+]
 
 [[package]]
 name = "num-bigint-dig"
@@ -1497,10 +1508,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "rusty_h264-common"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaf982ae23ecf8f13015ec1c5576fe2935f4e4296b097ebc4233b5872623af2a"
+dependencies = [
+ "bytemuck",
+ "libm",
+ "once_cell",
+ "portable-atomic",
+ "wide",
+]
+
+[[package]]
+name = "rusty_h264-decoder"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0f4deb1a3a5e928cbaa1dff7db6bc46262c850aedeb75cb5aeab890494c18a5"
+dependencies = [
+ "rusty_h264-common",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "safe_arch"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96b02de82ddbe1b636e6170c21be622223aea188ef2e139be0a5b219ec215323"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "scopeguard"
@@ -1660,7 +1702,6 @@ dependencies = [
 [[package]]
 name = "socket2"
 version = "0.6.5"
-source = "git+https://github.com/sirno-baka/socket2?branch=master#87153e4d2346314a6027f9fa856d1ff6364fe490"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -1802,6 +1843,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "telnetd"
+version = "0.1.0"
+
+[[package]]
 name = "thin-vec"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1833,7 +1878,6 @@ dependencies = [
 [[package]]
 name = "tokio"
 version = "1.53.1"
-source = "git+https://github.com/sirno-baka/tokio?branch=popugos#db0e3f6d9465e269984fdbf42d0aa4ac39f7c15c"
 dependencies = [
  "bytes",
  "libc",
@@ -1949,9 +1993,12 @@ dependencies = [
  "dlmalloc",
  "getrandom",
  "libm",
+ "popugos",
  "reqwest",
  "rustls",
  "rustls-rustcrypto",
+ "rusty_h264-common",
+ "rusty_h264-decoder",
  "serde",
  "serde_json",
  "symphonia",
@@ -2116,6 +2163,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "wide"
+version = "0.7.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ce5da8ecb62bcd8ec8b7ea19f69a51275e91299be594ea5cc6ef7819e16cd03"
+dependencies = [
+ "bytemuck",
+ "safe_arch",
 ]
 
 [[package]]

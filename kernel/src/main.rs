@@ -47,7 +47,7 @@ use core::ptr::{read_volatile, write_volatile};
 use core::str::FromStr;
 use drivers::pic::PICS;
 use filesystem::ext2::Ext2;
-use gdt::{GlobalDescriptorTable, GDT};
+use gdt::{GDT, GlobalDescriptorTable};
 use interrupts::idt::IDT;
 use memory::paging::PAGING;
 use print::PRINTER;
@@ -64,11 +64,11 @@ use crate::drivers::net::i8255x::SCB_STATUS;
 use crate::drivers::pcmcia;
 use crate::drivers::pcmcia::PcmciaDevice;
 use crate::filesystem::devfs::DevFS;
-use crate::filesystem::fat32::{find_fat_partition_config, FatDisk, FatFs};
+use crate::filesystem::fat32::{FatDisk, FatFs, find_fat_partition_config};
 use crate::filesystem::init::init_usb;
 use crate::filesystem::{Filesystem, VFS};
 use crate::io::outb;
-use crate::pci::ide::{IDEDevice, IDE};
+use crate::pci::ide::{IDE, IDEDevice};
 use crate::pci::print_devices;
 use crate::pit::init;
 use crate::sync::mutex::Mutex;
@@ -132,7 +132,7 @@ pub extern "C" fn _start() -> ! {
         // ---------------------------------------------------------------
         const TEMP_PD_PHYS: u32 = 0x0020_0000;
         const TEMP_PT0_PHYS: u32 = 0x0020_1000; // covers 0–4 MiB identity + higher
-                                                // More PTs can be added if needed.
+        // More PTs can be added if needed.
 
         // Zero PD
         let pd = TEMP_PD_PHYS as *mut u32;
@@ -147,7 +147,7 @@ pub extern "C" fn _start() -> ! {
         for i in 0..16u32 {
             let phys = i * 0x400000;
             let flags = 0x83u32; // Present + Writable + Large page
-                                 // Identity
+            // Identity
             *pd.add(i as usize) = phys | flags;
             // Higher-half (PDE index for 0xC0000000 is 768)
             *pd.add(768 + i as usize) = phys | flags;
@@ -189,6 +189,9 @@ pub extern "C" fn higher_half_entry() -> ! {
     unsafe {
         // Now ESP must be the high virtual stack
         asm!("mov esp, {}", in(reg) STACK_START);
+        // Userspace is compiled for legacy i386/x87 (SSE disabled). Configure
+        // the BSP before any Rust/kernel code has a chance to execute x87.
+        crate::multitasking::task::init_cpu_x87();
         // let mut mask: u8;
         // asm!("in al, 0x21", out("al") mask);
         // asm!("out 0x21, al", in("al") mask | 1);
@@ -249,7 +252,7 @@ pub extern "C" fn higher_half_entry() -> ! {
             drivers::mouse::mouse_irq as u32,
         );
         IDT.load(); // ← ПЕРЕМЕСТИТЬ СЮДА
-                    // После полной инициализации paging
+        // После полной инициализации paging
 
         // Bring up application processors after the final page tables and IDT
         // exist. APs use private stacks and remain in kernel idle for now.

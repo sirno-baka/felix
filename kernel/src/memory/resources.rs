@@ -393,11 +393,17 @@ pub struct DmaBuffer {
 /// Order descriptor/payload accesses explicitly; WBINVD is neither necessary
 /// nor an ownership protocol, and SSE2 fences are unavailable on older CPUs.
 #[inline]
-pub fn dma_wmb() { compiler_fence(Ordering::Release); }
+pub fn dma_wmb() {
+    compiler_fence(Ordering::Release);
+}
 #[inline]
-pub fn dma_rmb() { compiler_fence(Ordering::Acquire); }
+pub fn dma_rmb() {
+    compiler_fence(Ordering::Acquire);
+}
 #[inline]
-pub fn dma_mb() { fence(Ordering::SeqCst); }
+pub fn dma_mb() {
+    fence(Ordering::SeqCst);
+}
 
 impl DmaBuffer {
     /// Translate an address inside this owned DMA allocation to its bus-visible
@@ -721,7 +727,9 @@ pub fn dma_alloc_for(
     max_phys: u64,
 ) -> Result<DmaBuffer, ResourceError> {
     let alloc_len = align_up_u64(size as u64, PAGE_SIZE as u64)? as usize;
-    if size == 0 { return Err(ResourceError::ZeroSize); }
+    if size == 0 {
+        return Err(ResourceError::ZeroSize);
+    }
     let max_phys = max_phys.min(detected_ram_bytes() as u64 - 1);
     let phys = alloc_phys_below(max_phys, size, align, ResourceKind::Dma, owner)?;
     let virt = VirtAddr(phys_to_virt(phys.0));

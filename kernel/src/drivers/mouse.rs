@@ -9,7 +9,7 @@ use crate::io::{inb, io_wait, outb};
 use crate::time::jiffies;
 use crate::{debugln, println};
 use core::arch::{asm, naked_asm};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 /// IRQ12 remapped: 32 + 12 = 44
 pub const MOUSE_INT: u8 = 44;
@@ -133,11 +133,7 @@ fn mouse_write(val: u8) {
 }
 
 fn mouse_read() -> u8 {
-    if wait_output_full() {
-        inb(PS2_DATA)
-    } else {
-        0
-    }
+    if wait_output_full() { inb(PS2_DATA) } else { 0 }
 }
 
 fn set_sample_rate(rate: u8) -> bool {
@@ -168,7 +164,7 @@ pub fn init() {
     };
     cmd |= 0x02; // enable IRQ12
     cmd |= 0x01; // keep IRQ1 (keyboard) enabled — writing the command byte
-                 // without this bit kills the kbd on many laptops.
+    // without this bit kills the kbd on many laptops.
     cmd &= !0x20; // enable mouse clock (clear disable bit)
     cmd &= !0x10; // enable keyboard clock
 

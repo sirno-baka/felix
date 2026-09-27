@@ -5,8 +5,8 @@ use core::ptr::{read_volatile, write_volatile};
 use crate::memory::resources::ioremap;
 use crate::time::sleep;
 
-use super::pc16::{addrwin, Pc16};
-use super::{CardInfo, CardType, CF_MEM_SIZE, cf_mem_phys, cf_mem_virt, set_cf_mem_virt};
+use super::pc16::{Pc16, addrwin};
+use super::{CF_MEM_SIZE, CardInfo, CardType, cf_mem_phys, cf_mem_virt, set_cf_mem_virt};
 
 const TUPLE_VERS1: u8 = 0x15;
 const TUPLE_CONFIG: u8 = 0x1A;

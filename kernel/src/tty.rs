@@ -9,8 +9,8 @@ use alloc::vec::Vec;
 
 use crate::filesystem::file::PtySide;
 use crate::multitasking::task::{MAX_TASKS, TASK_MANAGER};
-use crate::sync::mutex::Mutex;
 use crate::sync::MutexLazy;
+use crate::sync::mutex::Mutex;
 
 pub const MAX_TTYS: usize = 4;
 pub const MAX_PTYS: usize = 8;

@@ -1,8 +1,10 @@
 //! Intel 8255x (82557/82558/82559) driver with proper Rx/Tx rings
 //! Uses Felix PCI subsystem + PageManager for DMA buffers
 
-use crate::drivers::net::{map_mmio, RX_BUF_SIZE, RX_RING_SIZE, TX_BUF_SIZE, TX_RING_SIZE};
-use crate::memory::resources::{DmaBuffer as DmaAllocation, MmioMapping, dma_alloc_for, dma_wmb, dma_rmb};
+use crate::drivers::net::{RX_BUF_SIZE, RX_RING_SIZE, TX_BUF_SIZE, TX_RING_SIZE, map_mmio};
+use crate::memory::resources::{
+    DmaBuffer as DmaAllocation, MmioMapping, dma_alloc_for, dma_rmb, dma_wmb,
+};
 use crate::pci::{self, device::PciDevice};
 use crate::println;
 use crate::sync::mutex::Mutex;
@@ -223,7 +225,9 @@ impl I8255x {
         *NET.lock() = Some(nic);
         IRQ_MMIO.store(mmio, Ordering::Release);
         IRQ_LINE.store(dev.interrupt_line, Ordering::Release);
-        if crate::drivers::shared_irq::register_named(dev.interrupt_line, irq_entry, "i8255x").is_ok() {
+        if crate::drivers::shared_irq::register_named(dev.interrupt_line, irq_entry, "i8255x")
+            .is_ok()
+        {
             dev.write_u16(0x04, dev.read_u16(0x04) & !0x0400);
             if let Some(nic) = NET.lock().as_ref() {
                 unsafe {
@@ -233,7 +237,10 @@ impl I8255x {
                 }
             }
         } else {
-            println!("i8255x: IRQ{} unavailable, polling fallback", dev.interrupt_line);
+            println!(
+                "i8255x: IRQ{} unavailable, polling fallback",
+                dev.interrupt_line
+            );
         }
         Ok(())
     }
@@ -590,11 +597,7 @@ impl I8255x {
                 let _ = self.start_ru();
             }
 
-            if valid {
-                Some(count)
-            } else {
-                None
-            }
+            if valid { Some(count) } else { None }
         }
     }
 

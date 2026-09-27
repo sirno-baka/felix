@@ -42,8 +42,8 @@ const ISR_RXOVW: u16 = 1 << 4;
 const ISR_PUN_LINKCHG: u16 = 1 << 5;
 const ISR_FOVW: u16 = 1 << 6;
 const ISR_SERR: u16 = 1 << 15;
-const IRQ_MASK: u16 = ISR_ROK | ISR_RER | ISR_TOK | ISR_TER | ISR_RXOVW
-    | ISR_PUN_LINKCHG | ISR_FOVW | ISR_SERR;
+const IRQ_MASK: u16 =
+    ISR_ROK | ISR_RER | ISR_TOK | ISR_TER | ISR_RXOVW | ISR_PUN_LINKCHG | ISR_FOVW | ISR_SERR;
 
 const TSD_OWN: u32 = 1 << 13;
 const TSD_TOK: u32 = 1 << 15;
@@ -100,7 +100,6 @@ pub static NET: Mutex<Option<Rtl8139>> = Mutex::new(None);
 static RX_LOGS: AtomicUsize = AtomicUsize::new(12);
 static IRQ_IO: AtomicUsize = AtomicUsize::new(0);
 static IRQ_LINE: AtomicU8 = AtomicU8::new(u8::MAX);
-
 
 impl Rtl8139 {
     pub fn init() -> Result<(), &'static str> {
@@ -181,14 +180,19 @@ impl Rtl8139 {
         *NET.lock() = Some(nic);
         IRQ_IO.store(io as usize, Ordering::Release);
         IRQ_LINE.store(dev.interrupt_line, Ordering::Release);
-        if crate::drivers::shared_irq::register_named(dev.interrupt_line, irq_entry, "rtl8139").is_ok() {
+        if crate::drivers::shared_irq::register_named(dev.interrupt_line, irq_entry, "rtl8139")
+            .is_ok()
+        {
             dev.write_u16(0x04, dev.read_u16(0x04) & !0x0400);
             if let Some(nic) = NET.lock().as_ref() {
                 outw(nic.io + REG_ISR, 0xffff);
                 outw(nic.io + REG_IMR, IRQ_MASK);
             }
         } else {
-            println!("rtl8139: IRQ{} unavailable, polling fallback", dev.interrupt_line);
+            println!(
+                "rtl8139: IRQ{} unavailable, polling fallback",
+                dev.interrupt_line
+            );
         }
         Ok(())
     }
@@ -335,7 +339,7 @@ impl Rtl8139 {
                 let next = next % RX_RING;
                 self.rx_off.store(next, Ordering::Release);
                 crate::memory::resources::dma_mb();
-            outw(self.io + REG_CAPR, next.wrapping_sub(16) as u16);
+                outw(self.io + REG_CAPR, next.wrapping_sub(16) as u16);
                 return None;
             }
 

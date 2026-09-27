@@ -208,8 +208,13 @@ pub fn init_native_lcd() -> Result<(), &'static str> {
 
         crate::println!(
             "[M6] MMIO={:#x} size={:#x} CRTC_GEN={:#x} CRTC_EXT={:#x} FP_GEN={:#x} LVDS={:#x} PITCH={:#x}",
-            mmio_phys, mmio_size, crtc_gen_before, crtc_ext_before,
-            fp_gen_before, lvds_before, pitch_before
+            mmio_phys,
+            mmio_size,
+            crtc_gen_before,
+            crtc_ext_before,
+            fp_gen_before,
+            lvds_before,
+            pitch_before
         );
 
         // Keep the display engine enabled, but blank the output while changing
@@ -372,7 +377,13 @@ pub fn init_native_lcd() -> Result<(), &'static str> {
 
         crate::println!(
             "[M6] native 1280x600 set: H={:#x} HS={:#x} V={:#x} VS={:#x} PLL(ref={:#x},div3={:#x}) pitch={}",
-            h, hs, v, vs, pll_ref, pll_div3, pitch_bytes
+            h,
+            hs,
+            v,
+            vs,
+            pll_ref,
+            pll_div3,
+            pitch_bytes
         );
 
         // Sanity: if CRTC was not accepted, report instead of silently

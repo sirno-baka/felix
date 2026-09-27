@@ -304,10 +304,9 @@ unsafe fn install_ggtt_framebuffer(
         .ok_or("Intel framebuffer DMA range overflow")?;
     for i in 0..page_count {
         let phys = first_phys + i * PAGE_SIZE;
-        let pte_addr = mmio
-            .base
-            .add(GGTT_PTE_WINDOW + ((first_pte + i) as usize * 4))
-            as *mut u32;
+        let pte_addr =
+            mmio.base
+                .add(GGTT_PTE_WINDOW + ((first_pte + i) as usize * 4)) as *mut u32;
         write_volatile(pte_addr, gen6_pte(phys));
     }
     *INTEL_FB_DMA.lock() = Some(fb_dma);
@@ -328,11 +327,7 @@ unsafe fn install_ggtt_framebuffer(
         .checked_add(gtt_offset)
         .ok_or("GMADR physical address overflow")?;
 
-    let fb_virt = map_framebuffer_resource(
-        cpu_aperture_phys,
-        fb_bytes,
-        "intel-snb-framebuffer",
-    )?;
+    let fb_virt = map_framebuffer_resource(cpu_aperture_phys, fb_bytes, "intel-snb-framebuffer")?;
 
     // Clear before the display plane points at this surface.
     write_bytes(fb_virt as *mut u8, 0, fb_bytes as usize);

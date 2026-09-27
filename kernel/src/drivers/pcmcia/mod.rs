@@ -88,7 +88,7 @@ pub fn rearm_io() {
 }
 
 use crate::sync::mutex::Mutex;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 static IRQ_LINE: AtomicU8 = AtomicU8::new(0xFF);
 static PENDING: AtomicU8 = AtomicU8::new(0); // 1=insert 2=remove
@@ -435,9 +435,14 @@ fn find_controller() -> Option<alloc::boxed::Box<dyn controller::SocketControlle
         }
         crate::println!(
             "[PCMCIA] controller candidate {:02x}:{:02x}.{} [{:04x}:{:04x}] class={:02x}:{:02x}:{:02x}",
-            dev.bus, dev.device, dev.function,
-            dev.vendor_id, dev.device_id,
-            dev.class_code, dev.subclass, dev.prog_if
+            dev.bus,
+            dev.device,
+            dev.function,
+            dev.vendor_id,
+            dev.device_id,
+            dev.class_code,
+            dev.subclass,
+            dev.prog_if
         );
         if let Some(ctrl) = attach_controller(dev) {
             crate::println!("[PCMCIA] matched controller driver: {}", ctrl.name());

@@ -1,4 +1,4 @@
-use super::{IDEChannelRegisters, IDEDevice, IDE_IRQ_INVOKED};
+use super::{IDE_IRQ_INVOKED, IDEChannelRegisters, IDEDevice};
 
 use crate::io;
 
