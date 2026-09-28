@@ -113,6 +113,41 @@ fn controls(stop: Arc<AtomicBool>) {
 // The queue is bounded for memory safety, but send().await applies backpressure;
 // it never drops a queued segment.
 const SEGMENT_QUEUE_CAPACITY: usize = 16;
+const SEGMENT_DOWNLOAD_CONCURRENCY: usize = 4;
+
+struct DownloadedSegment {
+    segment: hls::Segment,
+    ts: Vec<u8>,
+    download_ms: u128,
+}
+
+async fn download_segment(
+    client: Client,
+    media_url: Url,
+    segment: hls::Segment,
+) -> Result<DownloadedSegment, String> {
+    let url = twitch::resolve_url(&media_url, &segment.uri).map_err(|error| error.to_string())?;
+    let started = std::time::Instant::now();
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let response = response
+        .error_for_status()
+        .map_err(|error| error.to_string())?;
+    let ts = response
+        .bytes()
+        .await
+        .map_err(|error| error.to_string())?
+        .to_vec();
+
+    Ok(DownloadedSegment {
+        segment,
+        ts,
+        download_ms: started.elapsed().as_millis(),
+    })
+}
 
 async fn segment_downloader(
     client: Client,
@@ -138,85 +173,139 @@ async fn segment_downloader(
         if segments.is_empty() {
             return Err("empty media playlist".to_string());
         }
+        let live_edge_sequence = segments.last().map(|segment| segment.sequence);
 
-        // Start at the live edge. HLS video segments are expected to start on
-        // an access-unit boundary; decoder state then persists across segments.
+        // Do not start on the newest segment. At the exact live edge the
+        // presenter inevitably reaches the end of each ~2 s segment before
+        // Twitch has published the next one, which looks like a periodic
+        // underrun even when downloads take only a few hundred milliseconds.
+        //
+        // Begin three already-published segments behind the edge. They can be
+        // downloaded immediately and remain compressed in the upstream queue,
+        // giving the decoder/presenter a stable reserve without consuming tens
+        // of MiB of extra YUV memory.
         if last_sequence.is_none() {
+            const STARTUP_SEGMENTS_BEHIND: usize = 6;
+            let start = segments.len().saturating_sub(STARTUP_SEGMENTS_BEHIND);
             last_sequence = segments
-                .last()
+                .get(start)
                 .map(|segment| segment.sequence.saturating_sub(1));
+            if let (Some(first), Some(last)) = (segments.get(start), segments.last()) {
+                println!(
+                    "[net] startup backlog seq={}..{} ({} segments)",
+                    first.sequence,
+                    last.sequence,
+                    segments.len().saturating_sub(start)
+                );
+            }
         }
 
+        let pending: Vec<_> = segments
+            .into_iter()
+            .filter(|segment| {
+                !last_sequence.is_some_and(|last| segment.sequence <= last)
+            })
+            .collect();
+
         let mut downloaded_any = false;
-        for segment in segments {
+        for batch in pending.chunks(SEGMENT_DOWNLOAD_CONCURRENCY) {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            if last_sequence.is_some_and(|last| segment.sequence <= last) {
-                continue;
+
+            // Start every segment in this batch concurrently. The previous code
+            // used chunks(4) but only spawned pair[0] and pair[1], silently
+            // skipping pair[2] and pair[3]. That created real holes in the
+            // MPEG-TS/H.264 bitstream every batch.
+            //
+            // Await handles in the original playlist order because H264Demuxer
+            // is stateful and PES/continuity state must see sequential segments.
+            let mut tasks = Vec::with_capacity(batch.len());
+            for segment in batch {
+                tasks.push(tokio::spawn(download_segment(
+                    client.clone(),
+                    media_url.clone(),
+                    segment.clone(),
+                )));
             }
 
-            let url =
-                twitch::resolve_url(&media_url, &segment.uri).map_err(|error| error.to_string())?;
-            let segment_started = std::time::Instant::now();
-            let response = client
-                .get(url)
-                .send()
-                .await
-                .map_err(|error| error.to_string())?;
-            let response = response
-                .error_for_status()
-                .map_err(|error| error.to_string())?;
-            let ts = response.bytes().await.map_err(|error| error.to_string())?;
-            let download_ms = segment_started.elapsed().as_millis();
-            let h264 = video_demuxer.push_segment(&ts)?;
-            let queued = tx.max_capacity().saturating_sub(tx.capacity());
-            let mbps = if download_ms > 0 {
-                (ts.len() as f64 * 8.0) / (download_ms as f64 * 1000.0)
-            } else {
-                0.0
-            };
-            let (seg_ms, load_pct) = segment.duration
-                .filter(|duration| *duration > 0.0)
-                .map(|duration| {
-                    let seg_ms = duration * 1000.0;
-                    (seg_ms, download_ms as f64 * 100.0 / seg_ms)
-                })
-                .unwrap_or((0.0, 0.0));
-            println!(
-                "[net] seq={} ts={:.1}KiB h264={:.1}KiB dl={}ms seg={:.0}ms load={:.0}% {:.2}Mbps segq={}/{}",
-                segment.sequence,
-                ts.len() as f64 / 1024.0,
-                h264.len() as f64 / 1024.0,
-                download_ms,
-                seg_ms,
-                load_pct,
-                mbps,
-                queued,
-                tx.max_capacity()
-            );
-
-            if !h264.is_empty()
-                && tx
-                    .send(VideoChunk {
-                        sequence: segment.sequence,
-                        h264,
-                    })
+            for task in tasks {
+                let downloaded = task
                     .await
-                    .is_err()
-            {
-                return Ok(());
-            }
+                    .map_err(|error| format!("segment task: {error}"))??;
+                let segment = downloaded.segment;
 
-            last_sequence = Some(segment.sequence);
-            downloaded_any = true;
+                if let Some(last) = last_sequence {
+                    let expected = last.saturating_add(1);
+                    if segment.sequence != expected {
+                        eprintln!(
+                            "[net] *** HLS SEQUENCE GAP expected={} got={} ***",
+                            expected,
+                            segment.sequence
+                        );
+                    }
+                }
+                let ts = downloaded.ts;
+                let download_ms = downloaded.download_ms;
+                let pts_fps = mpegts::video_fps_from_pts(&ts);
+                let h264 = video_demuxer.push_segment(&ts)?;
+                let queued = tx.max_capacity().saturating_sub(tx.capacity());
+                let mbps = if download_ms > 0 {
+                    (ts.len() as f64 * 8.0) / (download_ms as f64 * 1000.0)
+                } else {
+                    0.0
+                };
+                let (seg_ms, load_pct) = segment.duration
+                    .filter(|duration| *duration > 0.0)
+                    .map(|duration| {
+                        let seg_ms = duration * 1000.0;
+                        (seg_ms, download_ms as f64 * 100.0 / seg_ms)
+                    })
+                    .unwrap_or((0.0, 0.0));
+                println!(
+                    "[net] seq={} edge={} behind={} ts={:.1}KiB h264={:.1}KiB dl={}ms seg={:.0}ms load={:.0}% {:.2}Mbps pts_fps={:.2} segq={}/{} inflight={}",
+                    segment.sequence,
+                    live_edge_sequence.unwrap_or(segment.sequence),
+                    live_edge_sequence
+                        .unwrap_or(segment.sequence)
+                        .saturating_sub(segment.sequence),
+                    ts.len() as f64 / 1024.0,
+                    h264.len() as f64 / 1024.0,
+                    download_ms,
+                    seg_ms,
+                    load_pct,
+                    mbps,
+                    pts_fps.unwrap_or(0.0),
+                    queued,
+                    tx.max_capacity(),
+                    batch.len()
+                );
+
+                if !h264.is_empty()
+                    && tx
+                        .send(VideoChunk {
+                            sequence: segment.sequence,
+                            duration: segment.duration,
+                            fps: pts_fps,
+                            h264,
+                        })
+                        .await
+                        .is_err()
+                {
+                    return Ok(());
+                }
+
+                last_sequence = Some(segment.sequence);
+                downloaded_any = true;
+            }
         }
 
         if !downloaded_any {
-            // Twitch's ordinary live segments are much longer than this. 250
-            // ms caused needless playlist/TLS activity when connection reuse
-            // was imperfect on PopugOS.
-            tokio::time::sleep(Duration::from_millis(750)).await;
+            // Poll close enough to the live edge that playlist publication jitter
+            // does not consume the decoded presentation buffer. Segment GETs are
+            // still only issued once per sequence; this only refreshes the small
+            // media playlist while waiting for Twitch to publish the next segment.
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
@@ -303,7 +392,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(format!("unknown argument: {arg}").into());
     }
 
-    tokio::runtime::Builder::new_current_thread()
+    tokio::runtime::Builder::new_multi_thread().worker_threads(2)
         .enable_io()
         .enable_time()
         .build()?

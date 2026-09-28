@@ -6,6 +6,7 @@
 //! owner and overlap checks happen in one place.
 
 use alloc::vec::Vec;
+use core::arch::asm;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering, compiler_fence, fence};
 
@@ -15,6 +16,96 @@ use crate::memory::paging::{
     KERNEL_MMIO_BASE, KERNEL_MMIO_END, PAGE_SIZE, PAGING, PTEFlags, PhysAddr, VirtAddr,
     detected_ram_bytes, phys_to_virt,
 };
+
+/// IA32_PAT entry 4 (PAT=1, PCD=0, PWT=0) is reserved by Felix for
+/// write-combining framebuffer mappings. The architectural reset value of
+/// entry 4 is WB, so we only select it after explicitly programming WC.
+static PAT_WC_ENABLED: AtomicBool = AtomicBool::new(false);
+
+fn cpuid_leaf1_edx() -> Option<u32> {
+    let original: u32;
+    let changed: u32;
+    unsafe {
+        asm!(
+            "pushfd",
+            "pop {original:e}",
+            "mov {changed:e}, {original:e}",
+            "xor {changed:e}, 0x00200000",
+            "push {changed:e}",
+            "popfd",
+            "pushfd",
+            "pop {changed:e}",
+            "push {original:e}",
+            "popfd",
+            original = lateout(reg) original,
+            changed = lateout(reg) changed,
+            options(preserves_flags),
+        );
+    }
+    if (original ^ changed) & 0x0020_0000 == 0 {
+        return None;
+    }
+
+    let edx: u32;
+    unsafe {
+        asm!(
+            "push ebx",
+            "mov eax, 1",
+            "cpuid",
+            "pop ebx",
+            lateout("eax") _,
+            lateout("ecx") _,
+            lateout("edx") edx,
+            options(preserves_flags),
+        );
+    }
+    Some(edx)
+}
+
+/// Program an otherwise-unused PAT slot to WC on the current logical CPU.
+///
+/// Called once on the BSP and every AP before userspace is scheduled. CPUs
+/// without PAT simply keep framebuffer mappings uncached.
+pub fn init_cpu_pat_wc() {
+    const CPUID_PAT: u32 = 1 << 16;
+    const IA32_PAT: u32 = 0x277;
+    const PAT_WC: u32 = 0x01;
+
+    let supported = cpuid_leaf1_edx()
+        .map(|edx| edx & CPUID_PAT != 0)
+        .unwrap_or(false);
+    if !supported {
+        return;
+    }
+
+    unsafe {
+        let mut low: u32;
+        let mut high: u32;
+        asm!(
+            "rdmsr",
+            in("ecx") IA32_PAT,
+            lateout("eax") low,
+            lateout("edx") high,
+            options(nostack),
+        );
+
+        // Entry 4 is bits 32..39, i.e. the low byte of EDX.
+        // No current Felix mapping sets the PTE PAT bit, so changing this
+        // otherwise-unused slot does not alter the cache type of live mappings.
+        high = (high & !0xff) | PAT_WC;
+
+        asm!(
+            "wrmsr",
+            in("ecx") IA32_PAT,
+            in("eax") low,
+            in("edx") high,
+            options(nostack),
+        );
+    }
+
+    PAT_WC_ENABLED.store(true, Ordering::Release);
+}
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResourceKind {
@@ -595,7 +686,7 @@ pub fn free_kernel_virtual(virt: VirtAddr, size: usize) -> Result<(), ResourceEr
 
 /// Map a physical device range uncached into the central kernel MMIO window.
 /// This function only maps; callers reserve physical ownership separately.
-pub fn ioremap(phys: u64, size: usize, owner: &'static str) -> Result<VirtAddr, ResourceError> {
+fn ioremap_with_flags(phys: u64, size: usize, owner: &'static str, flags: PTEFlags) -> Result<VirtAddr, ResourceError> {
     if size == 0 {
         return Err(ResourceError::ZeroSize);
     }
@@ -619,12 +710,6 @@ pub fn ioremap(phys: u64, size: usize, owner: &'static str) -> Result<VirtAddr, 
     }
 
     let map_base = alloc_kernel_virtual(map_size as usize, PAGE_SIZE, owner)?;
-    let flags = PTEFlags::new()
-        .present()
-        .writable()
-        .write_through()
-        .cache_disable();
-
     let map_result = without_interrupts(|| unsafe {
         let mut paging = PAGING.lock();
         paging.map_physical_range(phys_base as u32, map_size as u32, map_base.0, flags)
@@ -656,6 +741,32 @@ pub fn ioremap(phys: u64, size: usize, owner: &'static str) -> Result<VirtAddr, 
         size
     );
     Ok(returned)
+}
+
+pub fn ioremap(phys: u64, size: usize, owner: &'static str) -> Result<VirtAddr, ResourceError> {
+    // Device registers and ordinary MMIO stay strongly uncached.
+    let flags = PTEFlags::new()
+        .present()
+        .writable()
+        .write_through()
+        .cache_disable();
+    ioremap_with_flags(phys, size, owner, flags)
+}
+
+/// Map a write-mostly linear framebuffer using PAT write-combining when the
+/// CPU supports it. Falls back to the normal uncached MMIO mapping otherwise.
+pub fn ioremap_wc(phys: u64, size: usize, owner: &'static str) -> Result<VirtAddr, ResourceError> {
+    let flags = if PAT_WC_ENABLED.load(Ordering::Acquire) {
+        // PAT=1, PCD=0, PWT=0 -> PAT entry 4, programmed to WC by init_cpu_pat_wc.
+        PTEFlags::new().present().writable().pat()
+    } else {
+        PTEFlags::new()
+            .present()
+            .writable()
+            .write_through()
+            .cache_disable()
+    };
+    ioremap_with_flags(phys, size, owner, flags)
 }
 
 pub fn iounmap(virt: VirtAddr) -> Result<(), ResourceError> {

@@ -1,14 +1,14 @@
 //! PS/2 mouse driver (IRQ12) + software cursor.
 //!
-//! Protocol: standard 3-byte packets. Cursor is drawn with a small
-//! under-buffer so we can erase/redraw without full-screen compose.
+//! Protocol: standard 3-byte packets. The IRQ path only updates state/events;
+//! the WM compositor owns all cursor drawing as its final overlay layer.
 
 use crate::drivers::framebuffer::FRAMEBUFFER;
 use crate::drivers::pic::PICS;
 use crate::io::{inb, io_wait, outb};
 use crate::time::jiffies;
 use crate::{debugln, println};
-use core::arch::{asm, naked_asm};
+use core::arch::naked_asm;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 /// IRQ12 remapped: 32 + 12 = 44
@@ -40,13 +40,10 @@ static POS_Y: AtomicU32 = AtomicU32::new(300);
 static BUTTONS: AtomicU8 = AtomicU8::new(0);
 static PREV_BUTTONS: AtomicU8 = AtomicU8::new(0);
 
-/// Software cursor under-buffer (12×20, 32bpp).
-const CUR_W: usize = 12;
-const CUR_H: usize = 20;
-static mut UNDER: [u32; CUR_W * CUR_H] = [0; CUR_W * CUR_H];
-static mut CUR_DRAWN: bool = false;
-static mut CUR_OX: i32 = 0;
-static mut CUR_OY: i32 = 0;
+/// Software cursor dimensions. Pixel storage lives nowhere: the cursor is
+/// rendered directly as the compositor's top-most layer.
+pub const CUR_W: usize = 12;
+pub const CUR_H: usize = 20;
 
 /// Simple arrow bitmap (1 = foreground).
 const CURSOR_MASK: [[u8; CUR_W]; CUR_H] = [
@@ -360,8 +357,9 @@ fn process_packet() {
             }
         }
 
-        // Redraw cursor (try_lock only — never block in IRQ)
-        redraw_cursor();
+        // Cursor pixels are owned by the WM compositor. IRQ12 never writes
+        // directly to the framebuffer; on_mouse_move() invalidates old/new
+        // cursor rectangles through the pending-input path.
     }
 }
 
@@ -374,96 +372,48 @@ fn screen_size() -> (i32, i32) {
     (800, 600)
 }
 
-/// Restore previous under-pixels and draw cursor at current position.
-/// Safe from IRQ if FRAMEBUFFER.try_lock succeeds.
-pub fn redraw_cursor() {
-    let Some(mut guard) = FRAMEBUFFER.try_lock() else {
-        return;
-    };
-    let Some(fb) = guard.as_mut() else {
-        return;
-    };
+/// Draw the cursor at x,y, clipped to a compositor dirty rectangle.
+///
+/// This never saves/restores pixels. The scene underneath is reconstructed by
+/// the compositor before this final top-most layer is painted.
+pub fn draw_cursor_clipped(
+    fb: &mut crate::drivers::framebuffer::Framebuffer,
+    x: i32,
+    y: i32,
+    clip_x: i32,
+    clip_y: i32,
+    clip_w: u32,
+    clip_h: u32,
+) {
+    let clip_right = clip_x.saturating_add(clip_w as i32);
+    let clip_bottom = clip_y.saturating_add(clip_h as i32);
 
-    hide_cursor(fb);
-    show_cursor(fb);
-}
-
-/// Remove the software cursor before the compositor touches the framebuffer.
-/// The compositor already owns the framebuffer lock when calling this.
-pub fn hide_cursor(fb: &mut crate::drivers::framebuffer::Framebuffer) {
-    unsafe {
-        if !CUR_DRAWN {
-            return;
-        }
-        for row in 0..CUR_H {
-            for col in 0..CUR_W {
-                let px = CUR_OX + col as i32;
-                let py = CUR_OY + row as i32;
-                if px >= 0
-                    && py >= 0
-                    && (px as u32) < fb.info.width as u32
-                    && (py as u32) < fb.info.height as u32
-                {
-                    fb.put_pixel_raw(px as u32, py as u32, UNDER[row * CUR_W + col]);
-                }
+    for row in 0..CUR_H {
+        for col in 0..CUR_W {
+            if CURSOR_MASK[row][col] == 0 {
+                continue;
             }
-        }
-        CUR_DRAWN = false;
-    }
-}
 
-/// Paint the cursor as the final compositor layer and refresh its under-buffer.
-pub fn show_cursor(fb: &mut crate::drivers::framebuffer::Framebuffer) {
-    let (x, y) = position();
-    unsafe {
-        for row in 0..CUR_H {
-            for col in 0..CUR_W {
-                let px = x + col as i32;
-                let py = y + row as i32;
-                let color = if px >= 0
-                    && py >= 0
-                    && (px as u32) < fb.info.width as u32
-                    && (py as u32) < fb.info.height as u32
-                {
-                    read_pixel(fb, px as u32, py as u32)
-                } else {
-                    0
-                };
-                UNDER[row * CUR_W + col] = color;
-
-                if CURSOR_MASK[row][col] != 0
-                    && px >= 0
-                    && py >= 0
-                    && (px as u32) < fb.info.width as u32
-                    && (py as u32) < fb.info.height as u32
-                {
-                    // White fill + black outline-ish via neighbors already in mask
-                    let edge = row == 0
-                        || col == 0
-                        || CURSOR_MASK[row.saturating_sub(1)][col] == 0
-                        || (col + 1 < CUR_W && CURSOR_MASK[row][col + 1] == 0);
-                    let c = if edge { 0x00_00_00 } else { 0x00_F0_F0_F0 };
-                    fb.put_pixel_raw(px as u32, py as u32, c);
-                }
+            let px = x + col as i32;
+            let py = y + row as i32;
+            if px < clip_x
+                || py < clip_y
+                || px >= clip_right
+                || py >= clip_bottom
+                || px < 0
+                || py < 0
+                || (px as u32) >= fb.info.width as u32
+                || (py as u32) >= fb.info.height as u32
+            {
+                continue;
             }
-        }
-        CUR_OX = x;
-        CUR_OY = y;
-        CUR_DRAWN = true;
-    }
-}
 
-fn read_pixel(fb: &crate::drivers::framebuffer::Framebuffer, x: u32, y: u32) -> u32 {
-    if x >= fb.info.width as u32 || y >= fb.info.height as u32 {
-        return 0;
-    }
-    let bpp = ((fb.info.bpp as u32 + 7) / 8) as usize;
-    let offset = (y * fb.info.pitch as u32 + x * bpp as u32) as usize;
-    let ptr = (fb.virt_base as *const u8).wrapping_add(offset);
-    unsafe {
-        let b = *ptr as u32;
-        let g = *ptr.add(1) as u32;
-        let r = *ptr.add(2) as u32;
-        (r << 16) | (g << 8) | b
+            let edge = row == 0
+                || col == 0
+                || CURSOR_MASK[row.saturating_sub(1)][col] == 0
+                || (col + 1 < CUR_W && CURSOR_MASK[row][col + 1] == 0);
+            let color = if edge { 0x00_00_00 } else { 0x00_F0_F0_F0 };
+            fb.put_pixel_raw(px as u32, py as u32, color);
+        }
     }
 }

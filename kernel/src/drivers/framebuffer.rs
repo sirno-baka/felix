@@ -1,5 +1,5 @@
 use crate::memory::paging::VirtAddr;
-use crate::memory::resources::{ResourceKind, ioremap, iounmap, release_range, reserve_range};
+use crate::memory::resources::{ResourceKind, ioremap_wc, iounmap, release_range, reserve_range};
 use crate::sync::mutex::Mutex;
 use crate::{debugln, println};
 use core::arch::asm;
@@ -85,7 +85,7 @@ pub fn map_framebuffer_resource(
         }
         return Err("framebuffer physical range is already owned");
     }
-    let virt = match ioremap(phys as u64, size as usize, owner) {
+    let virt = match ioremap_wc(phys as u64, size as usize, owner) {
         Ok(v) => v,
         Err(_) => {
             let _ = release_range(phys as u64, size as u64);
@@ -112,7 +112,7 @@ pub fn map_framebuffer_resource(
 
 fn restore_framebuffer_resource(phys: u32, size: u32, owner: &'static str) -> Result<u32, ()> {
     reserve_range(phys as u64, size as u64, ResourceKind::Framebuffer, owner).map_err(|_| ())?;
-    let virt = match ioremap(phys as u64, size as usize, owner) {
+    let virt = match ioremap_wc(phys as u64, size as usize, owner) {
         Ok(v) => v,
         Err(_) => {
             let _ = release_range(phys as u64, size as u64);

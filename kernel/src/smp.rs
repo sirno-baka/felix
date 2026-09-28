@@ -66,8 +66,8 @@ static CURRENT_CR3: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CP
 static IDLE_ESP: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 static TLB_TARGET_CR3: AtomicU32 = AtomicU32::new(0);
 static TLB_TARGET_PAGE: AtomicU32 = AtomicU32::new(0);
-static TLB_ACKS: AtomicU32 = AtomicU32::new(0);
-static TLB_SHOOTDOWN_BROKEN: AtomicBool = AtomicBool::new(false);
+static TLB_EPOCH: AtomicU32 = AtomicU32::new(0);
+static TLB_ACK_EPOCH: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 
 #[derive(Clone, Copy)]
 struct SmpJob {
@@ -740,48 +740,68 @@ extern "C" fn work_ipi_ack() {
 }
 
 pub fn shootdown_tlb(page_dir_phys: u32, page: u32) -> bool {
-    if TLB_SHOOTDOWN_BROKEN.load(Ordering::Acquire) {
-        return false;
-    }
     let base = LAPIC_VIRT.load(Ordering::Acquire) as *mut u8;
     if base.is_null() {
         return true;
     }
+
     let sender = current_cpu_index();
-    let mut targets = [0u8; MAX_CPUS];
+    let mut target_cpus = [0usize; MAX_CPUS];
+    let mut target_apics = [0u8; MAX_CPUS];
     let mut count = 0usize;
     for cpu in 0..MAX_CPUS {
         if ONLINE_MASK.load(Ordering::Acquire) & (1 << cpu) != 0
             && cpu != sender
             && CURRENT_CR3[cpu].load(Ordering::Acquire) == page_dir_phys
         {
-            targets[count] = CPU_APIC_IDS[cpu].load(Ordering::Acquire) as u8;
+            target_cpus[count] = cpu;
+            target_apics[count] = CPU_APIC_IDS[cpu].load(Ordering::Acquire) as u8;
             count += 1;
         }
     }
     if count == 0 {
         return true;
     }
+
+    // Tag every transaction. The old implementation used one global ACK count
+    // and permanently disabled all future shootdowns after one timeout. A
+    // single delayed/missed IPI therefore made every later munmap leak physical
+    // frames forever. Per-CPU epochs make delayed IPIs harmless: an IPI always
+    // flushes the *current* target and records the current epoch.
     TLB_TARGET_CR3.store(page_dir_phys, Ordering::Relaxed);
     TLB_TARGET_PAGE.store(page & !0xfff, Ordering::Relaxed);
-    TLB_ACKS.store(0, Ordering::Release);
-    for apic_id in targets[..count].iter().copied() {
-        if !unsafe { send_ipi(base, apic_id, TLB_IPI_VECTOR as u32) } {
-            TLB_SHOOTDOWN_BROKEN.store(true, Ordering::Release);
-            return false;
-        }
+    let mut epoch = TLB_EPOCH.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    if epoch == 0 {
+        epoch = TLB_EPOCH.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
     }
+
+    for apic_id in target_apics[..count].iter().copied() {
+        // Do not poison every future shootdown if one send fails. The target
+        // may context-switch away before the wait finishes, which is equally
+        // safe because reloading CR3 discards the stale non-global TLB entry.
+        let _ = unsafe { send_ipi(base, apic_id, TLB_IPI_VECTOR as u32) };
+    }
+
     for _ in 0..10_000_000 {
-        if TLB_ACKS.load(Ordering::Acquire) >= count as u32 {
+        let mut complete = true;
+        for &cpu in &target_cpus[..count] {
+            if CURRENT_CR3[cpu].load(Ordering::Acquire) != page_dir_phys {
+                continue;
+            }
+            if TLB_ACK_EPOCH[cpu].load(Ordering::Acquire) != epoch {
+                complete = false;
+                break;
+            }
+        }
+        if complete {
             return true;
         }
         core::hint::spin_loop();
     }
-    // Never let one missing IPI acknowledgement freeze the giant kernel lock.
-    // The caller must retain the physical frame and virtual range, so a stale
-    // remote TLB entry cannot alias reused memory. Disable later transactions
-    // because a delayed acknowledgement must not satisfy a newer request.
-    TLB_SHOOTDOWN_BROKEN.store(true, Ordering::Release);
+
+    // The caller must retain the physical frame if this returns false. Unlike
+    // the previous implementation, a single timeout does not permanently break
+    // all later shootdowns and turn every subsequent munmap into a leak.
     false
 }
 
@@ -811,12 +831,13 @@ pub extern "C" fn tlb_ipi_interrupt() {
 
 #[unsafe(no_mangle)]
 extern "C" fn tlb_ipi_ack() {
+    let epoch = TLB_EPOCH.load(Ordering::Acquire);
     let current: u32;
     unsafe { asm!("mov {}, cr3", out(reg) current, options(nomem, nostack)) };
     if current == TLB_TARGET_CR3.load(Ordering::Acquire) {
         crate::memory::paging::PageDirectory::flush_page(TLB_TARGET_PAGE.load(Ordering::Relaxed));
     }
-    TLB_ACKS.fetch_add(1, Ordering::Release);
+    TLB_ACK_EPOCH[current_cpu_index()].store(epoch, Ordering::Release);
     let base = LAPIC_VIRT.load(Ordering::Acquire) as *mut u8;
     if !base.is_null() {
         unsafe { lapic_write(base, LAPIC_EOI, 0) };
@@ -1003,7 +1024,8 @@ pub fn init() {
 #[unsafe(no_mangle)]
 extern "C" fn ap_entry() -> ! {
     // Each logical CPU owns a distinct hardware x87 register file.
-    crate::multitasking::task::init_cpu_x87();
+    crate::multitasking::task::init_cpu_fp();
+    crate::memory::resources::init_cpu_pat_wc();
     let lapic = LAPIC_VIRT.load(Ordering::Acquire) as *mut u8;
     let Some(slot) = cpu_slot_for_lapic(lapic) else {
         // Never alias an unrecognised AP onto CPU0's per-CPU state/stack.

@@ -226,6 +226,9 @@ impl PTEFlags {
     pub const CACHE_DISABLE: u32 = 1 << 4;
     pub const ACCESSED: u32 = 1 << 5;
     pub const DIRTY: u32 = 1 << 6;
+    /// PAT selector for a 4 KiB PTE (bit 7). Do not use this bit on a PDE,
+    /// where bit 7 means PAGE_SIZE.
+    pub const PAT: u32 = 1 << 7;
 
     pub fn new() -> Self {
         Self(0)
@@ -263,6 +266,11 @@ impl PTEFlags {
 
     pub fn dirty(mut self) -> Self {
         self.0 |= Self::DIRTY;
+        self
+    }
+
+    pub fn pat(mut self) -> Self {
+        self.0 |= Self::PAT;
         self
     }
 
@@ -501,6 +509,36 @@ impl PageDirectory {
         unsafe {
             asm!("invlpg [{0}]", in(reg) addr);
         }
+    }
+
+    /// Change write permission of an already mapped 4 KiB userspace page.
+    /// ELF loading initially needs writable mappings to copy segment bytes;
+    /// final PT_LOAD permissions are applied once loading is complete.
+    pub fn set_user_page_writable(&mut self, virt_addr: u32, writable: bool) {
+        let page = virt_addr & !0xFFF;
+        let vpage = page >> 12;
+        let pd_idx = (vpage >> 10) as usize;
+        let pt_idx = (vpage & 0x3FF) as usize;
+
+        let pde = self.entries[pd_idx];
+        if pde & PDEFlags::PRESENT == 0 || pde & PDEFlags::DIR_PAGE_SIZE != 0 {
+            return;
+        }
+
+        let pt_phys = pde & 0xFFFF_F000;
+        let pt = phys_to_virt(pt_phys) as *mut [u32; 1024];
+        unsafe {
+            let pte = &mut (*pt)[pt_idx];
+            if *pte & PTEFlags::PRESENT == 0 {
+                return;
+            }
+            if writable {
+                *pte |= PTEFlags::WRITABLE;
+            } else {
+                *pte &= !PTEFlags::WRITABLE;
+            }
+        }
+        Self::flush_page(page);
     }
 
     pub fn alloc_and_map_user_page(&mut self, virt_addr: u32) {

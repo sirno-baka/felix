@@ -6,3 +6,20 @@
 [build]
 rustflags = ["--cfg", "test_disabled", "--cfg", "getrandom_backend=\"custom\""]
 
+# PopugOS deliberately exposes only x87 today. Some RustCrypto/HTTP crates do
+# runtime CPUID dispatch and would otherwise enter SSE/AES/PCLMUL code merely
+# because the physical CPU supports it, even though the OS does not preserve
+# XMM state.
+[target.i686-unknown-popugos]
+rustflags = [
+    "--cfg", "test_disabled",
+    "--cfg", "getrandom_backend=\"custom\"",
+    "--cfg", "aes_force_soft",
+    "--cfg", "polyval_force_soft",
+    "--cfg", "poly1305_force_soft",
+    "--cfg", "chacha20_force_soft",
+]
+
+[env]
+CARGO_CFG_HTTPARSE_DISABLE_SIMD = { value = "1", force = true }
+

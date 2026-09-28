@@ -189,9 +189,10 @@ pub extern "C" fn higher_half_entry() -> ! {
     unsafe {
         // Now ESP must be the high virtual stack
         asm!("mov esp, {}", in(reg) STACK_START);
-        // Userspace is compiled for legacy i386/x87 (SSE disabled). Configure
+        // Configure x87 and, when CPUID allows it, FXSR/SSE context support on
         // the BSP before any Rust/kernel code has a chance to execute x87.
-        crate::multitasking::task::init_cpu_x87();
+        crate::multitasking::task::init_cpu_fp();
+        crate::memory::resources::init_cpu_pat_wc();
         // let mut mask: u8;
         // asm!("in al, 0x21", out("al") mask);
         // asm!("out 0x21, al", in("al") mask | 1);

@@ -125,6 +125,10 @@ pub const SYS_MOUSE_STATE: u32 = 0xF107;
 /// wm_poll(id, *mut WmEvent, max) → number of events copied
 pub const SYS_WM_POLL: u32 = 0xF108;
 pub const SYS_WM_WINDOWS: u32 = 0xF109;
+/// wm_map_shared(id, *mut WmSharedInfo) → 0 / usize::MAX
+pub const SYS_WM_MAP_SHARED: u32 = 0xF10A;
+/// wm_present_shared(id, buffer_index, *const WmDirtyRect|null) → 0 / usize::MAX
+pub const SYS_WM_PRESENT_SHARED: u32 = 0xF10B;
 /// pci_list(*mut PciInfoUser, max) → number of devices written (or needed if max=0)
 pub const SYS_PCI_LIST: u32 = 0xF110;
 /// ifconfig(cmd, *mut IfConfigUser) → 0 / usize::MAX

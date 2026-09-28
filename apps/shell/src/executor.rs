@@ -304,7 +304,6 @@ fn spawn_pipeline(shell: &Shell, commands: &[SimpleCmd], foreground: bool) -> Re
             }
             Err(e) => {
                 for pid in &pids { unsafe { let _ = kill(*pid, SIGKILL); } }
-                if foreground { let _ = unsafe { tty_setfg(getpgrp()) }; }
                 close_unique(&[pty_slave as i32, pty_master as i32]);
                 for (r, w) in pipes { close_unique(&[r as i32, w as i32]); }
                 return Err(e);
@@ -454,9 +453,8 @@ fn supervise_group(
     out: &mut TermBuffer,
     win: &mut Window,
 ) -> SuperviseResult {
-    let shell_pgid = unsafe { getpgrp() };
-    let _ = unsafe { tty_setfg(group.pgid) };
     if let Some(fd) = group.capture_fd {
+        let _ = unsafe { tcsetpgrp(fd, group.pgid) };
         let _ = unsafe { set_nonblock(fd) };
     }
     let mut ui = UiBridge { win };
@@ -494,7 +492,6 @@ fn supervise_group(
             }
             let status = group.last_status;
             close_group_io(&mut group);
-            let _ = unsafe { tty_setfg(shell_pgid) };
             ui.redraw(out);
             return SuperviseResult::Exited(status);
         }
@@ -506,7 +503,6 @@ fn supervise_group(
             // Consume the SIGSTOP transitions generated above. Otherwise a
             // later `fg` could immediately observe a stale WUNTRACED event.
             let _ = reap_group_nonblocking(&mut group);
-            let _ = unsafe { tty_setfg(shell_pgid) };
             ui.redraw(out);
             return SuperviseResult::Stopped(group);
         }
@@ -716,9 +712,11 @@ fn run_special_builtin(
             let job = shell.jobs.remove(idx);
             let id = job.id;
             let command = job.command.clone();
-            // Give tty ownership back before waking the stopped group; otherwise
-            // a resumed reader can immediately receive SIGTTIN again.
-            let _ = unsafe { tty_setfg(job.pgid) };
+            // Give this job's PTY back to its process group before waking it;
+            // the parent shell's controlling TTY is a separate terminal.
+            if let Some(fd) = job.capture_fd {
+                let _ = unsafe { tcsetpgrp(fd, job.pgid) };
+            }
             unsafe { let _ = kill(-job.pgid, SIGCONT); }
             match supervise_group(running_from_job(job), out, win) {
                 SuperviseResult::Exited(status) => Some(status),

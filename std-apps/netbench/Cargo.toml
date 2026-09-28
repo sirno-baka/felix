@@ -12,6 +12,7 @@ getrandom = { version = "0.2.17", features = ["custom"] }
 reqwest = { version = "=0.12.26", default-features = false, features = ["rustls-tls-manual-roots-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "custom-provider"] }
 rustls-rustcrypto = "0.0.2-alpha"
+sha2 = { version = "0.10.9", default-features = false, features = ["force-soft"] }
 tokio = { version = "1.53.1", default-features = false, features = ["net", "rt-multi-thread", "sync", "time"] }
 webpki-roots = "1"
 

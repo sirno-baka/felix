@@ -926,11 +926,22 @@ pub(crate) fn sys_execve_wasm(
                 _ => None,
             })
             .unwrap_or(task.pty_id);
+        if task.pty_id >= 0 {
+            if let Some(tty_id) = crate::tty::pty_tty_id(task.pty_id as usize) {
+                task.tty_id = tty_id as i16;
+            }
+        }
         task.fd_table = fd_table;
 
         TASK_MANAGER.tasks[slot] = Some(task);
         TASK_MANAGER.task_count += 1;
-        if params.foreground && parent_slot != 0 {
+        if TASK_MANAGER.tasks[slot]
+            .as_ref()
+            .is_some_and(|task| task.pty_id >= 0)
+        {
+            let pty_id = TASK_MANAGER.tasks[slot].as_ref().unwrap().pty_id as usize;
+            let _ = crate::tty::set_foreground_pty(slot, pty_id, pgid);
+        } else if params.foreground && parent_slot != 0 {
             let _ = crate::tty::set_foreground(parent_slot, pgid);
         }
         // Syscall trampoline entered with IF=0; iretd restores the user's IF.

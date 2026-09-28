@@ -1,7 +1,7 @@
 use crate::memory::paging::{KERNEL_MMIO_BASE, PAGE_SIZE, PageDirectory, phys_to_virt};
 use crate::println;
 use elf::ElfBytes;
-use elf::abi::{EM_386, ET_EXEC, PT_LOAD};
+use elf::abi::{EM_386, ET_EXEC, PF_W, PT_LOAD};
 use elf::endian::AnyEndian;
 
 #[derive(Debug)]
@@ -55,10 +55,42 @@ pub fn load_elf(binary: &[u8], page_dir: &mut PageDirectory) -> Result<u32, ElfL
         page += 0x1000;
     }
 
-    // Потом обычная загрузка сегментов по p_vaddr
+    // Потом обычная загрузка сегментов по p_vaddr.
+    // Pages stay writable during the copy; final ELF permissions are applied
+    // only after every segment is populated.
     for phdr in segments.iter() {
         if phdr.p_type == PT_LOAD {
             load_segment(&phdr, binary, page_dir)?;
+        }
+    }
+
+    // Apply PT_LOAD write permissions. First make every loadable segment
+    // read-only, then re-enable writes for PF_W segments. The two-pass form
+    // handles the rare case where ELF segments share a page.
+    for phdr in segments.iter() {
+        if phdr.p_type != PT_LOAD {
+            continue;
+        }
+        let start = (phdr.p_vaddr as u32) & !(PAGE_SIZE as u32 - 1);
+        let end = ((phdr.p_vaddr + phdr.p_memsz + PAGE_SIZE as u64 - 1)
+            & !(PAGE_SIZE as u64 - 1)) as u32;
+        let mut page = start;
+        while page < end {
+            page_dir.set_user_page_writable(page, false);
+            page += PAGE_SIZE as u32;
+        }
+    }
+    for phdr in segments.iter() {
+        if phdr.p_type != PT_LOAD || phdr.p_flags & PF_W == 0 {
+            continue;
+        }
+        let start = (phdr.p_vaddr as u32) & !(PAGE_SIZE as u32 - 1);
+        let end = ((phdr.p_vaddr + phdr.p_memsz + PAGE_SIZE as u64 - 1)
+            & !(PAGE_SIZE as u64 - 1)) as u32;
+        let mut page = start;
+        while page < end {
+            page_dir.set_user_page_writable(page, true);
+            page += PAGE_SIZE as u32;
         }
     }
 

@@ -621,6 +621,7 @@ dependencies = [
  "rustls-rustcrypto",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "webpki-roots",
 ]
@@ -984,6 +985,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-rustcrypto",
+ "sha2",
  "tokio",
  "webpki-roots",
 ]
@@ -1329,6 +1331,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-rustcrypto",
+ "sha2",
  "tokio",
  "webpki-roots",
 ]
@@ -2001,6 +2004,7 @@ dependencies = [
  "rusty_h264-decoder",
  "serde",
  "serde_json",
+ "sha2",
  "symphonia",
  "tokio",
  "webpki-roots",

@@ -9,6 +9,8 @@ pub const SYS_WM_FLIP: u32 = 0xF104;
 pub const SYS_WM_FOCUS: u32 = 0xF105;
 pub const SYS_WM_SCREEN: u32 = 0xF106;
 pub const SYS_WM_POLL: u32 = 0xF108;
+pub const SYS_WM_MAP_SHARED: u32 = 0xF10A;
+pub const SYS_WM_PRESENT_SHARED: u32 = 0xF10B;
 
 #[repr(C)]
 pub struct WmCreateArgs {
@@ -32,6 +34,25 @@ pub struct RawWindowInfo {
     pub client_h: u32,
     pub pitch: u32,
     pub focused: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RawWmSharedInfo {
+    pub buffers: [u32; 2],
+    pub len: u32,
+    pub pitch: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WmDirtyRect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
 }
 
 #[repr(C)]
@@ -153,6 +174,45 @@ pub unsafe fn wm_flip(id: u32, pixels: *const u8, len: usize) -> usize {
 
 #[cfg(not(target_os = "popugos"))]
 pub unsafe fn wm_flip(_id: u32, _pixels: *const u8, _len: usize) -> usize { usize::MAX }
+
+#[cfg(target_os = "popugos")]
+pub unsafe fn wm_map_shared(id: u32, out: *mut RawWmSharedInfo) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_WM_MAP_SHARED => ret,
+        in("ebx") id,
+        in("ecx") out,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+#[cfg(not(target_os = "popugos"))]
+pub unsafe fn wm_map_shared(_id: u32, _out: *mut RawWmSharedInfo) -> usize { usize::MAX }
+
+#[cfg(target_os = "popugos")]
+pub unsafe fn wm_present_shared(id: u32, buffer_index: usize, dirty: *const WmDirtyRect) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_WM_PRESENT_SHARED => ret,
+        in("ebx") id,
+        in("ecx") buffer_index,
+        in("edx") dirty,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+#[cfg(not(target_os = "popugos"))]
+pub unsafe fn wm_present_shared(
+    _id: u32,
+    _buffer_index: usize,
+    _dirty: *const WmDirtyRect,
+) -> usize {
+    usize::MAX
+}
 
 #[cfg(target_os = "popugos")]
 pub unsafe fn wm_screen_size(out: *mut u32) -> usize {

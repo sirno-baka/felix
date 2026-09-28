@@ -7,6 +7,9 @@ BUILD_STD_FLAGS := -Z build-std=core,compiler_builtins,alloc \
 	-Z build-std-features=compiler-builtins-mem
 STD_APPS_LOCAL_CONFIG := std-apps/.cargo/config.local.toml
 STD_APPS_CONFIG_ARG := $(if $(wildcard $(STD_APPS_LOCAL_CONFIG)),--config "$(STD_APPS_LOCAL_CONFIG)",)
+STD_APPS_SSE2_CONFIG := std-apps/.cargo/config.sse2.toml
+STD_APPS_SSE2_CONFIG_ARG := --config "$(STD_APPS_SSE2_CONFIG)"
+STD_APPS_SSE2_TARGET_DIR := std-apps/target-sse2
 
 # Every cargo invocation needs both the custom getrandom backend selected by
 # Felix and warning suppression. Recipe-local `export` commands do not persist
@@ -168,8 +171,15 @@ std-runtime-apps:
 		echo "  → rootfs/bin/$$p"; \
 	done
 
+.PHONY: std-twitch-radio-sse2
+std-twitch-radio-sse2:
+	@echo "Building SSE2 Twitch player -> /bin/twitch-radio-sse2"
+	@CARGO_TARGET_DIR="$(STD_APPS_SSE2_TARGET_DIR)" cargo +popugos $(STD_APPS_CONFIG_ARG) $(STD_APPS_SSE2_CONFIG_ARG) build --manifest-path std-apps/Cargo.toml --target i686-unknown-popugos --release -p twitch-radio
+	@mkdir -p rootfs/bin
+	@cp -f $(STD_APPS_SSE2_TARGET_DIR)/i686-unknown-popugos/release/twitch-radio rootfs/bin/twitch-radio-sse2
+
 .PHONY: image
-image: std-runtime-apps
+image: std-runtime-apps std-twitch-radio-sse2
 	@echo "=== Creating 64 MiB bootable disk (MBR | bootloader | ext2) ==="
 	@rm -f build/disk.img build/rootfs.img
 	@dd if=/dev/zero of=build/disk.img bs=1M count=64 status=none

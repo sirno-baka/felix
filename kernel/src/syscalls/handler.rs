@@ -678,7 +678,14 @@ fn syscall_handler_locked(esp: u32) -> u32 {
             sys_wm_info(state.ebx, state.ecx as *mut crate::drivers::wm::WindowInfo)
         }
         crate::syscalls::SYS_WM_FLIP => {
-            sys_wm_flip(state.ebx, state.ecx as *const u8, state.edx as usize)
+            // Window flips can copy and compose megabytes. Keeping IF=0 for
+            // the whole int 0x80 made mouse/keyboard IRQ latency track video
+            // frame time. While interrupted in ring0 timer_may_schedule()
+            // refuses task switches, so the current user CR3 remains stable.
+            unsafe { asm!("sti"); }
+            let ret = sys_wm_flip(state.ebx, state.ecx as *const u8, state.edx as usize);
+            unsafe { asm!("cli"); }
+            ret
         }
         crate::syscalls::SYS_WM_FOCUS => sys_wm_focus(state.ebx),
         crate::syscalls::SYS_WM_SCREEN => sys_wm_screen(state.ebx as *mut u32),
@@ -690,6 +697,31 @@ fn syscall_handler_locked(esp: u32) -> u32 {
             state.ecx as *mut crate::drivers::wm::WmEvent,
             state.edx as usize,
         ),
+        crate::syscalls::SYS_WM_MAP_SHARED => sys_wm_map_shared(
+            current_slot,
+            state.ebx,
+            state.ecx as *mut crate::drivers::wm::WmSharedInfo,
+        ),
+        crate::syscalls::SYS_WM_PRESENT_SHARED => {
+            // Shared-surface presentation still composes the client into the LFB
+            // and can take several milliseconds for video-sized windows. int 0x80
+            // enters with IF=0; leaving IRQs disabled here loses PIT ticks and makes
+            // Felix monotonic time run slow in proportion to video resolution.
+            //
+            // This is safe for the same reason as SYS_WM_FLIP above:
+            // timer_may_schedule() refuses task switches while the interrupted
+            // context is ring0, so this syscall keeps its kernel continuation and
+            // CR3 while timer/device IRQs are allowed to run.
+            unsafe { asm!("sti"); }
+            let ret = sys_wm_present_shared(
+                current_slot,
+                state.ebx,
+                state.ecx as usize,
+                state.edx as *const crate::drivers::wm::WmDirtyRect,
+            );
+            unsafe { asm!("cli"); }
+            ret
+        }
 
         crate::syscalls::SYS_WM_WINDOWS => sys_wm_window_list(
             state.ebx as *mut WindowListItem,
@@ -1264,6 +1296,7 @@ const MAP_SHARED: u32 = 0x01;
 const MAP_PRIVATE: u32 = 0x02;
 const MAP_FIXED: u32 = 0x10;
 const MAP_ANONYMOUS: u32 = 0x20;
+static MUNMAP_TLB_FAILURES: AtomicU32 = AtomicU32::new(0);
 
 /// Linux i386 old mmap arg block (syscall 90).
 #[repr(C)]
@@ -1370,8 +1403,8 @@ pub fn sys_mmap2(
                 if task.mmap_next < 0x6000_0000 {
                     task.mmap_next = 0x6000_0000;
                 }
-                // Keep below user stack / reserved upper userspace.
-                if task.mmap_next.saturating_add(len_u) >= 0xB000_0000 {
+                // Keep below the window-manager shared-surface VA range.
+                if task.mmap_next.saturating_add(len_u) >= crate::drivers::wm::WM_SHARED_BASE {
                     return ENOMEM;
                 }
                 let v = task.mmap_next;
@@ -1380,8 +1413,10 @@ pub fn sys_mmap2(
             }
         };
 
-        // Don't map into the reserved kernel MMIO window or higher half.
-        if va >= KERNEL_MMIO_BASE || va.saturating_add(len_u) > KERNEL_MMIO_BASE {
+        // Keep ordinary mmap out of the WM-owned shared-surface VA range.
+        if va >= crate::drivers::wm::WM_SHARED_BASE
+            || va.saturating_add(len_u) > crate::drivers::wm::WM_SHARED_BASE
+        {
             return EINVAL;
         }
 
@@ -1499,7 +1534,9 @@ pub fn sys_munmap(current_slot: usize, addr: u32, len: usize) -> usize {
     let page_size = PAGE_SIZE as u32;
     let start = addr & !(page_size - 1);
     let end = (addr.saturating_add(len as u32) + page_size - 1) & !(page_size - 1);
-    if start >= KERNEL_MMIO_BASE {
+    if start >= crate::drivers::wm::WM_SHARED_BASE
+        || end > crate::drivers::wm::WM_SHARED_BASE
+    {
         return EINVAL;
     }
     unsafe {
@@ -1517,8 +1554,22 @@ pub fn sys_munmap(current_slot: usize, addr: u32, len: usize) -> usize {
                     task.pd_mut().unmap(p);
                     let flushed = crate::smp::shootdown_tlb(task.page_dir_phys, p);
                     remotely_flushed &= flushed;
-                    if flushed && let Some(frame) = frame {
-                        crate::memory::shared::release_user_frame(frame);
+                    if flushed {
+                        if let Some(frame) = frame {
+                            crate::memory::shared::release_user_frame(frame);
+                        }
+                    } else {
+                        let failures = MUNMAP_TLB_FAILURES
+                            .fetch_add(1, Ordering::Relaxed)
+                            .saturating_add(1);
+                        if failures <= 4 || failures.is_power_of_two() {
+                            crate::debugln!(
+                                "[vm] munmap TLB shootdown failed count={} pd={:#x} va={:#x}; retaining frame",
+                                failures,
+                                task.page_dir_phys,
+                                p
+                            );
+                        }
                     }
                 }
                 p += page_size;
@@ -1528,7 +1579,11 @@ pub fn sys_munmap(current_slot: usize, addr: u32, len: usize) -> usize {
             // eligible; stack/ELF/fixed mappings must never become allocator
             // holes. If a page is still referenced, keep the whole range out of
             // the free list rather than risk overlapping a live mapping.
-            if remotely_flushed && start >= 0x6000_0000 && end <= 0xB000_0000 && end > start {
+            if remotely_flushed
+                && start >= 0x6000_0000
+                && end <= crate::drivers::wm::WM_SHARED_BASE
+                && end > start
+            {
                 let mut q = start;
                 let mut fully_unmapped = true;
                 while q < end {
@@ -4359,6 +4414,11 @@ fn sys_spawn_image(
                 _ => None,
             })
             .unwrap_or(task.pty_id);
+        if task.pty_id >= 0 {
+            if let Some(tty_id) = crate::tty::pty_tty_id(task.pty_id as usize) {
+                task.tty_id = tty_id as i16;
+            }
+        }
         task.fd_table = fd_table;
 
         // Publish only a fully initialized runnable task.
@@ -4371,10 +4431,19 @@ fn sys_spawn_image(
             pid, slot, pgid, sid, entry_point, USER_STACK_TOP, child_pd_phys, ppid
         );
 
-        // Foreground ownership is part of process creation, not a follow-up
-        // userspace race. Syscall entry already has IF=0, so the child cannot
-        // run before this handoff completes.
-        if foreground && parent_slot != 0 {
+        // A spawned PTY is its own terminal, so its foreground group must
+        // never be installed on the parent's controlling TTY. This is true
+        // even for a background GUI shell: its own PTY remains interactive
+        // independently of the parent shell.
+        if TASK_MANAGER.tasks[slot]
+            .as_ref()
+            .is_some_and(|task| task.pty_id >= 0)
+        {
+            let pty_id = TASK_MANAGER.tasks[slot].as_ref().unwrap().pty_id as usize;
+            if !crate::tty::set_foreground_pty(slot, pty_id, pgid) {
+                println!("[spawn] pty foreground handoff to pgid {} failed", pgid);
+            }
+        } else if foreground && parent_slot != 0 {
             if !crate::tty::set_foreground(parent_slot, pgid) {
                 println!("[spawn] tty foreground handoff to pgid {} failed", pgid);
             }
@@ -5222,6 +5291,41 @@ pub fn sys_wm_info(id: u32, out: *mut crate::drivers::wm::WindowInfo) -> usize {
 
 pub fn sys_wm_flip(id: u32, pixels: *const u8, len: usize) -> usize {
     if crate::drivers::wm::flip(id, pixels, len) {
+        0
+    } else {
+        usize::MAX
+    }
+}
+
+pub fn sys_wm_map_shared(
+    current_slot: usize,
+    id: u32,
+    out: *mut crate::drivers::wm::WmSharedInfo,
+) -> usize {
+    if out.is_null() {
+        return usize::MAX;
+    }
+    match crate::drivers::wm::map_shared_surfaces(id, current_slot) {
+        Some(info) => {
+            unsafe { *out = info };
+            0
+        }
+        None => usize::MAX,
+    }
+}
+
+pub fn sys_wm_present_shared(
+    current_slot: usize,
+    id: u32,
+    buffer_index: usize,
+    dirty: *const crate::drivers::wm::WmDirtyRect,
+) -> usize {
+    let dirty = if dirty.is_null() {
+        None
+    } else {
+        Some(unsafe { core::ptr::read_unaligned(dirty) })
+    };
+    if crate::drivers::wm::present_shared(id, current_slot, buffer_index, dirty) {
         0
     } else {
         usize::MAX

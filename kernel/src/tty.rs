@@ -12,7 +12,7 @@ use crate::multitasking::task::{MAX_TASKS, TASK_MANAGER};
 use crate::sync::MutexLazy;
 use crate::sync::mutex::Mutex;
 
-pub const MAX_TTYS: usize = 4;
+pub const MAX_TTYS: usize = 16;
 pub const MAX_PTYS: usize = 8;
 const PTY_BUF: usize = 8192;
 const CANON_BUF: usize = 1024;
@@ -210,9 +210,9 @@ pub fn set_foreground_pty(current_slot: usize, id: usize, pgid: i32) -> bool {
         let Some(caller) = TASK_MANAGER.tasks[current_slot].as_ref() else {
             return false;
         };
-        if caller.tty_id != tty_id as i16 {
-            return false;
-        }
+        // The PTY master is normally owned by the shell, whose own controlling
+        // tty is different from the slave's tty. Authorization is therefore by
+        // session, not by identical tty_id.
         let sid = caller.sid;
         let group_exists = TASK_MANAGER
             .tasks
@@ -245,7 +245,35 @@ pub fn tty_of_task(current_slot: usize) -> Option<i16> {
 }
 
 pub fn alloc_pty(current_slot: usize) -> Option<usize> {
-    let tty_id = ensure_controlling_tty(current_slot)?;
+    // A PTY slave is a terminal of its own. Reusing the caller's controlling
+    // tty here made every shell/job share one foreground_pgid, so a nested
+    // "shell &" could steal Ctrl+C from its parent shell.
+    let _ = ensure_controlling_tty(current_slot)?;
+    let (sid, pgid) = unsafe {
+        let task = TASK_MANAGER.tasks.get(current_slot)?.as_ref()?;
+        (task.sid, task.pgid)
+    };
+    if sid <= 0 {
+        return None;
+    }
+
+    let tty_id = unsafe {
+        let mut free = None;
+        for (id, tty) in TTYS.iter().enumerate() {
+            if !tty.allocated {
+                free = Some(id);
+                break;
+            }
+        }
+        let id = free?;
+        TTYS[id] = TtyState {
+            allocated: true,
+            session_id: sid,
+            foreground_pgid: pgid,
+        };
+        id
+    };
+
     let mut table = PTYS.get().lock();
     for id in 0..MAX_PTYS {
         if table.slots[id].is_none() {
@@ -253,7 +281,16 @@ pub fn alloc_pty(current_slot: usize) -> Option<usize> {
             return Some(id);
         }
     }
+
+    unsafe {
+        TTYS[tty_id] = TtyState::empty();
+    }
     None
+}
+
+pub fn pty_tty_id(id: usize) -> Option<usize> {
+    let table = PTYS.get().lock();
+    table.slots.get(id)?.as_ref().map(|pty| pty.tty_id)
 }
 
 pub fn add_ref(id: usize, side: PtySide) -> bool {
@@ -270,6 +307,7 @@ pub fn add_ref(id: usize, side: PtySide) -> bool {
 
 pub fn close_ref(id: usize, side: PtySide) {
     let mut hangup_tty = None;
+    let mut released_tty = None;
     {
         let mut table = PTYS.get().lock();
         let Some(slot) = table.slots.get_mut(id) else {
@@ -305,7 +343,15 @@ pub fn close_ref(id: usize, side: PtySide) {
             PtySide::Slave => pty.slave_refs = pty.slave_refs.saturating_sub(1),
         }
         if pty.master_refs == 0 && pty.slave_refs == 0 {
+            released_tty = Some(pty.tty_id);
             *slot = None;
+        }
+    }
+    if let Some(tty_id) = released_tty {
+        unsafe {
+            if let Some(tty) = TTYS.get_mut(tty_id) {
+                *tty = TtyState::empty();
+            }
         }
     }
     // Never signal while the PTY table lock is held: signal handling can close

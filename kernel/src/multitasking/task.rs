@@ -168,26 +168,87 @@ pub struct Task {
     /// Kernel wait key for FUTEX_WAIT. Shared futexes use the physical word
     /// address; FUTEX_PRIVATE_FLAG uses a process-scoped virtual key.
     pub futex_key: u64,
-    /// Per-thread x87 state. The i386 userspace target has SSE disabled, so
-    /// LLVM uses the x87 stack for ordinary floating-point conversions too.
-    x87_state: X87State,
-    x87_initialized: bool,
+    /// Per-thread x87/MMX/XMM state. FXSAVE uses all 512 bytes when the CPU
+    /// supports FXSR; the first 108 bytes are also large enough for the legacy
+    /// FNSAVE/FRSTOR fallback on pre-FXSR machines.
+    fp_state: FpState,
+    fp_initialized: bool,
 }
 
 #[repr(C, align(16))]
-pub struct X87State {
-    bytes: [u8; 108],
+pub struct FpState {
+    bytes: [u8; 512],
 }
 
-impl X87State {
+impl FpState {
     const fn new() -> Self {
-        Self { bytes: [0; 108] }
+        Self { bytes: [0; 512] }
     }
 }
 
-/// Enable the legacy x87 unit on the current CPU and reset it to the standard
-/// masked-exception state. Must be called independently by the BSP and every AP.
-pub fn init_cpu_x87() {
+// 0 = legacy FNSAVE/FRSTOR, 1 = FXSAVE/FXRSTOR.
+// All logical CPUs in the machines Felix targets are expected to expose the
+// same architectural feature set; every AP still runs init_cpu_fp itself.
+static FXSAVE_ENABLED: AtomicU8 = AtomicU8::new(0);
+static SSE_LEVEL: AtomicU8 = AtomicU8::new(0);
+static DEFAULT_MXCSR: u32 = 0x1f80;
+
+fn cpu_has_cpuid() -> bool {
+    let original: u32;
+    let changed: u32;
+    unsafe {
+        asm!(
+            "pushfd",
+            "pop {original:e}",
+            "mov {changed:e}, {original:e}",
+            "xor {changed:e}, 0x00200000",
+            "push {changed:e}",
+            "popfd",
+            "pushfd",
+            "pop {changed:e}",
+            "push {original:e}",
+            "popfd",
+            original = lateout(reg) original,
+            changed = lateout(reg) changed,
+            options(preserves_flags),
+        );
+    }
+    (original ^ changed) & 0x0020_0000 != 0
+}
+
+fn cpuid_leaf1_edx() -> Option<u32> {
+    if !cpu_has_cpuid() {
+        return None;
+    }
+    let edx: u32;
+    unsafe {
+        // EBX is not available as an inline-asm operand on every 32-bit LLVM
+        // configuration. Preserve it explicitly; only EDX is needed here.
+        asm!(
+            "push ebx",
+            "mov eax, 1",
+            "cpuid",
+            "pop ebx",
+            lateout("eax") _,
+            lateout("ecx") _,
+            lateout("edx") edx,
+            options(preserves_flags),
+        );
+    }
+    Some(edx)
+}
+
+/// Enable the best floating-point/SIMD context format supported by this CPU.
+///
+/// Old CPUs keep the existing x87 FNSAVE/FRSTOR path. FXSR-capable CPUs use
+/// FXSAVE/FXRSTOR, which preserves x87, MMX, MXCSR and all XMM registers. SSE
+/// execution is enabled only when CPUID reports both FXSR and SSE.
+pub fn init_cpu_fp() {
+    let features = cpuid_leaf1_edx().unwrap_or(0);
+    let fxsr = features & (1 << 24) != 0;
+    let sse = features & (1 << 25) != 0;
+    let sse2 = features & (1 << 26) != 0;
+
     unsafe {
         let mut cr0: u32;
         asm!("mov {0:e}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
@@ -195,29 +256,64 @@ pub fn init_cpu_x87() {
         cr0 |= (1 << 1) | (1 << 5);
         cr0 &= !((1 << 2) | (1 << 3));
         asm!("mov cr0, {0:e}", in(reg) cr0, options(nostack, preserves_flags));
+
+        if fxsr {
+            let mut cr4: u32;
+            asm!("mov {0:e}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+            cr4 |= 1 << 9; // OSFXSR
+            if sse {
+                cr4 |= 1 << 10; // OSXMMEXCPT
+            }
+            asm!("mov cr4, {0:e}", in(reg) cr4, options(nostack, preserves_flags));
+        }
+
         asm!("fninit", options(nomem, nostack));
+        if fxsr && sse {
+            asm!(
+                "ldmxcsr [{}]",
+                in(reg) core::ptr::addr_of!(DEFAULT_MXCSR),
+                options(nostack, readonly),
+            );
+        }
     }
+
+    FXSAVE_ENABLED.store(fxsr as u8, Ordering::Release);
+    SSE_LEVEL.store(if fxsr && sse2 { 2 } else if fxsr && sse { 1 } else { 0 }, Ordering::Release);
+
 }
 
 #[inline]
-fn save_task_x87(task: &mut Task) {
+fn save_task_fp(task: &mut Task) {
     unsafe {
-        // FNSAVE stores the complete 32-bit x87 environment/register stack and
-        // then resets the hardware x87 unit. It does not require SSE/FXSR.
-        asm!("fnsave [{}]", in(reg) task.x87_state.bytes.as_mut_ptr(), options(nostack));
-    }
-    task.x87_initialized = true;
-}
-
-#[inline]
-fn restore_task_x87(task: &mut Task) {
-    unsafe {
-        if task.x87_initialized {
-            asm!("frstor [{}]", in(reg) task.x87_state.bytes.as_ptr(), options(nostack));
+        if FXSAVE_ENABLED.load(Ordering::Acquire) != 0 {
+            asm!("fxsave [{}]", in(reg) task.fp_state.bytes.as_mut_ptr(), options(nostack));
         } else {
-            // A brand-new thread gets the architectural default control word
-            // (all exceptions masked, round-to-nearest) and an empty x87 stack.
+            asm!("fnsave [{}]", in(reg) task.fp_state.bytes.as_mut_ptr(), options(nostack));
+        }
+    }
+    task.fp_initialized = true;
+}
+
+#[inline]
+fn restore_task_fp(task: &mut Task) {
+    unsafe {
+        if task.fp_initialized {
+            if FXSAVE_ENABLED.load(Ordering::Acquire) != 0 {
+                asm!("fxrstor [{}]", in(reg) task.fp_state.bytes.as_ptr(), options(nostack));
+            } else {
+                asm!("frstor [{}]", in(reg) task.fp_state.bytes.as_ptr(), options(nostack));
+            }
+        } else {
+            // A brand-new task gets the architectural default x87 and MXCSR
+            // state. Its first switch-out will materialize that state in fp_state.
             asm!("fninit", options(nomem, nostack));
+            if SSE_LEVEL.load(Ordering::Acquire) != 0 {
+                asm!(
+                    "ldmxcsr [{}]",
+                    in(reg) core::ptr::addr_of!(DEFAULT_MXCSR),
+                    options(nostack, readonly),
+                );
+            }
         }
     }
 }
@@ -365,8 +461,8 @@ impl Task {
             wake_deadline_ms: 0,
             connect_deadline_ms: 0,
             futex_key: 0,
-            x87_state: X87State::new(),
-            x87_initialized: false,
+            fp_state: FpState::new(),
+            fp_initialized: false,
         }
     }
 
@@ -422,8 +518,8 @@ impl Task {
             wake_deadline_ms: 0,
             connect_deadline_ms: 0,
             futex_key: 0,
-            x87_state: X87State::new(),
-            x87_initialized: false,
+            fp_state: FpState::new(),
+            fp_initialized: false,
         }
     }
 
@@ -772,7 +868,7 @@ impl TaskManager {
             if let Some(task) = self.tasks[self.current_task as usize].as_mut() {
                 task.state = TaskState::Running(0);
                 if self.current_task > 0 {
-                    restore_task_x87(task);
+                    restore_task_fp(task);
                 }
             }
             return new_cpustate;
@@ -782,7 +878,7 @@ impl TaskManager {
         if self.current_task >= 0 {
             if let Some(ref mut task) = self.tasks[self.current_task as usize] {
                 if self.current_task > 0 {
-                    save_task_x87(task);
+                    save_task_fp(task);
                 }
                 task.cpu_state_ptr = cpu_state as u32;
                 if task.running {
@@ -812,7 +908,7 @@ impl TaskManager {
         if let Some(task) = self.tasks[self.current_task as usize].as_mut() {
             task.state = TaskState::Running(0);
             if self.current_task > 0 {
-                restore_task_x87(task);
+                restore_task_fp(task);
             }
         }
 
@@ -902,7 +998,7 @@ impl TaskManager {
             crate::smp::set_idle_esp(cpu, cpu_state as u32);
         } else if let Some(task) = self.tasks[previous as usize].as_mut() {
             if previous > 0 {
-                save_task_x87(task);
+                save_task_fp(task);
             }
             task.cpu_state_ptr = cpu_state as u32;
             if task.running {
@@ -936,7 +1032,7 @@ impl TaskManager {
         crate::smp::set_current_task_slot(next);
         if let Some(task) = self.tasks[next as usize].as_mut() {
             task.state = TaskState::Running(cpu as u8);
-            restore_task_x87(task);
+            restore_task_fp(task);
         }
         crate::smp::trace_scheduler(81);
         let task = self.tasks[next as usize].as_ref().unwrap();

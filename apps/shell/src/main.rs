@@ -21,7 +21,7 @@ use parser::{parse_line, CommandGroup, Connector, Redir, RedirKind, RedirTarget,
 use terminal::{Terminal, CELL_H, CELL_W};
 use libfelix::syscall::{
     self, chdir, close, getpid, getpgrp, kill, mkdir, mount, mount_list,
-    open, openpty, pipe, read, rmdir, set_nonblock, setpgid, task_list, tty_setfg, umount2, unlink,
+    open, openpty, pipe, read, rmdir, set_nonblock, setpgid, task_list, tcsetpgrp, tty_setfg, umount2, unlink,
     spawn_path_env_pgid, spawn_wasm_env_pgid, waitpid_status, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGCONT, SIGINT,
     SIGKILL, SIGSTOP, SIGTERM, SIGTSTP, TASK_RUNNING, TASK_STOPPED, TASK_ZOMBIE, WCONTINUED,
     WNOHANG, WUNTRACED,

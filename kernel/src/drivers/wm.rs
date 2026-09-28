@@ -6,12 +6,14 @@
 
 use crate::drivers::framebuffer::{FRAMEBUFFER, Framebuffer};
 use crate::drivers::wm_flags::WindowFlags;
+use crate::memory::paging::{PAGING, PAGE_SIZE, PTEFlags, phys_to_virt};
+use crate::multitasking::task::{MAX_TASKS, TASK_MANAGER};
 use crate::sync::mutex::Mutex;
 use crate::utils::flags::{FlagOp, Flags};
 use crate::{debugln, println};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use embedded_graphics::{
     mono_font::{MonoTextStyle, ascii::FONT_6X10},
     pixelcolor::Rgb888,
@@ -21,6 +23,11 @@ use embedded_graphics::{
 
 pub const MAX_WINDOWS: usize = 8;
 pub const TITLE_H: u32 = 18;
+
+pub const WM_SHARED_BASE: u32 = 0xA000_0000;
+const WM_SHARED_WINDOW_STRIDE: u32 = 0x0100_0000;
+const WM_SHARED_BUFFER_STRIDE: u32 = 0x0080_0000;
+const WM_SHARED_SURFACE_MAX: usize = WM_SHARED_BUFFER_STRIDE as usize;
 /// Close button size (square) inside the title bar.
 pub const CLOSE_SZ: i32 = 14;
 pub const CLOSE_PAD: i32 = 2;
@@ -133,6 +140,25 @@ pub struct WmFlipRect {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WmSharedInfo {
+    pub buffers: [u32; 2],
+    pub len: u32,
+    pub pitch: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WmDirtyRect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct WindowInfo {
     pub id: u32,
@@ -167,6 +193,40 @@ struct Surface {
     pixels: Vec<u8>,
 }
 
+struct SharedBuffer {
+    user_addr: u32,
+    len: usize,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    frames: Vec<u32>,
+}
+
+impl SharedBuffer {
+    fn copy_span_to(&self, mut offset: usize, mut dst: *mut u8, mut len: usize) {
+        while len > 0 && offset < self.len {
+            let page = offset / PAGE_SIZE;
+            let in_page = offset % PAGE_SIZE;
+            let chunk = len.min(PAGE_SIZE - in_page).min(self.len - offset);
+            let Some(&frame) = self.frames.get(page) else {
+                break;
+            };
+            let src = (phys_to_virt(frame << 12) as *const u8).wrapping_add(in_page);
+            unsafe {
+                core::ptr::copy_nonoverlapping(src, dst, chunk);
+                dst = dst.add(chunk);
+            }
+            offset += chunk;
+            len -= chunk;
+        }
+    }
+}
+
+struct SharedSurfaces {
+    buffers: [SharedBuffer; 2],
+    front: usize,
+}
+
 impl Surface {
     fn new(width: u32, height: u32) -> Option<Self> {
         if width == 0 || height == 0 {
@@ -184,33 +244,36 @@ impl Surface {
             );
             return None;
         }
-        let mut pixels = alloc::vec::Vec::new();
-        if pixels.try_reserve_exact(size).is_err() {
-            crate::debugln!(
-                "[wm] surface OOM {}x{} = {} bytes (kernel heap)",
-                width,
-                height,
-                size
-            );
-            return None;
-        }
-        pixels.resize(size, 0);
-        // dark client bg
-        for chunk in pixels.chunks_exact_mut(4) {
-            chunk[0] = 0x20; // B
-            chunk[1] = 0x18; // G
-            chunk[2] = 0x10; // R
-            chunk[3] = 0x00;
-        }
         Some(Self {
             width,
             height,
             pitch,
-            pixels,
+            pixels: Vec::new(),
         })
     }
 
+    fn ensure_pixels(&mut self) -> bool {
+        if !self.pixels.is_empty() {
+            return true;
+        }
+        let size = (self.pitch as usize).saturating_mul(self.height as usize);
+        if self.pixels.try_reserve_exact(size).is_err() {
+            return false;
+        }
+        self.pixels.resize(size, 0);
+        for chunk in self.pixels.chunks_exact_mut(4) {
+            chunk[0] = 0x20;
+            chunk[1] = 0x18;
+            chunk[2] = 0x10;
+            chunk[3] = 0;
+        }
+        true
+    }
+
     fn clear(&mut self, color: u32) {
+        if !self.ensure_pixels() {
+            return;
+        }
         let b = (color & 0xFF) as u8;
         let g = ((color >> 8) & 0xFF) as u8;
         let r = ((color >> 16) & 0xFF) as u8;
@@ -233,7 +296,7 @@ impl Surface {
         w: u32,
         h: u32,
     ) {
-        if src.is_null() || src_pitch < 4 {
+        if src.is_null() || src_pitch < 4 || !self.ensure_pixels() {
             return;
         }
         let w = w.min(self.width.saturating_sub(x));
@@ -254,12 +317,134 @@ impl Surface {
     }
 
     fn copy_from_user(&mut self, src: *const u8, len: usize) {
-        if src.is_null() || len == 0 {
+        if src.is_null() || len == 0 || !self.ensure_pixels() {
             return;
         }
         let n = len.min(self.pixels.len());
         unsafe {
             core::ptr::copy_nonoverlapping(src, self.pixels.as_mut_ptr(), n);
+        }
+    }
+}
+
+fn shared_user_addr(slot_index: u8, buffer_index: usize) -> u32 {
+    WM_SHARED_BASE
+        + slot_index as u32 * WM_SHARED_WINDOW_STRIDE
+        + buffer_index as u32 * WM_SHARED_BUFFER_STRIDE
+}
+
+fn allocate_shared_buffer(
+    slot_index: u8,
+    buffer_index: usize,
+    width: u32,
+    height: u32,
+) -> Option<SharedBuffer> {
+    let pitch = width.checked_mul(4)?;
+    let len = (pitch as usize).checked_mul(height as usize)?;
+    if len == 0 || len > WM_SHARED_SURFACE_MAX {
+        return None;
+    }
+    let pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    let mut frames = Vec::new();
+    if frames.try_reserve_exact(pages).is_err() {
+        return None;
+    }
+    {
+        let mut paging = unsafe { PAGING.lock() };
+        for _ in 0..pages {
+            frames.push(paging.alloc_phys_frame());
+        }
+    }
+    for &frame in &frames {
+        unsafe {
+            core::ptr::write_bytes(phys_to_virt(frame << 12) as *mut u8, 0, PAGE_SIZE);
+        }
+    }
+    Some(SharedBuffer {
+        user_addr: shared_user_addr(slot_index, buffer_index),
+        len,
+        width,
+        height,
+        pitch,
+        frames,
+    })
+}
+
+fn map_shared_surfaces_into_task(current_slot: usize, shared: &SharedSurfaces) -> bool {
+    if current_slot == 0 || current_slot >= MAX_TASKS as usize {
+        return false;
+    }
+    unsafe {
+        let Some(task) = TASK_MANAGER.tasks[current_slot].as_mut() else {
+            return false;
+        };
+
+        for buffer in &shared.buffers {
+            for page in 0..buffer.frames.len() {
+                let va = buffer.user_addr + (page * PAGE_SIZE) as u32;
+                if task.pd().translate(va).is_some() {
+                    return false;
+                }
+            }
+        }
+
+        for buffer in &shared.buffers {
+            for (page, &frame) in buffer.frames.iter().enumerate() {
+                let va = buffer.user_addr + (page * PAGE_SIZE) as u32;
+                let _ = task.page_refcounts.inc(va);
+                let mut alloc_pt = || PAGING.lock().alloc_frame();
+                task.pd_mut().map(
+                    va >> 12,
+                    frame,
+                    PTEFlags::new().present().writable().user().dirty(),
+                    &mut alloc_pt,
+                );
+            }
+        }
+    }
+    true
+}
+
+fn free_shared_buffer(buffer: SharedBuffer) {
+    let mut paging = unsafe { PAGING.lock() };
+    for frame in buffer.frames {
+        paging.free_phys_frame(frame);
+    }
+}
+
+fn shared_info(shared: &SharedSurfaces) -> WmSharedInfo {
+    WmSharedInfo {
+        buffers: [shared.buffers[0].user_addr, shared.buffers[1].user_addr],
+        len: shared.buffers[0].len as u32,
+        pitch: shared.buffers[0].pitch,
+        width: shared.buffers[0].width,
+        height: shared.buffers[0].height,
+    }
+}
+
+fn release_shared_surfaces(owner_slot: i8, shared: SharedSurfaces) {
+    if owner_slot >= 0 && (owner_slot as usize) < MAX_TASKS as usize {
+        unsafe {
+            if let Some(task) = TASK_MANAGER.tasks[owner_slot as usize].as_mut() {
+                let pd_phys = task.page_dir_phys;
+                for buffer in &shared.buffers {
+                    for (page, &frame) in buffer.frames.iter().enumerate() {
+                        let va = buffer.user_addr + (page * PAGE_SIZE) as u32;
+                        if task.pd().translate(va).map(|phys| phys >> 12) == Some(frame) {
+                            task.pd_mut().unmap(va);
+                            let _ = crate::smp::shootdown_tlb(pd_phys, va);
+                            let _ = task.page_refcounts.dec(va);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut paging = unsafe { PAGING.lock() };
+    for buffer in shared.buffers {
+        for frame in buffer.frames {
+            paging.free_phys_frame(frame);
         }
     }
 }
@@ -283,6 +468,7 @@ fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
 
 struct Window {
     id: u8,
+    slot_index: u8,
     x: i32,
     y: i32,
     w: u32,
@@ -293,6 +479,7 @@ struct Window {
     title: [u8; 32],
     flags: WindowFlags,
     surface: Surface,
+    shared: Option<SharedSurfaces>,
     owner_slot: i8, // task slot that created it (-1 = kernel)
     events: EventQueue,
 }
@@ -436,6 +623,11 @@ pub struct Compositor {
     drag: Option<DragState>,
     hovered_client: Option<u8>,
     mouse_capture: Option<u8>,
+    /// Position of the cursor layer currently represented by the framebuffer.
+    /// Mouse IRQ state may already be newer; pending input advances these only
+    /// while the compositor owns WM.
+    cursor_x: i32,
+    cursor_y: i32,
     dirty: Option<DirtyRect>,
 }
 
@@ -451,6 +643,8 @@ impl Compositor {
             drag: None,
             hovered_client: None,
             mouse_capture: None,
+            cursor_x: 0,
+            cursor_y: 0,
             dirty: None,
         }
     }
@@ -537,6 +731,51 @@ impl Compositor {
         None
     }
 
+    #[inline]
+    fn cursor_rect_at(x: i32, y: i32) -> DirtyRect {
+        DirtyRect::new(
+            x,
+            y,
+            crate::drivers::mouse::CUR_W as u32,
+            crate::drivers::mouse::CUR_H as u32,
+        )
+    }
+
+    #[inline]
+    fn cursor_rect(&self) -> DirtyRect {
+        Self::cursor_rect_at(self.cursor_x, self.cursor_y)
+    }
+
+    #[inline]
+    fn draw_cursor_overlay(&self, fb: &mut Framebuffer, clip: DirtyRect) {
+        if !self.cursor_rect().intersects(clip) {
+            return;
+        }
+        crate::drivers::mouse::draw_cursor_clipped(
+            fb,
+            self.cursor_x,
+            self.cursor_y,
+            clip.x,
+            clip.y,
+            clip.w,
+            clip.h,
+        );
+    }
+
+    /// Advance the compositor cursor and reconstruct just the pixels touched by
+    /// the old/new cursor rectangles. If the framebuffer is momentarily owned
+    /// elsewhere, retain the damage for the next compositor pass.
+    fn redraw_cursor_transition(&mut self, old: DirtyRect) {
+        let dirty = old.union(self.cursor_rect());
+        if let Some(mut guard) = FRAMEBUFFER.try_lock() {
+            if let Some(fb) = guard.as_mut() {
+                self.compose_region(fb, dirty);
+                return;
+            }
+        }
+        self.mark_dirty(dirty);
+    }
+
     fn mark_dirty(&mut self, rect: DirtyRect) {
         self.dirty = Some(match self.dirty {
             Some(old) => old.union(rect),
@@ -556,7 +795,6 @@ impl Compositor {
         let Some(fb) = guard.as_mut() else {
             return;
         };
-        crate::drivers::mouse::hide_cursor(fb);
         fb.fill_fast(self.bg);
 
         for id in self.sorted_ids().iter().flatten() {
@@ -564,7 +802,10 @@ impl Compositor {
                 self.draw_window_clipped(fb, w, DirtyRect::new(0, 0, self.screen_w, self.screen_h));
             }
         }
-        crate::drivers::mouse::show_cursor(fb);
+        self.draw_cursor_overlay(
+            fb,
+            DirtyRect::new(0, 0, self.screen_w, self.screen_h),
+        );
     }
 
     /// Compose one dirty region. The region is first restored from the desktop
@@ -583,42 +824,118 @@ impl Compositor {
                 }
             }
         }
+
+        self.draw_cursor_overlay(fb, dirty);
     }
 
-    /// Redraw a region already containing the background/underlying pixels.
-    ///
-    /// The target window is opaque, so its new position can be painted
-    /// directly without clearing the region first. Higher-z windows are
-    /// replayed afterwards for occlusion.
+    /// Redraw an opaque client region without ever touching pixels covered
+    /// by higher-Z windows. The previous implementation painted the lower
+    /// window first and replayed upper windows afterwards; that intermediate
+    /// state was visible as a flash when a terminal behind video redrew.
     fn compose_opaque_region(&self, fb: &mut Framebuffer, id: u8, region: DirtyRect) {
-        if region.is_empty() {
-            return;
-        }
+        const MAX_PIECES: usize = 64;
 
         let Some(target) = self.find(id) else {
             return;
         };
-        if !target.visible || !target.rect().intersects(region) {
+        if !target.visible {
             return;
         }
+        let Some(initial) = target.rect().intersection(region) else {
+            return;
+        };
 
         let target_z = target.z;
+        let mut current = [DirtyRect::new(0, 0, 0, 0); MAX_PIECES];
+        let mut next = [DirtyRect::new(0, 0, 0, 0); MAX_PIECES];
+        let mut current_len = 1usize;
+        current[0] = initial;
 
-        // Paint the moved window first. No background clear here.
-        self.draw_window_clipped(fb, target, region);
-
-        // Restore occlusion from windows above it.
         for oid in self.sorted_ids().iter().flatten() {
             if *oid == id {
                 continue;
             }
+            let Some(upper) = self.find(*oid) else {
+                continue;
+            };
+            if !upper.visible || upper.z <= target_z {
+                continue;
+            }
 
-            if let Some(w) = self.find(*oid) {
-                if w.z > target_z && w.rect().intersects(region) {
-                    self.draw_window_clipped(fb, w, region);
+            let cut = upper.rect();
+            let mut next_len = 0usize;
+            let mut overflow = false;
+
+            for src in current[..current_len].iter().copied() {
+                let Some(hit) = src.intersection(cut) else {
+                    if next_len < MAX_PIECES {
+                        next[next_len] = src;
+                        next_len += 1;
+                    } else {
+                        overflow = true;
+                    }
+                    continue;
+                };
+
+                let candidates = [
+                    DirtyRect::new(
+                        src.x,
+                        src.y,
+                        src.w,
+                        hit.y.saturating_sub(src.y) as u32,
+                    ),
+                    DirtyRect::new(
+                        src.x,
+                        hit.bottom(),
+                        src.w,
+                        src.bottom().saturating_sub(hit.bottom()) as u32,
+                    ),
+                    DirtyRect::new(
+                        src.x,
+                        hit.y,
+                        hit.x.saturating_sub(src.x) as u32,
+                        hit.h,
+                    ),
+                    DirtyRect::new(
+                        hit.right(),
+                        hit.y,
+                        src.right().saturating_sub(hit.right()) as u32,
+                        hit.h,
+                    ),
+                ];
+
+                for piece in candidates {
+                    if piece.is_empty() {
+                        continue;
+                    }
+                    if next_len < MAX_PIECES {
+                        next[next_len] = piece;
+                        next_len += 1;
+                    } else {
+                        overflow = true;
+                        break;
+                    }
                 }
             }
+
+            if overflow {
+                // With MAX_WINDOWS=8 this should not occur in normal layouts.
+                // Preserve correctness rather than drawing through an occluder.
+                return;
+            }
+
+            core::mem::swap(&mut current, &mut next);
+            current_len = next_len;
+            if current_len == 0 {
+                return;
+            }
         }
+
+        for clip in current[..current_len].iter().copied() {
+            self.draw_window_clipped(fb, target, clip);
+        }
+
+        self.draw_cursor_overlay(fb, region);
     }
 
     /// Smooth interactive window movement.
@@ -636,7 +953,6 @@ impl Compositor {
         let Some(fb) = guard.as_mut() else {
             return;
         };
-        crate::drivers::mouse::hide_cursor(fb);
 
         // 1. Paint new position first.
         self.compose_opaque_region(fb, id, new);
@@ -685,7 +1001,6 @@ impl Compositor {
             self.compose_region(fb, old);
         }
 
-        crate::drivers::mouse::show_cursor(fb);
     }
 
     /// Region-aware client update. The client surface is opaque, so paint the
@@ -712,9 +1027,7 @@ impl Compositor {
         let Some(fb) = guard.as_mut() else {
             return;
         };
-        crate::drivers::mouse::hide_cursor(fb);
         self.compose_opaque_region(fb, id, rect);
-        crate::drivers::mouse::show_cursor(fb);
     }
 
     /// Compatibility wrapper: compose exactly this window's current rectangle.
@@ -730,9 +1043,7 @@ impl Compositor {
         let Some(fb) = guard.as_mut() else {
             return;
         };
-        crate::drivers::mouse::hide_cursor(fb);
         self.compose_region(fb, w.rect());
-        crate::drivers::mouse::show_cursor(fb);
     }
 
     /// Consume the compositor dirty region.
@@ -750,9 +1061,7 @@ impl Compositor {
             return;
         };
 
-        crate::drivers::mouse::hide_cursor(fb);
         self.compose_region(fb, dirty);
-        crate::drivers::mouse::show_cursor(fb);
     }
 
     fn draw_window_clipped(&self, fb: &mut Framebuffer, w: &Window, clip: DirtyRect) {
@@ -782,16 +1091,39 @@ impl Compositor {
             if let Some(client_clip) = DirtyRect::new(cx, cy, cw, ch).intersection(clip) {
                 let sx = client_clip.x.saturating_sub(cx) as u32;
                 let sy = client_clip.y.saturating_sub(cy) as u32;
-                blit_surface_rect(
-                    fb,
-                    client_clip.x.max(0) as u32,
-                    client_clip.y.max(0) as u32,
-                    sx,
-                    sy,
-                    client_clip.w,
-                    client_clip.h,
-                    &w.surface,
-                );
+                if let Some(shared) = w.shared.as_ref() {
+                    blit_shared_rect(
+                        fb,
+                        client_clip.x.max(0) as u32,
+                        client_clip.y.max(0) as u32,
+                        sx,
+                        sy,
+                        client_clip.w,
+                        client_clip.h,
+                        &shared.buffers[shared.front],
+                    );
+                } else if !w.surface.pixels.is_empty() {
+                    blit_surface_rect(
+                        fb,
+                        client_clip.x.max(0) as u32,
+                        client_clip.y.max(0) as u32,
+                        sx,
+                        sy,
+                        client_clip.w,
+                        client_clip.h,
+                        &w.surface,
+                    );
+                } else {
+                    fill_rect_clipped(
+                        fb,
+                        clip,
+                        client_clip.x,
+                        client_clip.y,
+                        client_clip.w,
+                        client_clip.h,
+                        0x0010_1820,
+                    );
+                }
             }
         }
 
@@ -985,6 +1317,36 @@ fn blit_surface_rect(
     }
 }
 
+fn blit_shared_rect(
+    fb: &mut Framebuffer,
+    dx: u32,
+    dy: u32,
+    sx: u32,
+    sy: u32,
+    w: u32,
+    h: u32,
+    surf: &SharedBuffer,
+) {
+    if sx >= surf.width
+        || sy >= surf.height
+        || dx >= fb.info.width as u32
+        || dy >= fb.info.height as u32
+    {
+        return;
+    }
+    let w = w.min(surf.width - sx).min(fb.info.width as u32 - dx);
+    let h = h.min(surf.height - sy).min(fb.info.height as u32 - dy);
+    let dst_pitch = fb.info.pitch as usize;
+    let src_pitch = surf.pitch as usize;
+    let row = w as usize * 4;
+    for y in 0..h as usize {
+        let src = (sy as usize + y) * src_pitch + sx as usize * 4;
+        let dst = (dy as usize + y) * dst_pitch + dx as usize * 4;
+        let dst_ptr = unsafe { (fb.virt_base as *mut u8).add(dst) };
+        surf.copy_span_to(src, dst_ptr, row);
+    }
+}
+
 fn blit_surface(fb: &mut Framebuffer, dx: u32, dy: u32, w: u32, h: u32, surf: &Surface) {
     let fb_w = fb.info.width as u32;
     let fb_h = fb.info.height as u32;
@@ -1104,6 +1466,118 @@ fn draw_close_button(fb: &mut Framebuffer, w: &Window) {
     }
 }
 
+
+const PENDING_INPUT_CAP: usize = 128;
+
+const INPUT_MOUSE_DOWN: u8 = 1;
+const INPUT_MOUSE_UP: u8 = 2;
+const INPUT_MOUSE_RIGHT_DOWN: u8 = 3;
+const INPUT_MOUSE_RIGHT_UP: u8 = 4;
+const INPUT_MOUSE_MOVE: u8 = 5;
+const INPUT_MOUSE_WHEEL: u8 = 6;
+const INPUT_KEY_DOWN: u8 = 7;
+const INPUT_KEY_UP: u8 = 8;
+
+#[derive(Clone, Copy)]
+struct PendingInput {
+    kind: u8,
+    a: i32,
+    b: i32,
+    c: i32,
+}
+
+struct PendingInputSlot {
+    kind: AtomicU32,
+    a: AtomicU32,
+    b: AtomicU32,
+    c: AtomicU32,
+}
+
+impl PendingInputSlot {
+    const fn new() -> Self {
+        Self {
+            kind: AtomicU32::new(0),
+            a: AtomicU32::new(0),
+            b: AtomicU32::new(0),
+            c: AtomicU32::new(0),
+        }
+    }
+
+    #[inline]
+    fn write(&self, input: PendingInput) {
+        self.kind.store(input.kind as u32, Ordering::Relaxed);
+        self.a.store(input.a as u32, Ordering::Relaxed);
+        self.b.store(input.b as u32, Ordering::Relaxed);
+        self.c.store(input.c as u32, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn read(&self) -> PendingInput {
+        PendingInput {
+            kind: self.kind.load(Ordering::Relaxed) as u8,
+            a: self.a.load(Ordering::Relaxed) as i32,
+            b: self.b.load(Ordering::Relaxed) as i32,
+            c: self.c.load(Ordering::Relaxed) as i32,
+        }
+    }
+}
+
+/// IRQ-safe SPSC queue. Keyboard and mouse use separate instances, so each
+/// queue has exactly one hardware producer. Consumers are serialized by WM.
+///
+/// Slot fields are written before the producer publishes tail with Release;
+/// the consumer acquires tail before reading them. Only 32-bit atomics are
+/// used so the i386 kernel needs no libatomic helpers.
+struct PendingInputQueue {
+    slots: [PendingInputSlot; PENDING_INPUT_CAP],
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    dropped: AtomicUsize,
+}
+
+impl PendingInputQueue {
+    const fn new() -> Self {
+        Self {
+            slots: [const { PendingInputSlot::new() }; PENDING_INPUT_CAP],
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            dropped: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    fn push(&self, input: PendingInput) {
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Relaxed);
+        let next = (tail + 1) % PENDING_INPUT_CAP;
+
+        if next == head {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        self.slots[tail].write(input);
+        self.tail.store(next, Ordering::Release);
+    }
+
+    #[inline]
+    fn pop(&self) -> Option<PendingInput> {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        if head == tail {
+            return None;
+        }
+
+        let input = self.slots[head].read();
+        self.head
+            .store((head + 1) % PENDING_INPUT_CAP, Ordering::Release);
+        Some(input)
+    }
+}
+
+static MOUSE_INPUT: PendingInputQueue = PendingInputQueue::new();
+static KEY_INPUT: PendingInputQueue = PendingInputQueue::new();
+
 pub static WM: Mutex<Compositor> = Mutex::new(Compositor::empty());
 
 /// Run `f` under kernel CR3 so LFB large-page PDE is present.
@@ -1149,6 +1623,9 @@ pub fn init() {
         wm.drag = None;
         wm.hovered_client = None;
         wm.mouse_capture = None;
+        let (cursor_x, cursor_y) = crate::drivers::mouse::position();
+        wm.cursor_x = cursor_x;
+        wm.cursor_y = cursor_y;
         wm.dirty = None;
         wm.compose();
     }
@@ -1213,6 +1690,7 @@ pub fn create_window(
 
         wm.windows[slot] = Some(Window {
             id,
+            slot_index: slot as u8,
             x,
             y,
             w: total_w, // Сохраняем ОБЩУЮ ширину
@@ -1223,6 +1701,7 @@ pub fn create_window(
             title: title_buf,
             flags,
             surface,
+            shared: None,
             owner_slot,
             events: EventQueue::new(),
         });
@@ -1233,16 +1712,15 @@ pub fn create_window(
 }
 
 pub fn destroy_window(id: u32) -> bool {
-    with_lfb(|| {
+    let mut released = None;
+    let destroyed = with_lfb(|| {
         let mut wm = WM.lock();
         let id = id as u8;
         for slot in wm.windows.iter_mut() {
             if slot.as_ref().map(|w| w.id) == Some(id) {
-                let rect = slot
-                    .as_ref()
-                    .map(|w| w.rect())
-                    .unwrap_or(DirtyRect::new(0, 0, 0, 0));
-                *slot = None;
+                let mut window = slot.take().unwrap();
+                let rect = window.rect();
+                released = window.shared.take().map(|shared| (window.owner_slot, shared));
                 if wm.hovered_client == Some(id) {
                     wm.hovered_client = None;
                 }
@@ -1255,7 +1733,11 @@ pub fn destroy_window(id: u32) -> bool {
             }
         }
         false
-    })
+    });
+    if let Some((owner_slot, shared)) = released {
+        release_shared_surfaces(owner_slot, shared);
+    }
+    destroyed
 }
 
 /// Drop every window owned by `owner_slot` (process exit / kill).
@@ -1264,6 +1746,7 @@ pub fn destroy_windows_of(owner_slot: i8) {
         return;
     }
 
+    let mut released = Vec::new();
     with_lfb(|| {
         let mut wm = WM.lock();
         let mut any = false;
@@ -1276,13 +1759,15 @@ pub fn destroy_windows_of(owner_slot: i8) {
 
         for slot in wm.windows.iter_mut() {
             if slot.as_ref().map(|w| w.owner_slot) == Some(owner_slot) {
-                if let Some(w) = slot.as_ref() {
+                if let Some(mut w) = slot.take() {
                     dirty_rects[n] = Some(w.rect());
                     hovered_removed |= hovered == Some(w.id);
                     capture_removed |= captured == Some(w.id);
+                    if let Some(shared) = w.shared.take() {
+                        released.push(shared);
+                    }
                     n += 1;
                 }
-                *slot = None;
                 any = true;
             }
         }
@@ -1302,6 +1787,10 @@ pub fn destroy_windows_of(owner_slot: i8) {
             wm.compose_dirty();
         }
     });
+
+    for shared in released {
+        release_shared_surfaces(owner_slot, shared);
+    }
 }
 
 pub fn move_window(id: u32, x: i32, y: i32) -> bool {
@@ -1331,34 +1820,147 @@ pub fn window_info(id: u32) -> Option<WindowInfo> {
     wm.find(id as u8).map(|w| w.info())
 }
 
+pub fn map_shared_surfaces(id: u32, current_slot: usize) -> Option<WmSharedInfo> {
+    let id8 = id as u8;
+    let (slot_index, width, height, owner_slot, old_shared) = {
+        let mut wm = WM.lock();
+        let w = wm.find_mut(id8)?;
+        if w.owner_slot != current_slot as i8 {
+            return None;
+        }
+
+        if let Some(shared) = w.shared.as_ref() {
+            if shared.buffers[0].width == w.surface.width
+                && shared.buffers[0].height == w.surface.height
+            {
+                return Some(shared_info(shared));
+            }
+        }
+
+        (
+            w.slot_index,
+            w.surface.width,
+            w.surface.height,
+            w.owner_slot,
+            w.shared.take(),
+        )
+    };
+
+    if let Some(old) = old_shared {
+        release_shared_surfaces(owner_slot, old);
+    }
+
+    let first = allocate_shared_buffer(slot_index, 0, width, height)?;
+    let second = match allocate_shared_buffer(slot_index, 1, width, height) {
+        Some(buffer) => buffer,
+        None => {
+            free_shared_buffer(first);
+            return None;
+        }
+    };
+    let shared = SharedSurfaces {
+        buffers: [first, second],
+        front: 0,
+    };
+
+    if !map_shared_surfaces_into_task(current_slot, &shared) {
+        release_shared_surfaces(owner_slot, shared);
+        return None;
+    }
+
+    let info = shared_info(&shared);
+    let mut wm = WM.lock();
+    let Some(w) = wm.find_mut(id8) else {
+        drop(wm);
+        release_shared_surfaces(owner_slot, shared);
+        return None;
+    };
+    if w.owner_slot != owner_slot
+        || w.surface.width != width
+        || w.surface.height != height
+    {
+        drop(wm);
+        release_shared_surfaces(owner_slot, shared);
+        return None;
+    }
+    w.surface.pixels = Vec::new();
+    w.shared = Some(shared);
+    Some(info)
+}
+
+pub fn present_shared(
+    id: u32,
+    current_slot: usize,
+    buffer_index: usize,
+    dirty: Option<WmDirtyRect>,
+) -> bool {
+    if buffer_index >= 2 {
+        return false;
+    }
+
+    let id8 = id as u8;
+    with_lfb(|| {
+        let mut wm = WM.lock();
+        drain_pending_input(&mut wm);
+        let rect = {
+            let Some(w) = wm.find_mut(id8) else {
+                return false;
+            };
+            if w.owner_slot != current_slot as i8 {
+                return false;
+            }
+            let Some(shared) = w.shared.as_mut() else {
+                return false;
+            };
+            if shared.buffers[buffer_index].width != w.surface.width
+                || shared.buffers[buffer_index].height != w.surface.height
+            {
+                return false;
+            }
+
+            shared.front = buffer_index;
+            match dirty {
+                Some(dirty) => (
+                    dirty.x,
+                    dirty.y,
+                    dirty.w.min(w.surface.width.saturating_sub(dirty.x)),
+                    dirty.h.min(w.surface.height.saturating_sub(dirty.y)),
+                ),
+                None => (0, 0, w.surface.width, w.surface.height),
+            }
+        };
+
+        wm.compose_client_rect(id8, rect.0, rect.1, rect.2, rect.3);
+        true
+    })
+}
+
 /// Copy pixels from user buffer into surface (full client, BGRX 32bpp),
 /// then compose only the client area. Client flips never invalidate title/border.
 ///
-/// User buffer is only valid under the *current* task CR3. A timer tick
-/// mid-copy would switch page directories and page-fault (e.g. CR2=0x40e000).
+/// User buffer is valid under the current task CR3. SYS_WM_FLIP enables IRQs,
+/// but timer preemption from ring0 is forbidden, so that CR3 remains stable.
 pub fn flip(id: u32, user_pixels: *const u8, len: usize) -> bool {
-    // copy_from_user must run under user CR3; compose under kernel CR3.
     let mut partial = None;
     let mut wm = WM.lock();
+    drain_pending_input(&mut wm);
     if let Some(w) = wm.find_mut(id as u8) {
         if !user_pixels.is_null() && len > 0 {
-            without_interrupts(|| {
-                if len == usize::MAX {
-                    let desc =
-                        unsafe { core::ptr::read_unaligned(user_pixels as *const WmFlipRect) };
-                    w.surface.copy_rect_from_user(
-                        desc.pixels,
-                        desc.pitch,
-                        desc.x,
-                        desc.y,
-                        desc.w,
-                        desc.h,
-                    );
-                    partial = Some((desc.x, desc.y, desc.w, desc.h));
-                } else {
-                    w.surface.copy_from_user(user_pixels, len);
-                }
-            });
+            if len == usize::MAX {
+                let desc =
+                    unsafe { core::ptr::read_unaligned(user_pixels as *const WmFlipRect) };
+                w.surface.copy_rect_from_user(
+                    desc.pixels,
+                    desc.pitch,
+                    desc.x,
+                    desc.y,
+                    desc.w,
+                    desc.h,
+                );
+                partial = Some((desc.x, desc.y, desc.w, desc.h));
+            } else {
+                w.surface.copy_from_user(user_pixels, len);
+            }
         }
         drop(wm);
         with_lfb(|| {
@@ -1467,11 +2069,99 @@ fn apply_resize(w: &mut Window, new_w: u32, new_h: u32) {
     });
 }
 
-/// Left button down: close / start title drag / resize / focus.
+fn dispatch_pending_locked(wm: &mut Compositor, input: PendingInput) {
+    match input.kind {
+        INPUT_MOUSE_DOWN => on_mouse_down_locked(wm, input.a, input.b),
+        INPUT_MOUSE_UP => on_mouse_up_locked(wm, input.a, input.b),
+        INPUT_MOUSE_RIGHT_DOWN => on_mouse_right_down_locked(wm, input.a, input.b),
+        INPUT_MOUSE_RIGHT_UP => on_mouse_right_up_locked(wm, input.a, input.b),
+        INPUT_MOUSE_MOVE => {
+            let old_cursor = wm.cursor_rect();
+            wm.cursor_x = input.a;
+            wm.cursor_y = input.b;
+            on_mouse_move_locked(wm, input.a, input.b);
+            wm.redraw_cursor_transition(old_cursor);
+        }
+        INPUT_MOUSE_WHEEL => on_mouse_wheel_locked(wm, input.a, input.b, input.c),
+        INPUT_KEY_DOWN => push_key_locked(wm, true, input.a as u8, input.b as u8, input.c as u8),
+        INPUT_KEY_UP => push_key_locked(wm, false, input.a as u8, input.b as u8, input.c as u8),
+        _ => {}
+    }
+}
+
+fn drain_pending_input(wm: &mut Compositor) {
+    let mut pending_move = None;
+    while let Some(input) = MOUSE_INPUT.pop() {
+        if input.kind == INPUT_MOUSE_MOVE {
+            pending_move = Some(input);
+            continue;
+        }
+        if let Some(movement) = pending_move.take() {
+            dispatch_pending_locked(wm, movement);
+        }
+        dispatch_pending_locked(wm, input);
+    }
+    if let Some(movement) = pending_move {
+        dispatch_pending_locked(wm, movement);
+    }
+
+    while let Some(input) = KEY_INPUT.pop() {
+        dispatch_pending_locked(wm, input);
+    }
+}
+
+#[inline]
+fn try_drain_pending_input() {
+    if let Some(mut wm) = WM.try_lock() {
+        drain_pending_input(&mut wm);
+    }
+}
+
 pub fn on_mouse_down(x: i32, y: i32) {
-    let Some(mut wm) = WM.try_lock() else {
+    MOUSE_INPUT.push(PendingInput { kind: INPUT_MOUSE_DOWN, a: x, b: y, c: 0 });
+    try_drain_pending_input();
+}
+
+pub fn on_mouse_up(x: i32, y: i32) {
+    MOUSE_INPUT.push(PendingInput { kind: INPUT_MOUSE_UP, a: x, b: y, c: 0 });
+    try_drain_pending_input();
+}
+
+pub fn on_mouse_right_down(x: i32, y: i32) {
+    MOUSE_INPUT.push(PendingInput { kind: INPUT_MOUSE_RIGHT_DOWN, a: x, b: y, c: 0 });
+    try_drain_pending_input();
+}
+
+pub fn on_mouse_right_up(x: i32, y: i32) {
+    MOUSE_INPUT.push(PendingInput { kind: INPUT_MOUSE_RIGHT_UP, a: x, b: y, c: 0 });
+    try_drain_pending_input();
+}
+
+pub fn on_mouse_move(x: i32, y: i32) {
+    MOUSE_INPUT.push(PendingInput { kind: INPUT_MOUSE_MOVE, a: x, b: y, c: 0 });
+    try_drain_pending_input();
+}
+
+pub fn on_mouse_wheel(x: i32, y: i32, delta: i32) {
+    if delta == 0 {
         return;
-    };
+    }
+    MOUSE_INPUT.push(PendingInput { kind: INPUT_MOUSE_WHEEL, a: x, b: y, c: delta });
+    try_drain_pending_input();
+}
+
+pub fn push_key(down: bool, scancode: u8, ch: u8, mods: u8) {
+    KEY_INPUT.push(PendingInput {
+        kind: if down { INPUT_KEY_DOWN } else { INPUT_KEY_UP },
+        a: scancode as i32,
+        b: ch as i32,
+        c: mods as i32,
+    });
+    try_drain_pending_input();
+}
+
+/// Left button down: close / start title drag / resize / focus.
+fn on_mouse_down_locked(wm: &mut Compositor, x: i32, y: i32) {
     wm.mouse_capture = None;
     let ids = wm.sorted_ids();
     for id in ids.iter().rev().flatten() {
@@ -1669,10 +2359,7 @@ pub fn on_mouse_down(x: i32, y: i32) {
 /// Right button down. Unlike the primary button it never starts a title drag or
 /// resize; it is delivered to the top-most client so userspace can open a
 /// context menu. `c=2` is the right-button code in the userspace WM ABI.
-pub fn on_mouse_right_down(x: i32, y: i32) {
-    let Some(mut wm) = WM.try_lock() else {
-        return;
-    };
+fn on_mouse_right_down_locked(wm: &mut Compositor, x: i32, y: i32) {
     let ids = wm.sorted_ids();
     for id in ids.iter().rev().flatten() {
         let Some(w) = wm.find_mut(*id) else {
@@ -1703,10 +2390,7 @@ pub fn on_mouse_right_down(x: i32, y: i32) {
 
 /// Right button up. Kept in the ABI even though PopUI currently opens context
 /// menus on the down edge.
-pub fn on_mouse_right_up(x: i32, y: i32) {
-    let Some(mut wm) = WM.try_lock() else {
-        return;
-    };
+fn on_mouse_right_up_locked(wm: &mut Compositor, x: i32, y: i32) {
     let ids = wm.sorted_ids();
     for id in ids.iter().rev().flatten() {
         let Some(w) = wm.find_mut(*id) else {
@@ -1736,10 +2420,7 @@ pub fn on_mouse_right_up(x: i32, y: i32) {
 }
 
 /// Pointer move: title drag or client MouseMove.
-pub fn on_mouse_move(x: i32, y: i32) {
-    let Some(mut wm) = WM.try_lock() else {
-        return;
-    };
+fn on_mouse_move_locked(wm: &mut Compositor, x: i32, y: i32) {
 
     if let Some(drag) = wm.drag {
         let id = drag.id;
@@ -1842,10 +2523,7 @@ pub fn on_mouse_move(x: i32, y: i32) {
 }
 
 /// Left button up: end drag + client MouseUp.
-pub fn on_mouse_up(x: i32, y: i32) {
-    let Some(mut wm) = WM.try_lock() else {
-        return;
-    };
+fn on_mouse_up_locked(wm: &mut Compositor, x: i32, y: i32) {
     let finishing = wm.drag.take();
     if let Some(drag) = finishing {
         if drag.kind == 1 {
@@ -1893,13 +2571,10 @@ pub fn on_mouse_up(x: i32, y: i32) {
 }
 
 /// Deliver signed wheel steps to the top-most client below the pointer.
-pub fn on_mouse_wheel(x: i32, y: i32, delta: i32) {
+fn on_mouse_wheel_locked(wm: &mut Compositor, x: i32, y: i32, delta: i32) {
     if delta == 0 {
         return;
     }
-    let Some(mut wm) = WM.try_lock() else {
-        return;
-    };
     let Some((id, cx, cy)) = wm.client_at(x, y) else {
         return;
     };
@@ -1915,10 +2590,7 @@ pub fn on_mouse_wheel(x: i32, y: i32, delta: i32) {
 }
 
 /// Key to focused window. `mods`: bit0=shift, bit1=ctrl. `ch`=0 if none.
-pub fn push_key(down: bool, scancode: u8, ch: u8, mods: u8) {
-    let Some(mut wm) = WM.try_lock() else {
-        return;
-    };
+fn push_key_locked(wm: &mut Compositor, down: bool, scancode: u8, ch: u8, mods: u8) {
     for w in wm.windows.iter_mut().flatten() {
         if w.focused && w.visible {
             w.events.push(WmEvent {
@@ -1939,6 +2611,7 @@ pub fn poll_events(id: u32, out: *mut WmEvent, max: usize) -> usize {
         return 0;
     }
     let mut wm = WM.lock();
+    drain_pending_input(&mut wm);
     let Some(w) = wm.find_mut(id as u8) else {
         return 0;
     };
