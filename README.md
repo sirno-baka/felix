@@ -2,7 +2,7 @@
 
 Felix is an experimental **32-bit x86 (IA-32) operating system written from scratch in Rust**.
 
-The kernel and most of the system are `#![no_std]`. Felix boots through a custom BIOS boot chain, runs a higher-half kernel, has its own paging, process model, VFS, device drivers, a software window compositor, native ELF userspace, and experimental WASM/WASI execution.
+The kernel and most of the system are `#![no_std]`. Felix boots through a custom BIOS boot chain, runs a higher-half kernel, has its own paging, process model, VFS, device drivers, a software window compositor, and native ELF userspace.
 
 The project is developed against both **QEMU** and real legacy hardware, especially the **Sony VAIO PCG-C1MAH / C1M generation**.
 
@@ -34,7 +34,6 @@ The project is developed against both **QEMU** and real legacy hardware, especia
 - [libfelix and userspace UI](#libfelix-and-userspace-ui)
 - [Applications](#applications)
 - [Networking](#networking)
-- [WASM / WASI](#wasm--wasi)
 - [Debugging](#debugging)
 - [Project layout](#project-layout)
 - [Building and running](#building-and-running)
@@ -67,7 +66,6 @@ The project is developed against both **QEMU** and real legacy hardware, especia
 | Window system | In-kernel software compositor, max 8 windows |
 | Userspace UI | `libfelix`, `embedded-graphics`, retained-mode Taffy UI |
 | Network stack | smoltcp-based IPv4/TCP/UDP, currently experimental and disabled by default |
-| WASM | wasmi + partial WASI, experimental |
 | Real-hardware target | Sony VAIO PCG-C1MAH / C1M family |
 
 ---
@@ -145,10 +143,8 @@ A simplified view of Felix:
   ├── in-kernel window compositor
   └── task scheduler
           │
-          ├── native ring-3 ELF applications
-          │      └── libfelix
-          │
-          └── experimental wasmi/WASI tasks
+          └── native ring-3 ELF applications
+                 └── libfelix
 ```
 
 The native userspace is intentionally small and Unix-like where useful, but Felix is not attempting to be Linux ABI compatible as a whole. Some syscall numbers and data layouts intentionally mirror Linux i386 to simplify porting code.
@@ -622,7 +618,6 @@ The syscall entry disables interrupts, saves general-purpose registers, calls th
 | 201 | `free` |
 | 202 | `realloc` |
 | 302 | `ls` convenience syscall |
-| 1000 | `execve_wasm` |
 
 The current private thread ABI also provides `thread_create`, `thread_exit`,
 `thread_join`, `thread_detach`, `tls_get` and `tls_set`; libfelix and the
@@ -1178,7 +1173,7 @@ loop {
 
 # Applications
 
-The Makefile automatically builds every `apps/<name>` package. Packages named `wasm-*` are built for `wasm32-wasip1`; other applications are native i386 userspace programs.
+The Makefile automatically builds every native `apps/<name>` package as an i386 userspace program.
 
 ## `shell`
 
@@ -1192,7 +1187,6 @@ Current features:
 - Up/Down history navigation
 - tab completion
 - external native ELF execution
-- automatic WASM execution based on file magic
 - pipes: `|`
 - input redirection: `<`
 - output redirection: `>`
@@ -1282,9 +1276,6 @@ Experimental asynchronous SSH client using Sunset and the Felix `edge-nal` adapt
 
 The current program is a development/test client with a hard-coded QEMU-style endpoint and credentials, not a general interactive SSH utility yet.
 
-## `wasm-hello`
-
-Minimal WASI test application used to validate the WASM execution path.
 
 ---
 
@@ -1330,65 +1321,6 @@ Client TCP/UDP paths are much more complete than server-side semantics. In parti
 
 ---
 
-# WASM / WASI
-
-Felix contains an experimental WebAssembly execution path using **wasmi**.
-
-Special syscall:
-
-```text
-SYS_EXECVE_WASM = 1000
-```
-
-The shell detects the WebAssembly magic and selects this path automatically.
-
-## Runtime
-
-A WASM task gets:
-
-- a wasmi `Engine`
-- module instance
-- linear memory
-- a partial WASI linker
-- Felix file/socket host calls
-
-The runtime looks for `_start`, then `main`.
-
-## Important privilege note
-
-WASM tasks currently execute their interpreter entry in **ring 0**:
-
-```text
-CS = 0x08
-SS = 0x10
-```
-
-So this is not currently a CPU-privilege sandbox equivalent to native ring-3 ELF userspace. WASM isolation relies primarily on the interpreter's linear-memory model.
-
-## Partial WASI support
-
-Implemented or partially implemented host calls include:
-
-- `proc_exit`
-- `fd_read`
-- `fd_write`
-- `fd_close`
-- `fd_fdstat_get`
-- argument/environment helpers
-- socket open/connect/send/recv/shutdown paths
-- basic option/flag stubs
-- `random_get`
-- `clock_time_get`
-
-Some of these are placeholders:
-
-- `random_get` is not cryptographically secure;
-- `clock_time_get` currently returns a placeholder time in the WASI path;
-- several socket/WASI functions are no-op compatibility stubs.
-
-The WASI layer should therefore be considered developmental rather than standards-complete.
-
----
 
 # Debugging
 
@@ -1436,7 +1368,7 @@ felix/
 │       ├── multitasking/ # Task + scheduler
 │       ├── net/          # smoltcp integration/socket state
 │       ├── pci/          # PCI and IDE
-│       ├── syscalls/     # int 0x80 dispatcher + WASM host path
+│       ├── syscalls/     # int 0x80 dispatcher
 │       ├── elf.rs        # i386 ELF loader
 │       ├── signal.rs
 │       ├── pipe.rs
@@ -1448,7 +1380,6 @@ felix/
 │   ├── dd/
 │   ├── http-client/
 │   ├── ssh/
-│   └── wasm-hello/
 ├── rootfs/               # extra files copied to the root ext2 image
 ├── pxe/                  # network-boot assets/scripts
 ├── build/                # generated artifacts
@@ -1494,7 +1425,6 @@ build boot stage
 build bootloader
 build kernel
 build native apps
-build wasm-* apps for wasm32-wasip1
 objcopy boot/kernel images
 create 32 MiB disk image
 create ext2 root filesystem
@@ -1545,7 +1475,6 @@ The ext2 filesystem receives:
 
 - `/kernel.bin`
 - native applications
-- WASM applications
 - files from `rootfs/`
 
 ## Run in QEMU
@@ -1649,12 +1578,6 @@ Felix is an actively developed hobby/research OS. The following are deliberate c
 - several socket syscalls are defined but not implemented
 - no claim of complete BSD/POSIX sockets compatibility
 
-## WASM
-
-- partial WASI only
-- WASM interpreter task currently runs ring 0
-- WASI random/time functions include development placeholders
-- not a security sandbox suitable for untrusted code
 
 ---
 

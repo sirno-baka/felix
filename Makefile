@@ -39,10 +39,8 @@ ifeq ($(UNAME), Linux)
 	E2MKDIR := e2mkdir
 endif
 
-# Native userspace = every apps/<name> except wasm-* and applications already
-# migrated to the std userspace.
-NATIVE_APPS := $(sort $(filter-out wasm-% filemanager,$(patsubst apps/%/Cargo.toml,%,$(wildcard apps/*/Cargo.toml))))
-WASM_APPS   := $(sort $(patsubst apps/%/Cargo.toml,%,$(wildcard apps/wasm-*/Cargo.toml)))
+# Native userspace = every apps/<name> except applications already migrated to std userspace.
+NATIVE_APPS := $(sort $(filter-out filemanager,$(patsubst apps/%/Cargo.toml,%,$(wildcard apps/*/Cargo.toml))))
 STD_RUNTIME_APPS := reqwest-smoke tokio-smoke netbench telnetd twitch-radio ui-smoke
 ROOTFS_FILES := $(shell find rootfs -type f ! -name README ! -name '.gitkeep' 2>/dev/null)
 
@@ -70,7 +68,6 @@ build:
 
 	@echo "Building Felix..."
 	@echo "  native apps: $(NATIVE_APPS)"
-	@echo "  wasm apps:   $(WASM_APPS)"
 	@cargo build $(BUILD_STD_FLAGS) --target=x86_16-felix.json --package=felix-boot --release -Z json-target-spec
 	@cargo build $(BUILD_STD_FLAGS) --target=x86_16-felix.json --package=felix-bootloader -Z json-target-spec
 	@#cargo build $(BUILD_STD_FLAGS) --target=x86_16-felix.json --package=felix-bootloader --release -Z json-target-spec
@@ -79,10 +76,6 @@ build:
 	@for p in $(NATIVE_APPS); do \
 		echo "  cargo build $$p"; \
 		cargo build $(BUILD_STD_FLAGS) --target=x86_32-felix.json --package=$$p --release -Z json-target-spec; \
-	done
-	@for p in $(WASM_APPS); do \
-		echo "  cargo build $$p (wasm)"; \
-		cargo build --target=wasm32-wasip1 --package=$$p --release; \
 	done
 
 .PHONY: objcopy
@@ -98,14 +91,6 @@ objcopy:
 		cp -f target/x86_32-felix/release/$$p build/apps/$$p; \
 		echo "  → build/$$p"; \
 	done
-	@for p in $(WASM_APPS); do \
-		if [ -f target/wasm32-wasip1/release/$$p.wasm ]; then \
-			cp -f target/wasm32-wasip1/release/$$p.wasm build/$$p.wasm; \
-			echo "  → build/$$p.wasm"; \
-		fi; \
-	done
-	@# keep historic /wasm name used by the shell
-	@if [ -f build/wasm-hello.wasm ]; then cp -f build/wasm-hello.wasm build/wasm; fi
 
 # Copy userspace + rootfs extras into an ext2 image ($1 = image path).
 define populate_ext2
@@ -118,13 +103,6 @@ define populate_ext2
 		if [ "$$p" = init ]; then dst=/init; else dst=/bin/$$p; fi; \
 		$(E2CP) -p build/$$p $(1):$$dst && echo "  → $$dst"; \
 	done
-	@for w in build/*.wasm; do \
-		[ -f "$$w" ] || continue; \
-		base=$$(basename $$w); \
-		$(E2CP) -p $$w $(1):/bin/$$base && echo "  → /bin/$$base"; \
-	done
-	@if [ -f build/wasm ]; then $(E2CP) -p build/wasm $(1):/bin/wasm && echo "  → /bin/wasm"; fi
-	@if [ -f build/busybox.wasm ]; then $(E2CP) -p build/busybox.wasm $(1):/bin/busybox && echo "  → /bin/busybox"; fi
 	@if [ -d rootfs ]; then \
 		find rootfs -type f ! -name README ! -name '.gitkeep' | while read -r f; do \
 			rel=$${f#rootfs/}; \

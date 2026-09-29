@@ -19,7 +19,7 @@ use parser::{parse_line, CommandGroup, Connector, Redir, RedirKind, RedirTarget,
 use libfelix::syscall::{
     self, chdir, close, getcwd, getpid, getpgrp, kill, mkdir, mount, mount_list,
     open, pipe, read, rmdir, setpgid, task_list, tcsetpgrp, umount2, unlink,
-    spawn_path_env_pgid, spawn_wasm_env_pgid, waitpid_status, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGCONT, SIGINT,
+    spawn_path_env_pgid, waitpid_status, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGCONT, SIGINT,
     SIGKILL, SIGSTOP, SIGTERM, SIGTSTP, TASK_RUNNING, TASK_STOPPED, TASK_ZOMBIE, WCONTINUED,
     WNOHANG, WUNTRACED,
 };

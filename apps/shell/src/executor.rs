@@ -24,32 +24,6 @@ fn spawn(
     pgid: i32,
     foreground: bool,
 ) -> Option<i32> {
-    // WASM still uses the in-memory interpreter ABI. Native ELF and Rhai use
-    // path-based spawn below so large binaries are never duplicated in the
-    // shell heap.
-    if path.ends_with(".wasm") {
-        let mut file = File::open(path).ok()?;
-        let image = file.read_to_end().ok()?;
-        if image.len() < 4 || &image[..4] != b"\0asm" { return None; }
-
-        let mut argv_store = Vec::new();
-        for arg in args {
-            let mut value = arg.clone();
-            value.push('\0');
-            argv_store.push(value);
-        }
-        let argv: Vec<*const u8> = argv_store.iter().map(|s| s.as_ptr()).collect();
-        let env_store = shell.exported_env();
-        let envp: Vec<*const u8> = env_store.iter().map(|s| s.as_ptr()).collect();
-        let pid = unsafe {
-            spawn_wasm_env_pgid(
-                image.as_ptr(), image.len(), stdin_fd, stdout_fd, stderr_fd,
-                &argv, &envp, pgid, foreground,
-            )
-        };
-        return (pid != usize::MAX).then_some(pid as i32);
-    }
-
     // Rhai is the system script format. The shell keeps script execution in
     // userspace by transparently spawning /bin/rhai with the script path as argv[1].
     let is_rhai = path.ends_with(".rhai");

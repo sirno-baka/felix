@@ -7,7 +7,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use libfelix::prelude::*;
 use libfelix::syscall::{
-    getpid, spawn_env, spawn_wasm_env, sys_sleep, waitpid_status, wifexited,
+    getpid, spawn_env, sys_sleep, waitpid_status, wifexited,
     wifsignaled, wexitstatus, wtermsig, WNOHANG,
 };
 
@@ -141,16 +141,14 @@ fn spawn_service(service: &mut Service) -> bool {
     let env_store = [String::from("PATH=/bin\0"), String::from("HOME=/home/user\0")];
     let envp: Vec<*const u8> = env_store.iter().map(|s| s.as_ptr()).collect();
 
-    let pid = unsafe {
-        match &service.image[..4] {
-            b"\x7fELF" => spawn_env(
+    let pid = if &service.image[..4] == b"\x7fELF" {
+        unsafe {
+            spawn_env(
                 service.image.as_ptr(), service.image.len(), -1, -1, -1, &argv, &envp,
-            ),
-            b"\0asm" => spawn_wasm_env(
-                service.image.as_ptr(), service.image.len(), -1, -1, -1, &argv, &envp,
-            ),
-            _ => usize::MAX,
+            )
         }
+    } else {
+        usize::MAX
     };
 
     if pid == usize::MAX {

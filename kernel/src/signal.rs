@@ -232,7 +232,6 @@ pub fn drain_deferred_cleanup() {
         }
 
         close_task_fds(leader as i8);
-        crate::syscalls::wasm::clear_task_state(leader);
         crate::drivers::wm::destroy_windows_of(leader as i8);
     }
 }

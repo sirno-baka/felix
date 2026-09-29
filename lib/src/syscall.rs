@@ -14,7 +14,6 @@ pub const SYS_UNLINK: u32 = 10;
 pub const SYS_EXECVE: u32 = 11;
 pub const SYS_CHDIR: u32 = 12;
 pub const SYS_SPAWN: u32 = 0xF000;
-pub const SYS_EXECVE_WASM: u32 = 0xF001;
 pub const SYS_SPAWN_PATH: u32 = 0xF002;
 pub const SYS_REBOOT: u32 = 0xF003;
 
@@ -836,37 +835,6 @@ pub unsafe fn spawn(
     ret
 }
 
-pub unsafe fn spawn_wasm(
-    buf: *const u8,
-    buf_size: usize,
-    stdin_fd: i32,
-    stdout_fd: i32,
-    stderr_fd: i32,
-    argv: &[*const u8],
-) -> usize {
-    let params = ExecParams {
-        stdin: stdin_fd,
-        stdout: stdout_fd,
-        stderr: stderr_fd,
-        argc: argv.len() as u32,
-        argv: argv.as_ptr(),
-        envc: 0,
-        envp: core::ptr::null(),
-        pgid: -1,
-        foreground: 0,
-    };
-    let ret: usize;
-    asm!(
-    "int 0x80",
-    inlateout("eax") SYS_EXECVE_WASM => ret,
-    in("ebx") buf,
-    in("ecx") buf_size,
-    in("edx") &params as *const ExecParams,
-    options(nostack, preserves_flags)
-    );
-    ret
-}
-
 /// ELF exec with an explicit exported environment (`KEY=VALUE\0` strings).
 pub unsafe fn spawn_env(
     buf: *const u8,
@@ -963,74 +931,6 @@ pub unsafe fn spawn_path_env_pgid(
         "int 0x80",
         inlateout("eax") SYS_SPAWN_PATH => ret,
         in("ebx") path,
-        in("edx") &params as *const ExecParams,
-        options(nostack, preserves_flags)
-    );
-    ret
-}
-
-/// WASM exec with an explicit exported environment.
-pub unsafe fn spawn_wasm_env(
-    buf: *const u8,
-    buf_size: usize,
-    stdin_fd: i32,
-    stdout_fd: i32,
-    stderr_fd: i32,
-    argv: &[*const u8],
-    envp: &[*const u8],
-) -> usize {
-    let params = ExecParams {
-        stdin: stdin_fd,
-        stdout: stdout_fd,
-        stderr: stderr_fd,
-        argc: argv.len() as u32,
-        argv: argv.as_ptr(),
-        envc: envp.len() as u32,
-        envp: envp.as_ptr(),
-        pgid: -1,
-        foreground: 0,
-    };
-    let ret: usize;
-    asm!(
-        "int 0x80",
-        inlateout("eax") SYS_EXECVE_WASM => ret,
-        in("ebx") buf,
-        in("ecx") buf_size,
-        in("edx") &params as *const ExecParams,
-        options(nostack, preserves_flags)
-    );
-    ret
-}
-
-/// WASM exec with environment and atomic process-group placement.
-pub unsafe fn spawn_wasm_env_pgid(
-    buf: *const u8,
-    buf_size: usize,
-    stdin_fd: i32,
-    stdout_fd: i32,
-    stderr_fd: i32,
-    argv: &[*const u8],
-    envp: &[*const u8],
-    pgid: i32,
-    foreground: bool,
-) -> usize {
-    let params = ExecParams {
-        stdin: stdin_fd,
-        stdout: stdout_fd,
-        stderr: stderr_fd,
-        argc: argv.len() as u32,
-        argv: argv.as_ptr(),
-        envc: envp.len() as u32,
-        envp: envp.as_ptr(),
-        pgid,
-        foreground: foreground as u32,
-    };
-    let ret: usize;
-    asm!(
-        "int 0x80",
-        inlateout("eax") SYS_EXECVE_WASM => ret,
-        in("ebx") buf,
-        in("ecx") buf_size,
         in("edx") &params as *const ExecParams,
         options(nostack, preserves_flags)
     );

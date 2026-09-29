@@ -740,13 +740,6 @@ fn syscall_handler_locked(esp: u32) -> u32 {
             state.ecx as *mut crate::net::stack::IfConfigUser,
         ),
 
-        crate::syscalls::wasm::SYS_EXECVE_WASM => crate::syscalls::wasm::sys_execve_wasm(
-            current_slot,
-            state.ebx as *const u8,             // buf_ptr
-            state.ecx as usize,                 // count
-            state.edx as *const ExecParamsUser, // параметры (argc/argv и stdin/stdout/stderr)
-        ),
-
         _ => 0,
     };
 
@@ -2885,7 +2878,6 @@ fn finish_process(leader_slot: usize, status: i32, term_signal: u32) {
             leader.term_signal = term_signal;
             leader.exit_code = status;
         }
-        crate::syscalls::wasm::clear_task_state(leader_slot);
         TASK_MANAGER.reparent_children_of(dead_pid);
         TASK_MANAGER.wake_waiters(crate::multitasking::task::WaitReason::Child);
         TASK_MANAGER.wake_waiters(crate::multitasking::task::WaitReason::Thread);
