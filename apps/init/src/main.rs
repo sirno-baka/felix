@@ -12,7 +12,7 @@ use libfelix::syscall::{
 };
 
 const SELFTEST: &str = "/bin/selftest";
-const DEFAULT_SHELL: &str = "/bin/shell";
+const DEFAULT_TERMINAL: &str = "/bin/terminal";
 const POLL_MS: u32 = 50;
 
 fn exit_code_from_wait(status: i32) -> i32 {
@@ -75,9 +75,9 @@ fn parse_config() -> Vec<(bool, Vec<String>)> {
 fn load_services() -> Vec<Service> {
     let mut specs = parse_config();
     // Recovery fallback only: an explicit init.conf owns the complete service
-    // set. Do not silently inject a shell into a deliberately minimal config.
+    // set. Do not silently inject a terminal into a deliberately minimal config.
     if specs.is_empty() {
-        specs.push((true, alloc::vec![DEFAULT_SHELL.to_string()]));
+        specs.push((true, alloc::vec![DEFAULT_TERMINAL.to_string()]));
     }
 
     let mut services = Vec::new();

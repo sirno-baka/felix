@@ -6,76 +6,12 @@ struct RunningGroup {
     pgid: i32,
     pids: Vec<i32>,
     last_pid: i32,
-    capture_fd: Option<u32>,
-    stdin_w: Option<u32>,
     last_status: i32,
 }
 
 enum SuperviseResult {
     Exited(i32),
     Stopped(RunningGroup),
-}
-
-enum UiTick {
-    None,
-    Interrupt,
-    Suspend,
-    Data([u8; 8], usize),
-}
-
-struct UiBridge<'a> {
-    win: &'a mut Window,
-}
-
-impl UiBridge<'_> {
-    fn poll_keys(&mut self) -> UiTick {
-        let mut evbuf = [WmEvent::default(); 32];
-        let n = self.win.poll_events(&mut evbuf);
-        for e in &evbuf[..n] {
-            if e.kind != EV_KEY_DOWN {
-                continue;
-            }
-            let sc = e.a as u8;
-            let ch = e.b as u8;
-            let mods = e.c as u8;
-            let ctrl = (mods & 2) != 0;
-            if ch == 0x03 || (sc == SCAN_C && ctrl) {
-                return UiTick::Interrupt;
-            }
-            if ch == 0x1a || (sc == SCAN_Z && ctrl) {
-                return UiTick::Suspend;
-            }
-            let (buf, n) = map_child_key(sc, ch, mods);
-            if n > 0 {
-                return UiTick::Data(buf, n);
-            }
-        }
-        UiTick::None
-    }
-
-    fn redraw(&mut self, term: &TermBuffer) {
-        refresh_terminal(self.win, term);
-        let _ = self.win.flip();
-    }
-}
-
-fn map_child_key(scancode: u8, ch: u8, mods: u8) -> ([u8; 8], usize) {
-    let ctrl = (mods & 2) != 0;
-    if ctrl && ch >= b'a' && ch <= b'z' {
-        return ([ch - b'a' + 1, 0, 0, 0, 0, 0, 0, 0], 1);
-    }
-    match scancode {
-        SCAN_ENTER => ([b'\r', 0, 0, 0, 0, 0, 0, 0], 1),
-        SCAN_BACKSPACE => ([0x7f, 0, 0, 0, 0, 0, 0, 0], 1),
-        SCAN_TAB => ([b'\t', 0, 0, 0, 0, 0, 0, 0], 1),
-        SCAN_ESC => ([0x1b, 0, 0, 0, 0, 0, 0, 0], 1),
-        SCAN_UP => ([0x1b, b'[', b'A', 0, 0, 0, 0, 0], 3),
-        SCAN_DOWN => ([0x1b, b'[', b'B', 0, 0, 0, 0, 0], 3),
-        SCAN_RIGHT => ([0x1b, b'[', b'C', 0, 0, 0, 0, 0], 3),
-        SCAN_LEFT => ([0x1b, b'[', b'D', 0, 0, 0, 0, 0], 3),
-        _ if ch >= 0x20 && ch < 0x7f => ([ch, 0, 0, 0, 0, 0, 0, 0], 1),
-        _ => ([0; 8], 0),
-    }
 }
 
 fn spawn(
@@ -175,9 +111,23 @@ fn spawn_stage(
     pgid: i32,
     foreground: bool,
 ) -> Result<i32, String> {
-    let full = shell
-        .find_executable(&cmd.args[0])
-        .ok_or_else(|| format!("{}: command not found", cmd.args[0]))?;
+    // Builtins in a pipeline must run in a child context just like a Unix
+    // subshell. Reuse the same /bin/shell in a small non-interactive mode
+    // rather than duplicating builtin implementations or forcing applets into
+    // /bin. Stateful builtins therefore do not mutate the parent shell.
+    let builtin_stage = BUILTINS.iter().any(|name| *name == cmd.args[0]);
+    let (full, exec_args) = if builtin_stage {
+        let mut args = Vec::with_capacity(cmd.args.len() + 2);
+        args.push(String::from("/bin/shell"));
+        args.push(String::from("--builtin"));
+        args.extend(cmd.args.iter().cloned());
+        (String::from("/bin/shell"), args)
+    } else {
+        let full = shell
+            .find_executable(&cmd.args[0])
+            .ok_or_else(|| format!("{}: command not found", cmd.args[0]))?;
+        (full, cmd.args.clone())
+    };
 
     // Apply redirections strictly left-to-right. This preserves the important
     // distinction between `>file 2>&1` and `2>&1 >file`.
@@ -224,7 +174,7 @@ fn spawn_stage(
         }
     }
 
-    let pid = spawn(shell, &full, sin, sout, serr, &cmd.args, pgid, foreground)
+    let pid = spawn(shell, &full, sin, sout, serr, &exec_args, pgid, foreground)
         .ok_or_else(|| format!("{}: exec failed", cmd.args[0]));
     close_unique(&opened);
     pid
@@ -254,28 +204,17 @@ fn spawn_pipeline(shell: &Shell, commands: &[SimpleCmd], foreground: bool) -> Re
         return Err(String::from("empty pipeline"));
     }
 
-    // One PTY connects the GUI shell to the whole foreground/background job.
-    // Internal pipeline edges remain anonymous pipes; stdin of stage 0 and
-    // stdout/stderr of the terminal-facing stages use the PTY slave.
-    let mut pty_fds = [0u32; 2];
-    let pty_rc = unsafe { openpty(pty_fds.as_mut_ptr()) };
-    if (pty_rc as isize) < 0 {
-        return Err(format!("openpty failed ({})", pty_rc as isize));
-    }
-    let pty_master = pty_fds[0];
-    let pty_slave = pty_fds[1];
-    let _ = unsafe { set_nonblock(pty_master) };
-
+    // The shell and every job share one controlling TTY. Anonymous pipes are
+    // used only between pipeline stages; the terminal-facing ends inherit the
+    // shell's fd 0/1/2.
     let mut pipes = Vec::new();
     for _ in 0..commands.len().saturating_sub(1) {
         match make_pipe() {
             Ok(p) => pipes.push(p),
             Err(e) => {
-                // Drop the slave before the master: closing a master while a
-                // slave is still open generates SIGHUP for the foreground
-                // process group, which includes the shell on this error path.
-                close_unique(&[pty_slave as i32, pty_master as i32]);
-                for (r, w) in pipes { close_unique(&[r as i32, w as i32]); }
+                for (r, w) in pipes {
+                    close_unique(&[r as i32, w as i32]);
+                }
                 return Err(e);
             }
         }
@@ -284,18 +223,24 @@ fn spawn_pipeline(shell: &Shell, commands: &[SimpleCmd], foreground: bool) -> Re
     let mut pids = Vec::new();
     let mut pgid = 0i32;
     for (i, cmd) in commands.iter().enumerate() {
-        let base_in = if i == 0 { pty_slave as i32 } else { pipes[i - 1].0 as i32 };
+        let base_in = if i == 0 { 0 } else { pipes[i - 1].0 as i32 };
         let base_out = if i + 1 == commands.len() {
-            pty_slave as i32
+            1
         } else {
             pipes[i].1 as i32
         };
-        let base_err = pty_slave as i32;
+        let base_err = 2;
 
-        // First stage asks the kernel to create a process group whose id is
-        // its own PID (pgid=0). Following stages atomically join that group.
         let requested_pgid = if pgid == 0 { 0 } else { pgid };
-        match spawn_stage(shell, cmd, base_in, base_out, base_err, requested_pgid, foreground) {
+        match spawn_stage(
+            shell,
+            cmd,
+            base_in,
+            base_out,
+            base_err,
+            requested_pgid,
+            foreground,
+        ) {
             Ok(pid) => {
                 if pgid == 0 {
                     pgid = pid;
@@ -303,17 +248,17 @@ fn spawn_pipeline(shell: &Shell, commands: &[SimpleCmd], foreground: bool) -> Re
                 pids.push(pid);
             }
             Err(e) => {
-                for pid in &pids { unsafe { let _ = kill(*pid, SIGKILL); } }
-                close_unique(&[pty_slave as i32, pty_master as i32]);
-                for (r, w) in pipes { close_unique(&[r as i32, w as i32]); }
+                for pid in &pids {
+                    unsafe { let _ = kill(*pid, SIGKILL); }
+                }
+                for (r, w) in pipes {
+                    close_unique(&[r as i32, w as i32]);
+                }
                 return Err(e);
             }
         }
     }
 
-    // Parent keeps only master. Every child-side stdio reference was duplicated
-    // into the task fd tables by execve; the shell's slave reference can close.
-    unsafe { close(pty_slave); }
     for (r, w) in pipes {
         close_unique(&[r as i32, w as i32]);
     }
@@ -323,44 +268,8 @@ fn spawn_pipeline(shell: &Shell, commands: &[SimpleCmd], foreground: bool) -> Re
         pgid,
         pids,
         last_pid,
-        capture_fd: Some(pty_master),
-        stdin_w: None,
         last_status: 0,
     })
-}
-
-fn drain_capture(fd: u32, out: &mut TermBuffer) -> bool {
-    let mut any = false;
-    let mut buf = [0u8; 512];
-    loop {
-        let n = unsafe { read(fd, buf.as_mut_ptr(), buf.len()) };
-        if n == 0 || n == usize::MAX {
-            break;
-        }
-        out.write_bytes(&buf[..n]);
-        any = true;
-    }
-    any
-}
-
-/// Background output can arrive while the user is editing the prompt. Start it
-/// on a fresh line; main() will redraw the prompt/editor afterwards.
-fn drain_background_capture(fd: u32, out: &mut TermBuffer) -> bool {
-    let mut buf = [0u8; 512];
-    let first = unsafe { read(fd, buf.as_mut_ptr(), buf.len()) };
-    if first == 0 || first == usize::MAX {
-        return false;
-    }
-    out.write_bytes(b"\r\n");
-    out.write_bytes(&buf[..first]);
-    loop {
-        let n = unsafe { read(fd, buf.as_mut_ptr(), buf.len()) };
-        if n == 0 || n == usize::MAX {
-            break;
-        }
-        out.write_bytes(&buf[..n]);
-    }
-    true
 }
 
 fn wait_status_exit_code(status: i32) -> i32 {
@@ -433,79 +342,36 @@ fn reap_group_nonblocking(group: &mut RunningGroup) -> (bool, bool, bool) {
     (group.pids.is_empty(), stopped_now, continued_now)
 }
 
-fn close_group_io(group: &mut RunningGroup) {
-    if let Some(fd) = group.capture_fd.take() {
-        unsafe { close(fd); }
-    }
-    if let Some(fd) = group.stdin_w.take() {
-        unsafe { close(fd); }
-    }
-}
-
 fn wait_for_activity() {
-    // Waiting for child state and GUI input must actually block.  Yielding
-    // alone keeps the shell runnable and spins at 100% while the child runs.
     unsafe { syscall::sys_sleep(10); }
 }
 
-fn supervise_group(
-    mut group: RunningGroup,
-    out: &mut TermBuffer,
-    win: &mut Window,
-) -> SuperviseResult {
-    if let Some(fd) = group.capture_fd {
-        let _ = unsafe { tcsetpgrp(fd, group.pgid) };
-        let _ = unsafe { set_nonblock(fd) };
+fn reclaim_shell_tty() {
+    let shell_pgid = unsafe { getpgrp() };
+    if shell_pgid > 0 {
+        let _ = unsafe { tcsetpgrp(0, shell_pgid) };
     }
-    let mut ui = UiBridge { win };
+}
+
+fn supervise_group(mut group: RunningGroup) -> SuperviseResult {
+    let _ = unsafe { tcsetpgrp(0, group.pgid) };
 
     loop {
-        if let Some(fd) = group.capture_fd {
-            if drain_capture(fd, out) {
-                ui.redraw(out);
-            }
-        }
-
-        match ui.poll_keys() {
-            UiTick::Interrupt => {
-                let control = [0x03u8];
-                let delivered = group.capture_fd.map(|fd| unsafe { write(fd, control.as_ptr(), 1) }).unwrap_or(0);
-                if delivered == 0 { unsafe { let _ = kill(-group.pgid, SIGINT); } }
-            }
-            UiTick::Suspend => {
-                let control = [0x1au8];
-                let delivered = group.capture_fd.map(|fd| unsafe { write(fd, control.as_ptr(), 1) }).unwrap_or(0);
-                if delivered == 0 { unsafe { let _ = kill(-group.pgid, SIGTSTP); } }
-            }
-            UiTick::Data(buf, n) => {
-                if let Some(master) = group.capture_fd {
-                    unsafe { let _ = write(master, buf.as_ptr(), n); }
-                }
-            }
-            _ => {}
-        }
-
         let (all_exited, stopped, _) = reap_group_nonblocking(&mut group);
         if all_exited {
-            if let Some(fd) = group.capture_fd {
-                let _ = drain_capture(fd, out);
-            }
-            let status = group.last_status;
-            close_group_io(&mut group);
-            ui.redraw(out);
-            return SuperviseResult::Exited(status);
+            reclaim_shell_tty();
+            return SuperviseResult::Exited(group.last_status);
         }
 
         if stopped {
-            // Treat a pipeline as one job. If one stage stopped, freeze any
-            // remaining stages as well so `bg`/`fg` resume a coherent group.
+            // Normalize the whole pipeline into one stopped job before giving
+            // the terminal back to the shell.
             unsafe { let _ = kill(-group.pgid, SIGSTOP); }
-            // Consume the SIGSTOP transitions generated above. Otherwise a
-            // later `fg` could immediately observe a stale WUNTRACED event.
             let _ = reap_group_nonblocking(&mut group);
-            ui.redraw(out);
+            reclaim_shell_tty();
             return SuperviseResult::Stopped(group);
         }
+
         wait_for_activity();
     }
 }
@@ -532,8 +398,6 @@ fn job_from_running(id: u32, command: String, state: JobState, group: RunningGro
         last_pid: group.last_pid,
         command,
         state,
-        capture_fd: group.capture_fd,
-        stdin_w: group.stdin_w,
         last_status: group.last_status,
     }
 }
@@ -543,8 +407,6 @@ fn running_from_job(job: BackgroundJob) -> RunningGroup {
         pgid: job.pgid,
         pids: job.pids,
         last_pid: job.last_pid,
-        capture_fd: job.capture_fd,
-        stdin_w: job.stdin_w,
         last_status: job.last_status,
     }
 }
@@ -597,23 +459,23 @@ fn wait_job(job: BackgroundJob, out: &mut TermBuffer) -> (i32, Option<Background
         out.push(&format!("wait: job %{} is stopped", job.id));
         return (1, Some(job));
     }
+
     let id = job.id;
     let command = job.command.clone();
     let mut group = running_from_job(job);
-    if let Some(fd) = group.capture_fd { let _ = unsafe { set_nonblock(fd) }; }
     loop {
-        if let Some(fd) = group.capture_fd { let _ = drain_capture(fd, out); }
         let (done, stopped, _) = reap_group_nonblocking(&mut group);
         if done {
-            let status = group.last_status;
-            close_group_io(&mut group);
-            return (status, None);
+            return (group.last_status, None);
         }
         if stopped {
             unsafe { let _ = kill(-group.pgid, SIGSTOP); }
             let _ = reap_group_nonblocking(&mut group);
             out.push(&format!("wait: job %{} stopped", id));
-            return (1, Some(job_from_running(id, command, JobState::Stopped, group)));
+            return (
+                1,
+                Some(job_from_running(id, command, JobState::Stopped, group)),
+            );
         }
         wait_for_activity();
     }
@@ -623,7 +485,6 @@ fn run_special_builtin(
     shell: &mut Shell,
     cmd: &SimpleCmd,
     out: &mut TermBuffer,
-    win: &mut Window,
 ) -> Option<i32> {
     let name = cmd.args.first()?.as_str();
 
@@ -700,7 +561,6 @@ fn run_special_builtin(
             let job = &mut shell.jobs[idx];
             unsafe { let _ = kill(-job.pgid, SIGCONT); }
             job.state = JobState::Running;
-            if let Some(fd) = job.stdin_w.take() { unsafe { close(fd); } }
             out.push(&format!("[{}] continued in background", job.id));
             Some(0)
         }
@@ -712,13 +572,9 @@ fn run_special_builtin(
             let job = shell.jobs.remove(idx);
             let id = job.id;
             let command = job.command.clone();
-            // Give this job's PTY back to its process group before waking it;
-            // the parent shell's controlling TTY is a separate terminal.
-            if let Some(fd) = job.capture_fd {
-                let _ = unsafe { tcsetpgrp(fd, job.pgid) };
-            }
+            let _ = unsafe { tcsetpgrp(0, job.pgid) };
             unsafe { let _ = kill(-job.pgid, SIGCONT); }
-            match supervise_group(running_from_job(job), out, win) {
+            match supervise_group(running_from_job(job)) {
                 SuperviseResult::Exited(status) => Some(status),
                 SuperviseResult::Stopped(group) => {
                     shell.jobs.push(job_from_running(id, command, JobState::Stopped, group));
@@ -795,7 +651,6 @@ fn execute_group(
     group: &CommandGroup,
     command_text: &str,
     out: &mut TermBuffer,
-    win: &mut Window,
 ) -> i32 {
     let commands: Vec<SimpleCmd> = group.pipeline.iter().map(|c| expand_cmd(shell, c)).collect();
     if commands.is_empty() {
@@ -803,7 +658,7 @@ fn execute_group(
     }
 
     if commands.len() == 1 {
-        if let Some(status) = run_special_builtin(shell, &commands[0], out, win) {
+        if let Some(status) = run_special_builtin(shell, &commands[0], out) {
             return status;
         }
         shell.last_status = 0;
@@ -822,7 +677,6 @@ fn execute_group(
     };
 
     if detach {
-        if let Some(fd) = running.stdin_w.take() { unsafe { close(fd); } }
         let id = shell.alloc_job_id();
         let last_pid = running.last_pid;
         let pgid = running.pgid;
@@ -831,7 +685,7 @@ fn execute_group(
         return 0;
     }
 
-    match supervise_group(running, out, win) {
+    match supervise_group(running) {
         SuperviseResult::Exited(status) => status,
         SuperviseResult::Stopped(group) => {
             let id = shell.alloc_job_id();
@@ -844,7 +698,26 @@ fn execute_group(
     }
 }
 
-pub(super) fn interpret(shell: &mut Shell, line: &str, out: &mut TermBuffer, win: &mut Window) {
+pub(super) fn run_builtin_argv(shell: &mut Shell, args: Vec<String>, out: &mut TermBuffer) -> i32 {
+    if args.is_empty() {
+        return 0;
+    }
+    let cmd = SimpleCmd {
+        args,
+        redirs: Vec::new(),
+    };
+    if let Some(status) = run_special_builtin(shell, &cmd, out) {
+        return status;
+    }
+    shell.last_status = 0;
+    if try_builtin(shell, &cmd, out) {
+        shell.last_status
+    } else {
+        127
+    }
+}
+
+pub(super) fn interpret(shell: &mut Shell, line: &str, out: &mut TermBuffer) {
     let groups = match parse_line(line) {
         Ok(v) => v,
         Err(e) => {
@@ -863,7 +736,7 @@ pub(super) fn interpret(shell: &mut Shell, line: &str, out: &mut TermBuffer, win
             Connector::Or => status != 0,
         };
         if run {
-            status = execute_group(shell, group, line, out, win);
+            status = execute_group(shell, group, line, out);
             shell.last_status = status;
             if shell.should_exit {
                 break;
@@ -878,32 +751,19 @@ pub(super) fn interpret(shell: &mut Shell, line: &str, out: &mut TermBuffer, win
 pub(super) fn poll_background_jobs(shell: &mut Shell, out: &mut TermBuffer) -> bool {
     let mut changed = false;
     let mut i = 0usize;
+
     while i < shell.jobs.len() {
         let previous_state = shell.jobs[i].state;
-
-        if previous_state == JobState::Running {
-            if let Some(fd) = shell.jobs[i].capture_fd {
-                if drain_background_capture(fd, out) { changed = true; }
-            }
-        }
-
-        // waitpid is now the sole source of child job-control state. Keep ps/
-        // task_list diagnostic-only so stop/continue transitions cannot race a
-        // separate task-table snapshot.
         let mut group = RunningGroup {
             pgid: shell.jobs[i].pgid,
             pids: core::mem::take(&mut shell.jobs[i].pids),
             last_pid: shell.jobs[i].last_pid,
-            capture_fd: shell.jobs[i].capture_fd,
-            stdin_w: shell.jobs[i].stdin_w,
             last_status: shell.jobs[i].last_status,
         };
-        let (done, stopped, continued) = reap_group_nonblocking(&mut group);
 
+        let (done, stopped, continued) = reap_group_nonblocking(&mut group);
         if stopped && !done {
             unsafe { let _ = kill(-group.pgid, SIGSTOP); }
-            // Consume stop notifications generated while normalizing the whole
-            // pipeline into one stopped job.
             let _ = reap_group_nonblocking(&mut group);
         }
 
@@ -911,11 +771,12 @@ pub(super) fn poll_background_jobs(shell: &mut Shell, out: &mut TermBuffer) -> b
         shell.jobs[i].last_status = group.last_status;
 
         if done || shell.jobs[i].pids.is_empty() {
-            if let Some(fd) = shell.jobs[i].capture_fd.take() { unsafe { close(fd); } }
-            if let Some(fd) = shell.jobs[i].stdin_w.take() { unsafe { close(fd); } }
             let status = shell.jobs[i].last_status;
-            if !changed { out.write_bytes(b"\r\n"); }
-            out.push(&format!("[{}] Done ({}) {}", shell.jobs[i].id, status, shell.jobs[i].command));
+            out.write_bytes(b"\r\n");
+            out.push(&format!(
+                "[{}] Done ({}) {}",
+                shell.jobs[i].id, status, shell.jobs[i].command
+            ));
             shell.jobs.remove(i);
             changed = true;
             continue;
@@ -924,19 +785,27 @@ pub(super) fn poll_background_jobs(shell: &mut Shell, out: &mut TermBuffer) -> b
         if stopped {
             shell.jobs[i].state = JobState::Stopped;
             if previous_state != JobState::Stopped {
-                if !changed { out.write_bytes(b"\r\n"); }
-                out.push(&format!("[{}] Stopped {}", shell.jobs[i].id, shell.jobs[i].command));
+                out.write_bytes(b"\r\n");
+                out.push(&format!(
+                    "[{}] Stopped {}",
+                    shell.jobs[i].id, shell.jobs[i].command
+                ));
                 changed = true;
             }
         } else if continued {
             shell.jobs[i].state = JobState::Running;
             if previous_state == JobState::Stopped {
-                if !changed { out.write_bytes(b"\r\n"); }
-                out.push(&format!("[{}] Continued {}", shell.jobs[i].id, shell.jobs[i].command));
+                out.write_bytes(b"\r\n");
+                out.push(&format!(
+                    "[{}] Continued {}",
+                    shell.jobs[i].id, shell.jobs[i].command
+                ));
                 changed = true;
             }
         }
+
         i += 1;
     }
+
     changed
 }

@@ -1,4 +1,4 @@
-//! Small UTF-8 aware command-line editor used by the GUI shell.
+//! Small UTF-8 aware command-line editor used by the interactive shell.
 
 use alloc::string::String;
 

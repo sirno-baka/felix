@@ -1596,11 +1596,8 @@ dependencies = [
 name = "shell"
 version = "0.1.0"
 dependencies = [
- "embedded-graphics",
- "embedded-graphics-unicodefonts",
  "libfelix",
  "pci-ids",
- "vte",
 ]
 
 [[package]]
@@ -1861,6 +1858,16 @@ dependencies = [
  "arrayvec",
  "serde",
  "slotmap",
+]
+
+[[package]]
+name = "terminal"
+version = "0.1.0"
+dependencies = [
+ "embedded-graphics",
+ "embedded-graphics-unicodefonts",
+ "libfelix",
+ "vte",
 ]
 
 [[package]]

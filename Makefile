@@ -318,8 +318,8 @@ smoke: std-thread-smoke std-tokio-smoke all usb-image
 	@grep -q 'std::thread smoke: PASS' build/smoke.log || { echo "smoke: std::thread test failed"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'tokio: multithread runtime ready workers=3' build/smoke.log || { echo "smoke: Tokio multi-thread runtime failed"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'tokio: poll timeout works' build/smoke.log || { echo "smoke: Tokio Mio/timer test failed"; tail -n 160 build/smoke.log; exit 1; }
-	@grep -q 'init: started pid=.* /bin/shell' build/smoke.log || { echo "smoke: shell was not spawned"; tail -n 160 build/smoke.log; exit 1; }
-	@grep -q 'shell: userspace main started pid=' build/smoke.log || { echo "smoke: shell did not reach main"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'init: started pid=.* /bin/terminal' build/smoke.log || { echo "smoke: terminal was not spawned"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'terminal: spawned /bin/shell pid=' build/smoke.log || { echo "smoke: terminal did not spawn /bin/shell"; tail -n 160 build/smoke.log; exit 1; }
 	@echo "smoke: PASS"
 
 .PHONY: debug

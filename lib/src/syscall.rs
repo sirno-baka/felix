@@ -16,6 +16,7 @@ pub const SYS_CHDIR: u32 = 12;
 pub const SYS_SPAWN: u32 = 0xF000;
 pub const SYS_EXECVE_WASM: u32 = 0xF001;
 pub const SYS_SPAWN_PATH: u32 = 0xF002;
+pub const SYS_REBOOT: u32 = 0xF003;
 
 pub const SYS_LSEEK: u32 = 19;
 pub const SYS_GETPID: u32 = 20;
@@ -305,6 +306,14 @@ pub unsafe fn sched_yield() {
         "int 0x80",
         in("eax") SYS_SCHED_YIELD,
         options(nostack, preserves_flags)
+    );
+}
+
+pub unsafe fn reboot() -> ! {
+    asm!(
+        "int 0x80",
+        in("eax") SYS_REBOOT,
+        options(nostack, noreturn)
     );
 }
 

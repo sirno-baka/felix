@@ -390,6 +390,7 @@ fn syscall_handler_locked(esp: u32) -> u32 {
                 params.foreground,
             )
         }
+        crate::syscalls::SYS_REBOOT => sys_reboot(),
         // Linux i386 waitpid(pid, status, options).
         crate::syscalls::SYS_WAIT => unreachable!(),
         crate::syscalls::SYS_TASK_LIST => {
@@ -1920,7 +1921,7 @@ pub fn sys_read(current_slot: usize, fd: usize, buf_ptr: *mut u8, count: usize) 
                     let out = core::slice::from_raw_parts_mut(buf_ptr, count);
                     let result = crate::tty::read(current_slot, pty_id, side, out, nonblock);
                     return if result == crate::tty::WOULD_BLOCK {
-                        BLOCK_AND_RESTART
+                        if nonblock { usize::MAX } else { BLOCK_AND_RESTART }
                     } else {
                         result
                     };
@@ -2065,7 +2066,7 @@ pub fn sys_write(current_slot: usize, fd: usize, buf_ptr: *const u8, count: usiz
                     let nonblock = current.fd_table.is_nonblock(fd);
                     let result = crate::tty::write(current_slot, pty_id, side, buf, nonblock);
                     return if result == crate::tty::WOULD_BLOCK {
-                        BLOCK_AND_RESTART
+                        if nonblock { usize::MAX } else { BLOCK_AND_RESTART }
                     } else {
                         result
                     };
@@ -4117,6 +4118,44 @@ fn sys_execve_path(
     }
 }
 
+/// Reboot through the legacy keyboard controller first, then the PCI reset
+/// control port. If neither mechanism resets the machine, force a triple fault.
+fn sys_reboot() -> ! {
+    println!("[reboot] rebooting...");
+    unsafe {
+        asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+
+    // 8042 keyboard-controller CPU reset pulse. This is useful on older PCs.
+    for _ in 0..100_000 {
+        if crate::io::inb(0x64) & 0x02 == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    crate::io::outb(0x64, 0xFE);
+
+    // If the controller reset worked, execution stops during this delay.
+    for _ in 0..100_000 {
+        core::hint::spin_loop();
+    }
+
+    // PCI reset control register: SYS_RST + FULL_RST.
+    crate::io::outb(0xCF9, 0x02);
+    crate::io::outb(0xCF9, 0x06);
+
+    for _ in 0..100_000 {
+        core::hint::spin_loop();
+    }
+
+    // Last resort: an empty IDT makes this exception escalate to triple fault.
+    let null_idt = [0u8; 6];
+    unsafe {
+        asm!("lidt [{}]", in(reg) null_idt.as_ptr(), options(readonly, nostack));
+        asm!("int3", options(noreturn));
+    }
+}
+
 /// Felix-private spawn from an ELF image in memory.
 /// Returns the new task's slot (pid) on success, or usize::MAX on failure.
 /// `stdin_fd`/`stdout_fd`/`stderr_fd`: parent fd to install as child's 0/1/2,
@@ -4431,21 +4470,22 @@ fn sys_spawn_image(
             pid, slot, pgid, sid, entry_point, USER_STACK_TOP, child_pd_phys, ppid
         );
 
-        // A spawned PTY is its own terminal, so its foreground group must
-        // never be installed on the parent's controlling TTY. This is true
-        // even for a background GUI shell: its own PTY remains interactive
-        // independently of the parent shell.
-        if TASK_MANAGER.tasks[slot]
-            .as_ref()
-            .is_some_and(|task| task.pty_id >= 0)
-        {
-            let pty_id = TASK_MANAGER.tasks[slot].as_ref().unwrap().pty_id as usize;
-            if !crate::tty::set_foreground_pty(slot, pty_id, pgid) {
-                println!("[spawn] pty foreground handoff to pgid {} failed", pgid);
-            }
-        } else if foreground && parent_slot != 0 {
-            if !crate::tty::set_foreground(parent_slot, pgid) {
-                println!("[spawn] tty foreground handoff to pgid {} failed", pgid);
+        // Only an explicitly foreground spawn may change a terminal's
+        // foreground process group. Background jobs may share the PTY slave,
+        // but must not steal the controlling TTY from their shell.
+        if foreground {
+            if TASK_MANAGER.tasks[slot]
+                .as_ref()
+                .is_some_and(|task| task.pty_id >= 0)
+            {
+                let pty_id = TASK_MANAGER.tasks[slot].as_ref().unwrap().pty_id as usize;
+                if !crate::tty::set_foreground_pty(slot, pty_id, pgid) {
+                    println!("[spawn] pty foreground handoff to pgid {} failed", pgid);
+                }
+            } else if parent_slot != 0 {
+                if !crate::tty::set_foreground(parent_slot, pgid) {
+                    println!("[spawn] tty foreground handoff to pgid {} failed", pgid);
+                }
             }
         }
 

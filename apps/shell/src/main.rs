@@ -9,19 +9,16 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::min;
 
-use libfelix::embedded_graphics;
 use libfelix::prelude::*;
 mod executor;
 mod line_editor;
 mod parser;
-mod terminal;
-use executor::{interpret, poll_background_jobs};
+use executor::{interpret, poll_background_jobs, run_builtin_argv};
 use line_editor::LineEditor;
 use parser::{parse_line, CommandGroup, Connector, Redir, RedirKind, RedirTarget, SimpleCmd, PROTECTED};
-use terminal::{Terminal, CELL_H, CELL_W};
 use libfelix::syscall::{
-    self, chdir, close, getpid, getpgrp, kill, mkdir, mount, mount_list,
-    open, openpty, pipe, read, rmdir, set_nonblock, setpgid, task_list, tcsetpgrp, tty_setfg, umount2, unlink,
+    self, chdir, close, getcwd, getpid, getpgrp, kill, mkdir, mount, mount_list,
+    open, pipe, read, rmdir, setpgid, task_list, tcsetpgrp, umount2, unlink,
     spawn_path_env_pgid, spawn_wasm_env_pgid, waitpid_status, write, O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SIGCONT, SIGINT,
     SIGKILL, SIGSTOP, SIGTERM, SIGTSTP, TASK_RUNNING, TASK_STOPPED, TASK_ZOMBIE, WCONTINUED,
     WNOHANG, WUNTRACED,
@@ -44,8 +41,6 @@ struct BackgroundJob {
     last_pid: i32,
     command: String,
     state: JobState,
-    capture_fd: Option<u32>,
-    stdin_w: Option<u32>,
     last_status: i32,
 }
 
@@ -203,11 +198,20 @@ fn handle_tab_completion(shell: &mut Shell, input: &str, term: &mut TermBuffer) 
 
 impl Shell {
     fn new() -> Self {
+        let mut cwd_buf = [0u8; 256];
+        let cwd_len = unsafe { getcwd(cwd_buf.as_mut_ptr(), cwd_buf.len()) };
+        let cwd = if cwd_len > 1 && (cwd_len as isize) > 0 && cwd_len <= cwd_buf.len() {
+            core::str::from_utf8(&cwd_buf[..cwd_len - 1])
+                .unwrap_or("/")
+                .to_string()
+        } else {
+            String::from("/")
+        };
+
         let mut shell = Self {
-            cwd: String::from("/"),
-            old_cwd: String::from("/"),
-            // System programs live in /bin; `.` follows the current directory.
-            path: String::from("/bin:."),
+            cwd: cwd.clone(),
+            old_cwd: cwd.clone(),
+            path: String::new(),
             command_cache: None,
             jobs: Vec::new(),
             next_job_id: 1,
@@ -215,10 +219,22 @@ impl Shell {
             last_status: 0,
             should_exit: false,
         };
-        shell.set_var("PATH", "/bin:.", true);
-        shell.set_var("HOME", "/home/user", true);
-        shell.set_var("PWD", "/", true);
-        shell.set_var("OLDPWD", "/", true);
+
+        // Preserve the process environment supplied by terminal/telnetd or a
+        // parent shell. This is especially important for TERM, HOME and PATH.
+        for entry in envs() {
+            if let Some((name, value)) = entry.split_once('=') {
+                shell.set_var(name, value, true);
+            }
+        }
+        if shell.get_var("PATH").is_none() {
+            shell.set_var("PATH", "/bin:.", true);
+        }
+        if shell.get_var("HOME").is_none() {
+            shell.set_var("HOME", "/home/user", true);
+        }
+        shell.set_var("PWD", &cwd, true);
+        shell.set_var("OLDPWD", &cwd, true);
         shell
     }
 
@@ -558,81 +574,43 @@ fn open_redirs(shell: &Shell, redirs: &[Redir]) -> Result<(i32, i32), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Terminal buffer
+// Shell output
 // ---------------------------------------------------------------------------
 
-const MAX_HISTORY: usize = 64;
-const TERM_PAD: i32 = 8;
-
-pub struct TermBuffer {
-    inner: Terminal,
-    /// Last rendered row strings (label path / tab completion).
-    cache: Vec<String>,
+fn write_all_fd(fd: u32, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let n = unsafe { write(fd, bytes.as_ptr(), bytes.len()) };
+        if n == 0 || n == usize::MAX {
+            break;
+        }
+        bytes = &bytes[n..];
+    }
 }
 
+/// Minimal stdout abstraction kept so the existing builtins need only small
+/// changes. It deliberately contains no terminal emulator or WM state.
+pub struct TermBuffer;
+
 impl TermBuffer {
-    fn fit(win: &Window) -> (usize, usize) {
-        let w = win.client_width() as i32;
-        let h = win.client_height() as i32;
-        let cols = ((w - TERM_PAD * 2) / CELL_W).max(1) as usize;
-        let rows = ((h - TERM_PAD * 2) / CELL_H).max(1) as usize;
-        (cols, rows)
-    }
-
-    fn resize_to(&mut self, win: &Window) {
-        let (cols, rows) = Self::fit(win);
-        self.inner.resize(cols, rows);
-    }
-
-    fn new(win: &Window) -> Self {
-        let (cols, rows) = Self::fit(win);
-        Self {
-            inner: Terminal::new(cols, rows),
-            cache: Vec::new(),
-        }
+    fn new() -> Self {
+        Self
     }
 
     fn push(&mut self, line: &str) {
-        // Keep `\n` as line break; VTE handles wrap + CSI.
-        self.inner.write_str(line);
-        if !line.ends_with('\n') {
-            self.inner.process(b"\r\n");
-        }
-        self.cache = self.inner.visible_lines();
+        write_all_fd(1, line.as_bytes());
+        write_all_fd(1, b"\n");
     }
 
     fn write_bytes(&mut self, bytes: &[u8]) {
-        self.inner.process(bytes);
-        self.cache = self.inner.visible_lines();
+        write_all_fd(1, bytes);
     }
 
     fn clear(&mut self) {
-        self.inner.clear();
-        self.cache = self.inner.visible_lines();
-    }
-
-    fn visible_history(&self) -> impl Iterator<Item = &str> {
-        self.cache.iter().map(|s| s.as_str())
-    }
-
-    fn draw(&self, win: &mut Window) {
-        self.inner
-            .draw(win, embedded_graphics::prelude::Point::new(TERM_PAD, TERM_PAD));
+        write_all_fd(1, b"\x1b[2J\x1b[H");
     }
 
     fn prompt_line(&mut self, prompt: &str) {
-        self.inner.write_str(prompt);
-        self.cache = self.inner.visible_lines();
-    }
-
-    fn rubout_n(&mut self, n: usize) {
-        for _ in 0..n {
-            self.write_bytes(b"\x08 \x08");
-        }
-    }
-
-    fn scroll(&mut self, delta: i32) {
-        self.inner.scroll(delta);
+        write_all_fd(1, prompt.as_bytes());
     }
 }
 
@@ -645,7 +623,7 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
     match name {
         "help" | "exit" | "quit" | "pwd" | "cd" | "ls" | "cat" | "mkdir" | "rmdir" | "rm" | "mv"
         | "path" | "ps" | "jobs" | "fg" | "bg" | "kill" | "wait" | "export" | "unset" | "env"
-        | "set" | "clear" | "echo" | "head" | "lspci" | "ifconfig" | "mount" | "mounts" | "umount"
+        | "set" | "clear" | "reboot" | "echo" | "head" | "lspci" | "ifconfig" | "mount" | "mounts" | "umount"
         | "audiotest" => {}
         _ => return false,
     }
@@ -758,7 +736,7 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
             if let Some(file) = cmd.args.get(1) {
                 cat_to(&shell.resolve(file), file_fd, out);
             } else {
-                out.push("Usage: cat <file>");
+                cat_stdin(file_fd, out);
             }
             if file_fd >= 0 {
                 unsafe {
@@ -770,7 +748,7 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
             if let Some(file) = cmd.args.get(1) {
                 head_to(&shell.resolve(file), file_fd, 20, out);
             } else {
-                out.push("Usage: head <file>");
+                head_stdin(file_fd, 20, out);
             }
             if file_fd >= 0 {
                 unsafe {
@@ -953,6 +931,9 @@ fn try_builtin(shell: &mut Shell, cmd: &SimpleCmd, out: &mut TermBuffer) -> bool
                 }
             }
         }
+        "reboot" => unsafe {
+            syscall::reboot();
+        },
         "lspci" => {
             lspci_to(file_fd, out);
             if file_fd >= 0 {
@@ -1220,6 +1201,46 @@ fn ls_to(path: &str, file_fd: i32, out: &mut TermBuffer) {
     }
 }
 
+fn write_builtin_bytes(file_fd: i32, bytes: &[u8], out: &mut TermBuffer) {
+    if file_fd >= 0 {
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let n = unsafe { write(file_fd as u32, bytes[off..].as_ptr(), bytes.len() - off) };
+            if n == 0 || n == usize::MAX {
+                break;
+            }
+            off += n;
+        }
+    } else {
+        out.write_bytes(bytes);
+    }
+}
+
+fn cat_stdin(file_fd: i32, out: &mut TermBuffer) {
+    let mut buf = [0u8; 512];
+    loop {
+        let n = unsafe { read(0, buf.as_mut_ptr(), buf.len()) };
+        if n == 0 || n == usize::MAX {
+            break;
+        }
+        write_builtin_bytes(file_fd, &buf[..n], out);
+    }
+}
+
+fn head_stdin(file_fd: i32, count: u32, out: &mut TermBuffer) {
+    let mut remain = count as usize;
+    let mut buf = [0u8; 512];
+    while remain > 0 {
+        let want = core::cmp::min(remain, buf.len());
+        let n = unsafe { read(0, buf.as_mut_ptr(), want) };
+        if n == 0 || n == usize::MAX {
+            break;
+        }
+        write_builtin_bytes(file_fd, &buf[..n], out);
+        remain = remain.saturating_sub(n);
+    }
+}
+
 fn head_to(filename: &str, file_fd: i32, count: u32, out: &mut TermBuffer) {
     let mut path = String::from(filename);
     path.push('\0');
@@ -1235,15 +1256,7 @@ fn head_to(filename: &str, file_fd: i32, count: u32, out: &mut TermBuffer) {
         if n == 0 {
             break;
         }
-        if file_fd >= 0 {
-            unsafe {
-                write(file_fd as u32, buf.as_ptr(), n);
-            }
-        } else if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-            for line in s.split('\n') {
-                out.push(line);
-            }
-        }
+        write_builtin_bytes(file_fd, &buf[..n], out);
         remain = remain.saturating_sub(n);
     }
     unsafe {
@@ -1265,15 +1278,7 @@ fn cat_to(filename: &str, file_fd: i32, out: &mut TermBuffer) {
         if n == 0 {
             break;
         }
-        if file_fd >= 0 {
-            unsafe {
-                write(file_fd as u32, buf.as_ptr(), n);
-            }
-        } else if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-            for line in s.split('\n') {
-                out.push(line);
-            }
-        }
+        write_builtin_bytes(file_fd, &buf[..n], out);
     }
     unsafe {
         close(fd as u32);
@@ -1337,7 +1342,8 @@ fn help_text() -> String {
     String::from(
         "Builtins:\n\
   ls [path]        - list directory\n\
-  cat <file>       - display file content\n\
+  cat [file]       - display file content or stdin\n\
+  head [file]      - display first 20 bytes from file or stdin\n\
   cd [dir]         - change directory\n\
   pwd              - print working directory\n\
   path [dirs]      - show or set PATH\n\
@@ -1354,6 +1360,7 @@ fn help_text() -> String {
   umount <path>    - unmount removable filesystem\n\
   audiotest        - play 1s 440 Hz test tone via /dev/audio\n\
   clear            - clear terminal\n\
+  reboot           - reboot the machine\n\
   help / exit\n\n\
 Tab completes commands and paths relative to cwd.\n\
 cmd &              - run in background\n\
@@ -1361,533 +1368,23 @@ cmd > file         - redirect stdout and detach (Felix convenience)\n\
 cmd >> file        - append stdout and detach\n\
 Pipes run in foreground.\n\
 Files ending in .rhai are run through /bin/rhai.\n\
-Ctrl+C interrupts a foreground program (userspace).\n",
+Ctrl+C interrupts the foreground process group through the controlling TTY.\n",
     )
 }
 
-#[cfg(any())]
-mod legacy_execution {
-use super::*;
 // ---------------------------------------------------------------------------
-// Legacy execution path kept out of the build while the new executor.rs owns
-// pipelines/job control. It remains here temporarily to make the transition
-// easy to inspect and can be deleted after testing.
+// Interactive CLI
 // ---------------------------------------------------------------------------
 
-enum UiTick {
-    None,
-    Interrupt,
-    /// Bytes to push into the child's stdin pipe.
-    Data([u8; 8], usize),
-}
-
-const SCAN_ESC: u8 = 0x01;
-const SCAN_LEFT: u8 = 0x4B;
-const SCAN_RIGHT: u8 = 0x4D;
-
-fn map_child_key(scancode: u8, ch: u8, mods: u8) -> ([u8; 8], usize) {
-    let ctrl = (mods & 2) != 0;
-    if ch == 0x03 || (scancode == 0x2e && ctrl) {
-        return ([0x03, 0, 0, 0, 0, 0, 0, 0], 1);
-    }
-    if ctrl && ch >= b'a' && ch <= b'z' {
-        return ([ch - b'a' + 1, 0, 0, 0, 0, 0, 0, 0], 1);
-    }
-    match scancode {
-        SCAN_ENTER => ([b'\r', 0, 0, 0, 0, 0, 0, 0], 1),
-        SCAN_BACKSPACE => ([0x7f, 0, 0, 0, 0, 0, 0, 0], 1),
-        SCAN_TAB => ([b'\t', 0, 0, 0, 0, 0, 0, 0], 1),
-        SCAN_ESC => ([0x1b, 0, 0, 0, 0, 0, 0, 0], 1),
-        SCAN_UP => ([0x1b, b'[', b'A', 0, 0, 0, 0, 0], 3),
-        SCAN_DOWN => ([0x1b, b'[', b'B', 0, 0, 0, 0, 0], 3),
-        SCAN_RIGHT => ([0x1b, b'[', b'C', 0, 0, 0, 0, 0], 3),
-        SCAN_LEFT => ([0x1b, b'[', b'D', 0, 0, 0, 0, 0], 3),
-        _ if ch >= 0x20 && ch < 0x7f => ([ch, 0, 0, 0, 0, 0, 0, 0], 1),
-        _ => ([0; 8], 0),
-    }
-}
-
-fn spawn(
-    path: &str,
-    stdin_fd: i32,
-    stdout_fd: i32,
-    stderr_fd: i32,
-    args: &[String],
-) -> Option<i32> {
-    let mut f = File::open(path).ok()?;
-    let data = f.read_to_end().ok()?;
-    let mut c_strings: Vec<String> = Vec::new();
-    if args.is_empty() {
-        let mut s = String::from(path);
-        s.push('\0');
-        c_strings.push(s);
-    } else {
-        for a in args {
-            let mut s = a.clone();
-            s.push('\0');
-            c_strings.push(s);
-        }
-    }
-    let ptrs: Vec<*const u8> = c_strings.iter().map(|s| s.as_ptr()).collect();
-    if data.len() < 4 {
-        println!("Not executable file");
-        return None;
-    }
-    unsafe {
-        let pid = match &data[0..4] {
-            &[0x0, 0x61, 0x73, 0x6d] => spawn_wasm(
-                data.as_ptr(),
-                data.len(),
-                stdin_fd,
-                stdout_fd,
-                stderr_fd,
-                &ptrs,
-            ),
-            b"\x7fELF" => spawn(
-                data.as_ptr(),
-                data.len(),
-                stdin_fd,
-                stdout_fd,
-                stderr_fd,
-                &ptrs,
-            ),
-            _ => {
-                println!("Not executable file");
-                usize::MAX
-            }
-        };
-        if pid == usize::MAX {
-            None
-        } else {
-            Some(pid as i32)
-        }
-    }
-}
-
-/// Non-blocking pipe drain into the VT screen. Returns true if any data was consumed.
-fn drain_pipe_once(
-    fd: u32,
-    out: &mut TermBuffer,
-    _partial: &mut String,
-    _live_idx: &mut Option<usize>,
-) -> bool {
-    let mut buf = [0u8; 512];
-    let n = unsafe { read(fd, buf.as_mut_ptr(), buf.len()) };
-    if n == 0 || n == usize::MAX {
-        return false;
-    }
-    out.write_bytes(&buf[..n]);
-    true
-}
-
-/// UI bridge: one mutable owner of the window so tick + redraw don't conflict.
-struct UiBridge<'a> {
-    win: &'a mut Window,
-    prompt: String,
-}
-
-impl UiBridge<'_> {
-    fn poll_keys(&mut self) -> UiTick {
-        let mut evbuf = [WmEvent::default(); 32];
-        let n = self.win.poll_events(&mut evbuf);
-        for e in &evbuf[..n] {
-            if e.kind == EV_RESIZE {
-                continue;
-            }
-            if e.kind != EV_KEY_DOWN {
-                continue;
-            }
-            let ch = e.b as u8;
-            let sc = e.a as u8;
-            let mods = e.c as u8;
-            if ch == 0x03 || (sc == 0x2e && (mods & 2) != 0) {
-                return UiTick::Interrupt;
-            }
-            let (buf, n) = map_child_key(sc, ch, mods);
-            if n > 0 {
-                return UiTick::Data(buf, n);
-            }
-        }
-        UiTick::None
-    }
-
-    fn redraw(&mut self, term: &TermBuffer) {
-        refresh_terminal(self.win, term);
-        let _ = self.win.flip();
-    }
-}
-
-/// Ctrl+C in this window → kill(child, SIGINT).
-fn supervise_child(
-    pid: i32,
-    capture_fd: Option<u32>,
-    stdin_w: Option<u32>,
-    out: &mut TermBuffer,
-    ui: &mut UiBridge<'_>,
-) {
-    if let Some(fd) = capture_fd {
-        let _ = unsafe { set_nonblock(fd) };
-    }
-
-    let mut partial = String::new();
-    let mut live_idx: Option<usize> = None;
-    let mut done = false;
-    let mut sent_sigint = false;
-
-    while !done {
-        if let Some(fd) = capture_fd {
-            let mut any = false;
-            while drain_pipe_once(fd, out, &mut partial, &mut live_idx) {
-                any = true;
-            }
-            if any {
-                ui.redraw(out);
-            }
-        }
-
-        match ui.poll_keys() {
-            UiTick::Interrupt if !sent_sigint => {
-                unsafe {
-                    let _ = kill(pid, SIGINT);
-                }
-                if let Some(w) = stdin_w {
-                    let b = [0x03u8];
-                    unsafe {
-                        let _ = write(w, b.as_ptr(), 1);
-                    }
-                }
-                out.push("^C");
-                ui.redraw(out);
-                sent_sigint = true;
-            }
-            UiTick::Data(buf, n) => {
-                if let Some(w) = stdin_w {
-                    unsafe {
-                        let _ = write(w, buf.as_ptr(), n);
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        let w = unsafe { wait_options(pid, WNOHANG) };
-        if w == pid as usize || w == usize::MAX {
-            done = true;
-        }
-
-        if !done {
-            block_on_yield();
-        }
-    }
-
-    if let Some(fd) = capture_fd {
-        loop {
-            if !drain_pipe_once(fd, out, &mut partial, &mut live_idx) {
-                break;
-            }
-            ui.redraw(out);
-        }
-        if !partial.is_empty() {
-            if let Some(i) = live_idx {
-                if i < out.cache.len() {
-                    let _ = i;
-                }
-            } else {
-                out.push(&partial);
-            }
-            ui.redraw(out);
-        }
-        unsafe {
-            close(fd);
-        }
-    }
-    if let Some(w) = stdin_w {
-        unsafe {
-            close(w);
-        }
-    }
-}
-
-/// Tiny yield without pulling Executor into every call site.
-fn block_on_yield() {
-    // One Pending cycle via our runtime helper.
-    libfelix::async_rt::block_on(async {
-        yield_now().await;
-    });
-}
-
-fn run_external(
-    shell: &Shell,
-    cmd: &SimpleCmd,
-    forced_in: i32,
-    forced_out: i32,
-    background: bool,
-    out: &mut TermBuffer,
-    ui: &mut UiBridge<'_>,
-) -> Option<i32> {
-    let name = cmd.args[0].as_str();
-    let full = match shell.find_executable(name) {
-        Some(p) => p,
-        None => {
-            out.push(&format!("{}: command not found", name));
-            return None;
-        }
-    };
-
-    let (mut sin, mut sout) = match open_redirs(shell, &cmd.redirs) {
-        Ok(v) => v,
-        Err(e) => {
-            out.push(&e);
-            return None;
-        }
-    };
-    if forced_in >= 0 {
-        if sin >= 0 {
-            unsafe { close(sin as u32); }
-        }
-        sin = forced_in;
-    }
-    if forced_out >= 0 {
-        if sout >= 0 {
-            unsafe { close(sout as u32); }
-        }
-        sout = forced_out;
-    }
-
-    // A child without explicit stdin gets a private pipe. Foreground jobs are
-    // fed keyboard data by supervise_child(); background jobs get EOF when the
-    // shell closes its writer, so they cannot steal terminal input.
-    let mut stdin_r: i32 = -1;
-    let mut stdin_w: i32 = -1;
-    if sin < 0 {
-        let mut fds = [0u32; 2];
-        if unsafe { pipe(fds.as_mut_ptr()) } == 0 {
-            stdin_r = fds[0] as i32;
-            stdin_w = fds[1] as i32;
-            sin = stdin_r;
-        }
-    }
-
-    let mut capture_r: i32 = -1;
-    let mut capture_w: i32 = -1;
-    let mut serr: i32 = -1;
-
-    if !background {
-        // Foreground stdout/stderr are bridged into this GUI terminal. If
-        // stdout is redirected to a file, only stderr is captured.
-        let mut fds = [0u32; 2];
-        if unsafe { pipe(fds.as_mut_ptr()) } == 0 {
-            capture_r = fds[0] as i32;
-            capture_w = fds[1] as i32;
-            if sout < 0 {
-                sout = capture_w;
-            }
-            serr = capture_w;
-        }
-    }
-    // Background output must never go to an undrained anonymous pipe: a noisy
-    // task would block as soon as PIPE_BUF_SIZE fills. Explicit stdout
-    // redirection is kept; otherwise stdout/stderr use their default console.
-
-    let pid = spawn(&full, sin, sout, serr, &cmd.args);
-
-    if capture_w >= 0 {
-        unsafe { close(capture_w as u32); }
-    }
-
-    // Close only descriptors owned by this invocation. Pipeline fds supplied
-    // through forced_in/forced_out are owned by run_pipeline().
-    if stdin_r >= 0 {
-        unsafe { close(stdin_r as u32); }
-    } else if sin >= 0 && forced_in < 0 {
-        unsafe { close(sin as u32); }
-    }
-    if sout >= 0 && forced_out < 0 && sout != capture_w {
-        unsafe { close(sout as u32); }
-    }
-
-    let Some(p) = pid else {
-        if capture_r >= 0 {
-            unsafe { close(capture_r as u32); }
-        }
-        if stdin_w >= 0 {
-            unsafe { close(stdin_w as u32); }
-        }
-        return None;
-    };
-
-    if background {
-        if capture_r >= 0 {
-            unsafe { close(capture_r as u32); }
-        }
-        if stdin_w >= 0 {
-            unsafe { close(stdin_w as u32); }
-        }
-        return Some(p);
-    }
-
-    let cap = if capture_r >= 0 {
-        Some(capture_r as u32)
-    } else {
-        None
-    };
-    let kin = if stdin_w >= 0 {
-        Some(stdin_w as u32)
-    } else {
-        None
-    };
-    supervise_child(p, cap, kin, out, ui);
-    None
-}
-
-fn split_background(line: &str) -> (&str, bool) {
-    let trimmed = line.trim_end();
-    if let Some(body) = trimmed.strip_suffix('&') {
-        (body.trim_end(), true)
-    } else {
-        (trimmed, false)
-    }
-}
-
-fn has_stdout_redirection(cmd: &SimpleCmd) -> bool {
-    cmd.redirs
-        .iter()
-        .any(|r| r.kind == RedirKind::Out || r.kind == RedirKind::Append)
-}
-
-fn reap_background_jobs(shell: &mut Shell) {
-    let mut i = 0;
-    while i < shell.jobs.len() {
-        let pid = shell.jobs[i].pid;
-        let done = unsafe { wait_options(pid, WNOHANG) } == pid as usize;
-        if done {
-            shell.jobs.remove(i);
-        } else {
-            i += 1;
-        }
-    }
-}
-
-fn run_pipeline(shell: &Shell, stages: &[String], out: &mut TermBuffer, ui: &mut UiBridge<'_>) {
-    let n = stages.len();
-    if n == 0 {
-        return;
-    }
-
-    let mut pipes: Vec<(u32, u32)> = Vec::new();
-    for _ in 0..n.saturating_sub(1) {
-        let mut fds = [0u32; 2];
-        if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
-            out.push("pipe failed");
-            return;
-        }
-        pipes.push((fds[0], fds[1]));
-    }
-
-    let mut pids: Vec<i32> = Vec::new();
-
-    for (i, stage) in stages.iter().enumerate() {
-        let cmd = parse_simple(stage);
-        if cmd.args.is_empty() {
-            continue;
-        }
-        let in_fd: i32 = if i == 0 { -1 } else { pipes[i - 1].0 as i32 };
-        let out_fd: i32 = if i + 1 == n { -1 } else { pipes[i].1 as i32 };
-        let is_last = i + 1 == n;
-
-        // Only the last stage gets live UI supervision + capture.
-        if is_last {
-            let _ = run_external(shell, &cmd, in_fd, -1, false, out, ui);
-        } else {
-            // Intermediate stages: fire-and-forget wait after all spawned.
-            let name = cmd.args[0].as_str();
-            if let Some(full) = shell.find_executable(name) {
-                if let Some(p) = spawn(&full, in_fd, out_fd, -1, &cmd.args) {
-                    pids.push(p);
-                }
-            }
-        }
-    }
-
-    for (r, w) in pipes {
-        unsafe {
-            close(r);
-            close(w);
-        }
-    }
-    for pid in pids {
-        unsafe {
-            let _ = wait(pid);
-        }
-    }
-}
-
-fn interpret(shell: &mut Shell, line: &str, out: &mut TermBuffer, ui: &mut UiBridge<'_>) {
-    let (line, background_requested) = split_background(line);
-    let stages = split_pipeline(line.trim());
-    if stages.is_empty() {
-        return;
-    }
-    if stages.len() == 1 {
-        let cmd = parse_simple(&stages[0]);
-        if cmd.args.is_empty() {
-            return;
-        }
-        if try_builtin(shell, &cmd, out) {
-            return;
-        }
-
-        // Felix shell convenience: an external command with stdout redirected
-        // to a file is detached automatically. `cmd > file &` is also accepted.
-        let background = background_requested || has_stdout_redirection(&cmd);
-        if let Some(pid) = run_external(shell, &cmd, -1, -1, background, out, ui) {
-            shell.jobs.push(BackgroundJob {
-                pid,
-                command: line.to_string(),
-            });
-            out.push(&format!("[{}] started", pid));
-        }
-        return;
-    }
-
-    if background_requested {
-        out.push("background pipelines are not supported yet");
-        return;
-    }
-    run_pipeline(shell, &stages, out, ui);
-}
-
-}
-
-// ---------------------------------------------------------------------------
-// GUI terminal
-// ---------------------------------------------------------------------------
-
-const SCAN_ESC: u8 = 0x01;
-const SCAN_BACKSPACE: u8 = 0x0E;
-const SCAN_TAB: u8 = 0x0F;
-const SCAN_ENTER: u8 = 0x1C;
-const SCAN_A: u8 = 0x1E;
-const SCAN_D: u8 = 0x20;
-const SCAN_E: u8 = 0x12;
-const SCAN_U: u8 = 0x16;
-const SCAN_W: u8 = 0x11;
-const SCAN_K: u8 = 0x25;
-const SCAN_C: u8 = 0x2E;
-const SCAN_Z: u8 = 0x2C;
-const SCAN_HOME: u8 = 0x47;
-const SCAN_UP: u8 = 0x48;
-const SCAN_PGUP: u8 = 0x49;
-const SCAN_LEFT: u8 = 0x4B;
-const SCAN_RIGHT: u8 = 0x4D;
-const SCAN_END: u8 = 0x4F;
-const SCAN_DOWN: u8 = 0x50;
-const SCAN_PGDN: u8 = 0x51;
-const SCAN_DELETE: u8 = 0x53;
 const MAX_INPUT: usize = 1024;
 const CMD_HISTORY_MAX: usize = 64;
-const LINE_MAX_CHARS: usize = 69; // unused for wrap; VT reflows by window cols
 const HIST_PATH: &str = "/home/user/.shell_history";
+
+const BUILTINS: &[&str] = &[
+    "help", "exit", "quit", "pwd", "cd", "ls", "cat", "mkdir", "rmdir", "rm", "mv", "path", "ps",
+    "jobs", "fg", "bg", "kill", "wait", "export", "unset", "env", "set", "clear", "reboot", "echo",
+    "head", "lspci", "ifconfig", "mount", "mounts", "umount", "audiotest",
+];
 
 fn load_cmd_history() -> Vec<String> {
     let mut f = match File::open_ro(HIST_PATH) {
@@ -1922,15 +1419,6 @@ fn save_cmd_history(hist: &[String]) {
     let _ = f.write(buf.as_bytes());
 }
 
-/// Keep the **start** of the line (bus addr / prompt), not the tail.
-fn truncate_line(s: &str) -> &str {
-    s
-}
-
-fn refresh_terminal(win: &mut Window, term: &TermBuffer) {
-    term.draw(win);
-}
-
 fn redraw_editor(term: &mut TermBuffer, shell: &Shell, editor: &LineEditor) {
     term.write_bytes(b"\r\x1b[2K");
     term.write_bytes(shell.prompt().as_bytes());
@@ -1941,255 +1429,383 @@ fn redraw_editor(term: &mut TermBuffer, shell: &Shell, editor: &LineEditor) {
     }
 }
 
-fn wait_for_activity() {
-    // WM polling is non-blocking.  A plain sched_yield leaves the shell
-    // runnable, so an otherwise idle shell is immediately selected again and
-    // consumes an entire CPU.  Sleep briefly to let the scheduler run its idle
-    // task while keeping keyboard and mouse latency low.
-    unsafe { syscall::sys_sleep(10); }
+fn editor_termios(original: syscall::Termios) -> syscall::Termios {
+    let mut t = original;
+    t.c_lflag &= !(syscall::LFLAG_ICANON | syscall::LFLAG_ECHO | syscall::LFLAG_ISIG);
+    t.c_cc[syscall::VMIN] = 1;
+    t.c_cc[syscall::VTIME] = 0;
+    t
 }
 
-const BUILTINS: &[&str] = &[
-    "help", "exit", "quit", "pwd", "cd", "ls", "cat", "mkdir", "rmdir", "rm", "mv", "path", "ps",
-    "jobs", "fg", "bg", "kill", "wait", "export", "unset", "env", "set", "clear", "echo",
-    "head", "lspci", "ifconfig", "mount", "mounts", "umount",
-];
+#[derive(Clone, Copy)]
+enum InputKey {
+    Char(char),
+    Enter,
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    Tab,
+    Ctrl(u8),
+    PageUp,
+    PageDown,
+}
+
+struct InputDecoder {
+    esc: [u8; 8],
+    esc_len: usize,
+    utf8: [u8; 4],
+    utf8_len: usize,
+    utf8_need: usize,
+}
+
+impl InputDecoder {
+    fn new() -> Self {
+        Self {
+            esc: [0; 8],
+            esc_len: 0,
+            utf8: [0; 4],
+            utf8_len: 0,
+            utf8_need: 0,
+        }
+    }
+
+    fn feed(&mut self, b: u8) -> Option<InputKey> {
+        if self.utf8_need != 0 {
+            if self.utf8_len >= self.utf8.len() || (b & 0xc0) != 0x80 {
+                self.utf8_len = 0;
+                self.utf8_need = 0;
+                return None;
+            }
+            self.utf8[self.utf8_len] = b;
+            self.utf8_len += 1;
+            if self.utf8_len == self.utf8_need {
+                let result = core::str::from_utf8(&self.utf8[..self.utf8_len])
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                    .map(InputKey::Char);
+                self.utf8_len = 0;
+                self.utf8_need = 0;
+                return result;
+            }
+            return None;
+        }
+
+        if self.esc_len != 0 {
+            if self.esc_len < self.esc.len() {
+                self.esc[self.esc_len] = b;
+                self.esc_len += 1;
+            } else {
+                self.esc_len = 0;
+                return None;
+            }
+
+            let seq = &self.esc[..self.esc_len];
+            let done = b.is_ascii_alphabetic() || b == b'~';
+            if !done {
+                return None;
+            }
+            let key = match seq {
+                [0x1b, b'[', b'A'] | [0x1b, b'O', b'A'] => Some(InputKey::Up),
+                [0x1b, b'[', b'B'] | [0x1b, b'O', b'B'] => Some(InputKey::Down),
+                [0x1b, b'[', b'C'] | [0x1b, b'O', b'C'] => Some(InputKey::Right),
+                [0x1b, b'[', b'D'] | [0x1b, b'O', b'D'] => Some(InputKey::Left),
+                [0x1b, b'[', b'H'] | [0x1b, b'O', b'H'] | [0x1b, b'[', b'1', b'~'] => Some(InputKey::Home),
+                [0x1b, b'[', b'F'] | [0x1b, b'O', b'F'] | [0x1b, b'[', b'4', b'~'] => Some(InputKey::End),
+                [0x1b, b'[', b'3', b'~'] => Some(InputKey::Delete),
+                [0x1b, b'[', b'5', b'~'] => Some(InputKey::PageUp),
+                [0x1b, b'[', b'6', b'~'] => Some(InputKey::PageDown),
+                _ => None,
+            };
+            self.esc_len = 0;
+            return key;
+        }
+
+        match b {
+            0x1b => {
+                self.esc[0] = 0x1b;
+                self.esc_len = 1;
+                None
+            }
+            b'\r' | b'\n' => Some(InputKey::Enter),
+            0x08 | 0x7f => Some(InputKey::Backspace),
+            b'\t' => Some(InputKey::Tab),
+            0x01..=0x1a => Some(InputKey::Ctrl(b)),
+            0x20..=0x7e => Some(InputKey::Char(b as char)),
+            0xc2..=0xdf => {
+                self.utf8[0] = b;
+                self.utf8_len = 1;
+                self.utf8_need = 2;
+                None
+            }
+            0xe0..=0xef => {
+                self.utf8[0] = b;
+                self.utf8_len = 1;
+                self.utf8_need = 3;
+                None
+            }
+            0xf0..=0xf4 => {
+                self.utf8[0] = b;
+                self.utf8_len = 1;
+                self.utf8_need = 4;
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+fn handle_key(
+    key: InputKey,
+    shell: &mut Shell,
+    editor: &mut LineEditor,
+    term: &mut TermBuffer,
+    cmd_hist: &mut Vec<String>,
+    hist_pos: &mut Option<usize>,
+    draft: &mut String,
+    cooked: Option<syscall::Termios>,
+) {
+    let edited = match key {
+        InputKey::Ctrl(0x01) => editor.home(),
+        InputKey::Ctrl(0x05) => editor.end(),
+        InputKey::Ctrl(0x15) => editor.kill_before(),
+        InputKey::Ctrl(0x0b) => editor.kill_after(),
+        InputKey::Ctrl(0x17) => editor.delete_prev_word(),
+        _ => false,
+    };
+    if edited {
+        *hist_pos = None;
+        redraw_editor(term, shell, editor);
+        return;
+    }
+
+    match key {
+        InputKey::Ctrl(0x03) => {
+            editor.clear();
+            term.write_bytes(b"^C\n");
+            *hist_pos = None;
+            draft.clear();
+            shell.last_status = 130;
+            redraw_editor(term, shell, editor);
+        }
+        InputKey::Ctrl(0x04) if editor.text().is_empty() => {
+            shell.should_exit = true;
+        }
+        InputKey::Ctrl(0x04) => {
+            if editor.delete() {
+                *hist_pos = None;
+                redraw_editor(term, shell, editor);
+            }
+        }
+        InputKey::Enter => {
+            let cmd = editor.take();
+            let trimmed = cmd.trim();
+            if !trimmed.is_empty() && cmd_hist.last().map(|s| s.as_str()) != Some(trimmed) {
+                cmd_hist.push(trimmed.to_string());
+                if cmd_hist.len() > CMD_HISTORY_MAX {
+                    cmd_hist.remove(0);
+                }
+                save_cmd_history(cmd_hist);
+            }
+            *hist_pos = None;
+            draft.clear();
+            term.write_bytes(b"\n");
+            if !trimmed.is_empty() {
+                if let Some(t) = cooked.as_ref() {
+                    let _ = unsafe { syscall::tcsetattr(0, t as *const _) };
+                }
+                interpret(shell, &cmd, term);
+                if let Some(t) = cooked {
+                    let editor_mode = editor_termios(t);
+                    let _ = unsafe { syscall::tcsetattr(0, &editor_mode as *const _) };
+                }
+            }
+            if !shell.should_exit {
+                redraw_editor(term, shell, editor);
+            }
+        }
+        InputKey::Left => {
+            if editor.left() { redraw_editor(term, shell, editor); }
+        }
+        InputKey::Right => {
+            if editor.right() { redraw_editor(term, shell, editor); }
+        }
+        InputKey::Home => {
+            if editor.home() { redraw_editor(term, shell, editor); }
+        }
+        InputKey::End => {
+            if editor.end() { redraw_editor(term, shell, editor); }
+        }
+        InputKey::Delete => {
+            if editor.delete() {
+                *hist_pos = None;
+                redraw_editor(term, shell, editor);
+            }
+        }
+        InputKey::Backspace => {
+            if editor.backspace() {
+                *hist_pos = None;
+                redraw_editor(term, shell, editor);
+            }
+        }
+        InputKey::Up => {
+            if !cmd_hist.is_empty() {
+                let next = match *hist_pos {
+                    None => {
+                        *draft = editor.text().to_string();
+                        cmd_hist.len() - 1
+                    }
+                    Some(0) => 0,
+                    Some(i) => i - 1,
+                };
+                *hist_pos = Some(next);
+                editor.set(cmd_hist[next].clone());
+                redraw_editor(term, shell, editor);
+            }
+        }
+        InputKey::Down => {
+            if let Some(i) = *hist_pos {
+                if i + 1 < cmd_hist.len() {
+                    *hist_pos = Some(i + 1);
+                    editor.set(cmd_hist[i + 1].clone());
+                } else {
+                    *hist_pos = None;
+                    editor.set(draft.clone());
+                }
+                redraw_editor(term, shell, editor);
+            }
+        }
+        InputKey::Tab => {
+            let cursor = editor.cursor();
+            let prefix = editor.text()[..cursor].to_string();
+            let suffix = editor.text()[cursor..].to_string();
+            match handle_tab_completion(shell, &prefix, term) {
+                CompletionResult::None => {}
+                CompletionResult::Replace(new_prefix) => {
+                    let new_cursor = new_prefix.len();
+                    let mut full = new_prefix;
+                    full.push_str(&suffix);
+                    editor.set_with_cursor(full, new_cursor);
+                    redraw_editor(term, shell, editor);
+                }
+                CompletionResult::Listed => redraw_editor(term, shell, editor),
+            }
+        }
+        InputKey::Char(ch) if editor.text().len() < MAX_INPUT => {
+            editor.insert(ch);
+            *hist_pos = None;
+            redraw_editor(term, shell, editor);
+        }
+        InputKey::PageUp | InputKey::PageDown | InputKey::Ctrl(_) | InputKey::Char(_) => {}
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
+    let argv: Vec<String> = args().map(|arg| arg.to_string()).collect();
+    if argv.get(1).map(|arg| arg.as_str()) == Some("--builtin") {
+        let mut shell = Shell::new();
+        let mut term = TermBuffer::new();
+        let builtin_args = argv.into_iter().skip(2).collect();
+        return run_builtin_argv(&mut shell, builtin_args, &mut term);
+    }
+    if argv.get(1).map(|arg| arg.as_str()) == Some("-c") {
+        let command = argv[2..].join(" ");
+        let mut shell = Shell::new();
+        let mut term = TermBuffer::new();
+        interpret(&mut shell, &command, &mut term);
+        return shell.last_status;
+    }
+
     let shell_pid = unsafe { getpid() };
-    println!("shell: userspace main started pid={}", shell_pid);
-
-    let mut win = Window::create(30, 30, 640, 400, "Felix Shell").unwrap_or_else(|| {
-        Window::create(40, 40, 480, 320, "Felix Shell").expect("wm_create failed")
-    });
-
-    let mut shell = Shell::new();
-    // Become our own process group so foreground jobs can be handed the GUI tty
-    // and the shell can reclaim it afterwards.
     let _ = unsafe { setpgid(0, shell_pid) };
-    let shell_pgid = unsafe { getpgrp() };
-    let _ = unsafe { tty_setfg(shell_pgid) };
-    let mut term = TermBuffer::new(&win);
+
+    // An interactive shell that was started in the background must not touch
+    // the shared terminal modes until its process group becomes foreground.
+    // The parent shell will later tcsetpgrp()+SIGCONT it from `fg`.
+    loop {
+        let shell_pgid = unsafe { getpgrp() };
+        let foreground_pgid = unsafe { syscall::tcgetpgrp(0) };
+        if foreground_pgid < 0 || foreground_pgid == shell_pgid {
+            break;
+        }
+        unsafe {
+            let _ = kill(-shell_pgid, syscall::SIGTTIN);
+        }
+    }
+
+    println!("shell: userspace main started pid={}", shell_pid);
+    let mut shell = Shell::new();
+    let mut term = TermBuffer::new();
     let mut editor = LineEditor::new();
-    let mut cmd_hist: Vec<String> = load_cmd_history();
-    let mut hist_pos: Option<usize> = None;
+    let mut decoder = InputDecoder::new();
+    let mut cmd_hist = load_cmd_history();
+    let mut hist_pos = None;
     let mut draft = String::new();
+
+    let mut cooked = syscall::Termios::default();
+    let has_tty = unsafe { syscall::tcgetattr(0, &mut cooked as *mut _) } != usize::MAX;
+    let cooked = has_tty.then_some(cooked);
+    if let Some(t) = cooked {
+        let editor_mode = editor_termios(t);
+        let _ = unsafe { syscall::tcsetattr(0, &editor_mode as *const _) };
+    }
 
     term.push("=== Felix User Shell ===");
     term.push("Tab paths · arrows edit/history · Ctrl+C/Z · Ctrl+A/E/U/K/W · help");
     term.push("");
     redraw_editor(&mut term, &shell, &editor);
-    refresh_terminal(&mut win, &term);
-    let _ = win.flip();
 
-    loop {
-        let mut dirty = false;
-
-        // Background pipelines are reaped continuously, not only when the next
-        // command is entered. This is important with Felix's small task table.
+    let mut input = [0u8; 128];
+    while !shell.should_exit {
         if poll_background_jobs(&mut shell, &mut term) {
             redraw_editor(&mut term, &shell, &editor);
-            dirty = true;
         }
 
-        let mut evbuf = [WmEvent::default(); 64];
-        let n = win.poll_events(&mut evbuf);
-        for e in &evbuf[..n] {
-            if e.kind == EV_RESIZE {
-                term.resize_to(&win);
-                dirty = true;
-                continue;
-            }
-            if e.kind != EV_KEY_DOWN {
-                continue;
-            }
-
-            let scancode = e.a as u8;
-            let ch = e.b as u8;
-            let mods = e.c as u8;
-            let ctrl = (mods & 2) != 0;
-
-            // readline-like editing controls.
-            let edited = if ctrl && scancode == SCAN_A {
-                editor.home()
-            } else if ctrl && scancode == SCAN_E {
-                editor.end()
-            } else if ctrl && scancode == SCAN_U {
-                editor.kill_before()
-            } else if ctrl && scancode == SCAN_K {
-                editor.kill_after()
-            } else if ctrl && scancode == SCAN_W {
-                editor.delete_prev_word()
-            } else {
-                false
-            };
-            if edited {
-                hist_pos = None;
-                redraw_editor(&mut term, &shell, &editor);
-                dirty = true;
-                continue;
-            }
-
-            if ctrl && scancode == SCAN_C {
-                if !editor.text().is_empty() {
-                    editor.clear();
-                    term.write_bytes(b"^C\r\n");
-                    redraw_editor(&mut term, &shell, &editor);
-                    hist_pos = None;
-                    draft.clear();
-                    dirty = true;
-                }
-                continue;
-            }
-            if ctrl && scancode == SCAN_D && editor.text().is_empty() {
-                shell.last_status = 0;
-                shell.should_exit = true;
-            }
-            if shell.should_exit {
-                break;
-            }
-
-            match scancode {
-                SCAN_ENTER => {
-                    let cmd = editor.take();
-                    let trimmed = cmd.trim();
-                    if !trimmed.is_empty() && cmd_hist.last().map(|s| s.as_str()) != Some(trimmed) {
-                        cmd_hist.push(trimmed.to_string());
-                        if cmd_hist.len() > CMD_HISTORY_MAX {
-                            cmd_hist.remove(0);
-                        }
-                        save_cmd_history(&cmd_hist);
-                    }
-                    hist_pos = None;
-                    draft.clear();
-                    term.write_bytes(b"\r\n");
-                    refresh_terminal(&mut win, &term);
-                    let _ = win.flip();
-                    if !trimmed.is_empty() {
-                        interpret(&mut shell, &cmd, &mut term, &mut win);
-                    }
-                    if shell.should_exit {
-                        break;
-                    }
-                    redraw_editor(&mut term, &shell, &editor);
-                    dirty = true;
-                }
-                SCAN_PGUP => {
-                    term.scroll(8);
-                    dirty = true;
-                }
-                SCAN_PGDN => {
-                    term.scroll(-8);
-                    dirty = true;
-                }
-                SCAN_LEFT => {
-                    if editor.left() {
-                        redraw_editor(&mut term, &shell, &editor);
-                        dirty = true;
-                    }
-                }
-                SCAN_RIGHT => {
-                    if editor.right() {
-                        redraw_editor(&mut term, &shell, &editor);
-                        dirty = true;
-                    }
-                }
-                SCAN_HOME => {
-                    if editor.home() {
-                        redraw_editor(&mut term, &shell, &editor);
-                        dirty = true;
-                    }
-                }
-                SCAN_END => {
-                    if editor.end() {
-                        redraw_editor(&mut term, &shell, &editor);
-                        dirty = true;
-                    }
-                }
-                SCAN_DELETE => {
-                    if editor.delete() {
-                        hist_pos = None;
-                        redraw_editor(&mut term, &shell, &editor);
-                        dirty = true;
-                    }
-                }
-                SCAN_BACKSPACE => {
-                    if editor.backspace() {
-                        hist_pos = None;
-                        redraw_editor(&mut term, &shell, &editor);
-                        dirty = true;
-                    }
-                }
-                SCAN_UP => {
-                    if !cmd_hist.is_empty() {
-                        let next = match hist_pos {
-                            None => {
-                                draft = editor.text().to_string();
-                                cmd_hist.len() - 1
-                            }
-                            Some(0) => 0,
-                            Some(i) => i - 1,
-                        };
-                        hist_pos = Some(next);
-                        editor.set(cmd_hist[next].clone());
-                        redraw_editor(&mut term, &shell, &editor);
-                        dirty = true;
-                    }
-                }
-                SCAN_DOWN => {
-                    if let Some(i) = hist_pos {
-                        if i + 1 < cmd_hist.len() {
-                            hist_pos = Some(i + 1);
-                            editor.set(cmd_hist[i + 1].clone());
-                        } else {
-                            hist_pos = None;
-                            editor.set(draft.clone());
-                        }
-                        redraw_editor(&mut term, &shell, &editor);
-                        dirty = true;
-                    }
-                }
-                SCAN_TAB => {
-                    let cursor = editor.cursor();
-                    let prefix = editor.text()[..cursor].to_string();
-                    let suffix = editor.text()[cursor..].to_string();
-                    match handle_tab_completion(&mut shell, &prefix, &mut term) {
-                        CompletionResult::None => {}
-                        CompletionResult::Replace(new_prefix) => {
-                            let new_cursor = new_prefix.len();
-                            let mut full = new_prefix;
-                            full.push_str(&suffix);
-                            editor.set_with_cursor(full, new_cursor);
-                            redraw_editor(&mut term, &shell, &editor);
-                            dirty = true;
-                        }
-                        CompletionResult::Listed => {
-                            redraw_editor(&mut term, &shell, &editor);
-                            dirty = true;
-                        }
-                    }
-                }
-                _ if ch >= 0x20 && ch < 0x7f && editor.text().len() < MAX_INPUT => {
-                    editor.insert(ch as char);
-                    hist_pos = None;
-                    redraw_editor(&mut term, &shell, &editor);
-                    dirty = true;
-                }
-                _ => {}
-            }
+        let mut pfd = syscall::PollFd {
+            fd: 0,
+            events: syscall::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { syscall::poll(&mut pfd as *mut _, 1, 20) };
+        if ready == 0 || ready == usize::MAX || (pfd.revents & syscall::POLLIN) == 0 {
+            continue;
         }
 
-        if shell.should_exit {
+        let n = unsafe { read(0, input.as_mut_ptr(), input.len()) };
+        if n == 0 {
+            shell.should_exit = true;
             break;
         }
-        if dirty {
-            refresh_terminal(&mut win, &term);
-            let _ = win.flip();
-        } else {
-            wait_for_activity();
+        if n == usize::MAX {
+            continue;
+        }
+        for &b in &input[..n] {
+            if let Some(key) = decoder.feed(b) {
+                handle_key(
+                    key,
+                    &mut shell,
+                    &mut editor,
+                    &mut term,
+                    &mut cmd_hist,
+                    &mut hist_pos,
+                    &mut draft,
+                    cooked,
+                );
+                if shell.should_exit {
+                    break;
+                }
+            }
         }
     }
 
+    if let Some(t) = cooked {
+        let _ = unsafe { syscall::tcsetattr(0, &t as *const _) };
+    }
+    term.write_bytes(b"\n");
     shell.last_status
 }
