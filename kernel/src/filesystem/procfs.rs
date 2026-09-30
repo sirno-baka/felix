@@ -3,6 +3,7 @@
 //! Layout:
 //!   /proc/uptime
 //!   /proc/stat
+//!   /proc/meminfo
 //!   /proc/interrupts
 //!   /proc/mounts
 //!   /proc/<pid>/status
@@ -14,13 +15,14 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::filesystem::vfs::{DirEntry, Filesystem, Metadata, MOUNT_REGISTRY};
-use crate::multitasking::task::{Task, TASK_MANAGER};
+use crate::multitasking::task::{Task, TaskState, TASK_MANAGER};
 
 const INO_ROOT: u32 = 1;
 const INO_UPTIME: u32 = 2;
 const INO_MOUNTS: u32 = 3;
 const INO_STAT: u32 = 4;
 const INO_INTERRUPTS: u32 = 5;
+const INO_MEMINFO: u32 = 6;
 const PID_BASE: u32 = 0x0001_0000;
 const PID_STRIDE: u32 = 8;
 
@@ -77,14 +79,19 @@ impl ProcFs {
     }
 
     fn status(task: &Task) -> Vec<u8> {
+        let cpu = match task.state {
+            TaskState::Running(cpu) => cpu as i32,
+            _ => -1,
+        };
         format!(
-            "Name:\t{}\nState:\t{}\nPid:\t{}\nPPid:\t{}\nPGid:\t{}\nSid:\t{}\nTty:\t{}\nCwd:\t{}\nExitCode:\t{}\n",
+            "Name:\t{}\nState:\t{}\nPid:\t{}\nPPid:\t{}\nPGid:\t{}\nSid:\t{}\nCpu:\t{}\nTty:\t{}\nCwd:\t{}\nExitCode:\t{}\n",
             Self::task_name(task),
             Self::state_char(task),
             task.pid,
             task.ppid,
             task.pgid,
             task.sid,
+            cpu,
             task.tty_id,
             task.cwd,
             task.exit_code,
@@ -145,6 +152,15 @@ impl ProcFs {
         out.into_bytes()
     }
 
+    fn meminfo() -> Vec<u8> {
+        let mem = crate::memory::paging::memory_stats();
+        format!(
+            "MemTotal:\t{} kB\nMemManaged:\t{} kB\nMemFree:\t{} kB\nMemUsed:\t{} kB\n",
+            mem.total_kib, mem.managed_kib, mem.free_kib, mem.used_kib
+        )
+        .into_bytes()
+    }
+
     fn cpu_stat() -> Vec<u8> {
         let count = crate::smp::online_cpu_count();
         let mut rows = Vec::with_capacity(count);
@@ -190,6 +206,7 @@ impl ProcFs {
             }
             INO_MOUNTS => Some(Self::mounts()),
             INO_STAT => Some(Self::cpu_stat()),
+            INO_MEMINFO => Some(Self::meminfo()),
             INO_INTERRUPTS => Some(Self::interrupts()),
             _ => {
                 let (pid, kind) = Self::decode_pid_inode(inode)?;
@@ -217,6 +234,9 @@ impl ProcFs {
         }
         if clean == "stat" {
             return Some(INO_STAT);
+        }
+        if clean == "meminfo" {
+            return Some(INO_MEMINFO);
         }
         if clean == "interrupts" {
             return Some(INO_INTERRUPTS);
@@ -283,6 +303,12 @@ impl Filesystem for ProcFs {
             out.push(DirEntry {
                 inode: INO_INTERRUPTS,
                 name: "interrupts".to_string(),
+                file_type: 1,
+                size: 0,
+            });
+            out.push(DirEntry {
+                inode: INO_MEMINFO,
+                name: "meminfo".to_string(),
                 file_type: 1,
                 size: 0,
             });

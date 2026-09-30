@@ -97,6 +97,26 @@ pub fn find_ext2_part_lba() -> u32 {
     2048
 }
 
+/// Number of sectors occupied by the Felix image according to the MBR.
+/// This intentionally ignores the physical capacity reported by a USB stick:
+/// writing a 64 MiB disk.img to a 32 GiB stick must still copy only 64 MiB.
+pub fn image_sectors_from_mbr() -> Option<u32> {
+    let mbr = 0x7C00u16 as *const u8;
+    unsafe {
+        for i in 0..4 {
+            let entry = mbr.add(0x1BE + i * 16);
+            if *entry.add(4) == 0x83 {
+                let start = ru32(entry.add(8));
+                let len = ru32(entry.add(12));
+                if start != 0 && len != 0 {
+                    return start.checked_add(len);
+                }
+            }
+        }
+    }
+    None
+}
+
 impl Ext2Fs {
     pub fn mount(part_lba: u32, buf: u16) -> Option<Self> {
         print!("[ext2] superblock...");
@@ -171,6 +191,25 @@ impl Ext2Fs {
         unsafe {
             DISK.init(self.block_to_lba(block) as u64, self.buf);
             DISK.read_sectors(self.sectors_per_block(), dest);
+        }
+    }
+
+    fn read_block_run_to_high(&self, first_block: u32, blocks: u32, dest: u32) {
+        if first_block == 0 || blocks == 0 {
+            return;
+        }
+
+        if crate::disk::fast_high_reads() {
+            let sectors = blocks * self.sectors_per_block() as u32;
+            unsafe {
+                DISK.read_extent_to_high(self.block_to_lba(first_block) as u64, sectors, dest);
+            }
+            return;
+        }
+
+        // Legacy IDE/PXE: retain the old one-ext2-block-at-a-time behavior.
+        for i in 0..blocks {
+            self.read_block_to_high(first_block + i, dest + i * self.block_size);
         }
     }
 
@@ -249,33 +288,49 @@ impl Ext2Fs {
         let mut written = 0u32;
         let mut dest_ptr = dest;
 
-        for i in 0..12 {
-            if written >= size {
+        let mut i = 0usize;
+        while i < 12 && written < size {
+            let first = inode.blocks[i];
+            if first == 0 {
                 break;
             }
-            let b = inode.blocks[i];
-            if b == 0 {
-                break;
+            let mut count = 1usize;
+            while i + count < 12 {
+                let next = inode.blocks[i + count];
+                if next == 0 || next != first + count as u32 {
+                    break;
+                }
+                count += 1;
             }
-            self.read_block_to_high(b, dest_ptr);
-            written += core::cmp::min(self.block_size, size - written);
-            dest_ptr += self.block_size;
+            self.read_block_run_to_high(first, count as u32, dest_ptr);
+            let span = count as u32 * self.block_size;
+            written += core::cmp::min(span, size - written);
+            dest_ptr += span;
+            i += count;
         }
 
         if written < size && inode.blocks[12] != 0 {
             if self.read_block_low(inode.blocks[12], INDIRECT_BUF) {
                 let entries = (self.block_size / 4) as usize;
-                for i in 0..entries {
-                    if written >= size {
+                let mut i = 0usize;
+                while i < entries && written < size {
+                    let first = ru32((INDIRECT_BUF as usize + i * 4) as *const u8);
+                    if first == 0 {
                         break;
                     }
-                    let b = ru32((INDIRECT_BUF as usize + i * 4) as *const u8);
-                    if b == 0 {
-                        break;
+                    let mut count = 1usize;
+                    while i + count < entries {
+                        let next = ru32((INDIRECT_BUF as usize + (i + count) * 4) as *const u8);
+                        if next == 0 || next != first + count as u32 {
+                            break;
+                        }
+                        count += 1;
                     }
-                    self.read_block_to_high(b, dest_ptr);
-                    written += core::cmp::min(self.block_size, size - written);
-                    dest_ptr += self.block_size;
+                    self.read_block_run_to_high(first, count as u32, dest_ptr);
+                    let span = count as u32 * self.block_size;
+                    written += core::cmp::min(span, size - written);
+                    dest_ptr += span;
+                    i += count;
                 }
             }
         }

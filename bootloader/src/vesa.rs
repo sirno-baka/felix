@@ -161,7 +161,11 @@ pub unsafe fn init_vesa() -> bool {
             if bpp != 16 && bpp != 24 && bpp != 32 {
                 continue;
             }
-            if w < 640 || h < 400 || w > 1600 || h > 900 {
+            // Modern CSM/VBE implementations commonly expose 1920x1080.
+            // Keep the fallback search bounded to laptop-sized modes so a BIOS
+            // advertising 2560/4K compatibility modes does not consume nearly
+            // the whole 16 MiB Felix MMIO VA window with one framebuffer.
+            if w < 640 || h < 400 || w > 1920 || h > 1200 {
                 continue;
             }
 
@@ -174,8 +178,10 @@ pub unsafe fn init_vesa() -> bool {
             if fb != 0 {
                 s += 10_000;
             }
-            // Pitch is often 0 until 4F02 on OEM ATI. Still try native-wide modes.
-            let wide = w >= 1280 && h >= 560 && h <= 800;
+            // Pitch is often 0 until 4F02 on some firmware. Pick the best
+            // laptop-sized wide mode by the normal score, without any
+            // machine-specific resolution preference.
+            let wide = w >= 1024 && h >= 560 && h <= 1200;
             if wide && s > wide_score {
                 wide_score = s;
                 wide_mode = mode;

@@ -4,6 +4,7 @@
 //! starts each application processor with INIT/SIPI, and gives every online CPU
 //! a private stack, timer and scheduler entry point.
 
+use alloc::alloc::{Layout, alloc};
 use alloc::collections::VecDeque;
 use core::arch::{asm, global_asm, naked_asm};
 use core::ptr::{
@@ -14,7 +15,8 @@ use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, Ordering};
 use crate::memory::paging::{KERNEL_PD_PHYS, phys_to_virt};
 use crate::memory::resources::{ResourceKind, ioremap, iounmap, reserve_and_ioremap};
 
-const MAX_CPUS: usize = 8;
+const MAX_CPUS: usize = 64;
+const CPU_MASK_WORDS: usize = (MAX_CPUS + 31) / 32;
 const AP_STACK_SIZE: usize = 16 * 1024;
 const TRAMPOLINE_PHYS: u32 = 0x0000_8000;
 const TRAMPOLINE_VECTOR: u32 = TRAMPOLINE_PHYS >> 12;
@@ -41,14 +43,14 @@ pub const TLB_IPI_VECTOR: u8 = 0xf2;
 const AP_TIMER_PERIODIC: u32 = 1 << 17;
 const LVT_DELIVERY_EXTINT: u32 = 0x7 << 8;
 
-#[repr(C, align(16))]
-struct ApStacks([[u8; AP_STACK_SIZE]; MAX_CPUS]);
-
-static mut AP_STACKS: ApStacks = ApStacks([[0; AP_STACK_SIZE]; MAX_CPUS]);
+static AP_STACKS_BASE: AtomicU32 = AtomicU32::new(0);
 static mut AP_GDTS: [crate::gdt::PerCpuGdt; MAX_CPUS] =
     [const { crate::gdt::PerCpuGdt::new() }; MAX_CPUS];
 static AP_ONLINE: AtomicU32 = AtomicU32::new(1);
-static ONLINE_MASK: AtomicU32 = AtomicU32::new(1);
+static ONLINE_MASK: [AtomicU32; CPU_MASK_WORDS] = [
+    AtomicU32::new(1),
+    AtomicU32::new(0),
+];
 static LAPIC_VIRT: AtomicU32 = AtomicU32::new(0);
 static CPU_APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
 static AP_TIMER_TICKS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
@@ -59,7 +61,10 @@ static WORK_QUEUE: interrupt_sync::SpinMutex<VecDeque<SmpJob>> =
     interrupt_sync::SpinMutex::new(VecDeque::new());
 static WORK_SUBMITTED: AtomicU32 = AtomicU32::new(0);
 static WORK_COMPLETED: AtomicU32 = AtomicU32::new(0);
-static WORK_CPU_MASK: AtomicU32 = AtomicU32::new(0);
+static WORK_CPU_MASK: [AtomicU32; CPU_MASK_WORDS] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
 static USER_SCHEDULING: AtomicBool = AtomicBool::new(false);
 static CURRENT_TASK: [AtomicI8; MAX_CPUS] = [const { AtomicI8::new(-1) }; MAX_CPUS];
 static CURRENT_CR3: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
@@ -68,6 +73,53 @@ static TLB_TARGET_CR3: AtomicU32 = AtomicU32::new(0);
 static TLB_TARGET_PAGE: AtomicU32 = AtomicU32::new(0);
 static TLB_EPOCH: AtomicU32 = AtomicU32::new(0);
 static TLB_ACK_EPOCH: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+
+#[inline]
+fn cpu_mask_test(mask: &[AtomicU32; CPU_MASK_WORDS], cpu: usize, order: Ordering) -> bool {
+    if cpu >= MAX_CPUS {
+        return false;
+    }
+    let word = cpu >> 5;
+    let bit = cpu & 31;
+    mask[word].load(order) & (1u32 << bit) != 0
+}
+
+#[inline]
+fn cpu_mask_set(mask: &[AtomicU32; CPU_MASK_WORDS], cpu: usize, order: Ordering) {
+    if cpu < MAX_CPUS {
+        let word = cpu >> 5;
+        let bit = cpu & 31;
+        mask[word].fetch_or(1u32 << bit, order);
+    }
+}
+
+fn allocate_ap_stacks() -> Result<(), &'static str> {
+    if AP_STACKS_BASE.load(Ordering::Acquire) != 0 {
+        return Ok(());
+    }
+    let size = AP_STACK_SIZE
+        .checked_mul(MAX_CPUS)
+        .ok_or("AP stack allocation size overflow")?;
+    let layout = Layout::from_size_align(size, 16).map_err(|_| "invalid AP stack layout")?;
+    let ptr = unsafe { alloc(layout) };
+    if ptr.is_null() {
+        return Err("out of kernel heap for AP stacks");
+    }
+    AP_STACKS_BASE.store(ptr as u32, Ordering::Release);
+    Ok(())
+}
+
+#[inline]
+fn ap_stack_top(slot: usize) -> Option<u32> {
+    if slot >= MAX_CPUS {
+        return None;
+    }
+    let base = AP_STACKS_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return None;
+    }
+    base.checked_add(((slot + 1) * AP_STACK_SIZE) as u32)
+}
 
 #[derive(Clone, Copy)]
 struct SmpJob {
@@ -96,7 +148,7 @@ fn run_pending_work(cpu_slot: usize) -> bool {
         return false;
     };
     (job.function)(job.argument, cpu_slot);
-    WORK_CPU_MASK.fetch_or(1 << cpu_slot, Ordering::Relaxed);
+    cpu_mask_set(&WORK_CPU_MASK, cpu_slot, Ordering::Relaxed);
     WORK_COMPLETED.fetch_add(1, Ordering::Release);
     true
 }
@@ -126,10 +178,11 @@ fn verify_parallel_work(ap_count: usize) {
         core::hint::spin_loop();
     }
     crate::println!(
-        "[smp] worker test: completed={}/{} cpu-mask={:#x}",
+        "[smp] worker test: completed={}/{} cpu-mask={:08x}:{:08x}",
         WORK_COMPLETED.load(Ordering::Acquire) - before,
         ap_count,
-        WORK_CPU_MASK.load(Ordering::Acquire)
+        WORK_CPU_MASK[1].load(Ordering::Acquire),
+        WORK_CPU_MASK[0].load(Ordering::Acquire)
     );
 }
 
@@ -428,7 +481,7 @@ pub fn cpu_slot_count() -> usize {
 }
 
 pub fn cpu_times(cpu: usize) -> Option<CpuTimes> {
-    if cpu >= MAX_CPUS || ONLINE_MASK.load(Ordering::Acquire) & (1 << cpu) == 0 {
+    if !cpu_mask_test(&ONLINE_MASK, cpu, Ordering::Acquire) {
         return None;
     }
     Some(CpuTimes {
@@ -750,7 +803,7 @@ pub fn shootdown_tlb(page_dir_phys: u32, page: u32) -> bool {
     let mut target_apics = [0u8; MAX_CPUS];
     let mut count = 0usize;
     for cpu in 0..MAX_CPUS {
-        if ONLINE_MASK.load(Ordering::Acquire) & (1 << cpu) != 0
+        if cpu_mask_test(&ONLINE_MASK, cpu, Ordering::Acquire)
             && cpu != sender
             && CURRENT_CR3[cpu].load(Ordering::Acquire) == page_dir_phys
         {
@@ -907,6 +960,10 @@ pub fn init() {
         crate::println!("[smp] one processor reported");
         return;
     }
+    if let Err(e) = allocate_ap_stacks() {
+        crate::println!("[smp] {}", e);
+        return;
+    }
 
     let lapic = match reserve_and_ioremap(
         info.lapic_phys as u64,
@@ -958,7 +1015,10 @@ pub fn init() {
         for slot in 1..logical {
             let apic_id = CPU_APIC_IDS[slot].load(Ordering::Acquire) as u8;
             let before = AP_ONLINE.load(Ordering::Acquire);
-            let stack_top = AP_STACKS.0[slot].as_ptr().add(AP_STACK_SIZE) as u32;
+            let Some(stack_top) = ap_stack_top(slot) else {
+                crate::println!("[smp] no stack for CPU slot {}", slot);
+                break;
+            };
             write_unaligned(phys_to_virt(PARAM_STACK) as *mut u32, stack_top);
             core::sync::atomic::fence(Ordering::SeqCst);
             crate::println!("[smp] starting APIC {} stack={:#x}", apic_id, stack_top);
@@ -1034,14 +1094,18 @@ extern "C" fn ap_entry() -> ! {
             unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
         }
     };
-    let stack_top = unsafe { AP_STACKS.0[slot].as_ptr().add(AP_STACK_SIZE) as u32 };
+    let Some(stack_top) = ap_stack_top(slot) else {
+        loop {
+            unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
+        }
+    };
     unsafe {
         AP_GDTS[slot].init_and_load(stack_top);
         crate::interrupts::idt::IDT.load();
         configure_local_timer(lapic);
     }
     set_current_cr3(unsafe { KERNEL_PD_PHYS });
-    ONLINE_MASK.fetch_or(1 << slot, Ordering::Release);
+    cpu_mask_set(&ONLINE_MASK, slot, Ordering::Release);
     AP_ONLINE.fetch_add(1, Ordering::Release);
     loop {
         let _ = run_pending_work(slot);
@@ -1072,7 +1136,7 @@ impl core::fmt::Display for DebugSnapshot {
             lock_ctx_name
         )?;
         for cpu in 0..MAX_CPUS {
-            if ONLINE_MASK.load(Ordering::Acquire) & (1 << cpu) == 0 {
+            if !cpu_mask_test(&ONLINE_MASK, cpu, Ordering::Acquire) {
                 continue;
             }
             writeln!(

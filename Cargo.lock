@@ -950,6 +950,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "htop"
+version = "0.1.0"
+dependencies = [
+ "libfelix",
+]
+
+[[package]]
 name = "http-client"
 version = "0.1.0"
 dependencies = [

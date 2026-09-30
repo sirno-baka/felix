@@ -14,7 +14,7 @@ use interrupt_sync::{SpinMutex, without_interrupts};
 
 use crate::memory::paging::{
     KERNEL_MMIO_BASE, KERNEL_MMIO_END, PAGE_SIZE, PAGING, PTEFlags, PhysAddr, VirtAddr,
-    detected_ram_bytes, phys_to_virt,
+    detected_ram_bytes, installed_ram_mib, phys_to_virt,
 };
 
 /// IA32_PAT entry 4 (PAT=1, PCD=0, PWT=0) is reserved by Felix for
@@ -977,7 +977,8 @@ pub fn init() -> Result<(), ResourceError> {
     }
 
     crate::println!(
-        "[mem] resource manager ready: RAM={} MiB, MMIO-VA={:#x}..{:#x}",
+        "[mem] resource manager ready: installed={} MiB managed={} MiB, MMIO-VA={:#x}..{:#x}",
+        installed_ram_mib(),
         detected_ram_bytes() / (1024 * 1024),
         KERNEL_MMIO_BASE,
         KERNEL_MMIO_END

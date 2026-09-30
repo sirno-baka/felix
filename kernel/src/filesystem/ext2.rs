@@ -437,6 +437,49 @@ impl Ext2 {
         None
     }
 
+    /// Return a data block for `logical_block`, allocating direct or
+    /// single-indirect storage when needed. Newly allocated blocks are zeroed.
+    /// This is the write-side counterpart of resolve_block().
+    fn ensure_file_block(&mut self, inode: &mut Ext2Inode, logical_block: usize) -> Option<u32> {
+        let ptrs_per_block = self.block_size as usize / 4;
+        if logical_block >= 12 + ptrs_per_block {
+            return None;
+        }
+
+        if logical_block < 12 {
+            if inode.i_block[logical_block] == 0 {
+                let block = self.alloc_block()?;
+                let zeros = alloc::vec![0u8; self.block_size as usize];
+                unsafe { self.write_blocks(block, zeros.as_ptr(), 1); }
+                inode.i_block[logical_block] = block;
+            }
+            return Some(inode.i_block[logical_block]);
+        }
+
+        if inode.i_block[12] == 0 {
+            let table = self.alloc_block()?;
+            let zeros = alloc::vec![0u8; self.block_size as usize];
+            unsafe { self.write_blocks(table, zeros.as_ptr(), 1); }
+            inode.i_block[12] = table;
+        }
+
+        let mut table = alloc::vec![0u8; self.block_size as usize];
+        unsafe { self.read_blocks(inode.i_block[12], table.as_mut_ptr(), 1); }
+        let entry = logical_block - 12;
+        let off = entry * 4;
+        let mut block = u32::from_le_bytes([
+            table[off], table[off + 1], table[off + 2], table[off + 3],
+        ]);
+        if block == 0 {
+            block = self.alloc_block()?;
+            let zeros = alloc::vec![0u8; self.block_size as usize];
+            unsafe { self.write_blocks(block, zeros.as_ptr(), 1); }
+            table[off..off + 4].copy_from_slice(&block.to_le_bytes());
+            unsafe { self.write_blocks(inode.i_block[12], table.as_ptr(), 1); }
+        }
+        Some(block)
+    }
+
     // ====================== BLOCK GROUP & INODE ======================
 
     /// Исправленная версия — теперь правильно работает с несколькими блоками BGD-таблицы
@@ -992,8 +1035,8 @@ impl Ext2 {
         Some(data)
     }
 
-    /// Записать данные в файл по inode (только direct блоки, перезапись)
-    pub fn write_file_by_inode(&self, inode_num: u32, data: &[u8]) -> bool {
+    /// Записать данные в файл по inode (direct + single-indirect, перезапись).
+    pub fn write_file_by_inode(&mut self, inode_num: u32, data: &[u8]) -> bool {
         let mut inode = self.read_inode(inode_num);
         if (inode.i_mode & 0xF000) != 0x8000 {
             println!("[EXT2] Not a regular file for writing!");
@@ -1001,36 +1044,40 @@ impl Ext2 {
         }
 
         let num_blocks_needed = ((data.len() as u32) + self.block_size - 1) / self.block_size;
-
-        if num_blocks_needed > 12 {
-            println!("[EXT2] File too big for simple direct blocks (max 12)!");
+        let ptrs_per_block = self.block_size / 4;
+        let max_blocks = 12 + ptrs_per_block;
+        if num_blocks_needed > max_blocks {
+            println!(
+                "[EXT2] File too big ({} blocks, max {} with single indirect)",
+                num_blocks_needed, max_blocks
+            );
             return false;
         }
 
         for i in 0..num_blocks_needed as usize {
-            if inode.i_block[i] == 0 {
-                println!(
-                    "[EXT2] Block {} not allocated (add block allocation later)",
-                    i
-                );
+            let Some(block) = self.ensure_file_block(&mut inode, i) else {
+                println!("[EXT2] Failed to allocate file block {}", i);
                 return false;
-            }
-
+            };
             let start = i * self.block_size as usize;
             let end = core::cmp::min(start + self.block_size as usize, data.len());
-            let chunk = &data[start..end];
-
-            unsafe {
-                self.write_blocks(inode.i_block[i], chunk.as_ptr(), 1);
-            }
+            let mut block_buf = alloc::vec![0u8; self.block_size as usize];
+            block_buf[..end - start].copy_from_slice(&data[start..end]);
+            unsafe { self.write_blocks(block, block_buf.as_ptr(), 1); }
         }
 
-        // обновляем inode
         inode.i_size = data.len() as u32;
         let now = (crate::time::realtime_ms() / 1000) as u32;
         inode.i_mtime = now;
         inode.i_ctime = now;
-        inode.i_blocks = num_blocks_needed * (self.block_size / 512);
+        let sectors_per_block = self.block_size / 512;
+        let needed_sectors = (num_blocks_needed
+            + if num_blocks_needed > 12 { 1 } else { 0 })
+            * sectors_per_block;
+        // We intentionally keep already allocated tail blocks when a file is
+        // rewritten shorter; a later grow reuses them. i_size still truncates
+        // the visible file, and this avoids risky metadata churn in the logger.
+        inode.i_blocks = inode.i_blocks.max(needed_sectors);
 
         self.write_inode(inode_num, &inode);
         true
@@ -1049,7 +1096,7 @@ impl Ext2 {
     }
 
     /// Записать файл по пути (перезаписывает существующий файл)
-    pub fn write_file_path(&self, path: &str, data: &[u8]) -> bool {
+    pub fn write_file_path(&mut self, path: &str, data: &[u8]) -> bool {
         if let Some(inode_num) = self.resolve_path(path) {
             if self.write_file_by_inode(inode_num, data) {
                 println!("[EXT2] Successfully wrote {} bytes to {}", data.len(), path);
@@ -1842,44 +1889,26 @@ impl crate::filesystem::Filesystem for Ext2 {
         }
 
         let block_size = self.block_size as u64;
+        let max_blocks = 12usize + self.block_size as usize / 4;
         let mut written = 0usize;
         let mut cur = offset;
 
         while written < buf.len() {
             let block_index = (cur / block_size) as usize;
-            if block_index >= 12 {
-                // only direct blocks for now
+            if block_index >= max_blocks {
                 break;
             }
 
-            // allocate if missing
-            if inode.i_block[block_index] == 0 {
-                match self.alloc_block() {
-                    Some(b) => {
-                        inode.i_block[block_index] = b;
-                        // zero the new block
-                        let zeros = [0u8; 4096];
-                        unsafe {
-                            self.write_blocks(b, zeros.as_ptr(), 1);
-                        }
-                    }
-                    None => break,
-                }
-            }
-
-            let block_num = inode.i_block[block_index];
+            let Some(block_num) = self.ensure_file_block(&mut inode, block_index) else {
+                break;
+            };
             let block_off = (cur % block_size) as usize;
             let can = core::cmp::min(buf.len() - written, self.block_size as usize - block_off);
 
-            // read-modify-write
             let mut block_buf = alloc::vec![0u8; self.block_size as usize];
-            unsafe {
-                self.read_blocks(block_num, block_buf.as_mut_ptr(), 1);
-            }
+            unsafe { self.read_blocks(block_num, block_buf.as_mut_ptr(), 1); }
             block_buf[block_off..block_off + can].copy_from_slice(&buf[written..written + can]);
-            unsafe {
-                self.write_blocks(block_num, block_buf.as_ptr(), 1);
-            }
+            unsafe { self.write_blocks(block_num, block_buf.as_ptr(), 1); }
 
             written += can;
             cur += can as u64;
@@ -1887,8 +1916,11 @@ impl crate::filesystem::Filesystem for Ext2 {
 
         let new_size = core::cmp::max(inode.i_size as u64, offset + written as u64) as u32;
         inode.i_size = new_size;
-        let used_blocks = ((new_size as u32 + self.block_size - 1) / self.block_size).min(12);
-        inode.i_blocks = used_blocks * (self.block_size / 512);
+        let used_blocks = (new_size + self.block_size - 1) / self.block_size;
+        let sectors_per_block = self.block_size / 512;
+        let needed_sectors = (used_blocks + if used_blocks > 12 { 1 } else { 0 })
+            * sectors_per_block;
+        inode.i_blocks = inode.i_blocks.max(needed_sectors);
         if written != 0 {
             let now = (crate::time::realtime_ms() / 1000) as u32;
             inode.i_mtime = now;

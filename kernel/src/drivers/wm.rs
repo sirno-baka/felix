@@ -545,6 +545,27 @@ struct DragState {
     orig_h: u32,
 }
 
+const MIN_VISIBLE_TITLE_W: i32 = 64;
+
+#[inline]
+fn clamp_window_position(
+    screen_w: u32,
+    screen_h: u32,
+    window_w: u32,
+    _window_h: u32,
+    x: i32,
+    y: i32,
+) -> (i32, i32) {
+    // Windows may be parked partially off the left/right/bottom edges, but
+    // enough of the title bar must remain visible to grab the window and pull
+    // it back. Keep the whole title bar vertically accessible.
+    let visible_w = MIN_VISIBLE_TITLE_W.min(window_w as i32).max(1);
+    let min_x = visible_w.saturating_sub(window_w as i32);
+    let max_x = (screen_w as i32).saturating_sub(visible_w);
+    let max_y = (screen_h as i32).saturating_sub(TITLE_H as i32).max(0);
+    (x.clamp(min_x, max_x), y.clamp(0, max_y))
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DirtyRect {
     x: i32,
@@ -1688,6 +1709,8 @@ pub fn create_window(
             wm.mark_dirty(rect);
         }
 
+        let (x, y) = clamp_window_position(wm.screen_w, wm.screen_h, total_w, total_h, x, y);
+
         wm.windows[slot] = Some(Window {
             id,
             slot_index: slot as u8,
@@ -1798,6 +1821,17 @@ pub fn move_window(id: u32, x: i32, y: i32) -> bool {
         let mut wm = WM.lock();
         let id = id as u8;
         let old = wm.find(id).map(|w| w.rect());
+        let Some((window_w, window_h)) = wm.find(id).map(|w| (w.w, w.h)) else {
+            return false;
+        };
+        let (x, y) = clamp_window_position(
+            wm.screen_w,
+            wm.screen_h,
+            window_w,
+            window_h,
+            x,
+            y,
+        );
         if let Some(w) = wm.find_mut(id) {
             w.x = x;
             w.y = y;
@@ -2427,9 +2461,15 @@ fn on_mouse_move_locked(wm: &mut Compositor, x: i32, y: i32) {
         if drag.kind == 1 {
             let dw = x - drag.grab_dx;
             let dh = y - drag.grab_dy;
-            let nw = (drag.orig_w as i32 + dw).clamp(80, wm.screen_w as i32) as u32;
-            let nh =
-                (drag.orig_h as i32 + dh).clamp((TITLE_H as i32) + 40, wm.screen_h as i32) as u32;
+            let (win_x, win_y) = wm.find(id).map(|w| (w.x, w.y)).unwrap_or((0, 0));
+            let max_w = wm.screen_w.saturating_sub(win_x.max(0) as u32).max(80);
+            let min_h = TITLE_H + 40;
+            let max_h = wm
+                .screen_h
+                .saturating_sub(win_y.max(0) as u32)
+                .max(min_h);
+            let nw = (drag.orig_w as i32 + dw).clamp(80, max_w as i32) as u32;
+            let nh = (drag.orig_h as i32 + dh).clamp(min_h as i32, max_h as i32) as u32;
             let old_rect = wm.find(id).map(|w| w.rect());
             if let Some(w) = wm.find_mut(id) {
                 if w.w != nw || w.h != nh {
@@ -2449,10 +2489,18 @@ fn on_mouse_move_locked(wm: &mut Compositor, x: i32, y: i32) {
         }
         let nx = x - drag.grab_dx;
         let ny = y - drag.grab_dy;
-        let max_x = wm.screen_w.saturating_sub(40) as i32;
-        let max_y = wm.screen_h.saturating_sub(TITLE_H) as i32;
-        let nx = nx.clamp(-((wm.screen_w as i32) / 2), max_x);
-        let ny = ny.clamp(0, max_y);
+        let Some((window_w, window_h)) = wm.find(id).map(|w| (w.w, w.h)) else {
+            wm.drag = None;
+            return;
+        };
+        let (nx, ny) = clamp_window_position(
+            wm.screen_w,
+            wm.screen_h,
+            window_w,
+            window_h,
+            nx,
+            ny,
+        );
 
         let old_rect = wm.find(id).map(|w| w.rect());
         if let Some(w) = wm.find_mut(id) {

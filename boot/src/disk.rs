@@ -48,7 +48,7 @@ impl DiskReader {
                 in(reg) dap_address as u16,
                 out(reg) _,
                 in("ax") 0x4200u16,
-                in("dx") 0x0080u16,
+                in("dx") crate::boot_drive() as u16,
             );
         }
     }

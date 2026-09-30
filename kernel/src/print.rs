@@ -29,6 +29,10 @@ struct Klog {
     lens: [u8; LOG_LINES],
     head: usize,
     count: usize,
+    /// Monotonic sequence number of the next completed line.
+    /// Unlike head/count this never wraps with the ring and is used by the
+    /// persistent /var/system.log flusher to append only new lines.
+    total_lines: u64,
     cur: [u8; LOG_WIDTH],
     cur_len: u8,
 }
@@ -39,6 +43,7 @@ const fn klog_new() -> Klog {
         lens: [0; LOG_LINES],
         head: 0,
         count: 0,
+        total_lines: 0,
         cur: [0; LOG_WIDTH],
         cur_len: 0,
     }
@@ -86,6 +91,7 @@ fn klog_commit_line(k: &mut Klog) {
     if k.count < LOG_LINES {
         k.count += 1;
     }
+    k.total_lines = k.total_lines.wrapping_add(1);
     k.cur_len = 0;
 }
 
@@ -152,16 +158,44 @@ pub fn klog_for_each_line_last(mut f: impl FnMut(&[u8])) {
     }
 }
 
-/// Copy the current kernel log oldest -> newest, adding a newline after every
-/// stored line. Intended for the one-shot pre-STI dump to /var/system.log.
-/// Allocation happens only here, never in the normal print/panic path.
-pub fn klog_snapshot() -> Vec<u8> {
+/// Copy completed log lines newer than `cursor`, oldest -> newest.
+///
+/// Returns `(bytes, end_cursor)`. The caller must advance its cursor only after
+/// the bytes were successfully persisted. If the ring wrapped before the
+/// caller flushed, the oldest still-available line is used automatically.
+///
+/// Allocation happens only in the background persistence path, never in the
+/// normal print/panic path.
+pub fn klog_snapshot_from(cursor: u64) -> (Vec<u8>, u64) {
+    let Some(k) = KLOG.try_lock() else {
+        return (Vec::new(), cursor);
+    };
+
+    let total = k.total_lines;
+    let count = k.count as u64;
+    let oldest_seq = total.saturating_sub(count);
+    let first_seq = cursor.max(oldest_seq).min(total);
+    if first_seq == total {
+        return (Vec::new(), total);
+    }
+
+    let oldest_idx = if k.count < LOG_LINES {
+        0
+    } else {
+        k.head % LOG_LINES
+    };
+
     let mut out = Vec::new();
-    klog_for_each_line(|line| {
-        out.extend_from_slice(line);
+    let skip = (first_seq - oldest_seq) as usize;
+    let take = (total - first_seq) as usize;
+    for n in 0..take {
+        let i = (oldest_idx + skip + n) % LOG_LINES;
+        let len = k.lens[i] as usize;
+        out.extend_from_slice(&k.lines[i][..len]);
         out.push(b'\n');
-    });
-    out
+    }
+
+    (out, total)
 }
 
 // ---------------------------------------------------------------------------

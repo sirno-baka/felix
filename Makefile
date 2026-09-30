@@ -69,8 +69,7 @@ build:
 	@echo "Building Felix..."
 	@echo "  native apps: $(NATIVE_APPS)"
 	@cargo build $(BUILD_STD_FLAGS) --target=x86_16-felix.json --package=felix-boot --release -Z json-target-spec
-	@cargo build $(BUILD_STD_FLAGS) --target=x86_16-felix.json --package=felix-bootloader -Z json-target-spec
-	@#cargo build $(BUILD_STD_FLAGS) --target=x86_16-felix.json --package=felix-bootloader --release -Z json-target-spec
+	@cargo build $(BUILD_STD_FLAGS) --target=x86_16-felix.json --package=felix-bootloader --release -Z json-target-spec
 	@cargo build $(BUILD_STD_FLAGS) --target=x86_32-felix.json --package=felix-kernel -Z json-target-spec
 	@#cargo build $(BUILD_STD_FLAGS) --target=x86_32-felix.json --package=felix-kernel --release -Z json-target-spec
 	@for p in $(NATIVE_APPS); do \
@@ -84,7 +83,7 @@ objcopy:
 	@mkdir -p build/apps
 	@$(OBJCOPY) -I elf32-i386 -O binary -S --strip-all \
         target/x86_16-felix/release/felix-boot build/boot.bin
-	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_16-felix/debug/felix-bootloader build/bootloader.bin
+	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_16-felix/release/felix-bootloader build/bootloader.bin
 	@$(OBJCOPY) -I elf32-i386 -O binary target/x86_32-felix/debug/felix-kernel build/kernel.bin
 	@for p in $(NATIVE_APPS); do \
 		cp -f target/x86_32-felix/release/$$p build/$$p; \
@@ -224,7 +223,7 @@ run: all usb-image
 		-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
 		-device pci-ohci,id=ohci \
 		-device AC97 \
-		-smp 4 \
+		-smp 8 \
 		-no-reboot -no-shutdown -vga std -m 1280M \
 		-debugcon file:debug.log -serial stdio
 

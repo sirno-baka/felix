@@ -131,6 +131,19 @@ pub fn detected_ram_bytes() -> u32 {
     unsafe { DETECTED_RAM_BYTES }
 }
 
+/// Physical RAM reported by firmware, capped to the 4 GiB non-PAE address
+/// space. This may be larger than `detected_ram_bytes()`, which is the portion
+/// permanently direct-mapped and managed by the current frame allocator.
+pub fn installed_ram_mib() -> u32 {
+    unsafe {
+        let bi = core::ptr::read_volatile(BOOTINFO_PHYS as *const BootInfo);
+        if bi.magic == BOOTINFO_MAGIC && bi.mem_total_mib != 0 {
+            return bi.mem_total_mib.min(4096);
+        }
+    }
+    detected_ram_bytes() / (1024 * 1024)
+}
+
 #[inline]
 pub fn large_page_count() -> u32 {
     unsafe { LARGE_PAGE_COUNT_RT }
@@ -196,6 +209,7 @@ pub struct BootInfo {
     pub disk_sectors: u32,
     pub flags: u32,
     pub mem_bytes: u32,
+    pub mem_total_mib: u32,
 }
 
 pub const BOOTINFO_PHYS: u32 = 0x0000_7000;
@@ -1185,4 +1199,31 @@ pub static mut PAGING: SpinMutex<PageManager> = SpinMutex::new(PageManager::new(
 /// Allocate a frame with interrupts disabled (PAGING is a plain SpinMutex).
 pub fn alloc_frame_irqsafe() -> u32 {
     interrupt_sync::without_interrupts(|| unsafe { PAGING.lock().alloc_frame() })
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct MemoryStats {
+    pub total_kib: u64,
+    pub managed_kib: u64,
+    pub free_kib: u64,
+    pub used_kib: u64,
+}
+
+/// Snapshot of physical-memory accounting for /proc and monitoring tools.
+/// `total_kib` is firmware-reported RAM (up to the non-PAE 4 GiB ceiling),
+/// while managed/free/used describe the currently direct-mapped allocator pool.
+pub fn memory_stats() -> MemoryStats {
+    let managed_bytes = detected_ram_bytes() as u64;
+    let max_page = detected_ram_bytes() >> 12;
+    let pm = unsafe { PAGING.lock() };
+    let bump_free = max_page.saturating_sub(pm.next_free_page) as u64;
+    let recycled = pm.free_frames.len() as u64;
+    let free_bytes = (bump_free + recycled) * PAGE_SIZE as u64;
+    let free_bytes = free_bytes.min(managed_bytes);
+    MemoryStats {
+        total_kib: installed_ram_mib() as u64 * 1024,
+        managed_kib: managed_bytes / 1024,
+        free_kib: free_bytes / 1024,
+        used_kib: managed_bytes.saturating_sub(free_bytes) / 1024,
+    }
 }

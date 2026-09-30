@@ -67,6 +67,12 @@ use crate::filesystem::devfs::DevFS;
 use crate::filesystem::fat32::{FatDisk, FatFs, find_fat_partition_config};
 use crate::filesystem::init::init_usb;
 use crate::filesystem::{Filesystem, VFS};
+
+static SYSTEM_LOG_CURSOR: crate::sync::mutex::Mutex<u64> = crate::sync::mutex::Mutex::new(0);
+static SYSTEM_LOG_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static SYSTEM_LOG_LAST_FLUSH_MS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 use crate::io::outb;
 use crate::pci::ide::{IDE, IDEDevice};
 use crate::pci::print_devices;
@@ -209,7 +215,8 @@ pub extern "C" fn higher_half_entry() -> ! {
             let ram = crate::memory::paging::detect_ram();
             crate::memory::paging::configure_from_ram(ram);
             println!(
-                "[mem] detected {} MiB RAM → {} large pages",
+                "[mem] installed {} MiB, managed lowmem {} MiB → {} large pages",
+                crate::memory::paging::installed_ram_mib(),
                 crate::memory::paging::detected_ram_bytes() / (1024 * 1024),
                 crate::memory::paging::large_page_count()
             );
@@ -263,13 +270,17 @@ pub extern "C" fn higher_half_entry() -> ! {
         // After graphics mode VGA text is gone — software console + mini-WM.
         crate::drivers::framebuffer::init();
 
-        match crate::drivers::intel_snb::init_native_framebuffer() {
-            Ok(true) => println!("[SNB] native Intel framebuffer enabled"),
-            Ok(false) => match crate::drivers::ati_m6::init_native_lcd() {
-                Ok(()) => println!("[M6] native LCD mode enabled"),
-                Err(e) => println!("[M6] error: {}", e),
+        match crate::drivers::intel_gen9::init_native_framebuffer() {
+            Ok(true) => println!("[GEN9] native Intel framebuffer enabled"),
+            Ok(false) => match crate::drivers::intel_snb::init_native_framebuffer() {
+                Ok(true) => println!("[SNB] native Intel framebuffer enabled"),
+                Ok(false) => match crate::drivers::ati_m6::init_native_lcd() {
+                    Ok(()) => println!("[M6] native LCD mode enabled"),
+                    Err(e) => println!("[M6] error: {}", e),
+                },
+                Err(e) => println!("[SNB] takeover skipped: {}", e),
             },
-            Err(e) => println!("[SNB] takeover skipped: {}", e),
+            Err(e) => println!("[GEN9] takeover skipped: {}", e),
         }
 
         crate::drivers::wm::init();
@@ -348,20 +359,29 @@ pub extern "C" fn higher_half_entry() -> ! {
         println!("[!] Enabling interrupts — entering idle");
         init(200);
 
-        // Persist the complete pre-STI kernel log for this boot.  The print
-        // path has been collecting into the fixed panic-safe KLOG from the
-        // beginning; only this one-shot snapshot allocates.
+        // Start a fresh persistent kernel log for this boot. KLOG itself is
+        // always populated by println!/debugln; disk persistence happens only
+        // from this idle context, never from IRQ/print paths.
         let _ = VFS.get().mkdir("/var");
-        let boot_log = crate::print::klog_snapshot();
-        if !VFS.get().write_file("/var/system.log", &boot_log) {
-            let _ = VFS.get().create_file("/var/system.log", &boot_log);
+        if VFS.get().resolve_path("/var/system.log").is_some() {
+            let _ = VFS.get().write_file("/var/system.log", &[]);
+        } else {
+            let _ = VFS.get().create_file("/var/system.log", &[]);
         }
+        *SYSTEM_LOG_CURSOR.lock() = 0;
+        flush_system_log();
+        SYSTEM_LOG_LAST_FLUSH_MS.store(
+            crate::time::uptime_ms() as usize,
+            core::sync::atomic::Ordering::Release,
+        );
+        SYSTEM_LOG_READY.store(true, core::sync::atomic::Ordering::Release);
 
         // Enable interrupts. Boot used nested wrappers::_cli() above, while
         // this point intentionally releases *all* boot-time interrupt guards.
         // Keep the software nesting counter synchronized with the real IF.
         crate::wrappers::_rst();
         asm!("sti");
+
         loop {
             asm!("hlt");
         }
@@ -403,6 +423,43 @@ fn first_ata_disk() -> Option<IDEDevice> {
         }
     }
     None
+}
+
+fn flush_system_log() {
+    let cursor = *SYSTEM_LOG_CURSOR.lock();
+    let (bytes, end_cursor) = crate::print::klog_snapshot_from(cursor);
+    if bytes.is_empty() {
+        *SYSTEM_LOG_CURSOR.lock() = end_cursor;
+        return;
+    }
+
+    let Some(inode) = VFS.get().resolve_path("/var/system.log") else {
+        return;
+    };
+    let (written, _) = VFS.get().append_write(inode, &bytes);
+    if written == bytes.len() {
+        *SYSTEM_LOG_CURSOR.lock() = end_cursor;
+    }
+}
+
+pub(crate) fn maybe_flush_system_log() {
+    use core::sync::atomic::Ordering;
+
+    if !SYSTEM_LOG_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let now = crate::time::uptime_ms() as usize;
+    let last = SYSTEM_LOG_LAST_FLUSH_MS.load(Ordering::Acquire);
+    if now.wrapping_sub(last) < 1000 {
+        return;
+    }
+    if SYSTEM_LOG_LAST_FLUSH_MS
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    flush_system_log();
 }
 
 fn halt() -> ! {

@@ -14,6 +14,9 @@ _start:
     mov fs, ax
     mov gs, ax
 
+    # Preserve the BIOS boot drive before any Rust/BIOS call can clobber DL.
+    mov byte ptr [BOOT_DRIVE], dl
+
     # set stack pointer to beginning of program, so it grows before the program
     # the stack grows downwards when you push, so putting the stack after the program would overwrite the program
     # rember that bios loads the program at 0x7c00 in memory, so everything before is empty (not sure about this)

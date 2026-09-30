@@ -111,6 +111,9 @@ pub extern "C" fn syscall_handler(esp: u32) -> u64 {
     crate::multitasking::task::set_kernel_lock_context(
         crate::multitasking::task::KERNEL_LOCK_CTX_SYSCALL,
     );
+    // Deferred persistence of kernel/runtime logs. This runs in normal
+    // syscall context under the giant kernel lock, never in IRQ context.
+    crate::maybe_flush_system_log();
     // Signal delivery from an AP timer only marks a process dead and queues
     // resource teardown. Finish that work here, in normal syscall context,
     // rather than while an interrupt handler owns the giant kernel lock.

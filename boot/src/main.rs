@@ -14,6 +14,13 @@ const BOOTLOADER_SIZE: u16 = 64;
 
 global_asm!(include_str!("boot.asm"));
 
+#[unsafe(no_mangle)]
+static mut BOOT_DRIVE: u8 = 0xFF;
+
+pub(crate) fn boot_drive() -> u8 {
+    unsafe { core::ptr::read_volatile(&raw const BOOT_DRIVE) }
+}
+
 unsafe extern "C" {
     static _bootloader_start: u16;
 }
@@ -57,8 +64,16 @@ fn print(msg: &[u8]) {
 }
 
 fn jump(addr: *const u16) {
+    let drive = boot_drive() as u16;
     unsafe {
-        asm!("jmp {0:x}", in(reg) addr as u16, options(nostack));
+        // BIOS defines DL as the boot drive on entry. Preserve that ABI for
+        // stage2 instead of assuming the boot disk is always 0x80.
+        asm!(
+            "jmp ax",
+            in("ax") addr as u16,
+            in("dx") drive,
+            options(nostack)
+        );
     }
 }
 
