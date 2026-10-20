@@ -41,7 +41,7 @@ endif
 
 # Native userspace = every apps/<name> except applications already migrated to std userspace.
 NATIVE_APPS := $(sort $(filter-out filemanager,$(patsubst apps/%/Cargo.toml,%,$(wildcard apps/*/Cargo.toml))))
-STD_RUNTIME_APPS := reqwest-smoke tokio-smoke netbench telnetd twitch-radio ui-smoke
+STD_RUNTIME_APPS := reqwest-smoke tokio-smoke netbench telnetd twitch-radio ui-smoke filemanager rhai rhai-ide taskpanel startmenu
 ROOTFS_FILES := $(shell find rootfs -type f ! -name README ! -name '.gitkeep' 2>/dev/null)
 
 .PHONY: all

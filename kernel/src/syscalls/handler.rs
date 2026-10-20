@@ -394,6 +394,7 @@ fn syscall_handler_locked(esp: u32) -> u32 {
             )
         }
         crate::syscalls::SYS_REBOOT => sys_reboot(),
+        crate::syscalls::SYS_POWEROFF => sys_poweroff(),
         // Linux i386 waitpid(pid, status, options).
         crate::syscalls::SYS_WAIT => unreachable!(),
         crate::syscalls::SYS_TASK_LIST => {
@@ -4115,6 +4116,23 @@ fn sys_execve_path(
 
 /// Reboot through the legacy keyboard controller first, then the PCI reset
 /// control port. If neither mechanism resets the machine, force a triple fault.
+fn sys_poweroff() -> ! {
+    println!("[poweroff] powering off...");
+    unsafe {
+        asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+
+    // Common virtual-machine ACPI power ports. Real hardware without an ACPI
+    // S5 parser falls through to a halted CPU below.
+    crate::io::outw(0x0604, 0x2000); // QEMU / modern Bochs
+    crate::io::outw(0xB004, 0x2000); // older Bochs
+    crate::io::outw(0x4004, 0x3400); // VirtualBox
+
+    loop {
+        unsafe { asm!("hlt", options(nomem, nostack)); }
+    }
+}
+
 fn sys_reboot() -> ! {
     println!("[reboot] rebooting...");
     unsafe {

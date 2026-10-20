@@ -129,6 +129,7 @@ impl WindowFlags {
     pub const WINDOW_CLOSE_BUTTON_HINT: u8 = 1;
     pub const WINDOW_FULLSCREEN_BUTTON_HINT: u8 = 2;
     pub const FRAMELESS_WINDOW_HINT: u8 = 3;
+    pub const ALWAYS_ON_TOP_HINT: u8 = 4;
 
 
     pub fn new() -> Self {

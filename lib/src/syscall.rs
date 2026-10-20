@@ -16,6 +16,7 @@ pub const SYS_CHDIR: u32 = 12;
 pub const SYS_SPAWN: u32 = 0xF000;
 pub const SYS_SPAWN_PATH: u32 = 0xF002;
 pub const SYS_REBOOT: u32 = 0xF003;
+pub const SYS_POWEROFF: u32 = 0xF004;
 
 pub const SYS_LSEEK: u32 = 19;
 pub const SYS_GETPID: u32 = 20;
@@ -312,6 +313,14 @@ pub unsafe fn reboot() -> ! {
     asm!(
         "int 0x80",
         in("eax") SYS_REBOOT,
+        options(nostack, noreturn)
+    );
+}
+
+pub unsafe fn poweroff() -> ! {
+    asm!(
+        "int 0x80",
+        in("eax") SYS_POWEROFF,
         options(nostack, noreturn)
     );
 }

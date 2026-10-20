@@ -18,6 +18,7 @@ impl WindowFlags {
     pub const CLOSE_BUTTON: u8 = 1 << 1;
     pub const FULLSCREEN_BUTTON: u8 = 1 << 2;
     pub const FRAMELESS: u8 = 1 << 3;
+    pub const ALWAYS_ON_TOP: u8 = 1 << 4;
 
     pub const fn new(bits: u8) -> Self { Self(bits) }
     pub const fn bits(self) -> u8 { self.0 }
@@ -32,6 +33,19 @@ impl Default for WindowFlags {
     fn default() -> Self {
         Self(Self::TITLE | Self::CLOSE_BUTTON)
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WindowListItem {
+    pub id: u32,
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    pub focused: bool,
+    pub visible: bool,
+    pub owner_slot: i8,
+    pub title: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -169,6 +183,11 @@ impl WindowBuilder {
 
     pub fn frameless(mut self, enabled: bool) -> Self {
         self.flags.set(WindowFlags::FRAMELESS, enabled);
+        self
+    }
+
+    pub fn always_on_top(mut self, enabled: bool) -> Self {
+        self.flags.set(WindowFlags::ALWAYS_ON_TOP, enabled);
         self
     }
 
@@ -620,6 +639,34 @@ pub fn screen_size() -> (u32, u32) {
     } else {
         (800, 600)
     }
+}
+
+pub fn window_list() -> Vec<WindowListItem> {
+    const MAX_WINDOWS: usize = 16;
+    let mut raw = vec![sys::RawWindowListItem::default(); MAX_WINDOWS];
+    let count = unsafe { sys::wm_window_list(raw.as_mut_ptr(), raw.len()) }.min(raw.len());
+    raw.truncate(count);
+    raw.into_iter()
+        .map(|item| {
+            let end = item.title.iter().position(|&b| b == 0).unwrap_or(item.title.len());
+            let title = String::from_utf8_lossy(&item.title[..end]).into_owned();
+            WindowListItem {
+                id: item.id as u32,
+                x: item.x,
+                y: item.y,
+                w: item.w,
+                h: item.h,
+                focused: item.focused != 0,
+                visible: item.visible != 0,
+                owner_slot: item.owner_slot,
+                title,
+            }
+        })
+        .collect()
+}
+
+pub fn focus_window(id: u32) -> bool {
+    unsafe { sys::wm_focus(id) == 0 }
 }
 
 fn initialize_pixels(buffer: &mut [u8]) {

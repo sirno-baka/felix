@@ -76,6 +76,7 @@ pub const SYS_SPAWN: u32 = 0xF000;
 pub const SYS_SPAWN_PATH: u32 = 0xF002;
 /// Reboot the machine. This call does not return.
 pub const SYS_REBOOT: u32 = 0xF003;
+pub const SYS_POWEROFF: u32 = 0xF004;
 pub const SYS_MALLOC: u32 = 0xF010;
 pub const SYS_FREE: u32 = 0xF011;
 pub const SYS_REALLOC: u32 = 0xF012;

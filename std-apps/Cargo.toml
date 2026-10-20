@@ -1,6 +1,6 @@
 [workspace]
-members = ["hello", "thread-smoke", "tokio-smoke", "reqwest-smoke", "netbench", "telnetd", "ui-smoke", "filemanager", "rhai", "rhai-ide", "twitch-radio"]
-default-members = ["hello", "tokio-smoke", "reqwest-smoke", "netbench", "telnetd", "ui-smoke", "filemanager", "rhai", "rhai-ide", "twitch-radio"]
+members = ["hello", "thread-smoke", "tokio-smoke", "reqwest-smoke", "netbench", "telnetd", "ui-smoke", "filemanager", "rhai", "rhai-ide", "twitch-radio", "taskpanel", "startmenu"]
+default-members = ["hello", "tokio-smoke", "reqwest-smoke", "netbench", "telnetd", "ui-smoke", "filemanager", "rhai", "rhai-ide", "twitch-radio", "taskpanel", "startmenu"]
 resolver = "2"
 
 [workspace.package]

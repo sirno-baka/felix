@@ -1,6 +1,8 @@
 #[cfg(target_os = "popugos")]
 use core::arch::asm;
 
+pub const SYS_REBOOT: u32 = 0xF003;
+pub const SYS_POWEROFF: u32 = 0xF004;
 pub const SYS_WM_CREATE: u32 = 0xF100;
 pub const SYS_WM_DESTROY: u32 = 0xF101;
 pub const SYS_WM_MOVE: u32 = 0xF102;
@@ -9,6 +11,7 @@ pub const SYS_WM_FLIP: u32 = 0xF104;
 pub const SYS_WM_FOCUS: u32 = 0xF105;
 pub const SYS_WM_SCREEN: u32 = 0xF106;
 pub const SYS_WM_POLL: u32 = 0xF108;
+pub const SYS_WM_WINDOWS: u32 = 0xF109;
 pub const SYS_WM_MAP_SHARED: u32 = 0xF10A;
 pub const SYS_WM_PRESENT_SHARED: u32 = 0xF10B;
 
@@ -34,6 +37,20 @@ pub struct RawWindowInfo {
     pub client_h: u32,
     pub pitch: u32,
     pub focused: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RawWindowListItem {
+    pub id: u8,
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    pub focused: u8,
+    pub visible: u8,
+    pub owner_slot: i8,
+    pub title: [u8; 32],
 }
 
 #[repr(C)]
@@ -124,6 +141,46 @@ macro_rules! syscall_id {
 
 syscall_id!(wm_destroy, SYS_WM_DESTROY);
 syscall_id!(wm_focus, SYS_WM_FOCUS);
+
+#[cfg(target_os = "popugos")]
+pub unsafe fn reboot() -> ! {
+    asm!(
+        "int 0x80",
+        in("eax") SYS_REBOOT,
+        options(nostack, noreturn)
+    );
+}
+
+#[cfg(not(target_os = "popugos"))]
+pub unsafe fn reboot() -> ! { panic!("reboot is only available on PopugOS") }
+
+#[cfg(target_os = "popugos")]
+pub unsafe fn poweroff() -> ! {
+    asm!(
+        "int 0x80",
+        in("eax") SYS_POWEROFF,
+        options(nostack, noreturn)
+    );
+}
+
+#[cfg(not(target_os = "popugos"))]
+pub unsafe fn poweroff() -> ! { panic!("poweroff is only available on PopugOS") }
+
+#[cfg(target_os = "popugos")]
+pub unsafe fn wm_window_list(out: *mut RawWindowListItem, max: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "int 0x80",
+        inlateout("eax") SYS_WM_WINDOWS => ret,
+        in("ebx") out,
+        in("ecx") max,
+        options(nostack, preserves_flags)
+    );
+    ret
+}
+
+#[cfg(not(target_os = "popugos"))]
+pub unsafe fn wm_window_list(_out: *mut RawWindowListItem, _max: usize) -> usize { 0 }
 
 #[cfg(target_os = "popugos")]
 pub unsafe fn wm_move(id: u32, x: i32, y: i32) -> usize {

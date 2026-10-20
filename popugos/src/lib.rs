@@ -7,8 +7,16 @@
 pub mod window;
 
 pub use window::{
-    screen_size, Event as WindowEvent, KeyEvent, MouseButton, MouseEvent, Window, WindowBuilder,
-    WindowError, WindowFlags, WindowInfo,
+    focus_window, screen_size, window_list, Event as WindowEvent, KeyEvent, MouseButton, MouseEvent,
+    Window, WindowBuilder, WindowError, WindowFlags, WindowInfo, WindowListItem,
 };
 
 mod sys;
+
+pub fn reboot() -> ! {
+    unsafe { sys::reboot() }
+}
+
+pub fn poweroff() -> ! {
+    unsafe { sys::poweroff() }
+}

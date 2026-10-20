@@ -709,6 +709,7 @@ impl Compositor {
     fn sorted_ids(&self) -> [Option<u8>; MAX_WINDOWS] {
         let mut ids: [Option<u8>; MAX_WINDOWS] = [None; MAX_WINDOWS];
         let mut zs: [u8; MAX_WINDOWS] = [0; MAX_WINDOWS];
+        let mut layers: [u8; MAX_WINDOWS] = [0; MAX_WINDOWS];
         let mut n = 0;
         for w in self.windows.iter().flatten() {
             if !w.visible {
@@ -716,12 +717,17 @@ impl Compositor {
             }
             ids[n] = Some(w.id);
             zs[n] = w.z;
+            layers[n] = if w.flags.is_enable(WindowFlags::ALWAYS_ON_TOP_HINT) { 1 } else { 0 };
             n += 1;
         }
-        // insertion sort by z ascending
+        // insertion sort by compositor layer first, then z ascending.
         for i in 1..n {
             let mut j = i;
-            while j > 0 && zs[j - 1] > zs[j] {
+            while j > 0
+                && (layers[j - 1] > layers[j]
+                    || (layers[j - 1] == layers[j] && zs[j - 1] > zs[j]))
+            {
+                layers.swap(j - 1, j);
                 zs.swap(j - 1, j);
                 ids.swap(j - 1, j);
                 j -= 1;

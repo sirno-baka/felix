@@ -642,14 +642,27 @@ pub fn set_kernel_lock_context(context: u8) {
 }
 
 pub fn lock_kernel() -> interrupt_sync::SpinMutexGuard<'static, ()> {
+    // Syscalls enter through an interrupt gate with IF cleared.  A CPU that
+    // loses this lock can nevertheless be a TLB-shootdown target for the CPU
+    // that owns it (threads share one CR3).  Keep maskable interrupts enabled
+    // for the whole wait, otherwise the owner waits for the TLB IPI ACK while
+    // this CPU waits for the owner to release the lock.  A tiny
+    // `sti; pause; cli` window is not sufficient: interrupt recognition after
+    // STI is delayed by one instruction and some APIC/QEMU timings repeatedly
+    // miss that window.
+    unsafe { asm!("sti", options(nomem, nostack)) };
     loop {
         if let Some(guard) = try_lock_kernel() {
+            // The syscall/scheduler core has always run with local interrupts
+            // disabled.  Close the interruptible wait before returning the
+            // guard so the existing giant-lock invariant remains unchanged.
+            unsafe { asm!("cli", options(nomem, nostack)) };
             return guard;
         }
-        // Lock release does not generate an interrupt. Sleeping with HLT here
-        // can strand a CPU forever when its Local APIC timer is slow or missed
-        // on real hardware. Keep IPIs serviceable and actively recheck.
-        unsafe { asm!("sti", "pause", "cli", options(nomem, nostack)) };
+        // Lock release does not generate an interrupt, so actively recheck
+        // rather than HLT.  IF stays set here, allowing TLB/work IPIs and the
+        // local timer to be serviced while another CPU owns the kernel lock.
+        core::hint::spin_loop();
     }
 }
 // The assembly epilogue owns this guard until it has left the outgoing stack.
