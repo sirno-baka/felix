@@ -1,0 +1,10 @@
+This directory mirrors the ext2 root filesystem hierarchy.
+
+- bin/ contains userspace executables.
+- etc/ contains system configuration and startup scripts.
+- home/user/ contains user scripts and shell state.
+- lib/rhai/ contains importable Rhai modules.
+- usr/share/felix/ contains shared images and other assets.
+
+The image builder also creates tmp/ and var/. `/init` and `/kernel.bin` are
+installed separately because they are required by the boot path.
