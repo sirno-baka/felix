@@ -246,6 +246,7 @@ smoke: std-thread-smoke std-tokio-smoke all usb-image
 	@dd if=build/smoke-disk.img of=build/smoke-rootfs.img bs=512 skip=2048 count=128488 status=none
 	@{ \
 		echo '# smoke-only services'; \
+		echo 'once       /bin/selftest'; \
 		echo 'once       /bin/thread-smoke'; \
 		echo 'once       /bin/tokio-smoke'; \
 		cat rootfs/etc/init.conf; \
@@ -291,7 +292,7 @@ smoke: std-thread-smoke std-tokio-smoke all usb-image
 	@grep -q 'selftest: OK process-shared-mutex' build/smoke.log || { echo "smoke: process-shared mutex/futex test failed"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'selftest: OK process-reclaim' build/smoke.log || { echo "smoke: SMP process/thread reclaim test failed"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'selftest: PASS' build/smoke.log || { echo "smoke: userspace selftest failed"; tail -n 160 build/smoke.log; exit 1; }
-	@grep -q 'init: boot selftest pid=.* status=0' build/smoke.log || { echo "smoke: PID 1 did not reap selftest cleanly"; tail -n 160 build/smoke.log; exit 1; }
+	@grep -q 'init: pid=.* exited status=0 /bin/selftest' build/smoke.log || { echo "smoke: PID 1 did not reap selftest cleanly"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'std::thread smoke: PASS' build/smoke.log || { echo "smoke: std::thread test failed"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'tokio: multithread runtime ready workers=3' build/smoke.log || { echo "smoke: Tokio multi-thread runtime failed"; tail -n 160 build/smoke.log; exit 1; }
 	@grep -q 'tokio: poll timeout works' build/smoke.log || { echo "smoke: Tokio Mio/timer test failed"; tail -n 160 build/smoke.log; exit 1; }
