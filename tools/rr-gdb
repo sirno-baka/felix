@@ -1,0 +1,6 @@
+#!/bin/sh
+# Custom GDB for RustRover Remote Debug.
+# RustRover's Debug Console is read-only — put commands in tools/felix.gdb.
+ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+GDB="${FELIX_GDB:-gdb}"
+exec "$GDB" -q -x "$ROOT/tools/felix.gdb" "$@"
