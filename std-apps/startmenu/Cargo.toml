@@ -1,0 +1,13 @@
+[package]
+name = "startmenu"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "startmenu"
+path = "src/main.rs"
+
+[dependencies]
+popui = { path = "../../popui" }
+popugos = { path = "../../popugos" }
+taffy = { version = "0.14", default-features = false, features = ["alloc", "flexbox", "taffy_tree"] }
