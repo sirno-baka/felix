@@ -1,12 +1,15 @@
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{
+    Config, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
+};
 use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr};
 
 use crate::drivers::net::AnyNic;
+use crate::drivers::net::{NetworkReady, READY_WORDS};
 use crate::drivers::net::e1000e_min::NET as E1000E_NET;
 use crate::drivers::net::i8255x::NET as I8255X_NET;
 use crate::drivers::net::rtl8139::NET as RTL_NET;
@@ -71,6 +74,13 @@ pub struct NetStack {
     if_gw: Option<Ipv4Address>,
     if_dns: Option<Ipv4Address>,
     mac: [u8; 6],
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct NetPollOutcome {
+    pub ready: NetworkReady,
+    pub more_work: bool,
+    pub budget_exhausted: bool,
 }
 
 impl NetStack {
@@ -250,8 +260,53 @@ impl NetStack {
         }
     }
 
-    /// Поллим стек (вызывать из таймера / из syscalls)
-    pub fn poll(&mut self, timestamp_ms: i64) {
+    fn readiness(&self) -> NetworkReady {
+        let mut ready = NetworkReady::default();
+        let table = crate::net::SOCKET_TABLE.try_lock();
+        for (index, mapping) in self.handles.iter().enumerate() {
+            let Some((handle, is_tcp)) = mapping else {
+                continue;
+            };
+            let socket_id = index + 1;
+            if socket_id > READY_WORDS * 32 {
+                break;
+            }
+            let word = (socket_id - 1) / 32;
+            let bit = 1u32 << ((socket_id - 1) & 31);
+            if *is_tcp {
+                let socket = self.sockets.get::<tcp::Socket>(*handle);
+                let listening = table
+                    .as_ref()
+                    .and_then(|table| table.get(socket_id))
+                    .is_some_and(|meta| meta.state == SocketState::Listening);
+                let read_ready = if listening {
+                    matches!(socket.state(), tcp::State::Established | tcp::State::CloseWait)
+                } else {
+                    socket.can_recv() || !socket.may_recv()
+                };
+                if read_ready {
+                    ready.read[word] |= bit;
+                }
+                if socket.can_send() || !socket.may_send() {
+                    ready.write[word] |= bit;
+                }
+            } else {
+                let socket = self.sockets.get::<udp::Socket>(*handle);
+                if socket.can_recv() {
+                    ready.read[word] |= bit;
+                }
+                if socket.can_send() {
+                    ready.write[word] |= bit;
+                }
+            }
+        }
+        ready
+    }
+
+    /// Bounded ingress/egress processing for IRQ and dedicated-CPU bottom
+    /// halves. The packet budget prevents one busy flow from monopolising a
+    /// CPU or the NET_STACK lock.
+    pub fn poll_budgeted(&mut self, timestamp_ms: i64, budget: usize) -> NetPollOutcome {
         // Socket close must not block a userspace runtime thread on NET_STACK.
         // Drain handles queued by close_descriptor() while we already own the
         // stack and before smoltcp polls the socket set.
@@ -262,18 +317,56 @@ impl NetStack {
         }
 
         let ts = Instant::from_millis(timestamp_ms);
-        // Two passes: ingress + the ACKs that pass queued after TX slots freed.
-        // Four full bursts held NET_STACK (and often KERNEL_LOCK) long enough
-        // that a concurrent connect() spinning on the stack looked like a hang.
+        self.iface.poll_maintenance(ts);
+        let mut consumed = 0usize;
+        while consumed < budget.max(1) {
+            match self
+                .iface
+                .poll_ingress_single(ts, &mut self.device, &mut self.sockets)
+            {
+                PollIngressSingleResult::None => break,
+                PollIngressSingleResult::PacketProcessed
+                | PollIngressSingleResult::SocketStateChanged => {}
+            }
+            consumed += 1;
+        }
+        let budget_exhausted = consumed == budget.max(1);
         for _ in 0..2 {
-            if matches!(
-                self.iface.poll(ts, &mut self.device, &mut self.sockets),
-                smoltcp::iface::PollResult::None
-            ) {
-                break;
+            match self
+                .iface
+                .poll_egress(ts, &mut self.device, &mut self.sockets)
+            {
+                PollResult::None => break,
+                PollResult::SocketStateChanged => {}
             }
         }
         self.process_dhcp();
+
+        let delay_ms = self
+            .iface
+            .poll_delay(ts, &self.sockets)
+            .map(|delay| delay.total_millis())
+            .unwrap_or(1000)
+            .clamp(1, 1000);
+        crate::drivers::net::set_next_poll_ms(
+            (timestamp_ms.max(0) as u64).saturating_add(delay_ms),
+        );
+        self.device.rearm_interrupts();
+
+        NetPollOutcome {
+            // Always sample readiness. A task may have blocked only because
+            // NET_STACK was briefly owned by this worker, even if this pass
+            // itself consumed no packet.
+            ready: self.readiness(),
+            more_work: budget_exhausted,
+            budget_exhausted,
+        }
+    }
+
+    /// Compatibility entry used by socket syscalls. It is now bounded too, so
+    /// no syscall can hold NET_STACK and the giant lock for an unbounded burst.
+    pub fn poll(&mut self, timestamp_ms: i64) {
+        let _ = self.poll_budgeted(timestamp_ms, 64);
     }
 
     /// Создать smoltcp-сокет и вернуть (наш id, smoltcp handle)

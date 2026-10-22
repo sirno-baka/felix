@@ -20,6 +20,7 @@ mod io;
 mod memory;
 mod multitasking;
 mod net;
+mod observability;
 mod pci;
 mod pipe;
 mod pit;

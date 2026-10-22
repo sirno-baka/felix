@@ -66,6 +66,7 @@ static WORK_CPU_MASK: [AtomicU32; CPU_MASK_WORDS] = [
     AtomicU32::new(0),
 ];
 static USER_SCHEDULING: AtomicBool = AtomicBool::new(false);
+static NETWORK_WORK_PENDING: AtomicBool = AtomicBool::new(false);
 static CURRENT_TASK: [AtomicI8; MAX_CPUS] = [const { AtomicI8::new(-1) }; MAX_CPUS];
 static CURRENT_CR3: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 static IDLE_ESP: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
@@ -476,6 +477,81 @@ pub fn online_cpu_count() -> usize {
     (AP_ONLINE.load(Ordering::Acquire) as usize).clamp(1, MAX_CPUS)
 }
 
+/// On machines with at least four logical CPUs, reserve CPU1 for NIC and
+/// smoltcp bottom halves. With fewer CPUs the ordinary BSP fallback is faster
+/// than sacrificing half (or a third) of all application capacity.
+pub fn network_cpu_index() -> Option<usize> {
+    (online_cpu_count() >= 4).then_some(1)
+}
+
+pub fn is_network_cpu(cpu: usize) -> bool {
+    network_cpu_index() == Some(cpu)
+}
+
+pub fn request_network_work() {
+    NETWORK_WORK_PENDING.store(true, Ordering::Release);
+    let Some(cpu) = network_cpu_index() else {
+        return;
+    };
+    let base = LAPIC_VIRT.load(Ordering::Acquire) as *mut u8;
+    let apic = CPU_APIC_IDS[cpu].load(Ordering::Acquire);
+    if base.is_null() || apic == u32::MAX {
+        return;
+    }
+    unsafe {
+        let _ = send_ipi(base, apic as u8, WORK_IPI_VECTOR as u32);
+    }
+}
+
+fn run_network_worker(cpu: usize) {
+    // Drain a short burst without sleeping. New RX interrupts arriving during
+    // a pass set NETWORK_WORK_PENDING again, so the empty->nonempty transition
+    // is never lost.
+    for _ in 0..8 {
+        let requested = NETWORK_WORK_PENDING.swap(false, Ordering::AcqRel);
+        let due = crate::drivers::net::network_due(crate::time::uptime_ms());
+        if !requested && !due {
+            break;
+        }
+        let more = crate::drivers::net::run_bottom_half(crate::time::uptime_ms());
+        service_network_wakes(cpu);
+        if more {
+            NETWORK_WORK_PENDING.store(true, Ordering::Release);
+        }
+    }
+    service_network_wakes(cpu);
+}
+
+fn service_network_wakes(cpu: usize) {
+    let ready = crate::drivers::net::take_ready();
+    if ready.is_empty() {
+        return;
+    }
+    let Some(kernel) = crate::multitasking::task::try_lock_kernel_on(cpu) else {
+        crate::drivers::net::restore_ready(ready);
+        NETWORK_WORK_PENDING.store(true, Ordering::Release);
+        return;
+    };
+    unsafe { asm!("cli", options(nomem, nostack)) };
+    let woken = unsafe {
+        crate::multitasking::task::TASK_MANAGER.wake_network_waiters(&ready.read, &ready.write)
+    };
+    crate::drivers::net::record_targeted_wakes(woken);
+    crate::multitasking::task::release_kernel_lock(kernel);
+    unsafe { asm!("sti", options(nomem, nostack)) };
+}
+
+pub fn service_network_wakes_locked() {
+    let ready = crate::drivers::net::take_ready();
+    if ready.is_empty() {
+        return;
+    }
+    let woken = unsafe {
+        crate::multitasking::task::TASK_MANAGER.wake_network_waiters(&ready.read, &ready.write)
+    };
+    crate::drivers::net::record_targeted_wakes(woken);
+}
+
 pub fn cpu_slot_count() -> usize {
     MAX_CPUS
 }
@@ -734,11 +810,19 @@ extern "C" fn ap_timer_handler(esp: u32) -> u64 {
     if let Some(slot) = cpu_slot_for_lapic(base) {
         AP_TIMER_TICKS[slot].fetch_add(1, Ordering::Relaxed);
     }
+    let cpu = cpu_slot_for_lapic(base).unwrap_or(0);
+    if is_network_cpu(cpu) {
+        if crate::drivers::net::network_due(crate::time::uptime_ms()) {
+            NETWORK_WORK_PENDING.store(true, Ordering::Release);
+        }
+        unsafe { lapic_write(base, LAPIC_EOI, 0) };
+        return esp as u64;
+    }
     let new_esp = if user_scheduling_enabled()
         && crate::multitasking::task::timer_may_schedule(
             esp as *const crate::multitasking::task::CPUState,
         ) {
-        let Some(kernel) = crate::multitasking::task::try_lock_kernel() else {
+        let Some(kernel) = crate::multitasking::task::try_lock_kernel_on(cpu) else {
             unsafe { lapic_write(base, LAPIC_EOI, 0) };
             return esp as u64;
         };
@@ -816,6 +900,8 @@ pub fn shootdown_tlb(page_dir_phys: u32, page: u32) -> bool {
         return true;
     }
 
+    let trace_started = crate::observability::read_tsc_low();
+
     // Tag every transaction. The old implementation used one global ACK count
     // and permanently disabled all future shootdowns after one timeout. A
     // single delayed/missed IPI therefore made every later munmap leak physical
@@ -827,12 +913,29 @@ pub fn shootdown_tlb(page_dir_phys: u32, page: u32) -> bool {
     if epoch == 0 {
         epoch = TLB_EPOCH.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
     }
+    crate::observability::trace_on_cpu(
+        sender,
+        crate::observability::TRACE_TLB_SEND,
+        epoch,
+        page_dir_phys,
+        page & !0xfff,
+        count as u32,
+    );
 
     for apic_id in target_apics[..count].iter().copied() {
         // Do not poison every future shootdown if one send fails. The target
         // may context-switch away before the wait finishes, which is equally
         // safe because reloading CR3 discards the stale non-global TLB entry.
-        let _ = unsafe { send_ipi(base, apic_id, TLB_IPI_VECTOR as u32) };
+        if !unsafe { send_ipi(base, apic_id, TLB_IPI_VECTOR as u32) } {
+            crate::observability::trace_on_cpu(
+                sender,
+                crate::observability::TRACE_TLB_IPI_FAIL,
+                epoch,
+                apic_id as u32,
+                page_dir_phys,
+                page & !0xfff,
+            );
+        }
     }
 
     for _ in 0..10_000_000 {
@@ -847,6 +950,14 @@ pub fn shootdown_tlb(page_dir_phys: u32, page: u32) -> bool {
             }
         }
         if complete {
+            crate::observability::trace_on_cpu(
+                sender,
+                crate::observability::TRACE_TLB_DONE,
+                epoch,
+                crate::observability::read_tsc_low().wrapping_sub(trace_started),
+                count as u32,
+                0,
+            );
             return true;
         }
         core::hint::spin_loop();
@@ -855,6 +966,22 @@ pub fn shootdown_tlb(page_dir_phys: u32, page: u32) -> bool {
     // The caller must retain the physical frame if this returns false. Unlike
     // the previous implementation, a single timeout does not permanently break
     // all later shootdowns and turn every subsequent munmap into a leak.
+    let first_missing = target_cpus[..count]
+        .iter()
+        .copied()
+        .find(|&cpu| {
+            CURRENT_CR3[cpu].load(Ordering::Acquire) == page_dir_phys
+                && TLB_ACK_EPOCH[cpu].load(Ordering::Acquire) != epoch
+        })
+        .unwrap_or(usize::MAX);
+    crate::observability::trace_on_cpu(
+        sender,
+        crate::observability::TRACE_TLB_TIMEOUT,
+        epoch,
+        crate::observability::read_tsc_low().wrapping_sub(trace_started),
+        first_missing as u32,
+        count as u32,
+    );
     false
 }
 
@@ -890,7 +1017,16 @@ extern "C" fn tlb_ipi_ack() {
     if current == TLB_TARGET_CR3.load(Ordering::Acquire) {
         crate::memory::paging::PageDirectory::flush_page(TLB_TARGET_PAGE.load(Ordering::Relaxed));
     }
-    TLB_ACK_EPOCH[current_cpu_index()].store(epoch, Ordering::Release);
+    let cpu = current_cpu_index();
+    TLB_ACK_EPOCH[cpu].store(epoch, Ordering::Release);
+    crate::observability::trace_on_cpu(
+        cpu,
+        crate::observability::TRACE_TLB_ACK,
+        epoch,
+        current,
+        TLB_TARGET_PAGE.load(Ordering::Relaxed),
+        0,
+    );
     let base = LAPIC_VIRT.load(Ordering::Acquire) as *mut u8;
     if !base.is_null() {
         unsafe { lapic_write(base, LAPIC_EOI, 0) };
@@ -1108,7 +1244,11 @@ extern "C" fn ap_entry() -> ! {
     cpu_mask_set(&ONLINE_MASK, slot, Ordering::Release);
     AP_ONLINE.fetch_add(1, Ordering::Release);
     loop {
-        let _ = run_pending_work(slot);
+        if is_network_cpu(slot) {
+            run_network_worker(slot);
+        } else {
+            let _ = run_pending_work(slot);
+        }
         unsafe { asm!("sti", "hlt", options(nomem, nostack)) };
     }
 }

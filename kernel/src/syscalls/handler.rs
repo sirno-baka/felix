@@ -30,6 +30,94 @@ use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 pub const SYSCALL_INT: u8 = 0x80;
 
+fn add_socket_wait(mask: &mut [u32; crate::drivers::net::READY_WORDS], socket_id: usize) -> bool {
+    if socket_id == 0 || socket_id > crate::drivers::net::READY_WORDS * 32 {
+        return false;
+    }
+    let bit = socket_id - 1;
+    mask[bit / 32] |= 1u32 << (bit & 31);
+    true
+}
+
+unsafe fn prepare_network_wait(
+    thread_slot: usize,
+    state: &CPUState,
+    reason: crate::multitasking::task::WaitReason,
+) {
+    if !matches!(
+        reason,
+        crate::multitasking::task::WaitReason::Socket
+            | crate::multitasking::task::WaitReason::Poll
+    ) {
+        return;
+    }
+
+    let process_slot = TASK_MANAGER.process_slot(thread_slot);
+    let mut read = [0u32; crate::drivers::net::READY_WORDS];
+    let mut write = [0u32; crate::drivers::net::READY_WORDS];
+    let mut any = false;
+    let mut poll_periodic = false;
+
+    if reason == crate::multitasking::task::WaitReason::Poll {
+        let fds = state.ebx as *const PollFd;
+        let nfds = (state.ecx as usize).min(64);
+        if fds.is_null() && nfds != 0 {
+            any = true;
+        } else if let Some(process) = TASK_MANAGER.tasks[process_slot].as_ref() {
+            for index in 0..nfds {
+                let pollfd = &*fds.add(index);
+                if pollfd.fd < 0 {
+                    continue;
+                }
+                let Some(descriptor) = process.fd_table.get(pollfd.fd as usize) else {
+                    continue;
+                };
+                let FileDescriptor::Socket { socket_id } = descriptor else {
+                    poll_periodic = true;
+                    continue;
+                };
+                let mut represented = true;
+                if pollfd.events & (POLLIN | POLLHUP | POLLERR) != 0 {
+                    represented &= add_socket_wait(&mut read, *socket_id);
+                }
+                if pollfd.events & (POLLOUT | POLLHUP | POLLERR) != 0 {
+                    represented &= add_socket_wait(&mut write, *socket_id);
+                }
+                any |= !represented;
+            }
+        } else {
+            any = true;
+        }
+    } else {
+        let fd = state.ebx as usize;
+        let socket_id = TASK_MANAGER.tasks[process_slot]
+            .as_ref()
+            .and_then(|process| process.fd_table.get(fd))
+            .and_then(|descriptor| match descriptor {
+                FileDescriptor::Socket { socket_id } => Some(*socket_id),
+                _ => None,
+            });
+        if let Some(socket_id) = socket_id {
+            let represented = match state.eax {
+                crate::syscalls::SYS_WRITE
+                | crate::syscalls::SYS_SENDTO
+                | crate::syscalls::SYS_CONNECT => add_socket_wait(&mut write, socket_id),
+                _ => add_socket_wait(&mut read, socket_id),
+            };
+            any = !represented;
+        } else {
+            any = true;
+        }
+    }
+
+    if let Some(task) = TASK_MANAGER.tasks[thread_slot].as_mut() {
+        task.network_wait_read = read;
+        task.network_wait_write = write;
+        task.network_wait_any = any;
+        task.poll_periodic = poll_periodic;
+    }
+}
+
 fn block_and_restart(
     thread_slot: usize,
     esp: u32,
@@ -40,9 +128,29 @@ fn block_and_restart(
         // `int 0x80` is two bytes. Resume at the instruction itself so the
         // syscall rechecks its condition after the wait queue wakes the task.
         state.eip = state.eip.wrapping_sub(2);
+        let trace_kind = match reason {
+            crate::multitasking::task::WaitReason::Socket => {
+                Some(crate::observability::TRACE_SOCKET_BLOCK)
+            }
+            crate::multitasking::task::WaitReason::Poll => {
+                Some(crate::observability::TRACE_POLL_BLOCK)
+            }
+            _ => None,
+        };
+        if let Some(kind) = trace_kind {
+            crate::observability::trace_on_cpu(
+                crate::multitasking::task::kernel_lock_owner_cpu(),
+                kind,
+                thread_slot as u32,
+                state.eax,
+                0,
+                0,
+            );
+        }
         if let Some(task) = TASK_MANAGER.tasks[thread_slot].as_mut() {
             task.block(reason);
         }
+        prepare_network_wait(thread_slot, state, reason);
         TASK_MANAGER.schedule(esp as *mut CPUState) as u32
     }
 }
@@ -1677,7 +1785,6 @@ pub fn sys_ioctl(current_slot: usize, fd: usize, req: u32, arg: u32) -> usize {
             EPERM
         };
     }
-
     match req {
         TCGETS => {
             if arg == 0 {
@@ -2690,6 +2797,14 @@ fn sys_futex(
                 task.futex_key = key;
                 task.wake_deadline_ms = wait_deadline_ms.unwrap_or(0);
                 task.block(crate::multitasking::task::WaitReason::Futex);
+                crate::observability::trace_on_cpu(
+                    crate::multitasking::task::kernel_lock_owner_cpu(),
+                    crate::observability::TRACE_FUTEX_WAIT,
+                    key as u32,
+                    (key >> 32) as u32,
+                    thread_slot as u32,
+                    wait_deadline_ms.is_some() as u32,
+                );
                 TASK_MANAGER.schedule(esp as *mut CPUState) as u32
             }
         }
@@ -2710,6 +2825,14 @@ fn sys_futex(
                     }
                 }
             }
+            crate::observability::trace_on_cpu(
+                crate::multitasking::task::kernel_lock_owner_cpu(),
+                crate::observability::TRACE_FUTEX_WAKE,
+                key as u32,
+                (key >> 32) as u32,
+                val,
+                woken,
+            );
             state.eax = woken;
             esp
         }
@@ -3727,21 +3850,6 @@ pub fn sys_poll(current_slot: usize, fds: *mut PollFd, nfds: usize, timeout_ms: 
     }
 
     loop {
-        if trace_reqwest {
-            crate::debugln!(
-                "[reqpoll] before stack.poll nfds={} fds={:#x}",
-                nfds,
-                fds as u32
-            );
-        }
-        if let Some(mut g) = crate::net::stack::NET_STACK.try_lock() {
-            if let Some(ref mut stack) = *g {
-                stack.poll(crate::time::uptime_ms() as i64);
-            }
-        }
-        if trace_reqwest {
-            crate::debugln!("[reqpoll] after stack.poll");
-        }
         let mut ready = 0usize;
         let mut requested_mask = 0u32;
         let mut returned_mask = 0u32;
@@ -4509,7 +4617,7 @@ fn sys_spawn_image(
 
 use crate::drivers::wm::WindowListItem;
 use crate::drivers::wm_flags::WindowFlags;
-use crate::net::stack::{NET_STACK, poll_stack};
+use crate::net::stack::NET_STACK;
 use crate::print::klog_write_str;
 use crate::time::sleep;
 use crate::utils::flags::{FlagOp, Flags};
@@ -4519,10 +4627,12 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 pub fn sys_socket(current_slot: usize, domain: u16, ty: u16, protocol: u8) -> usize {
-    let mut stack_guard = match NET_STACK.try_lock() {
-        Some(g) => g,
-        None => return usize::MAX,
-    };
+    // socket(2) has no EAGAIN contract. A dedicated network worker can own the
+    // stack for one bounded (64-packet) pass; treating that brief contention as
+    // a fatal allocation error made concurrent reqwest requests fail before
+    // connect(). Control-plane creation therefore waits, while send/recv/poll
+    // retain their nonblocking try_lock behaviour.
+    let mut stack_guard = NET_STACK.lock();
     let stack = match stack_guard.as_mut() {
         Some(s) => s,
         None => return usize::MAX,
@@ -4728,7 +4838,6 @@ pub fn sys_accept4(
             let Some(ref mut stack) = *guard else {
                 return ENXIO;
             };
-            stack.poll(crate::time::uptime_ms() as i64);
             stack.accept_tcp(listener_id)
         };
 
@@ -4876,8 +4985,6 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
         let Some(ref mut stack) = *guard else {
             return ENXIO;
         };
-        stack.poll(crate::time::uptime_ms() as i64);
-
         let (handle, is_tcp) = match stack.get_handle(socket_id) {
             Some(h) => h,
             None => return EBADF,
@@ -4944,7 +5051,6 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
             Err(_) => return EINVAL,
         }
 
-        stack.poll(crate::time::uptime_ms() as i64);
         let local_addr = stack
             .sockets
             .get::<tcp::Socket>(handle)
@@ -4957,6 +5063,7 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
             sock.state = SocketState::Connecting;
         }
     }
+    crate::drivers::net::request_poll();
 
     if nonblock {
         return EINPROGRESS;
@@ -4977,7 +5084,6 @@ pub fn sys_connect(current_slot: usize, fd: usize, addr_ptr: *const u8, addrlen:
             let Some(ref mut stack) = *guard else {
                 return ENXIO;
             };
-            stack.poll(crate::time::uptime_ms() as i64);
             let (handle, _) = match stack.get_handle(socket_id) {
                 Some(h) => h,
                 None => return EBADF,
@@ -5108,9 +5214,6 @@ pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) ->
             return ENXIO;
         };
 
-        let ts = crate::time::uptime_ms() as i64;
-        stack.poll(ts);
-
         let (handle, is_tcp) = match stack.get_handle(socket_id) {
             Some(h) => h,
             None => return EBADF,
@@ -5133,7 +5236,8 @@ pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) ->
             };
 
             if let Some(result) = result {
-                stack.poll(ts);
+                drop(stack_guard);
+                crate::drivers::net::request_poll();
                 return result;
             }
         } else {
@@ -5151,7 +5255,8 @@ pub fn sys_sendto(current_slot: usize, fd: usize, buf: *const u8, len: usize) ->
             let socket = stack.sockets.get_mut::<udp::Socket>(handle);
             match socket.send_slice(data, endpoint) {
                 Ok(()) => {
-                    stack.poll(ts);
+                    drop(stack_guard);
+                    crate::drivers::net::request_poll();
                     return len;
                 }
                 Err(_) => {}
@@ -5196,9 +5301,6 @@ pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) ->
             return ENXIO;
         };
 
-        let ts = crate::time::uptime_ms() as i64;
-        stack.poll(ts);
-
         let (handle, is_tcp) = match stack.get_handle(socket_id) {
             Some(h) => h,
             None => return EBADF,
@@ -5221,7 +5323,8 @@ pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) ->
             };
 
             if let Some(result) = result {
-                stack.poll(ts);
+                drop(stack_guard);
+                crate::drivers::net::request_poll();
                 return result;
             }
         } else {
@@ -5247,6 +5350,9 @@ pub fn sys_recvfrom(current_slot: usize, fd: usize, buf: *mut u8, len: usize) ->
                                 sock.peer_addr = Some(peer);
                             }
                         }
+                        drop(table);
+                        drop(stack_guard);
+                        crate::drivers::net::request_poll();
                         return size;
                     }
                     Err(code) => return code,

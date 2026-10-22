@@ -10,11 +10,6 @@ use core::arch::naked_asm;
 
 pub const TIMER_INT: u8 = 32;
 
-// Poll the network by elapsed time, not by IRQ count, so changing the PIT
-// frequency does not change the networking cadence.
-const NET_POLL_EVERY_MS: u64 = 10;
-static mut LAST_NET_POLL_MS: u64 = 0;
-
 /// Naked interrupt handler for timer (IRQ0)
 #[unsafe(naked)]
 pub extern "C" fn timer() {
@@ -92,13 +87,14 @@ pub extern "C" fn timer_handler(esp: u32) -> u64 {
             AUDIO_WAKE_PENDING.store(true, core::sync::atomic::Ordering::Release);
         }
 
-        // === 1. Сетевой полл (неблокирующий) ===
+        // IRQ/deadline-driven network bottom half. With 4+ CPUs it runs on the
+        // reserved network CPU; small systems keep a bounded BSP fallback.
         let now_ms = uptime_ms();
-        let net_irq = crate::drivers::net::take_irq_pending();
-        if net_irq || now_ms.saturating_sub(LAST_NET_POLL_MS) >= NET_POLL_EVERY_MS {
-            LAST_NET_POLL_MS = now_ms;
-            if !poll_network(now_ms as i64) && net_irq {
-                crate::drivers::net::restore_irq_pending();
+        if crate::drivers::net::network_due(now_ms) {
+            if crate::smp::network_cpu_index().is_some() {
+                crate::smp::request_network_work();
+            } else {
+                let _ = crate::drivers::net::run_bottom_half(now_ms);
             }
         }
         crate::drivers::shared_irq::maintenance_tick();
@@ -108,14 +104,12 @@ pub extern "C" fn timer_handler(esp: u32) -> u64 {
         // inside the scheduler/syscall core at a time.
         let new_esp = if !crate::multitasking::task::timer_may_schedule(esp as *const CPUState) {
             esp as u64
-        } else if let Some(kernel) = crate::multitasking::task::try_lock_kernel() {
+        } else if let Some(kernel) = crate::multitasking::task::try_lock_kernel_on(0) {
             crate::multitasking::task::set_kernel_lock_context(
                 crate::multitasking::task::KERNEL_LOCK_CTX_BSP_TIMER,
             );
-            // These sources are polled by the timer/device bottom halves. Wake
-            // only their queues so restartable syscalls can recheck readiness.
-            TASK_MANAGER.wake_waiters(WaitReason::Poll);
-            TASK_MANAGER.wake_waiters(WaitReason::Socket);
+            crate::smp::service_network_wakes_locked();
+            TASK_MANAGER.wake_periodic_poll_waiters();
             TASK_MANAGER.wake_waiters(WaitReason::Input);
             if AUDIO_WAKE_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
                 TASK_MANAGER.wake_waiters(WaitReason::Audio);
@@ -137,19 +131,4 @@ pub extern "C" fn timer_handler(esp: u32) -> u64 {
         PICS.end_interrupt(TIMER_INT);
         new_esp
     }
-}
-
-/// Безопасный полл из IRQ-контекста
-unsafe fn poll_network(timestamp_ms: i64) -> bool {
-    // Пытаемся взять стек без блокировки
-    if let Some(mut guard) = crate::net::stack::NET_STACK.try_lock() {
-        if let Some(ref mut stack) = *guard {
-            stack.poll(timestamp_ms);
-        }
-        true
-    } else {
-        false
-    }
-    // Если лок занят (syscall как раз работает с сетью) — просто пропускаем этот тик.
-    // Это нормально и безопасно.
 }

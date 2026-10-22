@@ -168,6 +168,12 @@ pub struct Task {
     /// Kernel wait key for FUTEX_WAIT. Shared futexes use the physical word
     /// address; FUTEX_PRIVATE_FLAG uses a process-scoped virtual key.
     pub futex_key: u64,
+    /// Socket ids this task is waiting to read/write. Four words cover the
+    /// first 128 sockets without requiring 64-bit atomics on i386.
+    pub network_wait_read: [u32; crate::drivers::net::READY_WORDS],
+    pub network_wait_write: [u32; crate::drivers::net::READY_WORDS],
+    pub network_wait_any: bool,
+    pub poll_periodic: bool,
     /// Per-thread x87/MMX/XMM state. FXSAVE uses all 512 bytes when the CPU
     /// supports FXSR; the first 108 bytes are also large enough for the legacy
     /// FNSAVE/FRSTOR fallback on pre-FXSR machines.
@@ -461,6 +467,10 @@ impl Task {
             wake_deadline_ms: 0,
             connect_deadline_ms: 0,
             futex_key: 0,
+            network_wait_read: [0; crate::drivers::net::READY_WORDS],
+            network_wait_write: [0; crate::drivers::net::READY_WORDS],
+            network_wait_any: false,
+            poll_periodic: false,
             fp_state: FpState::new(),
             fp_initialized: false,
         }
@@ -518,6 +528,10 @@ impl Task {
             wake_deadline_ms: 0,
             connect_deadline_ms: 0,
             futex_key: 0,
+            network_wait_read: [0; crate::drivers::net::READY_WORDS],
+            network_wait_write: [0; crate::drivers::net::READY_WORDS],
+            network_wait_any: false,
+            poll_periodic: false,
             fp_state: FpState::new(),
             fp_initialized: false,
         }
@@ -537,10 +551,20 @@ impl Task {
     pub fn wake(&mut self) {
         self.running = true;
         self.state = TaskState::Runnable;
+        self.network_wait_read.fill(0);
+        self.network_wait_write.fill(0);
+        self.network_wait_any = false;
+        self.poll_periodic = false;
     }
     pub fn block(&mut self, reason: WaitReason) {
         self.running = false;
         self.state = TaskState::Blocked(reason);
+        if !matches!(reason, WaitReason::Poll | WaitReason::Socket) {
+            self.network_wait_read.fill(0);
+            self.network_wait_write.fill(0);
+            self.network_wait_any = false;
+            self.poll_periodic = false;
+        }
     }
     pub fn stop(&mut self) {
         self.running = false;
@@ -630,10 +654,37 @@ pub fn live_kernel_stack_owner(frame: u32) -> Option<usize> {
     None
 }
 
-pub fn try_lock_kernel() -> Option<interrupt_sync::SpinMutexGuard<'static, ()>> {
+#[inline]
+fn try_lock_kernel_raw(cpu: usize) -> Option<interrupt_sync::SpinMutexGuard<'static, ()>> {
     let guard = SMP_KERNEL_LOCK.try_lock()?;
-    KERNEL_LOCK_OWNER.store(crate::smp::current_cpu_index() as i8, Ordering::Relaxed);
+    KERNEL_LOCK_OWNER.store(cpu as i8, Ordering::Relaxed);
     Some(guard)
+}
+
+pub fn try_lock_kernel_on(cpu: usize) -> Option<interrupt_sync::SpinMutexGuard<'static, ()>> {
+    match try_lock_kernel_raw(cpu) {
+        Some(guard) => Some(guard),
+        None => {
+            crate::observability::record_kernel_lock_try_miss(cpu);
+            None
+        }
+    }
+}
+
+pub fn release_kernel_lock(guard: interrupt_sync::SpinMutexGuard<'static, ()>) {
+    KERNEL_LOCK_CONTEXT.store(KERNEL_LOCK_CTX_NONE, Ordering::Relaxed);
+    KERNEL_LOCK_OWNER.store(-1, Ordering::Relaxed);
+    drop(guard);
+}
+
+#[inline]
+pub fn kernel_lock_owner_cpu() -> usize {
+    let owner = KERNEL_LOCK_OWNER.load(Ordering::Relaxed);
+    if owner >= 0 {
+        owner as usize
+    } else {
+        crate::smp::current_cpu_index()
+    }
 }
 
 #[inline]
@@ -650,18 +701,34 @@ pub fn lock_kernel() -> interrupt_sync::SpinMutexGuard<'static, ()> {
     // `sti; pause; cli` window is not sufficient: interrupt recognition after
     // STI is delayed by one instruction and some APIC/QEMU timings repeatedly
     // miss that window.
+    let cpu = crate::smp::current_cpu_index();
     unsafe { asm!("sti", options(nomem, nostack)) };
+    if let Some(guard) = try_lock_kernel_raw(cpu) {
+        unsafe { asm!("cli", options(nomem, nostack)) };
+        return guard;
+    }
+
+    // TSC and trace writes exist only on the contended slow path. The common
+    // syscall path remains exactly one successful try_lock plus CLI.
+    let wait_started = crate::observability::read_tsc_low();
+    let mut spin_loops = 0u32;
     loop {
-        if let Some(guard) = try_lock_kernel() {
+        if let Some(guard) = try_lock_kernel_raw(cpu) {
             // The syscall/scheduler core has always run with local interrupts
             // disabled.  Close the interruptible wait before returning the
             // guard so the existing giant-lock invariant remains unchanged.
             unsafe { asm!("cli", options(nomem, nostack)) };
+            crate::observability::record_kernel_lock_contention(
+                cpu,
+                crate::observability::read_tsc_low().wrapping_sub(wait_started),
+                spin_loops,
+            );
             return guard;
         }
         // Lock release does not generate an interrupt, so actively recheck
         // rather than HLT.  IF stays set here, allowing TLB/work IPIs and the
         // local timer to be serviced while another CPU owns the kernel lock.
+        spin_loops = spin_loops.saturating_add(1);
         core::hint::spin_loop();
     }
 }
@@ -965,7 +1032,10 @@ impl TaskManager {
     }
 
     fn wake_expired_timers(&mut self, now_ms: u64) {
-        for task in self.tasks.iter_mut().flatten() {
+        for (slot, task) in self.tasks.iter_mut().enumerate() {
+            let Some(task) = task.as_mut() else {
+                continue;
+            };
             match task.state {
                 TaskState::Blocked(WaitReason::Timer) if now_ms >= task.wake_deadline_ms => {
                     task.wake_deadline_ms = 0;
@@ -987,6 +1057,15 @@ impl TaskManager {
                             (*(task.cpu_state_ptr as *mut CPUState)).eax = (-110i32) as u32;
                         }
                     }
+                    let key = task.futex_key;
+                    crate::observability::trace_on_cpu(
+                        kernel_lock_owner_cpu(),
+                        crate::observability::TRACE_FUTEX_TIMEOUT,
+                        key as u32,
+                        (key >> 32) as u32,
+                        slot as u32,
+                        task.tid as u32,
+                    );
                     task.futex_key = 0;
                     task.wake_deadline_ms = 0;
                     task.wake();
@@ -996,12 +1075,86 @@ impl TaskManager {
         }
     }
 
-    pub fn wake_waiters(&mut self, reason: WaitReason) {
-        for task in self.tasks.iter_mut().flatten() {
+    pub fn wake_waiters(&mut self, reason: WaitReason) -> u32 {
+        let mut woken = 0u32;
+        let mut slots = 0u32;
+        for (slot, task) in self.tasks.iter_mut().enumerate() {
+            let Some(task) = task.as_mut() else {
+                continue;
+            };
             if task.state == TaskState::Blocked(reason) {
                 task.wake();
+                woken = woken.saturating_add(1);
+                if slot < 32 {
+                    slots |= 1u32 << slot;
+                }
             }
         }
+        let kind = match reason {
+            WaitReason::Socket => Some(crate::observability::TRACE_SOCKET_WAKE),
+            WaitReason::Poll => Some(crate::observability::TRACE_POLL_WAKE),
+            _ => None,
+        };
+        if woken != 0 {
+            if let Some(kind) = kind {
+                crate::observability::trace_on_cpu(kernel_lock_owner_cpu(), kind, woken, slots, 0, 0);
+            }
+        }
+        woken
+    }
+
+    pub fn wake_network_waiters(
+        &mut self,
+        readable: &[u32; crate::drivers::net::READY_WORDS],
+        writable: &[u32; crate::drivers::net::READY_WORDS],
+    ) -> u32 {
+        let mut woken = 0u32;
+        let mut slots = 0u32;
+        for (slot, task) in self.tasks.iter_mut().enumerate() {
+            let Some(task) = task.as_mut() else {
+                continue;
+            };
+            if !matches!(task.state, TaskState::Blocked(WaitReason::Poll | WaitReason::Socket)) {
+                continue;
+            }
+            let interested = task.network_wait_any
+                || (0..crate::drivers::net::READY_WORDS).any(|word| {
+                    task.network_wait_read[word] & readable[word] != 0
+                        || task.network_wait_write[word] & writable[word] != 0
+                });
+            if interested {
+                task.wake();
+                woken = woken.saturating_add(1);
+                if slot < 32 {
+                    slots |= 1u32 << slot;
+                }
+            }
+        }
+        if woken != 0 {
+            crate::observability::trace_on_cpu(
+                kernel_lock_owner_cpu(),
+                crate::observability::TRACE_SOCKET_WAKE,
+                woken,
+                slots,
+                readable[0],
+                writable[0],
+            );
+        }
+        woken
+    }
+
+    /// Compatibility path for poll sets containing pipes, PTYs or other
+    /// devices that do not yet publish keyed readiness notifications. Pure
+    /// socket pollers never enter this path.
+    pub fn wake_periodic_poll_waiters(&mut self) -> u32 {
+        let mut woken = 0u32;
+        for task in self.tasks.iter_mut().flatten() {
+            if task.state == TaskState::Blocked(WaitReason::Poll) && task.poll_periodic {
+                task.wake();
+                woken = woken.saturating_add(1);
+            }
+        }
+        woken
     }
 
     fn schedule_ap(&mut self, cpu: usize, cpu_state: *mut CPUState) -> *mut CPUState {

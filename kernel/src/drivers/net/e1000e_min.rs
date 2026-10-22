@@ -11,7 +11,7 @@
 
 use core::fmt;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 use crate::drivers::net::{RX_RING_SIZE, TX_BUF_SIZE, map_mmio};
 use crate::memory::resources::{DmaBuffer as DmaAllocation, MmioMapping, dma_alloc_for};
@@ -31,6 +31,8 @@ const REG_STATUS: usize = 0x0008;
 const REG_CTRL_EXT: usize = 0x0018;
 const REG_FEXTNVM3: usize = 0x003c;
 const REG_ICR: usize = 0x00c0;
+const REG_ITR: usize = 0x00c4;
+const REG_IMS: usize = 0x00d0;
 const REG_IMC: usize = 0x00d8;
 const REG_RCTL: usize = 0x0100;
 const REG_TCTL: usize = 0x0400;
@@ -117,6 +119,25 @@ const TXD_CMD_EOP: u8 = 1 << 0;
 const TXD_CMD_IFCS: u8 = 1 << 1;
 const TXD_CMD_RS: u8 = 1 << 3;
 const TXD_STAT_DD: u8 = 1 << 0;
+
+// Keep the hard IRQ minimal: acknowledge completion/link causes and defer all
+// descriptor walking and protocol work to the network bottom half.
+const ICR_TXDW: u32 = 1 << 0;
+const ICR_LSC: u32 = 1 << 2;
+const ICR_RXO: u32 = 1 << 6;
+const ICR_RXT0: u32 = 1 << 7;
+// Do not enable RXDMT0. It is a level condition ("descriptor minimum
+// threshold"), not an edge for newly received data. With the ring kept almost
+// entirely available it can stay asserted and create hundreds of thousands of
+// empty IRQs per second.
+const IRQ_MASK: u32 = ICR_TXDW | ICR_LSC | ICR_RXO | ICR_RXT0;
+
+static IRQ_MMIO: AtomicUsize = AtomicUsize::new(0);
+static IRQ_LINE: AtomicU8 = AtomicU8::new(u8::MAX);
+static IRQ_TXDW: AtomicU32 = AtomicU32::new(0);
+static IRQ_LSC: AtomicU32 = AtomicU32::new(0);
+static IRQ_RXO: AtomicU32 = AtomicU32::new(0);
+static IRQ_RXT0: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Profile {
@@ -271,8 +292,8 @@ impl E1000e {
         );
 
         dev.enable_bus_mastering();
-        // This baseline is polling-only. Keep legacy INTx disabled as well as
-        // masking all interrupt causes in the NIC.
+        // Keep legacy INTx disabled until rings, the shared handler and the
+        // bottom-half owner have all been published.
         dev.write_u16(0x04, dev.read_u16(0x04) | 0x0400);
 
         let (bar_phys, bar_size) = match dev.get_bar(0) {
@@ -358,7 +379,7 @@ impl E1000e {
         nic.initialized.store(true, Ordering::Release);
 
         println!(
-            "e1000e-min: {} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} polling-only",
+            "e1000e-min: {} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={}",
             nic.profile.name(),
             nic.mac[0],
             nic.mac[1],
@@ -370,6 +391,31 @@ impl E1000e {
         );
 
         *NET.lock() = Some(nic);
+
+        IRQ_MMIO.store(mmio, Ordering::Release);
+        IRQ_LINE.store(dev.interrupt_line, Ordering::Release);
+        if crate::drivers::shared_irq::register_named(
+            dev.interrupt_line,
+            irq_entry,
+            "e1000e-min",
+        )
+        .is_ok()
+        {
+            // 125 * 256 ns = 32 us: low enough for interactive latency while
+            // still coalescing packet bursts before they reach the PIC.
+            if let Some(nic) = NET.lock().as_ref() {
+                nic.write(REG_ITR, 125);
+                let _ = nic.read(REG_ICR);
+                nic.write(REG_IMS, IRQ_MASK);
+            }
+            dev.write_u16(0x04, dev.read_u16(0x04) & !0x0400);
+            println!("e1000e-min: IRQ{} enabled (32us moderation)", dev.interrupt_line);
+        } else {
+            println!(
+                "e1000e-min: IRQ{} unavailable, deadline polling fallback",
+                dev.interrupt_line
+            );
+        }
         Ok(())
     }
 
@@ -717,6 +763,17 @@ impl E1000e {
         unsafe { read_volatile(&(*self.tx_ring.add(slot)).status) & TXD_STAT_DD != 0 }
     }
 
+    pub fn rearm_interrupts(&self) {
+        if self.initialized.load(Ordering::Acquire) {
+            // IMS is set-on-write. Causes accumulated while the bottom half
+            // drained descriptors must remain latched: enabling them here
+            // either raises one follow-up INTx or does nothing. The hard IRQ
+            // masks first and then clears ICR, so stale causes cannot sustain
+            // a re-arm loop and newly arrived packets cannot lose their edge.
+            self.write(REG_IMS, IRQ_MASK);
+        }
+    }
+
     pub fn send(&self, data: &[u8]) -> Result<(), &'static str> {
         if !self.initialized.load(Ordering::Acquire) {
             return Err("e1000e-min not initialized");
@@ -819,6 +876,47 @@ impl E1000e {
     }
 }
 
+fn irq_entry(irq: u8) -> bool {
+    if IRQ_LINE.load(Ordering::Acquire) != irq {
+        return false;
+    }
+    let mmio = IRQ_MMIO.load(Ordering::Acquire);
+    if mmio == 0 {
+        return false;
+    }
+
+    // Mask before reading ICR. With IMS=0 the cause register is
+    // unconditionally clear-on-read, including delayed TX/RX causes. Reading
+    // first and masking afterwards leaves a small re-assertion window which
+    // can make legacy INTx self-sustain forever.
+    unsafe {
+        write_volatile((mmio + REG_IMC) as *mut u32, IRQ_MASK);
+        let _ = read_volatile((mmio + REG_STATUS) as *const u32);
+    }
+    let cause = unsafe { read_volatile((mmio + REG_ICR) as *const u32) } & IRQ_MASK;
+    if cause == 0 {
+        unsafe {
+            write_volatile((mmio + REG_IMS) as *mut u32, IRQ_MASK);
+            let _ = read_volatile((mmio + REG_STATUS) as *const u32);
+        }
+        return false;
+    }
+    if cause & ICR_TXDW != 0 {
+        IRQ_TXDW.fetch_add(1, Ordering::Relaxed);
+    }
+    if cause & ICR_LSC != 0 {
+        IRQ_LSC.fetch_add(1, Ordering::Relaxed);
+    }
+    if cause & ICR_RXO != 0 {
+        IRQ_RXO.fetch_add(1, Ordering::Relaxed);
+    }
+    if cause & ICR_RXT0 != 0 {
+        IRQ_RXT0.fetch_add(1, Ordering::Relaxed);
+    }
+    crate::drivers::net::mark_irq_pending();
+    true
+}
+
 impl E1000e {
     fn fmt_debug(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Intel statistics registers are clear-on-read. Keep a software total
@@ -850,6 +948,12 @@ impl E1000e {
             "e1000e-min {} link={} CTRL={:#010x} STATUS={:#010x} CTRL_EXT={:#010x} FWSM={:#010x}",
             self.profile.name(), self.link_up(), self.read(REG_CTRL), self.read(REG_STATUS),
             self.read(REG_CTRL_EXT), self.read(REG_FWSM),
+        )?;
+        writeln!(
+            f,
+            "IRQ causes TXDW={} LSC={} RXO={} RXT0={}",
+            IRQ_TXDW.load(Ordering::Relaxed), IRQ_LSC.load(Ordering::Relaxed),
+            IRQ_RXO.load(Ordering::Relaxed), IRQ_RXT0.load(Ordering::Relaxed),
         )?;
         writeln!(
             f,
