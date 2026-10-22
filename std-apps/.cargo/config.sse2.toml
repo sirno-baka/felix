@@ -1,0 +1,8 @@
+# Optional high-performance userspace profile for CPUs with SSE2.
+#
+# The Felix kernel remains i386 and detects FXSR/SSE at runtime. Use this
+# overlay only for binaries that are allowed to require SSE2.
+[target.i686-unknown-popugos]
+rustflags = [
+    "-C", "target-feature=+sse,+sse2",
+]

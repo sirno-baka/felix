@@ -944,6 +944,7 @@ dependencies = [
 [[package]]
 name = "mio"
 version = "1.2.4"
+source = "git+https://github.com/sirno-baka/mio?branch=master#a637cf4ae8cdb4a0bc42afe280027ecdd89b8a04"
 dependencies = [
  "libc",
  "wasi",
@@ -1705,6 +1706,7 @@ dependencies = [
 [[package]]
 name = "socket2"
 version = "0.6.5"
+source = "git+https://github.com/sirno-baka/socket2?branch=master#87153e4d2346314a6027f9fa856d1ff6364fe490"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -1899,6 +1901,7 @@ dependencies = [
 [[package]]
 name = "tokio"
 version = "1.53.1"
+source = "git+https://github.com/sirno-baka/tokio?branch=popugos#80fd87ba45fed1363901fd0a88a302fca6ad839c"
 dependencies = [
  "bytes",
  "libc",
