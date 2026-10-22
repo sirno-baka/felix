@@ -51,6 +51,8 @@ pub const TCSETSW: u32 = 0x5403;
 pub const TCSETSF: u32 = 0x5404;
 pub const TIOCGPGRP: u32 = 0x540F;
 pub const TIOCSPGRP: u32 = 0x5410;
+pub const TIOCGWINSZ: u32 = 0x5413;
+pub const TIOCSWINSZ: u32 = 0x5414;
 pub const IFLAG_ICRNL: u32 = 0x0100;
 pub const OFLAG_OPOST: u32 = 0x0001;
 pub const OFLAG_ONLCR: u32 = 0x0004;
@@ -81,6 +83,15 @@ pub struct Termios {
     pub c_lflag: u32,
     pub c_line: u8,
     pub c_cc: [u8; 19],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WinSize {
+    pub rows: u16,
+    pub cols: u16,
+    pub xpixel: u16,
+    pub ypixel: u16,
 }
 
 impl Default for Termios {
@@ -607,6 +618,14 @@ pub unsafe fn tcgetpgrp(fd: u32) -> i32 {
 
 pub unsafe fn tcsetpgrp(fd: u32, pgid: i32) -> usize {
     ioctl(fd, TIOCSPGRP, (&pgid as *const i32) as u32)
+}
+
+pub unsafe fn tcgetwinsize(fd: u32, winsize: *mut WinSize) -> usize {
+    ioctl(fd, TIOCGWINSZ, winsize as u32)
+}
+
+pub unsafe fn tcsetwinsize(fd: u32, winsize: *const WinSize) -> usize {
+    ioctl(fd, TIOCSWINSZ, winsize as u32)
 }
 
 #[repr(C)]

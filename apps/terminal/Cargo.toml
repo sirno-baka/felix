@@ -1,0 +1,14 @@
+[package]
+name = "terminal"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "terminal"
+test = false
+
+[dependencies]
+libfelix = { path = "../../lib" }
+vte = { version = "0.13.1", default-features = false, features = ["no_std"] }
+embedded-graphics = { version = "0.8.2", default-features = false }
+embedded-graphics-unicodefonts = "0.2.0"

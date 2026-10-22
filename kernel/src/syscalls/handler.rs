@@ -1730,6 +1730,8 @@ const TCSETSW: u32 = 0x5403;
 const TCSETSF: u32 = 0x5404;
 const TIOCGPGRP: u32 = 0x540F;
 const TIOCSPGRP: u32 = 0x5410;
+const TIOCGWINSZ: u32 = 0x5413;
+const TIOCSWINSZ: u32 = 0x5414;
 const IFLAG_ICRNL: u32 = 0x0100;
 const OFLAG_OPOST: u32 = 0x0001;
 const OFLAG_ONLCR: u32 = 0x0004;
@@ -1783,6 +1785,29 @@ pub fn sys_ioctl(current_slot: usize, fd: usize, req: u32, arg: u32) -> usize {
             0
         } else {
             EPERM
+        };
+    }
+    if req == TIOCGWINSZ {
+        if arg == 0 {
+            return EFAULT;
+        }
+        let Some(winsize) = crate::tty::winsize(pty_id) else {
+            return ENOTTY;
+        };
+        unsafe {
+            *(arg as *mut crate::tty::WinSize) = winsize;
+        }
+        return 0;
+    }
+    if req == TIOCSWINSZ {
+        if arg == 0 {
+            return EFAULT;
+        }
+        let winsize = unsafe { *(arg as *const crate::tty::WinSize) };
+        return if crate::tty::set_winsize(pty_id, winsize) {
+            0
+        } else {
+            ENOTTY
         };
     }
     match req {

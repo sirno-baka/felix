@@ -25,6 +25,7 @@ pub const SIGSTOP: u32 = 19;
 pub const SIGTSTP: u32 = 20;
 pub const SIGTTIN: u32 = 21;
 pub const SIGTTOU: u32 = 22;
+pub const SIGWINCH: u32 = 28;
 
 pub const SIG_DFL: u32 = 0;
 pub const SIG_IGN: u32 = 1;

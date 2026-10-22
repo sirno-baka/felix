@@ -18,6 +18,15 @@ const PTY_BUF: usize = 8192;
 const CANON_BUF: usize = 1024;
 pub const WOULD_BLOCK: usize = usize::MAX - 0x1001;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WinSize {
+    pub rows: u16,
+    pub cols: u16,
+    pub xpixel: u16,
+    pub ypixel: u16,
+}
+
 pub const NCCS: usize = 19;
 pub const VINTR: usize = 0;
 pub const VQUIT: usize = 1;
@@ -78,6 +87,7 @@ struct Pty {
     opost: bool,
     onlcr: bool,
     cc: [u8; NCCS],
+    winsize: WinSize,
 }
 
 impl Pty {
@@ -100,8 +110,30 @@ impl Pty {
             opost: true,
             onlcr: true,
             cc: default_cc(),
+            winsize: WinSize::default(),
         }
     }
+}
+
+pub fn winsize(id: usize) -> Option<WinSize> {
+    let table = PTYS.get().lock();
+    table.slots.get(id)?.as_ref().map(|pty| pty.winsize)
+}
+
+pub fn set_winsize(id: usize, winsize: WinSize) -> bool {
+    let (changed, tty_id) = {
+        let mut table = PTYS.get().lock();
+        let Some(pty) = table.slots.get_mut(id).and_then(|pty| pty.as_mut()) else {
+            return false;
+        };
+        let changed = pty.winsize != winsize;
+        pty.winsize = winsize;
+        (changed, pty.tty_id)
+    };
+    if changed {
+        signal_foreground(tty_id, crate::signal::SIGWINCH);
+    }
+    true
 }
 
 struct PtyTable {

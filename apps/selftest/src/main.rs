@@ -7,8 +7,8 @@ use alloc::sync::Arc;
 use libfelix::prelude::*;
 use libfelix::mutex::Mutex;
 use libfelix::syscall::{
-    close, execve, getcwd, getpid, getppid, gettid, mount_list, openpty, pipe, read, task_list, write,
-    MountInfo, TaskInfo,
+    close, execve, getcwd, getpid, getppid, gettid, mount_list, openpty, pipe, read, task_list,
+    tcgetwinsize, tcsetwinsize, write, MountInfo, TaskInfo, WinSize,
 };
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -218,11 +218,25 @@ fn test_pty() -> bool {
     let wrote = unsafe { write(fds[0], payload.as_ptr(), payload.len()) };
     let mut out = [0u8; 7];
     let got = unsafe { read(fds[1], out.as_mut_ptr(), out.len()) };
+    let expected_size = WinSize {
+        rows: 40,
+        cols: 120,
+        xpixel: 960,
+        ypixel: 640,
+    };
+    let set_size = unsafe { tcsetwinsize(fds[0], &expected_size) };
+    let mut actual_size = WinSize::default();
+    let get_size = unsafe { tcgetwinsize(fds[1], &mut actual_size) };
     unsafe {
         close(fds[1]);
         close(fds[0]);
     }
-    wrote == payload.len() && got == payload.len() && &out == payload
+    wrote == payload.len()
+        && got == payload.len()
+        && &out == payload
+        && set_size == 0
+        && get_size == 0
+        && actual_size == expected_size
 }
 
 fn mount_path(item: &MountInfo) -> &str {

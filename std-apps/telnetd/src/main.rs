@@ -23,13 +23,23 @@ const SYS_WRITE: u32 = 4;
 const SYS_CLOSE: u32 = 6;
 const SYS_WAITPID: u32 = 7;
 const SYS_FCNTL: u32 = 55;
+const SYS_IOCTL: u32 = 54;
 const SYS_SPAWN_PATH: u32 = 0xF002;
 const SYS_OPENPTY: u32 = 0xF116;
+const TIOCSWINSZ: u32 = 0x5414;
 
 const F_GETFL: u32 = 3;
 const F_SETFL: u32 = 4;
 const O_NONBLOCK: u32 = 0x800;
 const WNOHANG: u32 = 1;
+
+#[repr(C)]
+struct WinSize {
+    rows: u16,
+    cols: u16,
+    xpixel: u16,
+    ypixel: u16,
+}
 
 #[repr(C)]
 struct ExecParams {
@@ -96,6 +106,16 @@ unsafe fn set_nonblock(fd: u32) -> bool {
         return false;
     }
     unsafe { syscall3(SYS_FCNTL, fd, F_SETFL, flags as u32 | O_NONBLOCK) == 0 }
+}
+
+unsafe fn set_winsize(fd: u32, cols: u16, rows: u16) -> bool {
+    let size = WinSize {
+        rows,
+        cols,
+        xpixel: 0,
+        ypixel: 0,
+    };
+    unsafe { syscall3(SYS_IOCTL, fd, TIOCSWINSZ, &size as *const WinSize as u32) == 0 }
 }
 
 unsafe fn waitpid(pid: i32, status: &mut i32, options: u32) -> usize {
@@ -206,8 +226,6 @@ impl TelnetDecoder {
             let width = u16::from_be_bytes([self.sub_data[0], self.sub_data[1]]);
             let height = u16::from_be_bytes([self.sub_data[2], self.sub_data[3]]);
             self.naws = Some((width, height));
-            // Felix does not have TIOCSWINSZ yet. Keep the last NAWS value so
-            // the relay is protocol-correct and can wire it to the ioctl later.
         }
         self.sub_data.clear();
     }
@@ -350,6 +368,7 @@ fn relay_session(mut stream: TcpStream) -> io::Result<()> {
     let mut network_buf = [0u8; 2048];
     let mut pty_buf = [0u8; 2048];
     let mut disconnected = false;
+    let mut applied_naws = None;
 
     loop {
         flush_socket(&mut stream, &mut to_socket)?;
@@ -364,6 +383,12 @@ fn relay_session(mut stream: TcpStream) -> io::Result<()> {
                 Ok(n) => {
                     for &byte in &network_buf[..n] {
                         decoder.feed(byte, &mut to_pty, &mut to_socket);
+                    }
+                    if decoder.naws != applied_naws {
+                        if let Some((cols, rows)) = decoder.naws {
+                            let _ = unsafe { set_winsize(master, cols, rows) };
+                        }
+                        applied_naws = decoder.naws;
                     }
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
