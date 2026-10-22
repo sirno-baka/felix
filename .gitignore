@@ -9,3 +9,18 @@ pxe
 .idea
 std-apps/.cargo/config.local.toml
 std-apps/target
+std-apps/target-*/
+
+# Local IDE/research state and runtime diagnostics.
+.grok/
+.run/
+*.log
+*.pcap
+.*.txt
+mem.txt
+tmp_recv.txt
+
+# Generated root filesystem binaries and per-user runtime state.
+rootfs/bin/
+rootfs/home/user/.shell_history
+rootfs/home/user/tg.rhai
