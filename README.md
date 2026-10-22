@@ -61,11 +61,11 @@ The project is developed against both **QEMU** and real legacy hardware, especia
 | Storage | ATA PIO, CompactFlash ATA, USB Mass Storage |
 | USB | OHCI USB 1.1; control, bulk and interrupt transfers; hotplug polling |
 | Input | PS/2 keyboard + PS/2 mouse; experimental USB HID support |
-| Graphics | VESA LFB, 16/24/32 bpp; ATI Mobility Radeon M6 experimental native-mode support |
+| Graphics | VESA LFB plus native framebuffer takeover paths for Intel Gen9, Sandy Bridge and ATI Mobility Radeon M6 |
 | LFB virtual address | `0xD0000000` |
 | Window system | In-kernel software compositor, max 8 windows |
 | Userspace UI | `libfelix`, `embedded-graphics`, retained-mode Taffy UI |
-| Network stack | smoltcp-based IPv4/TCP/UDP, currently experimental and disabled by default |
+| Network stack | smoltcp-based IPv4/TCP/UDP with automatic e1000e/8255x/RTL8139 probing |
 | Real-hardware target | Sony VAIO PCG-C1MAH / C1M family |
 
 ---
@@ -77,10 +77,10 @@ The project is developed against both **QEMU** and real legacy hardware, especia
 The normal `make run` configuration currently uses:
 
 - i386 system emulation
-- 128 MiB RAM
+- 1280 MiB RAM
 - IDE disk image
 - VGA/VESA graphics
-- RTL8139 NIC
+- Intel e1000e NIC
 - PCI OHCI controller
 - USB Mass Storage backed by a FAT test image
 - serial output to stdio
@@ -455,7 +455,7 @@ Felix uses the legacy dual **8259A PIC**.
 | PIT | IRQ0 / vector 32 | scheduler tick |
 | PS/2 keyboard | IRQ1 / vector 33 | keyboard input |
 | PIC cascade | IRQ2 | slave PIC cascade |
-| Shared legacy PCI INTx | IRQ9 | currently kept masked for USB/PCMCIA polling |
+| Shared legacy PCI INTx | IRQ5/9/10/11 | shared dispatcher for registered PCI devices |
 | PS/2 mouse | IRQ12 / vector 44 | mouse input |
 | Syscalls | vector `0x80` | userspace → kernel |
 
@@ -465,9 +465,9 @@ The current PIT rate is:
 200 Hz
 ```
 
-The normal PIC configuration enables PIT, keyboard, cascade and PS/2 mouse. IRQ9 remains masked because the Sony C1M generation shares it between several PCI/CardBus devices while Felix does not yet have a generic shared-INTx dispatcher.
-
-USB and PCMCIA hotplug therefore use polling rather than their shared hardware interrupt.
+The shared-INTx dispatcher masks a line while its registered handlers run,
+tracks handled/spurious counts and restores the line after bounded recovery.
+USB root-hub and PCMCIA hotplug discovery still use periodic polling.
 
 ---
 
@@ -488,7 +488,7 @@ Felix has a small preemptive round-robin scheduler.
 - `wait()` / `WNOHANG` are supported
 - libfelix exposes `thread::spawn`, `JoinHandle::join`, `gettid` and `sched_yield`
 - the PopugOS Rust target exposes the same kernel threads through `std::thread`,
-  with per-thread key-based TLS and cooperative `std::sync` waits
+  with per-thread key-based TLS and kernel-backed futex waits
 
 Native user context uses standard Felix GDT selectors:
 
@@ -530,6 +530,7 @@ Recognized signal numbers include:
 | `SIGQUIT` | 3 | terminate |
 | `SIGKILL` | 9 | terminate, cannot be overridden |
 | `SIGTERM` | 15 | terminate |
+| `SIGWINCH` | 28 | ignored unless handled |
 
 Native tasks can install simple signal handlers through `sigaction` or use `SIG_IGN` where allowed.
 
@@ -561,6 +562,7 @@ Per-task descriptor tables can contain:
 - directories
 - DevFS devices
 - pipes
+- PTY masters/slaves
 - sockets
 
 Supported operations include open/read/write/close, lseek, dup2, fcntl and poll.
@@ -594,7 +596,7 @@ The syscall entry disables interrupts, saves general-purpose registers, calls th
 | 37 | `kill` | queue signal |
 | 42 | `pipe` | anonymous pipe |
 | 45 | `brk` | user heap growth |
-| 54 | `ioctl` | currently mostly `ENOTTY` stub |
+| 54 | `ioctl` | PTY termios, foreground process group and window size |
 | 55 | `fcntl` | `F_GETFL`, `F_SETFL`, nonblocking |
 | 63 | `dup2` | descriptor duplication |
 | 67 | `sigaction` | simple signal handler API |
@@ -608,6 +610,7 @@ The syscall entry disables interrupts, saves general-purpose registers, calls th
 | 220 | `getdents64` | directory iteration |
 | 158 | `sched_yield` | yield the current thread's time slice |
 | 224 | `gettid` | return the calling thread id |
+| 240 | `futex` | `FUTEX_WAIT` / `FUTEX_WAKE`, including shared mappings |
 | 252 | `exit_group` | terminate the complete thread group |
 
 ## Felix custom syscalls
@@ -634,7 +637,7 @@ Implemented paths currently include:
 | 361 | `bind` | implemented |
 | 362 | `connect` | implemented |
 | 363 | `listen` | implemented |
-| 364 | `accept4` | stub / not implemented |
+| 364 | `accept4` | blocking and `SOCK_NONBLOCK` listener accept |
 | 369 | `sendto` | implemented for TCP/UDP abstraction |
 | 371 | `recvfrom` | implemented for TCP/UDP abstraction |
 | 373 | `shutdown` | implemented |
@@ -756,6 +759,7 @@ The following table distinguishes code that exists from code that is part of the
 | PS/2 mouse | **working** | IRQ12 |
 | VESA LFB | **working** | 16/24/32 bpp |
 | ATI Radeon Mobility M6 | **experimental / hardware-specific** | Sony native-panel work |
+| Intel Gen9 | **working / firmware-assisted** | Skylake/Kaby Lake linear primary-plane takeover |
 | PCI enumeration | **working** | userspace `lspci` support |
 | IDE ATA PIO | **working** | root storage path |
 | ext2 | **working** | standard root FS |
@@ -768,9 +772,10 @@ The following table distinguishes code that exists from code that is part of the
 | Ricoh R5C475 PCMCIA | **active backend** | ExCA/CardBus/CF path |
 | CompactFlash ATA | **working on supported controller path** | BlockDevice + removable mount |
 | Toshiba ToPIC100 | **source backend exists, not wired into active registry** | `1179:0617` implementation present |
-| RTL8139 | **experimental / disabled by default** | networking integration in progress |
-| Intel 8255x | **experimental** | older QEMU/development path |
-| smoltcp IPv4/TCP/UDP | **implemented, disabled by default** | user socket API exists |
+| RTL8139 | **experimental** | fallback networking path |
+| Intel e1000e | **working in QEMU** | moderated legacy INTx with bounded bottom-half processing |
+| Intel 8255x | **experimental** | fallback development path |
+| smoltcp IPv4/TCP/UDP | **enabled when a supported NIC is found** | client and server socket paths |
 
 ---
 
@@ -991,6 +996,13 @@ The driver experiments with native panel programming, including CRTC, PLL and LV
 
 This path remains experimental; VESA is the normal generic graphics interface.
 
+## Intel Gen9
+
+The Skylake/Kaby Lake path reuses a linear XRGB8888 primary plane configured by
+firmware. It allocates a DMA-backed framebuffer, installs GGTT entries and
+switches the active plane surface without performing a full modeset. The driver
+fails closed when the firmware plane is scaled, tiled, rotated or compressed.
+
 ---
 
 # Window manager
@@ -1175,9 +1187,11 @@ loop {
 
 The Makefile automatically builds every native `apps/<name>` package as an i386 userspace program.
 
-## `shell`
+## `terminal` and `shell`
 
-The main Felix shell is a **userspace GUI terminal**, not a kernel console.
+`terminal` is the graphical PTY frontend and `shell` is the command interpreter
+spawned on its slave side. Resizing the window updates the PTY through
+`TIOCSWINSZ` and sends `SIGWINCH` to the foreground process group.
 
 Current features:
 
@@ -1194,6 +1208,16 @@ Current features:
 - child stdin/stdout/stderr plumbing through kernel pipes
 - Ctrl+C → `SIGINT`
 - live child output in the terminal window
+
+## `htop`
+
+`htop` reads `/proc/stat`, `/proc/meminfo` and per-process `/proc/<pid>/status`
+files to display per-CPU load, managed/free memory and the active process list.
+
+## `taskpanel` and `startmenu`
+
+The standard-library userspace includes a desktop task panel and start menu.
+They enumerate live windows through the WM API and launch installed programs.
 
 Built-ins currently include:
 
@@ -1281,11 +1305,14 @@ The current program is a development/test client with a hard-coded QEMU-style en
 
 # Networking
 
-Networking code exists but is currently **experimental and disabled in the normal boot path**.
+Networking is initialized during the normal boot path. Felix probes e1000e
+first, then Intel 8255x and RTL8139, and enables the first supported device.
+The stack remains experimental on real hardware.
 
 Implemented pieces include:
 
 - RTL8139 driver
+- Intel e1000e driver
 - Intel 8255x development driver
 - smoltcp IPv4 stack
 - ARP
@@ -1296,14 +1323,15 @@ Implemented pieces include:
 - static IPv4 configuration
 - socket descriptor integration
 - polling
+- IRQ/deadline-driven bounded bottom halves
 - userspace socket syscalls
 - `ifconfig`
 - HTTP client library/app
 - SSH experiment
 
-The normal `main.rs` currently does not enable the network driver initialization by default.
-
-Reasons include unfinished resource/IRQ coexistence on real legacy hardware. Some older experimental NIC code also uses fixed MMIO areas that overlap other current device windows, so it should not be treated as production-ready hardware management.
+On systems with at least four logical CPUs, CPU1 is reserved for network
+bottom-half work. Smaller systems use the bounded BSP fallback. Socket and poll
+waiters are woken from keyed readiness masks rather than every timer tick.
 
 ## ifconfig
 
@@ -1317,7 +1345,9 @@ ifconfig IP/PREFIX [GATEWAY]
 
 ## Socket limitations
 
-Client TCP/UDP paths are much more complete than server-side semantics. In particular `accept4` is still a stub, and several BSD/Linux socket operations are not implemented.
+TCP client and listener paths include blocking/nonblocking connect, listen and
+`accept4`. Several less common BSD/Linux socket options and syscall variants
+remain unimplemented; Felix does not claim complete POSIX socket compatibility.
 
 ---
 
@@ -1380,6 +1410,9 @@ felix/
 │   ├── dd/
 │   ├── http-client/
 │   ├── ssh/
+│   ├── terminal/
+│   └── htop/
+├── std-apps/             # PopugOS std applications and async/network tests
 ├── rootfs/               # extra files copied to the root ext2 image
 ├── pxe/                  # network-boot assets/scripts
 ├── build/                # generated artifacts
@@ -1426,7 +1459,7 @@ build bootloader
 build kernel
 build native apps
 objcopy boot/kernel images
-create 32 MiB disk image
+create 64 MiB disk image
 create ext2 root filesystem
 copy kernel/apps/rootfs files
 install boot sectors/partition table
@@ -1463,7 +1496,7 @@ pure-Rust `am-fs-ext4` library in its ext2-compatible mode.
 
 ## Standard disk-image layout
 
-The current Makefile creates a 32 MiB disk:
+The current Makefile creates a 64 MiB disk:
 
 ```text
 LBA 0          MBR / stage 1
@@ -1483,7 +1516,8 @@ The ext2 filesystem receives:
 make run
 ```
 
-The run target creates a test USB image if necessary and starts QEMU with an IDE boot disk, RTL8139 and PCI OHCI + USB storage.
+The run target creates a test USB image if necessary and starts QEMU with an
+IDE boot disk, e1000e, PCI OHCI, AC97 and eight virtual CPUs.
 
 ## Debug in QEMU
 
@@ -1524,7 +1558,7 @@ Felix is an actively developed hobby/research OS. The following are deliberate c
 
 ## Core / memory
 
-- ACPI MADT / Intel MP discovery and INIT/SIPI startup bring up to 8 CPUs;
+- ACPI MADT / Intel MP discovery and INIT/SIPI startup support up to 64 CPUs;
   each application processor has a private stack, GDT/TSS and periodic Local
   APIC timer, plus a shared queue for non-blocking kernel work
 - user processes and shared-address-space threads run on APs; page-table changes
@@ -1538,12 +1572,11 @@ Felix is an actively developed hobby/research OS. The following are deliberate c
 - RAM is currently clamped to 64 MiB..1 GiB for the paging model
 - process heap/mmap management is intentionally simple
 - no copy-on-write or demand paging
-- PXE RAM disk at `0x02000000` currently overlaps the fixed `0x01800000..0x02800000` kernel heap reservation and must be relocated before that path can be considered safe
+- PXE/USB RAM-disk hydration starts at `0x02800000`, after the fixed kernel heap
 
 ## Interrupts / devices
 
-- no generic shared PCI INTx dispatcher
-- IRQ9 is kept masked on the Sony target
+- the shared PCI INTx dispatcher currently covers legacy IRQ5/9/10/11 only
 - USB and PCMCIA hotplug are polling-based
 - only OHCI USB 1.1 is implemented; no UHCI/EHCI/xHCI
 - no general driver unload/hot-unload framework
@@ -1562,19 +1595,16 @@ Felix is an actively developed hobby/research OS. The following are deliberate c
 ## Filesystem / POSIX compatibility
 
 - ext2/FAT implementations cover Felix's current needs, not every filesystem feature
-- `ioctl` is largely a stub
+- `ioctl` currently focuses on PTY termios/job-control/window-size operations
 - syscall compatibility is Linux-inspired but incomplete
 - thread create/join/detach, key-based TLS and Linux-like PID/TID/exit-group
-  semantics are present; `std::sync` waits cooperatively yield because kernel
-  futex wait queues are not implemented yet
+  semantics are present; `std::sync` uses kernel futex wait queues
 - `execve` currently requires a single-threaded process
 - shell `ps` is currently a placeholder
 
 ## Networking
 
-- network initialization is disabled in the default boot path
 - NIC integration is experimental
-- `accept4` is not implemented
 - several socket syscalls are defined but not implemented
 - no claim of complete BSD/POSIX sockets compatibility
 
